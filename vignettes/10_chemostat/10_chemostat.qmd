@@ -1,0 +1,250 @@
+---
+title: "Chemostat Dynamics: Recovering Microbial Growth Kinetics"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+The **chemostat** is a fundamental model in microbial ecology and biotechnology. In a continuous-flow bioreactor, microorganisms grow on a limiting substrate. The specific growth rate $\mu(S)$ — how fast microbes grow as a function of substrate concentration — is a key unknown quantity.
+
+The classical **Monod kinetics** assumes $\mu(S) = \mu_{\max} S / (K_s + S)$, analogous to Michaelis–Menten enzyme kinetics. However, in practice:
+
+- Substrate inhibition may cause growth to decline at high $S$
+- Multiple limiting substrates may create more complex dependencies
+- Overflow metabolism or maintenance requirements may alter the relationship
+
+A PSM approach lets us **estimate $\mu(S)$ directly from time series data**, without assuming a specific functional form.
+
+## Setup
+
+```{julia}
+using PartiallySpecifiedModels
+using PartiallySpecifiedModels: solve
+using OrdinaryDiffEq
+using Plots
+using Statistics
+using Random
+Random.seed!(42)
+```
+
+## The Chemostat Model
+
+$$
+\begin{aligned}
+\frac{dS}{dt} &= D(S_{\text{in}} - S) - \frac{\mu(S) \cdot X}{Y} \\
+\frac{dX}{dt} &= \mu(S) \cdot X - D \cdot X
+\end{aligned}
+$$
+
+where:
+
+| Parameter | Description | Value |
+|-----------|-------------|-------|
+| $D$ | Dilution rate | 0.3 h⁻¹ |
+| $S_{\text{in}}$ | Feed substrate concentration | 10 g/L |
+| $Y$ | Yield coefficient | 0.5 g/g |
+| $\mu(S)$ | Specific growth rate | **Unknown** |
+
+The true growth kinetics follow Monod: $\mu(S) = \frac{\mu_{\max} S}{K_s + S} = \frac{S}{2 + S}$ with $\mu_{\max} = 1.0$ h⁻¹ and $K_s = 2.0$ g/L.
+
+### Visualise Monod kinetics
+
+```{julia}
+S_grid = range(0, 12, length=200)
+μ_true = [S / (2.0 + S) for S in S_grid]
+
+plot(S_grid, μ_true, lw=3, color=:black,
+     xlabel="Substrate S (g/L)", ylabel="μ(S) (h⁻¹)",
+     title="True Monod growth kinetics",
+     label="μ(S) = S/(2+S)", legend=:bottomright)
+hline!([1.0], ls=:dot, color=:gray, label="μmax = 1.0")
+vline!([2.0], ls=:dot, color=:gray, label="Ks = 2.0")
+```
+
+### Generate data
+
+We simulate a chemostat experiment: starting with high substrate and low biomass, the system approaches a steady state as the microbes consume the substrate.
+
+```{julia}
+function chemo_true!(du, u, p, t)
+    S, X = u
+    μ = 1.0 * S / (2.0 + S)
+    du[1] = 0.3 * (10.0 - S) - μ * X / 0.5
+    du[2] = μ * X - 0.3 * X
+end
+
+u0 = [10.0, 0.5]
+tspan = (0.0, 30.0)
+sol_ode = OrdinaryDiffEq.solve(ODEProblem(chemo_true!, u0, tspan), Tsit5(), saveat=0.5)
+
+data_t = sol_ode.t
+σ_S, σ_X = 0.3, 0.1
+data = max.(hcat(sol_ode[1,:], sol_ode[2,:]) .+
+            hcat(σ_S .* randn(length(data_t)), σ_X .* randn(length(data_t))), 0.01)
+
+p1 = plot(sol_ode.t, sol_ode[1,:], label="True S", lw=2, color=:purple, ls=:dash)
+scatter!(p1, data_t, data[:, 1], label="S (obs)", ms=3, alpha=0.6, color=:purple)
+p2 = plot(sol_ode.t, sol_ode[2,:], label="True X", lw=2, color=:teal, ls=:dash)
+scatter!(p2, data_t, data[:, 2], label="X (obs)", ms=3, alpha=0.6, color=:teal)
+plot(p1, p2, layout=(1, 2), size=(800, 350),
+     xlabel="Time (h)", ylabel="Concentration (g/L)")
+```
+
+## Define and Fit the PSM
+
+```{julia}
+function chemostat!(du, u, p, t)
+    S, X = u
+    μ_val = p.μ(max(S, 0.01))
+    du[1] = 0.3 * (10.0 - S) - max(μ_val, 0.0) * X / 0.5
+    du[2] = max(μ_val, 0.0) * X - 0.3 * X
+end
+
+approx_μ = BSplineApproximator(:μ, (0.0, 12.0), 8; initial=0.5)
+
+prob = PSMProblem(chemostat!, u0, tspan, [approx_μ];
+    data_times=data_t, data_values=data,
+    obs_to_state=[1, 2],
+    known_params=(D=0.3, Sin=10.0, Y=0.5),
+    solver=Tsit5())
+```
+
+### LAML fit
+
+```{julia}
+#| echo: false
+sol_laml = solve(prob, LAML(maxiters=100, verbose=true))
+println("Data loss: ", round(sol_laml.data_loss, digits=2))
+println("EDF: ", round(sol_laml.edf, digits=2))
+```
+
+### RodeoSolver fit (with uncertainty)
+
+```{julia}
+#| echo: false
+sol_rodeo = solve(prob, RodeoSolver(n_steps=200, n_deriv=3, maxiters=200, verbose=true))
+println("Data loss: ", round(sol_rodeo.data_loss, digits=2))
+```
+
+## Results
+
+### Fitted trajectories
+
+```{julia}
+p1 = plot(sol_ode.t, sol_ode[1,:], label="True", lw=2, color=:black, ls=:dash,
+          xlabel="Time (h)", ylabel="S (g/L)", title="Substrate")
+scatter!(p1, data_t, data[:, 1], label="Data", ms=3, alpha=0.5, color=:gray)
+plot!(p1, data_t, sol_laml.fitted_values[:, 1], label="LAML", lw=2, color=:blue)
+plot!(p1, data_t, sol_rodeo.fitted_values[:, 1], label="Rodeo", lw=2, color=:green)
+
+p2 = plot(sol_ode.t, sol_ode[2,:], label="True", lw=2, color=:black, ls=:dash,
+          xlabel="Time (h)", ylabel="X (g/L)", title="Biomass")
+scatter!(p2, data_t, data[:, 2], label="Data", ms=3, alpha=0.5, color=:gray)
+plot!(p2, data_t, sol_laml.fitted_values[:, 2], label="LAML", lw=2, color=:blue)
+plot!(p2, data_t, sol_rodeo.fitted_values[:, 2], label="Rodeo", lw=2, color=:green)
+
+plot(p1, p2, layout=(1, 2), size=(800, 350))
+```
+
+### Recovered growth kinetics
+
+```{julia}
+S_eval = range(0.5, 10.0, length=100)
+μ_true_vals = [S / (2.0 + S) for S in S_eval]
+μ_laml = [sol_laml.unknown_functions[:μ](S) for S in S_eval]
+μ_rodeo = [sol_rodeo.unknown_functions[:μ](S) for S in S_eval]
+
+plot(S_eval, μ_true_vals, label="True μ(S) = S/(2+S)", lw=3, color=:black, ls=:dash,
+     xlabel="Substrate S (g/L)", ylabel="Specific growth rate μ(S) (h⁻¹)",
+     title="Recovered growth kinetics", legend=:bottomright)
+plot!(S_eval, μ_laml, label="LAML", lw=2, color=:blue)
+plot!(S_eval, μ_rodeo, label="RodeoSolver", lw=2, color=:green)
+hline!([1.0], ls=:dot, color=:gray, alpha=0.5, label="μmax")
+```
+
+Both solvers recover the saturating Monod curve without assuming any parametric form. The key features are correctly identified:
+
+1. **Linear increase** at low substrate concentrations (first-order kinetics)
+2. **Saturation** approaching $\mu_{\max}$ at high concentrations
+3. **Half-saturation** correctly located near $K_s = 2$ g/L
+
+## Residual Diagnostics
+
+Good model fit can be verified using the built-in residual diagnostics:
+
+```{julia}
+#| echo: false
+diag = residual_diagnostics(sol_laml)
+resid = diag.residuals
+println("Residual diagnostics (LAML):")
+println("  RMSE S: ", round(sqrt(mean(resid[:, 1].^2)), digits=4))
+println("  RMSE X: ", round(sqrt(mean(resid[:, 2].^2)), digits=4))
+println("  Durbin-Watson: ", round.(diag.durbin_watson, digits=3))
+```
+
+```{julia}
+acf = diag.acf
+nlags = size(acf, 1) - 1
+p_acf = bar(0:nlags, acf[:, 1], label="S residual ACF", alpha=0.7, color=:purple,
+            xlabel="Lag", ylabel="Autocorrelation",
+            title="Residual autocorrelation")
+bar!(0:nlags, acf[:, 2], label="X residual ACF", alpha=0.7, color=:teal)
+hline!([1.96 / sqrt(length(data_t)), -1.96 / sqrt(length(data_t))],
+       ls=:dash, color=:gray, label="95% CI")
+p_acf
+```
+
+## Substrate Inhibition: What If Monod Is Wrong?
+
+In many industrial fermentations, high substrate concentrations actually **inhibit** growth. Let's see what happens when the true kinetics include inhibition:
+
+```{julia}
+# Haldane kinetics: μ(S) = μmax*S / (Ks + S + S²/Ki)
+function chemo_haldane!(du, u, p, t)
+    S, X = u
+    μ = 1.0 * S / (2.0 + S + S^2 / 15.0)  # Ki = 15
+    du[1] = 0.3 * (10.0 - S) - μ * X / 0.5
+    du[2] = μ * X - 0.3 * X
+end
+
+Random.seed!(123)
+sol_haldane = OrdinaryDiffEq.solve(ODEProblem(chemo_haldane!, u0, tspan), Tsit5(), saveat=0.5)
+data_haldane = max.(hcat(sol_haldane[1,:], sol_haldane[2,:]) .+
+                    hcat(0.3 .* randn(length(sol_haldane.t)), 0.1 .* randn(length(sol_haldane.t))), 0.01)
+
+prob_h = PSMProblem(chemostat!, u0, tspan, [BSplineApproximator(:μ, (0.0, 12.0), 10; initial=0.5)];
+    data_times=sol_haldane.t, data_values=data_haldane,
+    obs_to_state=[1, 2], known_params=(D=0.3, Sin=10.0, Y=0.5), solver=Tsit5())
+
+sol_h = solve(prob_h, LAML(maxiters=100, verbose=false))
+
+S_eval_h = range(0.5, 10.0, length=100)
+μ_haldane = [S / (2.0 + S + S^2 / 15.0) for S in S_eval_h]
+μ_est_h = [sol_h.unknown_functions[:μ](S) for S in S_eval_h]
+
+plot(S_eval_h, μ_haldane, label="True (Haldane)", lw=3, color=:black, ls=:dash,
+     xlabel="Substrate S (g/L)", ylabel="μ(S) (h⁻¹)",
+     title="Detecting substrate inhibition", legend=:topright)
+plot!(S_eval_h, μ_est_h, label="PSM estimate", lw=2, color=:red)
+```
+
+The PSM successfully detects the **non-monotonic** growth kinetics — the specific growth rate increases, peaks, and then declines — without any assumption about inhibition.
+
+## Key Takeaways
+
+1. **Chemostat dynamics** are a natural fit for PSMs — the growth kinetics are the main unknown
+2. **Both LAML and RodeoSolver** accurately recover Monod kinetics from noisy time series
+3. **Non-standard kinetics** (e.g., substrate inhibition) are detected automatically
+4. **Residual diagnostics** help verify model adequacy and detect systematic departures

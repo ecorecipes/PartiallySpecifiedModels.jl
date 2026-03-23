@@ -1,0 +1,113 @@
+---
+title: "Derivative-Free Optimization"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+The `DerivativeFreeSolver` uses gradient-free optimization (Nelder-Mead or Particle Swarm) to fit partially specified models. This is a **robust fallback** when gradient-based methods (LAML, Adam) struggle with:
+
+- Stiff or chaotic dynamics that break autodiff
+- Non-smooth objectives or discontinuous model behavior
+- Poor initial conditions where gradient methods get stuck
+
+The tradeoff is slower convergence — derivative-free methods need more function evaluations — but they can explore the objective landscape more broadly.
+
+```{julia}
+using PartiallySpecifiedModels
+using OrdinaryDiffEq
+using Plots
+using Random
+Random.seed!(42)
+```
+
+## Exponential Decay with Unknown Rate
+
+A simple model: $du/dt = -f(u)$ where $f(u) = 0.5u$ is unknown.
+
+```{julia}
+function decay!(du, u, p, t)
+    du[1] = -p.f(u[1])
+end
+
+sol_true = solve(ODEProblem(decay!, [5.0], (0.0, 10.0), (; f=x -> 0.5*x)),
+                 Tsit5(); saveat=0.5)
+t_data = collect(sol_true.t)
+data_vals = [sol_true.u[i][1] + 0.05 * randn() for i in 1:length(t_data)]
+data_matrix = reshape(max.(data_vals, 0.01), :, 1)
+```
+
+## Nelder-Mead vs Adam Comparison
+
+```{julia}
+uf = BSplineApproximator(:f, (0.0, 6.0), 8)
+
+prob = PSMProblem(decay!, [5.0], (0.0, 10.0), [uf];
+    data_times=t_data, data_values=Float64.(data_matrix),
+    obs_to_state=[1], known_params=NamedTuple())
+
+sol_nm = solve(prob, DerivativeFreeSolver(method=:nelder_mead, maxiters=5000, verbose=false))
+sol_adam = solve(prob, AdamSolver(lr=0.01, maxiters=2000, verbose=false))
+sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
+```
+
+### Recovered Function
+
+```{julia}
+f_nm = sol_nm.unknown_functions[:f]
+f_adam = sol_adam.unknown_functions[:f]
+f_laml = sol_laml.unknown_functions[:f]
+u_grid = range(0.0, 6.0, length=100)
+f_true(u) = 0.5 * u
+
+p1 = plot(u_grid, f_true.(u_grid), label="True f(u)", lw=2, color=:black,
+          xlabel="u", ylabel="f(u)", title="Decay Rate Recovery")
+plot!(p1, u_grid, [f_nm(x) for x in u_grid], label="NelderMead (loss=$(round(sol_nm.data_loss, digits=3)))", lw=2)
+plot!(p1, u_grid, [f_adam(x) for x in u_grid], label="Adam (loss=$(round(sol_adam.data_loss, digits=3)))", lw=2, ls=:dash)
+plot!(p1, u_grid, [f_laml(x) for x in u_grid], label="LAML (loss=$(round(sol_laml.data_loss, digits=3)))", lw=2, ls=:dot)
+p1
+```
+
+### Trajectory Fit
+
+```{julia}
+p2 = plot(t_data, data_matrix[:, 1], seriestype=:scatter, label="Data",
+          xlabel="Time", ylabel="u", title="Trajectory", ms=4, alpha=0.6)
+plot!(p2, t_data, sol_nm.fitted_values[:, 1], label="NelderMead", lw=2)
+plot!(p2, t_data, sol_adam.fitted_values[:, 1], label="Adam", lw=2, ls=:dash)
+plot!(p2, t_data, sol_laml.fitted_values[:, 1], label="LAML", lw=2, ls=:dot)
+p2
+```
+
+## Particle Swarm for Global Search
+
+Particle swarm optimization explores more broadly and can escape local minima:
+
+```{julia}
+sol_ps = solve(prob, DerivativeFreeSolver(method=:particle_swarm, maxiters=5000,
+                                           n_particles=20, verbose=false))
+f_ps = sol_ps.unknown_functions[:f]
+println("NelderMead: loss=$(round(sol_nm.data_loss, digits=4)), f(3)=$(round(f_nm(3.0), digits=3))")
+println("ParticleSwarm: loss=$(round(sol_ps.data_loss, digits=4)), f(3)=$(round(f_ps(3.0), digits=3))")
+println("True: f(3)=$(round(f_true(3.0), digits=3))")
+```
+
+## When to Use DerivativeFree
+
+- **Robustness**: Works when autodiff fails (stiff systems, discontinuities)
+- **Global search**: Particle swarm can find solutions that gradient methods miss
+- **No gradients needed**: Useful for complex models where ForwardDiff is prohibitively expensive
+- **Tradeoff**: Slower convergence — needs 5-10× more function evaluations than gradient methods
+- Best for **low-dimensional** parameter spaces (< 50 parameters)

@@ -1,0 +1,197 @@
+---
+title: "Delay Differential Equations"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+Many ecological systems exhibit **time delays** — for example, predator responses to prey density may depend on prey levels at some past time, or population dynamics may depend on maturation times. PartiallySpecifiedModels.jl supports **delay differential equations (DDEs)** through integration with [DelayDiffEq.jl](https://github.com/SciML/DelayDiffEq.jl).
+
+A DDE has the form:
+
+$$\frac{du}{dt} = f(u(t), u(t - \tau), p, t)$$
+
+where $\tau$ is the delay and the history function $h(t)$ provides initial values for $t \leq t_0$.
+
+```{julia}
+using PartiallySpecifiedModels
+using OrdinaryDiffEq
+using DelayDiffEq
+using Random
+Random.seed!(42)
+```
+
+## Example: Delayed Negative Feedback
+
+We consider a simple model with delayed negative feedback:
+
+$$\frac{du}{dt} = -f(u(t - \tau))$$
+
+where $f$ is an unknown function and $\tau = 1.0$. The true function is $f(x) = 0.5x$ (linear decay acting on the delayed state).
+
+### Generate Data
+
+```{julia}
+function dde_true!(du, u, h, p, t)
+    u_delayed = h(p, t - 1.0)
+    du[1] = -0.5 * u_delayed[1]
+end
+
+h_func(p, t) = [1.0]  # constant history
+
+prob_true = DDEProblem(dde_true!, [1.0], h_func, (0.0, 10.0);
+    constant_lags=[1.0])
+sol_true = solve(prob_true, MethodOfSteps(Tsit5()); saveat=0.25)
+
+t_data = collect(sol_true.t)
+noise = 0.02
+data_vals = [sol_true.u[i][1] + noise * randn() for i in 1:length(t_data)]
+data_matrix = reshape(max.(data_vals, 0.001), :, 1)
+```
+
+### Define the PSM Problem
+
+The key additions for DDEs are:
+
+- **`delays`**: a vector of constant delay values
+- **`history`**: a function `h(p, t)` returning the state for $t \leq t_0$
+- The dynamics function takes an extra `h` argument: `f!(du, u, h, p, t)`
+
+```{julia}
+function dde_psm!(du, u, h, p, t)
+    u_delayed = h(p, t - 1.0)
+    du[1] = -p.f(u_delayed[1])
+end
+
+uf = BSplineApproximator(:f, (0.0, 1.5), 8)
+
+prob = PSMProblem(dde_psm!, [1.0], (0.0, 10.0), [uf];
+    data_times=t_data, data_values=Float64.(data_matrix),
+    obs_to_state=[1], known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian(),
+    delays=[1.0],
+    history=h_func)
+```
+
+### Fit with LAML
+
+```{julia}
+sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
+```
+
+### Recovered Function
+
+```{julia}
+#| echo: false
+f_true(x) = 0.5 * x
+f_laml = sol_laml.unknown_functions[:f]
+
+println("Unknown function f(x) comparison:")
+println("  x    |  True   |  LAML")
+println("  -----|---------|--------")
+for x in [0.1, 0.3, 0.5, 0.7, 1.0]
+    println("  $(lpad(x, 4)) | $(lpad(round(f_true(x), digits=3), 7)) " *
+            "| $(lpad(round(f_laml(x), digits=3), 7))")
+end
+```
+
+### Fitted Trajectory
+
+```{julia}
+#| echo: false
+println("Trajectory comparison (selected time points):")
+println("  t    | Observed | Fitted")
+println("  -----|----------|-------")
+for i in 1:4:length(t_data)
+    t = t_data[i]
+    println("  $(lpad(round(t, digits=2), 5)) | $(lpad(round(data_vals[i], digits=3), 8)) " *
+            "| $(lpad(round(sol_laml.fitted_values[i,1], digits=3), 6))")
+end
+```
+
+## Example: Blowfly Model with Delayed Reproduction
+
+A more ecological example: Nicholson's blowfly equation with unknown reproduction function:
+
+$$\frac{dN}{dt} = g(N(t - \tau)) - \delta N(t)$$
+
+where $g$ is the density-dependent reproduction rate acting on the delayed population, and $\delta$ is the mortality rate.
+
+```{julia}
+g_true(N) = 5.0 * N * exp(-N / 50.0)
+
+function blowfly_true!(du, u, h, p, t)
+    N_delayed = h(p, t - 2.0)
+    du[1] = g_true(N_delayed[1]) - 0.1 * u[1]
+end
+
+h_blow(p, t) = [20.0]
+prob_blow = DDEProblem(blowfly_true!, [20.0], h_blow, (0.0, 50.0);
+    constant_lags=[2.0])
+sol_blow = solve(prob_blow, MethodOfSteps(Tsit5()); saveat=0.5)
+
+t_blow = collect(sol_blow.t)
+data_blow = [max(sol_blow.u[i][1] + 1.0 * randn(), 0.1) for i in 1:length(t_blow)]
+data_blow_matrix = reshape(data_blow, :, 1)
+```
+
+```{julia}
+function blowfly!(du, u, h, p, t)
+    N_delayed = h(p, t - 2.0)
+    du[1] = p.g(N_delayed[1]) - 0.1 * u[1]
+end
+
+uf_blow = BSplineApproximator(:g, (0.0, 80.0), 12)
+
+prob_blow_psm = PSMProblem(blowfly!, [20.0], (0.0, 50.0), [uf_blow];
+    data_times=t_blow, data_values=Float64.(data_blow_matrix),
+    obs_to_state=[1], known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian(),
+    delays=[2.0], history=h_blow)
+
+sol_blow_fit = solve(prob_blow_psm, LAML(maxiters=50, verbose=false))
+```
+
+### Recovered Reproduction Function
+
+```{julia}
+#| echo: false
+g_fitted = sol_blow_fit.unknown_functions[:g]
+
+println("Reproduction function g(N) comparison:")
+println("  N    |  True   |  Fitted")
+println("  -----|---------|--------")
+for N in [5.0, 10.0, 20.0, 40.0, 60.0]
+    println("  $(lpad(N, 4)) | $(lpad(round(g_true(N), digits=2), 7)) " *
+            "| $(lpad(round(g_fitted(N), digits=2), 7))")
+end
+```
+
+## DDE Problem Setup
+
+| Component | ODE | DDE |
+|-----------|-----|-----|
+| **Dynamics** | `f!(du, u, p, t)` | `f!(du, u, h, p, t)` |
+| **History** | Not needed | `h(p, t) → state vector` |
+| **Delays** | None | `delays=[τ₁, τ₂, ...]` |
+| **Accessing delayed state** | N/A | `h(p, t - τ)` |
+| **Solver** | `Tsit5()` etc. | `MethodOfSteps(Tsit5())` (automatic) |
+| **Compatible PSM solvers** | All | LAML, AdamSolver, BNGSolver* |
+
+*BNGSolver works with DDEs when all states are observed, since it only uses smoothed derivatives.
+
+## Summary
+
+PartiallySpecifiedModels.jl supports delay differential equations through the `delays` and `history` keyword arguments to `PSMProblem`. The DDE dynamics function takes an extra history argument `h` that provides delayed state values. All standard solvers (LAML, Adam) work with DDEs via automatic wrapping with `MethodOfSteps`.

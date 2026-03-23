@@ -1,0 +1,119 @@
+---
+title: "Likelihood-Free Inference with ABC-SMC"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+The `ABCSolver` implements **Approximate Bayesian Computation with Sequential Monte Carlo** (ABC-SMC), a likelihood-free inference method. Instead of evaluating a likelihood function, ABC:
+
+1. Samples parameter proposals from a prior (or previous generation)
+2. Simulates the model forward with each proposal
+3. Compares simulated data to observed data using a **summary statistic** (e.g., RMSE)
+4. Accepts proposals whose simulations are sufficiently close to the data
+
+ABC-SMC refines the tolerance $\epsilon$ over generations, progressively concentrating particles near the posterior.
+
+```{julia}
+using PartiallySpecifiedModels
+using OrdinaryDiffEq
+using Plots
+using Statistics
+using Random
+Random.seed!(42)
+```
+
+## Exponential Decay with Unknown Rate
+
+```{julia}
+function decay!(du, u, p, t)
+    du[1] = -p.f(u[1])
+end
+
+sol_true = solve(ODEProblem(decay!, [5.0], (0.0, 10.0), (; f=x -> 0.5*x)),
+                 Tsit5(); saveat=1.0)
+t_data = collect(sol_true.t)
+data_vals = [sol_true.u[i][1] + 0.1 * randn() for i in 1:length(t_data)]
+data_matrix = reshape(max.(data_vals, 0.01), :, 1)
+```
+
+## ABC-SMC Fit
+
+```{julia}
+uf = BSplineApproximator(:f, (0.0, 6.0), 6)
+
+prob = PSMProblem(decay!, [5.0], (0.0, 10.0), [uf];
+    data_times=t_data, data_values=Float64.(data_matrix),
+    obs_to_state=[1], known_params=NamedTuple())
+
+sol_abc = solve(prob, ABCSolver(n_particles=200, n_generations=8,
+                                 prior_scale=2.0, verbose=false))
+sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
+```
+
+### Recovered Function
+
+```{julia}
+f_abc = sol_abc.unknown_functions[:f]
+f_laml = sol_laml.unknown_functions[:f]
+f_true(u) = 0.5 * u
+u_grid = range(0.0, 6.0, length=100)
+
+p1 = plot(u_grid, f_true.(u_grid), label="True f(u)", lw=2, color=:black,
+          xlabel="u", ylabel="f(u)", title="ABC vs LAML: Decay Rate")
+plot!(p1, u_grid, [f_abc(x) for x in u_grid], label="ABC-SMC", lw=2)
+plot!(p1, u_grid, [f_laml(x) for x in u_grid], label="LAML", lw=2, ls=:dash)
+p1
+```
+
+### Trajectory Fit
+
+```{julia}
+p2 = plot(t_data, data_matrix[:, 1], seriestype=:scatter, label="Data",
+          xlabel="Time", ylabel="u", title="Trajectory", ms=4, alpha=0.6)
+plot!(p2, t_data, sol_abc.fitted_values[:, 1], label="ABC-SMC", lw=2)
+plot!(p2, t_data, sol_laml.fitted_values[:, 1], label="LAML", lw=2, ls=:dash)
+p2
+```
+
+### Tolerance Schedule
+
+```{julia}
+if haskey(sol_abc.convergence, :tolerance_history)
+    eps_hist = sol_abc.convergence[:tolerance_history]
+    p3 = plot(1:length(eps_hist), eps_hist, label="ε", xlabel="Generation",
+              ylabel="Tolerance", title="ABC Tolerance Schedule", lw=2, marker=:circle)
+    p3
+end
+```
+
+### Summary
+
+```{julia}
+println("ABC:  loss=$(round(sol_abc.data_loss, digits=4)), f(3)=$(round(f_abc(3.0), digits=3))")
+println("LAML: loss=$(round(sol_laml.data_loss, digits=4)), f(3)=$(round(f_laml(3.0), digits=3))")
+println("True: f(3)=$(round(f_true(3.0), digits=3))")
+if haskey(sol_abc.convergence, :n_accepted)
+    println("ABC accepted: $(sol_abc.convergence[:n_accepted]) / $(sol_abc.convergence[:n_total]) particles")
+end
+```
+
+## When to Use ABC
+
+- **Likelihood-free**: Works when the likelihood function is unavailable or intractable
+- **Robust**: No gradients needed — handles any model that can be simulated
+- **Flexible summary statistics**: Can encode domain knowledge about what aspects of the data matter
+- **Tradeoff**: Computationally expensive (many simulations), less efficient than gradient-based methods
+- Best for **complex simulators** where analytic likelihoods don't exist

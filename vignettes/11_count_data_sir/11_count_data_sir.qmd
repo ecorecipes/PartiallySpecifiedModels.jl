@@ -1,0 +1,303 @@
+---
+title: "Epidemiological Count Data: Non-Gaussian Likelihoods"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+Epidemiological surveillance data are often **discrete counts** — case reports, hospitalisations, or deaths — not continuous measurements. Using a Gaussian likelihood on count data can lead to biased estimates, particularly when counts are small (where the variance is proportional to the mean).
+
+`PartiallySpecifiedModels.jl` supports several likelihood families appropriate for count data:
+
+| Likelihood | Use case | Variance structure |
+|-----------|----------|-------------------|
+| `Gaussian()` | Continuous measurements | Constant (σ²) |
+| `Poisson()` | Count data, equidispersed | Var = Mean |
+| `NegativeBinomial()` | Count data, overdispersed | Var = Mean + Mean²/k |
+
+This vignette demonstrates fitting an SIR model with a density-dependent transmission rate to **count data**, comparing the effect of different likelihood specifications.
+
+## Setup
+
+```{julia}
+using PartiallySpecifiedModels
+using PartiallySpecifiedModels: solve
+using OrdinaryDiffEq
+using Plots
+using Statistics
+using Random
+import Distributions
+Random.seed!(42)
+```
+
+## Generating Realistic Epidemic Count Data
+
+### True model
+
+We simulate an SIR epidemic where the transmission rate declines with prevalence — a behavioural feedback:
+
+$$
+\beta(\text{prev}) = \beta_0 \, e^{-\alpha \cdot \text{prev}}
+$$
+
+```{julia}
+function sir_true!(du, u, p, t)
+    S, I = u; N = 1000.0
+    prev = I / N
+    β = 0.5 * exp(-2.0 * prev)
+    du[1] = -β * S * I / N
+    du[2] = β * S * I / N - 0.25 * I
+end
+
+u0 = [990.0, 10.0]
+tspan = (0.0, 50.0)
+sol_ode = OrdinaryDiffEq.solve(ODEProblem(sir_true!, u0, tspan), Tsit5(), saveat=1.0)
+data_t = sol_ode.t
+```
+
+### Generate observations
+
+Both S and I are observed as **overdispersed counts** (e.g. from serological surveys and case reports).  We use Negative Binomial noise with dispersion parameter $k=10$ for S (less noisy, larger counts) and $k=5$ for I (noisier, smaller counts):
+
+```{julia}
+S_true = max.(sol_ode[1,:], 0.1)
+I_true = max.(sol_ode[2,:], 0.1)
+k_S = 10.0  # dispersion for S (less noisy)
+k_I = 5.0   # dispersion for I (noisier)
+
+S_counts = Float64.([rand(Distributions.NegativeBinomial(
+    k_S, k_S / (k_S + v))) for v in S_true])
+I_counts = Float64.([rand(Distributions.NegativeBinomial(
+    k_I, k_I / (k_I + v))) for v in I_true])
+
+data = hcat(S_counts, I_counts)
+
+p1 = plot(sol_ode.t, sol_ode[1,:], label="True S", lw=2, ls=:dash, color=:blue)
+scatter!(p1, data_t, S_counts, label="S (NegBin, k=10)", ms=3, alpha=0.6, color=:blue)
+p2 = plot(sol_ode.t, sol_ode[2,:], label="True I", lw=2, ls=:dash, color=:red)
+scatter!(p2, data_t, I_counts, label="I (NegBin, k=5)", ms=3, alpha=0.6, color=:red)
+plot(p1, p2, layout=(1, 2), size=(800, 350),
+     xlabel="Time (days)", ylabel="Count")
+```
+
+### Data characteristics
+
+```{julia}
+#| echo: false
+for (name, counts) in [("Susceptible (S)", S_counts), ("Infected (I)", I_counts)]
+    println("$name:")
+    println("  Range: $(Int(minimum(counts))) – $(Int(maximum(counts)))")
+    println("  Mean: $(round(mean(counts), digits=1))")
+    m = mean(counts[counts .> 0])
+    println("  Var/Mean: $(round(var(counts)/max(m, 0.1), digits=1)) (>1 = overdispersion)")
+end
+```
+
+## Define the PSM
+
+The B-spline domain should closely match the **observed prevalence range** to avoid boundary artefacts.  The epidemic starts at `I/N = 0.01` and peaks around `I/N ≈ 0.10`, so we use `(0.005, 0.11)`:
+
+```{julia}
+#| echo: false
+function sir!(du, u, p, t)
+    S, I = u; N = 1000.0
+    prev = I / N
+    β_val = p.β(prev)
+    foi = max(β_val, 0.001) * S * I / N
+    du[1] = -foi
+    du[2] = foi - 0.25 * I
+end
+
+approx_β = BSplineApproximator(:β, (0.005, 0.11), 8; initial=0.4)
+
+# Check actual prevalence range
+prev_range = sol_ode[2,:] ./ 1000.0
+println("Prevalence range: $(round(minimum(prev_range), digits=3)) – $(round(maximum(prev_range), digits=3))")
+```
+
+## Compare Likelihood Specifications
+
+Each likelihood gets a fresh approximator:
+
+### Gaussian (standard, but wrong for counts)
+
+```{julia}
+#| echo: false
+prob_gauss = PSMProblem(sir!, u0, tspan,
+    [BSplineApproximator(:β, (0.005, 0.11), 8; initial=0.4)];
+    data_times=data_t, data_values=data,
+    obs_to_state=[1, 2], known_params=(γ=0.25,),
+    likelihood=Gaussian(), solver=Tsit5())
+
+sol_gauss = solve(prob_gauss, LAML(maxiters=100))
+println("Gaussian: data_loss = ", round(sol_gauss.data_loss, digits=1),
+        ", edf = ", round(sol_gauss.edf, digits=1))
+```
+
+### Poisson (correct variance structure for counts)
+
+```{julia}
+#| echo: false
+prob_pois = PSMProblem(sir!, u0, tspan,
+    [BSplineApproximator(:β, (0.005, 0.11), 8; initial=0.4)];
+    data_times=data_t, data_values=data,
+    obs_to_state=[1, 2], known_params=(γ=0.25,),
+    likelihood=PartiallySpecifiedModels.Poisson(), solver=Tsit5())
+
+sol_pois = solve(prob_pois, LAML(maxiters=100))
+println("Poisson: data_loss = ", round(sol_pois.data_loss, digits=1),
+        ", edf = ", round(sol_pois.edf, digits=1))
+```
+
+### Negative Binomial (accounts for overdispersion)
+
+```{julia}
+#| echo: false
+prob_nb = PSMProblem(sir!, u0, tspan,
+    [BSplineApproximator(:β, (0.005, 0.11), 8; initial=0.4)];
+    data_times=data_t, data_values=data,
+    obs_to_state=[1, 2], known_params=(γ=0.25,),
+    likelihood=NegativeBinomial(), solver=Tsit5())
+
+sol_nb = solve(prob_nb, LAML(maxiters=100))
+println("NegBin: data_loss = ", round(sol_nb.data_loss, digits=1),
+        ", edf = ", round(sol_nb.edf, digits=1))
+```
+
+## Compare Results
+
+### Fitted trajectories
+
+```{julia}
+p_S = plot(sol_ode.t, sol_ode[1,:], label="True", lw=2, color=:black, ls=:dash,
+           xlabel="Time", ylabel="S", title="Susceptibles")
+scatter!(p_S, data_t, S_counts, label="Data", ms=2, alpha=0.4, color=:gray)
+plot!(p_S, data_t, sol_gauss.fitted_values[:, 1], label="Gaussian", lw=2, color=:blue)
+plot!(p_S, data_t, sol_pois.fitted_values[:, 1], label="Poisson", lw=2, color=:green)
+plot!(p_S, data_t, sol_nb.fitted_values[:, 1], label="NegBin", lw=2, color=:red)
+
+p_I = plot(sol_ode.t, sol_ode[2,:], label="True", lw=2, color=:black, ls=:dash,
+           xlabel="Time", ylabel="I", title="Infected")
+scatter!(p_I, data_t, I_counts, label="Data", ms=2, alpha=0.4, color=:gray)
+plot!(p_I, data_t, sol_gauss.fitted_values[:, 2], label="Gaussian", lw=2, color=:blue)
+plot!(p_I, data_t, sol_pois.fitted_values[:, 2], label="Poisson", lw=2, color=:green)
+plot!(p_I, data_t, sol_nb.fitted_values[:, 2], label="NegBin", lw=2, color=:red)
+
+plot(p_S, p_I, layout=(1, 2), size=(900, 400))
+```
+
+### Recovered β(prevalence)
+
+This is the key comparison — how well each likelihood recovers the true transmission rate:
+
+```{julia}
+prev_grid = range(0.0, 0.1, length=100)
+β_true = [0.5 * exp(-2.0 * p) for p in prev_grid]
+
+plot(prev_grid, β_true, label="True β(prev)", lw=3, color=:black, ls=:dash,
+     xlabel="Prevalence (I/N)", ylabel="β",
+     title="Recovered transmission rate by likelihood")
+plot!(prev_grid, [sol_gauss.unknown_functions[:β](p) for p in prev_grid],
+      label="Gaussian", lw=2, color=:blue)
+plot!(prev_grid, [sol_pois.unknown_functions[:β](p) for p in prev_grid],
+      label="Poisson", lw=2, color=:green)
+plot!(prev_grid, [sol_nb.unknown_functions[:β](p) for p in prev_grid],
+      label="NegBin", lw=2, color=:red)
+```
+
+### Summary
+
+```{julia}
+#| echo: false
+println("Likelihood | β(0.01) est | β(0.06) est | EDF  | Cor(β̂, β_true)")
+println("-"^70)
+for (name, sol) in [("Gaussian", sol_gauss), ("Poisson", sol_pois), ("NegBin", sol_nb)]
+    β_est = [sol.unknown_functions[:β](p) for p in prev_grid]
+    c = round(cor(β_true, β_est), digits=3)
+    β1 = round(sol.unknown_functions[:β](0.01), digits=3)
+    β6 = round(sol.unknown_functions[:β](0.06), digits=3)
+    edf = round(sol.edf, digits=1)
+    println(rpad(name, 11), "| ", rpad("$β1 (0.490)", 14),
+            "| ", rpad("$β6 (0.443)", 14), "| ", rpad("$edf", 5),
+            "| ", c)
+end
+```
+
+## Using RodeoSolver with Count Data
+
+The RodeoSolver can also be used with count-like data, treating the observations as Gaussian with an appropriate observation variance:
+
+```{julia}
+#| echo: false
+# Use Rodeo with variance scaled to match overdispersion
+obs_var_est = var(I_counts[I_counts .> 0]) / mean(I_counts[I_counts .> 0])
+sol_rodeo = solve(prob_gauss, RodeoSolver(
+    n_steps=200, n_deriv=3, maxiters=200, verbose=false,
+    obs_var=max(obs_var_est, 1.0) * 10.0))
+
+println("Rodeo β recovery:")
+for p in [0.01, 0.03, 0.06, 0.09]
+    β_true_val = 0.5 * exp(-2.0 * p)
+    β_rod = round(sol_rodeo.unknown_functions[:β](p), digits=3)
+    println("  β($p): true=$(round(β_true_val, digits=3)), Rodeo=$β_rod")
+end
+```
+
+## Practical Considerations
+
+### When to use each likelihood
+
+| Data type | Recommended | Rationale |
+|-----------|-------------|-----------|
+| Continuous measurements (concentrations, biomass) | `Gaussian()` | Constant variance assumption reasonable |
+| Count data with no overdispersion | `Poisson()` | Variance = mean; fails badly if data are overdispersed |
+| Overdispersed counts (aggregated reports, surveillance) | `NegativeBinomial()` | Extra variance parameter handles clustering |
+| Mixed or uncertain variance structure | `NegativeBinomial()` or `Gaussian()` | Both are robust; Poisson is fragile to misspecification |
+
+### Log-link for positive-constrained rates
+
+When the unknown function represents a rate that must be positive (like $\beta$), consider modelling the **log** of the rate:
+
+```{julia}
+function sir_log!(du, u, p, t)
+    S, I = u; N = 1000.0; prev = I / N
+    # Model log(β) to ensure positivity
+    β_val = exp(p.log_β(prev))
+    foi = β_val * S * I / N
+    du[1] = -foi; du[2] = foi - 0.25 * I
+end
+
+approx_log_β = BSplineApproximator(:log_β, (0.005, 0.11), 8; initial=log(0.4))
+prob_log = PSMProblem(sir_log!, u0, tspan, [approx_log_β];
+    data_times=data_t, data_values=data,
+    obs_to_state=[1, 2], known_params=(γ=0.25,),
+    likelihood=NegativeBinomial(), solver=Tsit5())
+
+sol_log = solve(prob_log, LAML(maxiters=100))
+
+β_log_est = [exp(sol_log.unknown_functions[:log_β](p)) for p in prev_grid]
+plot(prev_grid, β_true, label="True", lw=3, color=:black, ls=:dash,
+     xlabel="Prevalence", ylabel="β",
+     title="Log-link: β(prev) = exp(log_β(prev))")
+plot!(prev_grid, β_log_est, label="Log-link NegBin", lw=2, color=:darkgreen)
+```
+
+## Key Takeaways
+
+1. **Set the B-spline domain to match the data range** — extending beyond the observed prevalence causes severe boundary artefacts.  Inspect the data to determine the actual range.
+2. **NegativeBinomial handles overdispersion** — crucial for real-world surveillance data. Poisson assumes $\text{Var}(Y) = \mu$, so it severely underestimates the true noise when data are overdispersed, leading to under-smoothed estimates (EDF ≈ number of knots).
+3. **Gaussian is surprisingly robust** for count data with moderate overdispersion, because it estimates a free variance parameter $\hat\sigma^2$ that absorbs the extra variability.
+4. **The log-link** ensures positive rates and can improve numerical stability.
+5. **All solvers** in `PartiallySpecifiedModels.jl` work with non-Gaussian likelihoods through LAML.
