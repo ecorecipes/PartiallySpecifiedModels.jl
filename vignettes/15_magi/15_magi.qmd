@@ -1,0 +1,195 @@
+---
+title: "MAGI: Manifold-Constrained Gaussian Process Inference"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+**MAGI** (Manifold-constrained Gaussian process Inference) is a Bayesian method that uses Gaussian processes to infer ODE parameters without numerically solving the ODE during sampling. Instead, it models each state component as integrated Brownian motion and uses a Kalman filter to enforce the ODE dynamics as a "manifold constraint."
+
+**Key advantages:**
+
+- **States marginalized out**: The Kalman filter analytically integrates over trajectory uncertainty, so only ODE parameters are sampled (lower-dimensional MCMC).
+- **No ODE solver in the loop**: Avoids numerical integration at each MCMC step — faster per iteration than `MCMCSolver`.
+- **Handles partially observed systems**: Unobserved state components are naturally inferred through the ODE constraint.
+
+This vignette demonstrates `MagiSolver` on two examples: a fully observed system and a partially observed one.
+
+**Reference:** Yang, Wong & Kou (2021) "Inference of dynamic systems from noisy and sparse data via manifold-constrained Gaussian processes." *PNAS* 118(15).
+
+```{julia}
+using PartiallySpecifiedModels
+using Random
+Random.seed!(123)
+```
+
+## Example 1: SIR Model (Fully Observed)
+
+We fit an SIR model where the force of infection `β(I)` is unknown.
+
+True model: `β(I) = 0.3` (constant, mass-action).
+
+```{julia}
+function sir!(du, u, p, t)
+    S, I, R = u
+    β_val = p.β(I)
+    du[1] = -β_val * S * I           # dS/dt
+    du[2] = β_val * S * I - 0.1 * I  # dI/dt
+    du[3] = 0.1 * I                  # dR/dt
+end
+```
+
+### Generate Data
+
+```{julia}
+using OrdinaryDiffEq
+
+true_p = (; β = I -> 0.3)
+sol_true = solve(ODEProblem(sir!, [0.99, 0.01, 0.0], (0.0, 40.0), true_p),
+                 Tsit5(); saveat=2.0)
+
+t_data = collect(sol_true.t)
+noise = 0.005
+data_SI = hcat([sol_true.u[i][1:2] .+ noise .* randn(2) for i in 1:length(sol_true.t)]...)'
+data_SI = max.(data_SI, 0.001)
+```
+
+### Set Up and Solve
+
+```{julia}
+uf_β = BSplineApproximator(:β, (0.0, 0.5), 6; initial=0.2)
+
+prob_sir = PSMProblem(sir!, [0.99, 0.01, 0.0], (0.0, 40.0), [uf_β];
+    data_times=t_data,
+    data_values=Float64.(data_SI),
+    obs_to_state=[1, 2],
+    known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+
+sol_sir = solve(prob_sir, MagiSolver(
+    n_samples=200, n_warmup=200,
+    n_gridpoints=80, n_deriv=3,
+    obs_var=noise^2, preoptimize=true, verbose=false))
+```
+
+```{julia}
+#| echo: false
+chains_sir = sol_sir.convergence.chains
+println("Chains: $(size(chains_sir, 1)) samples × $(size(chains_sir, 2)) parameters")
+```
+
+### Results
+
+```{julia}
+#| echo: false
+β_fitted = sol_sir.unknown_functions[:β]
+println("Posterior mean β(I) at selected infection levels:")
+for I_val in [0.01, 0.05, 0.1, 0.2]
+    println("  β($(I_val)) = $(round(β_fitted(I_val), digits=4))  (true: 0.3)")
+end
+```
+
+## Example 2: Predator-Prey (Partially Observed Prey Only)
+
+MAGI's key strength is handling **partially observed systems**. Here we observe only the prey population in a Lotka-Volterra model and infer the predator functional response.
+
+```{julia}
+function lv!(du, u, p, t)
+    H, P = u
+    du[1] = H * (1.0 - H / 5.0) - p.g(H) * P   # logistic prey + predation
+    du[2] = 0.5 * p.g(H) * P - 0.3 * P           # predator response - mortality
+end
+```
+
+True functional response: `g(H) = 0.5 * H / (1 + H)` (Holling Type II, saturates at 0.5).
+
+### Generate Data (Prey Only)
+
+```{julia}
+g_true(H) = 0.5 * H / (1.0 + H)
+
+true_p_lv = (; g = g_true)
+sol_true_lv = solve(ODEProblem(lv!, [2.0, 1.0], (0.0, 30.0), true_p_lv),
+                    Tsit5(); saveat=1.5)
+
+t_lv = collect(sol_true_lv.t)
+prey_data = [sol_true_lv.u[i][1] + 0.05 * randn() for i in 1:length(sol_true_lv.t)]
+prey_data = max.(prey_data, 0.01)
+prey_matrix = reshape(prey_data, :, 1)
+```
+
+### Fit with MAGI (Observing Only Prey)
+
+```{julia}
+uf_g = BSplineApproximator(:g, (0.0, 5.0), 8; initial=0.2)
+
+prob_lv = PSMProblem(lv!, [2.0, 1.0], (0.0, 30.0), [uf_g];
+    data_times=t_lv,
+    data_values=Float64.(prey_matrix),
+    obs_to_state=[1],       # only prey observed!
+    known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+
+sol_lv = solve(prob_lv, MagiSolver(
+    n_samples=200, n_warmup=200,
+    n_gridpoints=60, n_deriv=3,
+    sigma=[1.0, 1.0],      # explicit sigma for both states
+    obs_var=0.0025, preoptimize=true, verbose=false))
+```
+
+```{julia}
+#| echo: false
+chains_lv = sol_lv.convergence.chains
+println("Chains: $(size(chains_lv, 1)) samples × $(size(chains_lv, 2)) parameters")
+```
+
+### Functional Response Recovery
+
+```{julia}
+#| echo: false
+g_fitted = sol_lv.unknown_functions[:g]
+println("Posterior mean g(H) vs. true Holling Type II:")
+for H in [0.5, 1.0, 2.0, 3.0, 4.0]
+    println("  g($(H)) = $(round(g_fitted(H), digits=4))  " *
+            "(true: $(round(g_true(H), digits=4)))")
+end
+```
+
+## Comparison: MagiSolver vs MCMCSolver
+
+| Feature | MagiSolver | MCMCSolver |
+|---------|-----------|-----------|
+| **ODE solver per step** | No (Kalman filter) | Yes (full ODE solve) |
+| **States sampled?** | No (marginalized) | No (marginalized via ODE) |
+| **Partially observed** | Natural support | Requires all states |
+| **Speed per iteration** | Fast (matrix ops) | Slower (ODE integration) |
+| **Accuracy** | Approximate (IBM prior) | Exact (ODE solve) |
+| **Output** | `MCMCChains.Chains` | `MCMCChains.Chains` |
+
+**When to use MAGI:**
+
+- Partially observed systems (some state components unmeasured)
+- Large systems where ODE solving is expensive
+- Sparse or noisy data
+
+**When to use MCMCSolver:**
+
+- Need exact ODE trajectories in the posterior
+- Well-observed systems with cheap ODE solves
+- When IBM approximation may be insufficient
+
+## Summary
+
+`MagiSolver` provides a GP-based alternative to traditional ODE-in-the-loop Bayesian inference. By modeling trajectories as integrated Brownian motion and enforcing ODE dynamics through Kalman filtering, it marginalizes out state trajectories and samples only the unknown function parameters — making it efficient and naturally suited to partially observed systems.

@@ -1,0 +1,164 @@
+---
+title: "Bayesian Inference with MCMCSolver"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+While point estimation via LAML or Adam is fast, **fully Bayesian inference** quantifies uncertainty in both parameter estimates and unknown function reconstructions. `MCMCSolver` uses the No-U-Turn Sampler (NUTS) to draw posterior samples, returning an `MCMCChains.Chains` object for downstream analysis.
+
+This vignette demonstrates:
+
+1. Setting up a PSM for Bayesian inference
+2. Running `MCMCSolver` with NUTS/HMC
+3. Posterior diagnostics (trace plots, effective sample size)
+4. Credible intervals for unknown functions
+
+## Example: Logistic Growth with Unknown Carrying Capacity
+
+We model population growth where the per-capita growth rate `r(N)` is unknown — it should decrease as N approaches carrying capacity K.
+
+True model: `dN/dt = r₀ N (1 - N/K)` with `r₀ = 0.5`, `K = 100`.
+
+```{julia}
+using PartiallySpecifiedModels
+using Random
+Random.seed!(42)
+```
+
+### Generate Data
+
+```{julia}
+function logistic!(du, u, p, t)
+    du[1] = p.r(u[1]) * u[1]
+end
+
+# True per-capita rate: r(N) = 0.5 * (1 - N/100)
+r_true(N) = 0.5 * (1.0 - N / 100.0)
+
+using OrdinaryDiffEq
+true_p = (; r = r_true)
+sol_true = solve(ODEProblem(logistic!, [10.0], (0.0, 20.0), true_p), Tsit5();
+                 saveat=0.5)
+t_data = sol_true.t
+u_data = hcat(sol_true.u...) .+ 2.0 .* randn(1, length(sol_true.t))
+u_data = max.(u_data, 0.1)  # keep positive
+data_matrix = reshape(u_data[1, :], :, 1)
+```
+
+### Set Up PSM Problem
+
+```{julia}
+uf_r = BSplineApproximator(:r, (0.0, 120.0), 8; initial=0.3)
+
+prob = PSMProblem(logistic!, [10.0], (0.0, 20.0), [uf_r];
+    data_times=collect(t_data),
+    data_values=Float64.(data_matrix),
+    obs_to_state=[1],
+    known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+```
+
+### Run MCMCSolver
+
+```{julia}
+sol = solve(prob, MCMCSolver(
+    n_samples=500, n_warmup=200,
+    target_accept=0.8, prior_scale=1.0,
+    verbose=false))
+```
+
+### Posterior Diagnostics
+
+The solution stores an `MCMCChains.Chains` object:
+
+```{julia}
+chains = sol.convergence
+```
+
+```{julia}
+#| echo: false
+using MCMCChains
+println("Chain size: ", size(chains))
+println("Parameter names: ", names(chains, :parameters))
+```
+
+### Unknown Function Reconstruction
+
+The posterior mean gives a point estimate for `r(N)`:
+
+```{julia}
+r_fitted = sol.unknown_functions[:r]
+N_range = range(0.0, 120.0, length=50)
+r_fit_vals = [r_fitted(N) for N in N_range]
+r_true_vals = [r_true(N) for N in N_range]
+```
+
+```{julia}
+#| echo: false
+println("Posterior mean r(N) at selected points:")
+for N in [0.0, 25.0, 50.0, 75.0, 100.0]
+    println("  r($(Int(N))) = $(round(r_fitted(N), digits=4))  " *
+            "(true: $(round(r_true(N), digits=4)))")
+end
+```
+
+### Credible Intervals
+
+We can compute pointwise credible intervals by evaluating the unknown function at each posterior sample:
+
+```{julia}
+sample_matrix = Array(chains)
+n_samp = size(sample_matrix, 1)
+
+r_samples = zeros(n_samp, length(N_range))
+for i in 1:n_samp
+    params_i = sample_matrix[i, 1:nparams(uf_r)]
+    knots_x = collect(range(0.0, 120.0, length=uf_r.nknots))
+    ev = PartiallySpecifiedModels.build_bspline_evaluator(knots_x, params_i)
+    for (j, N) in enumerate(N_range)
+        r_samples[i, j] = ev(N)
+    end
+end
+
+r_lower = [quantile(r_samples[:, j], 0.025) for j in 1:length(N_range)]
+r_upper = [quantile(r_samples[:, j], 0.975) for j in 1:length(N_range)]
+r_median = [quantile(r_samples[:, j], 0.5) for j in 1:length(N_range)]
+```
+
+```{julia}
+#| echo: false
+using Statistics
+println("95% credible intervals for r(N):")
+for (k, N) in enumerate([0.0, 50.0, 100.0])
+    idx = argmin(abs.(collect(N_range) .- N))
+    println("  r($(Int(N))): [$(round(r_lower[idx], digits=3)), " *
+            "$(round(r_upper[idx], digits=3))] " *
+            "(median: $(round(r_median[idx], digits=3)), " *
+            "true: $(round(r_true(N), digits=3)))")
+end
+```
+
+## Summary
+
+| Feature | MCMCSolver |
+|---------|-----------|
+| **Inference type** | Fully Bayesian (NUTS/HMC) |
+| **Output** | `MCMCChains.Chains` |
+| **Uncertainty** | Full posterior, credible intervals |
+| **Speed** | Slower than LAML/Adam (ODE solve per sample) |
+| **Best for** | Uncertainty quantification, model comparison |
+
+`MCMCSolver` complements the point estimation solvers (LAML, Adam) by providing full posterior distributions. Use it when uncertainty quantification is important, or when you need to propagate parameter uncertainty into predictions.

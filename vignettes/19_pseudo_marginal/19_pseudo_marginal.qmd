@@ -1,0 +1,141 @@
+---
+title: "Bayesian Inference with PseudoMarginalSolver"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+The `PseudoMarginalSolver` combines **probabilistic ODE solving** with **Bayesian MCMC inference**. It uses a probabilistic ODE solver (fenrir/DALTON) as an inner likelihood estimator within an outer NUTS/HMC sampling loop, yielding full posterior distributions over the unknown function parameters.
+
+This differs from:
+
+- **MCMCSolver**: Uses deterministic ODE integration for the likelihood
+- **MagiSolver**: Uses Kalman-filtered Integrated Brownian Motion to marginalize states
+- **PseudoMarginalSolver**: Uses a probabilistic ODE solver for approximate marginal likelihood, then samples with NUTS
+
+```{julia}
+using PartiallySpecifiedModels
+using OrdinaryDiffEq
+using MCMCChains
+using Statistics
+using Random
+Random.seed!(42)
+```
+
+## Logistic Growth Model
+
+```{julia}
+r_true(N) = 0.5 * (1.0 - N / 10.0)
+
+function logistic!(du, u, p, t)
+    N = u[1]
+    du[1] = p.r(N) * N
+end
+
+sol_true = solve(ODEProblem(logistic!, [1.0], (0.0, 15.0), (; r=r_true)),
+                 Tsit5(); saveat=1.0)
+t_data = collect(sol_true.t)
+data_N = [sol_true.u[i][1] + 0.1 * randn() for i in 1:length(t_data)]
+data_matrix = reshape(max.(data_N, 0.01), :, 1)
+```
+
+### Fit with PseudoMarginalSolver
+
+We use the fenrir inner method with a coarse grid (50 steps) for speed.
+
+```{julia}
+uf = BSplineApproximator(:r, (0.0, 12.0), 6)
+
+prob = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf];
+    data_times=t_data, data_values=Float64.(data_matrix),
+    obs_to_state=[1], known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+
+sol_pm = solve(prob, PseudoMarginalSolver(
+    n_samples=200, n_warmup=100,
+    n_steps=50, n_deriv=3,
+    inner_method=:fenrir,
+    verbose=false))
+```
+
+### Posterior Summary
+
+The result contains an `MCMCChains.Chains` object with posterior samples.
+
+```{julia}
+chain = sol_pm.convergence
+println("Chain dimensions: $(size(chain, 1)) samples × $(size(chain, 2)) parameters")
+println()
+println("Parameter summary (first 3 coefficients):")
+param_names = names(chain, :parameters)
+for i in 1:min(3, length(param_names))
+    vals = vec(Array(chain[:, param_names[i], :]))
+    println("  $(param_names[i]): mean=$(round(mean(vals), digits=3)), " *
+            "std=$(round(std(vals), digits=3))")
+end
+```
+
+### Recovered Function with Uncertainty
+
+We can evaluate the unknown function at each posterior sample to get credible intervals.
+
+```{julia}
+#| echo: false
+r_fitted = sol_pm.unknown_functions[:r]
+println("Posterior mean r(N) vs true:")
+println("  N    |  True   |  Mean")
+println("  -----|---------|--------")
+for N in [1.0, 3.0, 5.0, 7.0, 9.0]
+    println("  $(lpad(N, 4)) | $(lpad(round(r_true(N), digits=3), 7)) " *
+            "| $(lpad(round(r_fitted(N), digits=3), 7))")
+end
+```
+
+### Compare with MCMCSolver
+
+```{julia}
+sol_mcmc = solve(prob, MCMCSolver(
+    n_samples=200, n_warmup=100, verbose=false))
+
+chain_mcmc = sol_mcmc.convergence
+```
+
+```{julia}
+#| echo: false
+r_mcmc = sol_mcmc.unknown_functions[:r]
+println("Comparison of posterior means:")
+println("  N    |  True   | PseudoM |  MCMC")
+println("  -----|---------|---------|--------")
+for N in [1.0, 3.0, 5.0, 7.0, 9.0]
+    println("  $(lpad(N, 4)) | $(lpad(round(r_true(N), digits=3), 7)) " *
+            "| $(lpad(round(r_fitted(N), digits=3), 7)) " *
+            "| $(lpad(round(r_mcmc(N), digits=3), 7))")
+end
+```
+
+## Bayesian Solver Comparison
+
+| Feature | MCMCSolver | MagiSolver | PseudoMarginalSolver |
+|---------|------------|------------|---------------------|
+| **Inner likelihood** | Deterministic ODE | Kalman marginal | Probabilistic ODE (fenrir/DALTON) |
+| **Outer sampler** | NUTS | NUTS | NUTS |
+| **State marginalization** | No (states from ODE) | Yes (Kalman filter) | Partial (IBM prior) |
+| **Unobserved states** | Requires all observed | Handles naturally | Handles via IBM |
+| **ODE error** | Ignored | Modeled as noise | Modeled via IBM prior |
+| **Output** | MCMCChains | MCMCChains | MCMCChains |
+
+## Summary
+
+The `PseudoMarginalSolver` provides full Bayesian inference over unknown function parameters using a probabilistic ODE solver for likelihood estimation. This naturally accounts for ODE discretization uncertainty, making it particularly appropriate when the ODE solution quality is uncertain or when the system is stiff.

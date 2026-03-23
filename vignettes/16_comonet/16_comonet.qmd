@@ -1,0 +1,205 @@
+---
+title: "COMONet: Shape-Constrained Neural Network Approximators"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+When modeling ecological systems, we often know qualitative properties of unknown functional responses — for example, that a predator's functional response should be **increasing** in prey density, or that **per-capita growth** should be **decreasing** (density dependence). PartiallySpecifiedModels.jl offers two approaches to enforce such constraints:
+
+1. **`ShapeConstrainedBSplineApproximator`** (SCBS) — B-spline basis functions with reparameterized coefficients (SCOP-splines, following Pya & Wood 2015). Uses the convex hull property of B-splines to guarantee constraints globally.
+
+2. **`COMONetApproximator`** — Neural networks with positive weights (`exp(W)`) and monotone activations (ReLU). Compositional structure guarantees shape constraints by construction.
+
+This vignette compares both constrained approximators against an unconstrained B-spline baseline on a logistic growth model.
+
+```{julia}
+using PartiallySpecifiedModels
+using OrdinaryDiffEq
+using Random
+Random.seed!(123)
+```
+
+## Logistic Growth with Unknown Per-Capita Rate
+
+The per-capita growth rate `r(N)` should be **decreasing** in population density (negative density dependence). In the standard logistic model, `r(N) = r₀(1 - N/K)` is linear, but we treat the functional form as unknown and attempt to recover it from time series data.
+
+True model: `r(N) = 0.5 × (1 - N/10)`.
+
+```{julia}
+function logistic!(du, u, p, t)
+    N = u[1]
+    du[1] = p.r(N) * N
+end
+
+r_true(N) = 0.5 * (1.0 - N / 10.0)
+```
+
+### Generate Data
+
+We simulate the logistic model and add Gaussian observation noise.
+
+```{julia}
+true_p = (; r = r_true)
+sol_true = solve(ODEProblem(logistic!, [1.0], (0.0, 15.0), true_p),
+                 Tsit5(); saveat=0.5)
+
+t_data = collect(sol_true.t)
+noise = 0.1
+data_N = [sol_true.u[i][1] + noise * randn() for i in 1:length(sol_true.t)]
+data_N = max.(data_N, 0.01)
+data_matrix = reshape(data_N, :, 1)
+```
+
+### Approach 1: Unconstrained B-Spline (Baseline)
+
+A standard B-spline approximator with no shape constraints. This serves as a baseline to assess the benefit of enforcing monotonicity.
+
+```{julia}
+uf_bs = BSplineApproximator(:r, (0.0, 12.0), 10)
+
+prob_bs = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf_bs];
+    data_times=t_data, data_values=Float64.(data_matrix),
+    obs_to_state=[1], known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+
+sol_bs = solve(prob_bs, AdamSolver(lr=0.01, maxiters=2000))
+```
+
+### Approach 2: Shape-Constrained B-Spline (Decreasing)
+
+The SCBS reparameterizes B-spline coefficients via a Σ matrix and `softplus` transform to guarantee the function is decreasing everywhere.
+
+```{julia}
+uf_scbs = ShapeConstrainedBSplineApproximator(:r, (0.0, 12.0), 10, :decreasing)
+
+prob_scbs = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf_scbs];
+    data_times=t_data, data_values=Float64.(data_matrix),
+    obs_to_state=[1], known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+
+sol_scbs = solve(prob_scbs, AdamSolver(lr=0.01, maxiters=2000))
+```
+
+### Approach 3: COMONet (Decreasing)
+
+COMONet uses a neural network with positive weights (`exp(W̃)`) and ReLU activations. For a `:decreasing` constraint, the input is negated before the forward pass. A single hidden layer with 8 units gives 25 parameters.
+
+```{julia}
+uf_como = COMONetApproximator(:r, (0.0, 12.0), (8,), :decreasing;
+    penalty_weight=0.001)
+
+prob_como = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf_como];
+    data_times=t_data, data_values=Float64.(data_matrix),
+    obs_to_state=[1], known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+
+sol_como = solve(prob_como, AdamSolver(lr=0.01, maxiters=2000))
+```
+
+### Compare Recovered Functions
+
+```{julia}
+#| echo: false
+r_bs = sol_bs.unknown_functions[:r]
+r_scbs = sol_scbs.unknown_functions[:r]
+r_como = sol_como.unknown_functions[:r]
+
+println("Per-capita growth rate r(N) comparison:")
+println("  N    |  True   | BSpline |  SCBS   | COMONet")
+println("  -----|---------|---------|---------|--------")
+for N in [0.5, 2.0, 4.0, 6.0, 8.0, 10.0]
+    println("  $(lpad(N, 4)) | $(lpad(round(r_true(N), digits=3), 7)) " *
+            "| $(lpad(round(r_bs(N), digits=3), 7)) " *
+            "| $(lpad(round(r_scbs(N), digits=3), 7)) " *
+            "| $(lpad(round(r_como(N), digits=3), 7))")
+end
+```
+
+### Verify Monotonicity
+
+Both constrained methods should produce strictly decreasing functions. The unconstrained B-spline may violate monotonicity.
+
+```{julia}
+#| echo: false
+test_N = collect(range(0.5, 11.0, length=100))
+
+bs_vals = [r_bs(N) for N in test_N]
+scbs_vals = [r_scbs(N) for N in test_N]
+como_vals = [r_como(N) for N in test_N]
+
+bs_decreasing = all(diff(bs_vals) .<= 1e-10)
+scbs_decreasing = all(diff(scbs_vals) .<= 1e-10)
+como_decreasing = all(diff(como_vals) .<= 1e-10)
+
+println("Monotonicity check (decreasing):")
+println("  BSpline (unconstrained): $bs_decreasing")
+println("  SCBS:    $scbs_decreasing")
+println("  COMONet: $como_decreasing")
+```
+
+### Fitted Trajectories
+
+```{julia}
+#| echo: false
+println("Population trajectory comparison (selected time points):")
+println("  t    | Observed | BSpline |  SCBS   | COMONet")
+println("  -----|----------|---------|---------|--------")
+for (i, t) in enumerate(t_data)
+    if i == 1 || (i-1) % 5 == 0 || i == length(t_data)
+        bs_val = sol_bs.fitted_values[i, 1]
+        scbs_val = sol_scbs.fitted_values[i, 1]
+        como_val = sol_como.fitted_values[i, 1]
+        println("  $(lpad(round(t, digits=1), 4)) | $(lpad(round(data_N[i], digits=2), 8)) " *
+                "| $(lpad(round(bs_val, digits=2), 7)) " *
+                "| $(lpad(round(scbs_val, digits=2), 7)) " *
+                "| $(lpad(round(como_val, digits=2), 7))")
+    end
+end
+```
+
+## Method Comparison
+
+| Feature | BSpline | SCBS | COMONet |
+|---------|---------|------|---------|
+| **Constraint** | None | Coefficient reparameterization | Positive weights + monotone activations |
+| **Parameters** | 10 (knot coefficients) | 10 (unconstrained γ) | 25 (weights + biases) |
+| **Smoothness** | Cubic (C²) | Cubic (C²) | Piecewise linear (C⁰) |
+| **Monotonicity** | Not guaranteed | Guaranteed | Guaranteed |
+| **Compatible solvers** | All (LAML, Adam, MCMC, ...) | All (LAML preferred) | Adam, MCMC, GradientMatching |
+| **Formal proofs** | — | Convex hull property | Lean 4 verified (43 theorems) |
+
+**When to use unconstrained B-splines:**
+
+- No prior knowledge about function shape
+- Need maximum flexibility (may overfit without smoothing penalty)
+- Compatible with LAML solver for automatic smoothing parameter selection
+
+**When to use SCBS:**
+
+- Known monotonicity, convexity, or other shape constraints
+- Parsimonious models with few parameters
+- LAML solver available for automatic smoothing
+
+**When to use COMONet:**
+
+- Need formally verified constraint guarantees
+- Complex constraints (e.g., combinations)
+- Integration with neural-network-based workflows
+- When C² smoothness is not required
+
+## Summary
+
+Shape constraints significantly improve function recovery, especially near domain boundaries where data is sparse. Both `ShapeConstrainedBSplineApproximator` and `COMONetApproximator` correctly enforce the decreasing constraint, while the unconstrained `BSplineApproximator` may violate it. The SCBS approach offers parsimony and smoothness, while COMONet provides a neural network alternative with formally verified constraint guarantees.

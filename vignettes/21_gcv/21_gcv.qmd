@@ -1,0 +1,121 @@
+---
+title: "GCV Smoothing Parameter Selection"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+The `GCVSolver` uses **Generalized Cross-Validation** (GCV) for automatic smoothing parameter selection — a simpler alternative to LAML (Laplace Approximate Marginal Likelihood). While LAML uses a Laplace approximation to the marginal likelihood with Fellner-Schall updates, GCV minimizes a leave-one-out cross-validation score:
+
+$$\text{GCV}(\lambda) = \frac{n \| W^{1/2}(z - J\hat\beta) \|^2}{(n - \gamma \cdot \text{tr}(A))^2}$$
+
+where $A = J(J'WJ + S^\lambda)^{-1}J'W$ is the hat matrix and $\gamma \geq 1$ is an inflation factor that guards against under-smoothing (default 1.4).
+
+```{julia}
+using PartiallySpecifiedModels
+using OrdinaryDiffEq
+using Plots
+using Random
+Random.seed!(123)
+```
+
+## Logistic Growth with Unknown Per-Capita Rate
+
+We model logistic growth $dN/dt = r(N) \cdot N$ where $r(N) = 0.5(1 - N/10)$ is unknown.
+
+```{julia}
+r_true(N) = 0.5 * (1.0 - N / 10.0)
+
+function logistic!(du, u, p, t)
+    N = u[1]
+    du[1] = p.r(N) * N
+end
+
+sol_true = solve(ODEProblem(logistic!, [1.0], (0.0, 15.0), (; r=r_true)),
+                 Tsit5(); saveat=0.5)
+t_data = collect(sol_true.t)
+data_N = [sol_true.u[i][1] + 0.1 * randn() for i in 1:length(t_data)]
+data_matrix = reshape(max.(data_N, 0.01), :, 1)
+```
+
+## GCV vs LAML Comparison
+
+```{julia}
+uf = BSplineApproximator(:r, (0.0, 12.0), 10)
+
+prob = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf];
+    data_times=t_data, data_values=Float64.(data_matrix),
+    obs_to_state=[1], known_params=NamedTuple())
+
+sol_gcv = solve(prob, GCVSolver(maxiters=50, gamma=1.4, verbose=false))
+sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
+```
+
+### Trajectory Fit
+
+```{julia}
+p1 = plot(t_data, data_matrix[:, 1], seriestype=:scatter, label="Data",
+          xlabel="Time", ylabel="N", title="Trajectory Comparison", ms=3, alpha=0.6)
+plot!(p1, t_data, sol_gcv.fitted_values[:, 1], label="GCV (loss=$(round(sol_gcv.data_loss, digits=2)))", lw=2)
+plot!(p1, t_data, sol_laml.fitted_values[:, 1], label="LAML (loss=$(round(sol_laml.data_loss, digits=2)))", lw=2, ls=:dash)
+p1
+```
+
+### Recovered Unknown Function
+
+```{julia}
+r_gcv = sol_gcv.unknown_functions[:r]
+r_laml = sol_laml.unknown_functions[:r]
+N_grid = range(0.0, 12.0, length=100)
+
+p2 = plot(N_grid, r_true.(N_grid), label="True r(N)", lw=2, color=:black,
+          xlabel="N", ylabel="r(N)", title="Per-Capita Growth Rate")
+plot!(p2, N_grid, [r_gcv(n) for n in N_grid], label="GCV (edf=$(round(sol_gcv.edf, digits=1)))", lw=2)
+plot!(p2, N_grid, [r_laml(n) for n in N_grid], label="LAML (edf=$(round(sol_laml.edf, digits=1)))", lw=2, ls=:dash)
+p2
+```
+
+### Summary
+
+```{julia}
+println("GCV:  data_loss=$(round(sol_gcv.data_loss, digits=3)), edf=$(round(sol_gcv.edf, digits=1)), " *
+        "r(5)=$(round(r_gcv(5.0), digits=3)) (true=$(round(r_true(5.0), digits=3)))")
+println("LAML: data_loss=$(round(sol_laml.data_loss, digits=3)), edf=$(round(sol_laml.edf, digits=1)), " *
+        "r(5)=$(round(r_laml(5.0), digits=3)) (true=$(round(r_true(5.0), digits=3)))")
+```
+
+## Effect of GCV Inflation Factor γ
+
+The inflation factor $\gamma$ controls the bias-variance tradeoff. $\gamma = 1$ is standard GCV; $\gamma > 1$ penalizes model complexity more, producing smoother fits.
+
+```{julia}
+gammas = [1.0, 1.4, 2.0]
+p3 = plot(N_grid, r_true.(N_grid), label="True", lw=2, color=:black,
+          xlabel="N", ylabel="r(N)", title="Effect of γ on Smoothing")
+for γ in gammas
+    sol_g = solve(prob, GCVSolver(maxiters=50, gamma=γ, verbose=false))
+    r_g = sol_g.unknown_functions[:r]
+    plot!(p3, N_grid, [r_g(n) for n in N_grid],
+          label="γ=$(γ) (edf=$(round(sol_g.edf, digits=1)))", lw=2)
+end
+p3
+```
+
+## When to Use GCV vs LAML
+
+- **GCV** is simpler, faster (no Hessian needed), and works well with abundant data
+- **LAML** is more principled (approximate marginal likelihood), handles complex penalty structures better
+- GCV with $\gamma = 1.4$ often gives similar results to LAML
+- For non-Gaussian likelihoods, LAML is generally preferred

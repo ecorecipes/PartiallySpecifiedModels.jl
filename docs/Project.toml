@@ -1,0 +1,6 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+PartiallySpecifiedModels = "15ae6619-3517-4aad-88ea-30ec1d16fab1"
+
+[compat]
+Documenter = "1"

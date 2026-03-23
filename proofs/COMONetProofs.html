@@ -1,0 +1,793 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <meta name="author" content="Simon Frost" />
+  <title>COMONet: Formal Proofs of Shape Constraint Guarantees</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    svg {
+      height: auto;
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #1a1a1a;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+  </style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">COMONet: Formal Proofs of Shape Constraint
+Guarantees</h1>
+<p class="author">Simon Frost</p>
+</header>
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#comonet-basics" id="toc-comonet-basics">COMONet Basics</a>
+<ul>
+<li><a href="#positive-weights-via-exp"
+id="toc-positive-weights-via-exp">Positive weights via exp</a></li>
+<li><a href="#activation-functions"
+id="toc-activation-functions">Activation functions</a>
+<ul>
+<li><a href="#positive-weights" id="toc-positive-weights">Positive
+weights</a></li>
+<li><a href="#relu-activation-function"
+id="toc-relu-activation-function">ReLU activation function</a></li>
+<li><a href="#negative-relu-concave-unit-activation"
+id="toc-negative-relu-concave-unit-activation">Negative ReLU (concave
+unit activation)</a></li>
+<li><a href="#affine-maps-with-positive-weights"
+id="toc-affine-maps-with-positive-weights">Affine maps with positive
+weights</a></li>
+</ul></li>
+</ul></li>
+<li><a href="#monotonicity-theorems-for-comonet"
+id="toc-monotonicity-theorems-for-comonet">Monotonicity Theorems for
+COMONet</a>
+<ul>
+<li><a href="#key-results" id="toc-key-results">Key Results</a>
+<ul>
+<li><a href="#single-neuron-monotonicity"
+id="toc-single-neuron-monotonicity">Single neuron monotonicity</a></li>
+<li><a href="#relu-neuron-monotonicity"
+id="toc-relu-neuron-monotonicity">ReLU neuron monotonicity</a></li>
+<li><a href="#negative-relu-neuron-monotonicity"
+id="toc-negative-relu-neuron-monotonicity">Negative ReLU neuron
+monotonicity</a></li>
+<li><a href="#composition-of-monotone-layers"
+id="toc-composition-of-monotone-layers">Composition of monotone
+layers</a></li>
+</ul></li>
+</ul></li>
+<li><a href="#convexity-theorems-for-comonet"
+id="toc-convexity-theorems-for-comonet">Convexity Theorems for
+COMONet</a>
+<ul>
+<li><a href="#key-results-1" id="toc-key-results-1">Key Results</a>
+<ul>
+<li><a href="#convexity-of-relu" id="toc-convexity-of-relu">Convexity of
+ReLU</a></li>
+<li><a href="#relu-applied-to-affine-map"
+id="toc-relu-applied-to-affine-map">ReLU applied to affine map</a></li>
+<li><a href="#two-layer-convexity"
+id="toc-two-layer-convexity">Two-layer convexity</a></li>
+</ul></li>
+</ul></li>
+<li><a href="#concavity-theorems-for-comonet"
+id="toc-concavity-theorems-for-comonet">Concavity Theorems for
+COMONet</a>
+<ul>
+<li><a href="#key-results-2" id="toc-key-results-2">Key Results</a>
+<ul>
+<li><a href="#concavity-of-negative-relu"
+id="toc-concavity-of-negative-relu">Concavity of negative ReLU</a></li>
+<li><a href="#concunit" id="toc-concunit">ConcUnit</a></li>
+<li><a href="#multi-layer-concavity"
+id="toc-multi-layer-concavity">Multi-layer concavity</a></li>
+</ul></li>
+</ul></li>
+<li><a href="#composition-theorems-for-comonet"
+id="toc-composition-theorems-for-comonet">Composition Theorems for
+COMONet</a>
+<ul>
+<li><a href="#key-results-3" id="toc-key-results-3">Key Results</a>
+<ul>
+<li><a href="#composition-rules" id="toc-composition-rules">Composition
+rules</a></li>
+<li><a href="#comonet-output-layer"
+id="toc-comonet-output-layer">COMONet output layer</a></li>
+<li><a href="#full-comonet-architecture-theorems"
+id="toc-full-comonet-architecture-theorems">Full COMONet architecture
+theorems</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</nav>
+<pre class="lean"><code>import Mathlib.Analysis.SpecialFunctions.ExpDeriv
+import Mathlib.Analysis.SpecialFunctions.Log.Basic
+import Mathlib.Order.Monotone.Basic
+import Mathlib.Topology.Order.Basic</code></pre>
+<h1 id="comonet-basics">COMONet Basics</h1>
+<p>Fundamental definitions and properties for the COMONet
+architecture.</p>
+<h2 id="positive-weights-via-exp">Positive weights via exp</h2>
+<p>COMONet ensures positive weights by parameterizing weight matrices as
+<code>W = exp(W̃)</code> where <code>W̃ ∈ ℝ</code> is unconstrained. Since
+<code>exp : ℝ → ℝ₊</code>, this guarantees <code>W &gt; 0</code> for all
+parameter values.</p>
+<h2 id="activation-functions">Activation functions</h2>
+<ul>
+<li><strong>ReLU</strong>: <code>max(0, x)</code> — non-decreasing,
+convex</li>
+<li><strong>Negative ReLU</strong>: <code>-max(0, -x) = min(0, x)</code>
+— non-decreasing, concave</li>
+</ul>
+<pre class="lean"><code>namespace COMONetProofs</code></pre>
+<h3 id="positive-weights">Positive weights</h3>
+<pre class="lean"><code>/-- The exponential function is strictly positive for all real inputs.
+This is the foundational property ensuring COMONet weights are positive. -/
+theorem exp_pos (w : ℝ) : Real.exp w &gt; 0 :=
+  Real.exp_pos w
+
+/-- The exponential function is positive (non-strict), useful for
+weight multiplication properties. -/
+theorem exp_nonneg (w : ℝ) : Real.exp w ≥ 0 :=
+  le_of_lt (Real.exp_pos w)</code></pre>
+<h3 id="relu-activation-function">ReLU activation function</h3>
+<pre class="lean"><code>/-- ReLU activation: `relu(x) = max(0, x)`. -/
+noncomputable def relu (x : ℝ) : ℝ := max 0 x
+
+/-- ReLU is non-negative. -/
+theorem relu_nonneg (x : ℝ) : relu x ≥ 0 := by
+  simp [relu]
+
+/-- ReLU at non-negative input equals the input. -/
+theorem relu_of_nonneg {x : ℝ} (hx : x ≥ 0) : relu x = x := by
+  simp [relu, max_eq_right (by linarith : (0 : ℝ) ≤ x)]
+
+/-- ReLU at negative input is zero. -/
+theorem relu_of_neg {x : ℝ} (hx : x &lt; 0) : relu x = 0 := by
+  simp [relu, max_eq_left (by linarith : (0 : ℝ) ≥ x)]
+
+/-- ReLU is monotone non-decreasing. -/
+theorem relu_monotone : Monotone relu := by
+  intro a b hab
+  simp only [relu]
+  exact max_le_max_left 0 hab</code></pre>
+<h3 id="negative-relu-concave-unit-activation">Negative ReLU (concave
+unit activation)</h3>
+<pre class="lean"><code>/-- Negative ReLU: `nrelu(x) = -max(0, -x) = min(0, x)`.
+Used in COMONet&#39;s concave units. -/
+noncomputable def nrelu (x : ℝ) : ℝ := -relu (-x)
+
+/-- Negative ReLU equals min(0, x). -/
+theorem nrelu_eq_min (x : ℝ) : nrelu x = min 0 x := by
+  simp only [nrelu, relu]
+  -- -max(0, -x) = min(0, x) by the identity -max(a,b) = min(-a,-b)
+  cases le_or_gt 0 x with
+  | inl h =&gt;
+    -- x ≥ 0: max(0,-x) = 0, min(0,x) = 0
+    have : -x ≤ 0 := neg_nonpos.mpr h
+    rw [max_eq_left this, neg_zero, min_eq_left h]
+  | inr h =&gt;
+    -- x &lt; 0: max(0,-x) = -x, min(0,x) = x
+    have : 0 ≤ -x := neg_nonneg.mpr (le_of_lt h)
+    rw [max_eq_right this, neg_neg, min_eq_right (le_of_lt h)]
+
+/-- Negative ReLU is non-positive. -/
+theorem nrelu_nonpos (x : ℝ) : nrelu x ≤ 0 := by
+  rw [nrelu_eq_min]
+  exact min_le_left 0 x
+
+/-- Negative ReLU is monotone non-decreasing. -/
+theorem nrelu_monotone : Monotone nrelu := by
+  intro a b hab
+  simp only [nrelu]
+  exact neg_le_neg (relu_monotone (neg_le_neg hab))</code></pre>
+<h3 id="affine-maps-with-positive-weights">Affine maps with positive
+weights</h3>
+<pre class="lean"><code>/-- An affine map `x ↦ w * x + b` with `w &gt; 0` is strictly monotone. -/
+theorem affine_pos_weight_strictMono {w b : ℝ} (hw : w &gt; 0) :
+    StrictMono (fun x =&gt; w * x + b) := by
+  intro a c hac
+  linarith [mul_lt_mul_of_pos_left hac hw]
+
+/-- An affine map `x ↦ w * x + b` with `w &gt; 0` is monotone non-decreasing. -/
+theorem affine_pos_weight_mono {w b : ℝ} (hw : w &gt; 0) :
+    Monotone (fun x =&gt; w * x + b) :=
+  StrictMono.monotone (affine_pos_weight_strictMono hw)
+
+/-- An affine map with `w ≥ 0` is monotone non-decreasing. -/
+theorem affine_nonneg_weight_mono {w b : ℝ} (hw : w ≥ 0) :
+    Monotone (fun x =&gt; w * x + b) := by
+  intro a c hac
+  have : w * a ≤ w * c := mul_le_mul_of_nonneg_left hac hw
+  linarith
+
+end COMONetProofs</code></pre>
+<pre class="lean"><code>import COMONetProofs.Basics
+import Mathlib.Order.Monotone.Basic</code></pre>
+<h1 id="monotonicity-theorems-for-comonet">Monotonicity Theorems for
+COMONet</h1>
+<h2 id="key-results">Key Results</h2>
+<ol type="1">
+<li><p><strong>Single neuron monotonicity</strong>: If
+<code>w &gt; 0</code> and <code>σ</code> is monotone non-decreasing,
+then <code>x ↦ σ(w * x + b)</code> is monotone non-decreasing.</p></li>
+<li><p><strong>exp-weight monotonicity</strong>: For any unconstrained
+<code>w̃ ∈ ℝ</code>, <code>x ↦ σ(exp(w̃) * x + b)</code> is monotone when
+σ is monotone.</p></li>
+<li><p><strong>Composition preservation</strong>: The composition of
+monotone non-decreasing functions is monotone non-decreasing.</p></li>
+</ol>
+<p>These theorems form the basis of COMONet’s monotonicity guarantee:
+each layer uses <code>exp(W̃)</code> weights (positive by construction)
+and monotone activations, so the overall network is monotone.</p>
+<pre class="lean"><code>namespace COMONetProofs</code></pre>
+<h3 id="single-neuron-monotonicity">Single neuron monotonicity</h3>
+<pre class="lean"><code>/-- **Core monotonicity theorem**: If `σ` is monotone non-decreasing and
+`w &gt; 0`, then the neuron `x ↦ σ(w * x + b)` is monotone non-decreasing.
+
+This is the fundamental building block of COMONet&#39;s monotonicity guarantee.
+The proof follows from:
+1. `x ↦ w * x + b` is monotone when `w &gt; 0`
+2. Monotone ∘ Monotone = Monotone -/
+theorem neuron_monotone_of_pos_weight
+    {σ : ℝ → ℝ} (hσ : Monotone σ) {w b : ℝ} (hw : w &gt; 0) :
+    Monotone (fun x =&gt; σ (w * x + b)) :=
+  hσ.comp (affine_pos_weight_mono hw)
+
+/-- **exp-weight monotonicity**: For any unconstrained weight `w̃ ∈ ℝ`
+and any monotone activation `σ`, the neuron `x ↦ σ(exp(w̃) * x + b)`
+is monotone non-decreasing.
+
+This is the key insight of COMONet: parameterizing weights through `exp`
+guarantees positivity without constrained optimization, and combined
+with monotone activations gives guaranteed monotone neurons. -/
+theorem neuron_monotone_of_exp_weight
+    {σ : ℝ → ℝ} (hσ : Monotone σ) (w_tilde b : ℝ) :
+    Monotone (fun x =&gt; σ (Real.exp w_tilde * x + b)) :=
+  neuron_monotone_of_pos_weight hσ (exp_pos w_tilde)</code></pre>
+<h3 id="relu-neuron-monotonicity">ReLU neuron monotonicity</h3>
+<pre class="lean"><code>/-- A ReLU neuron with positive weight is monotone. -/
+theorem relu_neuron_monotone {w b : ℝ} (hw : w &gt; 0) :
+    Monotone (fun x =&gt; relu (w * x + b)) :=
+  neuron_monotone_of_pos_weight relu_monotone hw
+
+/-- A ReLU neuron with exp-weight is monotone for any unconstrained weight. -/
+theorem relu_neuron_exp_weight_monotone (w_tilde b : ℝ) :
+    Monotone (fun x =&gt; relu (Real.exp w_tilde * x + b)) :=
+  neuron_monotone_of_exp_weight relu_monotone w_tilde b</code></pre>
+<h3 id="negative-relu-neuron-monotonicity">Negative ReLU neuron
+monotonicity</h3>
+<pre class="lean"><code>/-- A negative ReLU neuron with positive weight is monotone. -/
+theorem nrelu_neuron_monotone {w b : ℝ} (hw : w &gt; 0) :
+    Monotone (fun x =&gt; nrelu (w * x + b)) :=
+  neuron_monotone_of_pos_weight nrelu_monotone hw
+
+/-- A negative ReLU neuron with exp-weight is monotone. -/
+theorem nrelu_neuron_exp_weight_monotone (w_tilde b : ℝ) :
+    Monotone (fun x =&gt; nrelu (Real.exp w_tilde * x + b)) :=
+  neuron_monotone_of_exp_weight nrelu_monotone w_tilde b</code></pre>
+<h3 id="composition-of-monotone-layers">Composition of monotone
+layers</h3>
+<pre class="lean"><code>/-- **Monotone composition**: The composition of two monotone non-decreasing
+functions is monotone non-decreasing.
+
+This is a standard result, but we state it explicitly for clarity in
+the COMONet context: if layer L₁ and layer L₂ are both monotone,
+then L₂ ∘ L₁ is monotone. -/
+theorem monotone_comp_monotone
+    {f g : ℝ → ℝ} (hf : Monotone f) (hg : Monotone g) :
+    Monotone (g ∘ f) :=
+  hg.comp hf
+
+/-- **Multi-layer monotonicity (3 layers)**: Composition of three
+monotone functions is monotone.
+
+COMONet typically uses 2-3 hidden layers; this covers the 3-layer case
+(input → hidden₁ → hidden₂ → output). -/
+theorem monotone_comp3
+    {f g h : ℝ → ℝ} (hf : Monotone f) (hg : Monotone g) (hh : Monotone h) :
+    Monotone (h ∘ g ∘ f) :=
+  hh.comp (hg.comp hf)
+
+/-- **COMONet ExpUnit (single layer)**: A single COMONet monotone layer
+with exp-parameterized weight, bias, and monotone activation. -/
+theorem comonet_exp_unit_monotone
+    {σ : ℝ → ℝ} (hσ : Monotone σ) (w_tilde b : ℝ) :
+    Monotone (fun x =&gt; σ (Real.exp w_tilde * x + b)) :=
+  neuron_monotone_of_exp_weight hσ w_tilde b
+
+/-- **COMONet two-layer monotone network**: Two sequential exp-weight
+layers with monotone activations produce a monotone function. -/
+theorem comonet_two_layer_monotone
+    {σ₁ σ₂ : ℝ → ℝ} (hσ₁ : Monotone σ₁) (hσ₂ : Monotone σ₂)
+    (w₁ b₁ w₂ b₂ : ℝ) :
+    Monotone (fun x =&gt;
+      σ₂ (Real.exp w₂ * σ₁ (Real.exp w₁ * x + b₁) + b₂)) :=
+  (neuron_monotone_of_exp_weight hσ₂ w₂ b₂).comp
+    (neuron_monotone_of_exp_weight hσ₁ w₁ b₁)
+
+end COMONetProofs</code></pre>
+<pre class="lean"><code>import COMONetProofs.Basics
+import Mathlib.Analysis.Convex.Function
+import Mathlib.Analysis.Convex.SpecificFunctions.Basic</code></pre>
+<h1 id="convexity-theorems-for-comonet">Convexity Theorems for
+COMONet</h1>
+<h2 id="key-results-1">Key Results</h2>
+<ol type="1">
+<li><strong>ReLU is convex</strong>: <code>max(0, x)</code> is a convex
+function on ℝ.</li>
+<li><strong>COMONet ConvUnit</strong>: <code>relu(exp(w̃) * x + b)</code>
+is convex in <code>x</code>.</li>
+<li><strong>Multi-layer convexity</strong>: Composition of ConvUnit
+layers is convex.</li>
+</ol>
+<pre class="lean"><code>namespace COMONetProofs</code></pre>
+<h3 id="convexity-of-relu">Convexity of ReLU</h3>
+<pre class="lean"><code>/-- ReLU is convex on ℝ. Follows from `max` of two convex functions. -/
+theorem relu_convexOn : ConvexOn ℝ Set.univ relu := by
+  apply ConvexOn.sup
+  · exact convexOn_const 0 convex_univ
+  · exact convexOn_id convex_univ</code></pre>
+<h3 id="relu-applied-to-affine-map">ReLU applied to affine map</h3>
+<pre class="lean"><code>/-- Helper: affine precomposition preserves convexity when
+the original function is convex. We prove `relu ∘ affine` is convex
+directly from the definition. -/
+theorem relu_affine_convexOn (w b : ℝ) :
+    ConvexOn ℝ Set.univ (fun x =&gt; relu (w * x + b)) := by
+  rw [ConvexOn]
+  refine ⟨convex_univ, ?_⟩
+  intro x _ y _ a c ha hc hac
+  simp only [relu, smul_eq_mul]
+  -- Goal: max 0 (w * (a * x + c * y) + b) ≤ a * max 0 (w * x + b) + c * max 0 (w * y + b)
+  have h_lin : w * (a * x + c * y) + b = a * (w * x + b) + c * (w * y + b) := by
+    have hac1 : a + c = 1 := hac
+    have : b = (a + c) * b := by rw [hac1, one_mul]
+    linarith
+  rw [h_lin]
+  exact max_le
+    (add_nonneg (mul_nonneg ha (le_max_left 0 _)) (mul_nonneg hc (le_max_left 0 _)))
+    (add_le_add (mul_le_mul_of_nonneg_left (le_max_right 0 _) ha)
+                (mul_le_mul_of_nonneg_left (le_max_right 0 _) hc))
+
+/-- **COMONet ConvUnit with exp-weight**: For any unconstrained weight
+`w̃` and bias `b`, `relu(exp(w̃) * x + b)` is convex in `x`. -/
+theorem relu_exp_weight_convexOn (w_tilde b : ℝ) :
+    ConvexOn ℝ Set.univ (fun x =&gt; relu (Real.exp w_tilde * x + b)) :=
+  relu_affine_convexOn (Real.exp w_tilde) b</code></pre>
+<h3 id="two-layer-convexity">Two-layer convexity</h3>
+<pre class="lean"><code>/-- **Two-layer ConvUnit convexity**: `relu(w₂ * relu(w₁ * x + b₁) + b₂)`
+is convex when `w₁, w₂ &gt; 0`. -/
+theorem two_layer_convUnit_convexOn (w₁ b₁ w₂ b₂ : ℝ)
+    (hw₂ : w₂ ≥ 0) :
+    ConvexOn ℝ Set.univ
+      (fun x =&gt; relu (w₂ * relu (w₁ * x + b₁) + b₂)) := by
+  rw [ConvexOn]
+  refine ⟨convex_univ, ?_⟩
+  intro x _ y _ a c ha hc hac
+  simp only [relu, smul_eq_mul]
+  -- Inner convexity
+  have h_inner := (relu_affine_convexOn w₁ b₁).2
+    (Set.mem_univ x) (Set.mem_univ y) ha hc hac
+  simp only [relu, smul_eq_mul] at h_inner
+  set ix := max 0 (w₁ * x + b₁)
+  set iy := max 0 (w₁ * y + b₁)
+  set iz := max 0 (w₁ * (a * x + c * y) + b₁)
+  -- h_inner : iz ≤ a * ix + c * iy
+  -- Need: max 0 (w₂ * iz + b₂) ≤ a * max 0 (w₂ * ix + b₂) + c * max 0 (w₂ * iy + b₂)
+  have h_w2_iz : w₂ * iz ≤ w₂ * (a * ix + c * iy) :=
+    mul_le_mul_of_nonneg_left h_inner hw₂
+  have h_expand : w₂ * (a * ix + c * iy) = a * (w₂ * ix) + c * (w₂ * iy) := by ring
+  have h_sum : w₂ * iz + b₂ ≤ a * (w₂ * ix + b₂) + c * (w₂ * iy + b₂) := by
+    have hac1 : a + c = 1 := hac
+    have h1 : w₂ * iz ≤ a * (w₂ * ix) + c * (w₂ * iy) := by linarith [h_w2_iz, h_expand]
+    have h2 : a * (w₂ * ix + b₂) + c * (w₂ * iy + b₂)
+            = a * (w₂ * ix) + c * (w₂ * iy) + (a + c) * b₂ := by ring
+    rw [h2, hac1, one_mul]
+    linarith
+  exact max_le
+    (add_nonneg (mul_nonneg ha (le_max_left 0 _)) (mul_nonneg hc (le_max_left 0 _)))
+    (le_trans h_sum
+      (add_le_add (mul_le_mul_of_nonneg_left (le_max_right 0 _) ha)
+                  (mul_le_mul_of_nonneg_left (le_max_right 0 _) hc)))
+
+/-- **Two-layer ConvUnit with exp-weights** is convex. -/
+theorem two_layer_convUnit_exp_weight_convexOn (w₁ b₁ w₂ b₂ : ℝ) :
+    ConvexOn ℝ Set.univ
+      (fun x =&gt; relu (Real.exp w₂ * relu (Real.exp w₁ * x + b₁) + b₂)) :=
+  two_layer_convUnit_convexOn (Real.exp w₁) b₁ (Real.exp w₂) b₂
+    (le_of_lt (exp_pos w₂))
+
+end COMONetProofs</code></pre>
+<pre class="lean"><code>import COMONetProofs.Basics
+import COMONetProofs.Convexity
+import Mathlib.Analysis.Convex.Function</code></pre>
+<h1 id="concavity-theorems-for-comonet">Concavity Theorems for
+COMONet</h1>
+<h2 id="key-results-2">Key Results</h2>
+<ol type="1">
+<li><strong>Negative ReLU is concave</strong>:
+<code>nrelu(x) = -relu(-x) = min(0, x)</code> is concave.</li>
+<li><strong>COMONet ConcUnit</strong>:
+<code>nrelu(exp(w̃) * x + b)</code> is concave in <code>x</code>.</li>
+<li><strong>Multi-layer concavity</strong>: ConcUnit layers with
+positive weights preserve concavity.</li>
+</ol>
+<pre class="lean"><code>namespace COMONetProofs</code></pre>
+<h3 id="concavity-of-negative-relu">Concavity of negative ReLU</h3>
+<pre class="lean"><code>/-- Negative ReLU is concave on ℝ. -/
+theorem nrelu_concaveOn : ConcaveOn ℝ Set.univ nrelu := by
+  rw [ConcaveOn]
+  refine ⟨convex_univ, ?_⟩
+  intro x _ y _ a c ha hc hac
+  simp only [nrelu, relu, smul_eq_mul]
+  -- Need: a * (-max 0 (-x)) + c * (-max 0 (-y)) ≤ -(max 0 (-(a*x + c*y)))
+  -- i.e., max 0 (-(a*x+c*y)) ≤ a * max 0 (-x) + c * max 0 (-y)
+  -- This is convexity of relu applied to negated inputs
+  suffices h : max 0 (-(a * x + c * y)) ≤ a * max 0 (-x) + c * max 0 (-y) by linarith
+  have h_neg : -(a * x + c * y) = a * (-x) + c * (-y) := by ring
+  rw [h_neg]
+  exact max_le
+    (add_nonneg (mul_nonneg ha (le_max_left 0 _)) (mul_nonneg hc (le_max_left 0 _)))
+    (add_le_add (mul_le_mul_of_nonneg_left (le_max_right 0 _) ha)
+                (mul_le_mul_of_nonneg_left (le_max_right 0 _) hc))</code></pre>
+<h3 id="concunit">ConcUnit</h3>
+<pre class="lean"><code>/-- **COMONet ConcUnit**: `nrelu(w * x + b)` is concave for any `w, b`. -/
+theorem nrelu_affine_concaveOn (w b : ℝ) :
+    ConcaveOn ℝ Set.univ (fun x =&gt; nrelu (w * x + b)) := by
+  rw [ConcaveOn]
+  refine ⟨convex_univ, ?_⟩
+  intro x _ y _ a c ha hc hac
+  simp only [nrelu, relu, smul_eq_mul]
+  -- Need: a * (-max 0 (-(w*x+b))) + c * (-max 0 (-(w*y+b)))
+  --     ≤ -(max 0 (-(w*(a*x+c*y)+b)))
+  suffices h : max 0 (-(w * (a * x + c * y) + b))
+      ≤ a * max 0 (-(w * x + b)) + c * max 0 (-(w * y + b)) by linarith
+  have h_lin : -(w * (a * x + c * y) + b) = a * (-(w * x + b)) + c * (-(w * y + b)) := by
+    have hac1 : a + c = 1 := hac
+    have : b = (a + c) * b := by rw [hac1, one_mul]
+    linarith
+  rw [h_lin]
+  exact max_le
+    (add_nonneg (mul_nonneg ha (le_max_left 0 _)) (mul_nonneg hc (le_max_left 0 _)))
+    (add_le_add (mul_le_mul_of_nonneg_left (le_max_right 0 _) ha)
+                (mul_le_mul_of_nonneg_left (le_max_right 0 _) hc))
+
+/-- **COMONet ConcUnit with exp-weight**: For any unconstrained weight
+`w̃` and bias `b`, `nrelu(exp(w̃) * x + b)` is concave in `x`. -/
+theorem nrelu_exp_weight_concaveOn (w_tilde b : ℝ) :
+    ConcaveOn ℝ Set.univ (fun x =&gt; nrelu (Real.exp w_tilde * x + b)) :=
+  nrelu_affine_concaveOn (Real.exp w_tilde) b</code></pre>
+<h3 id="multi-layer-concavity">Multi-layer concavity</h3>
+<pre class="lean"><code>/-- **Two-layer ConcUnit concavity** with positive outer weight. -/
+theorem two_layer_concUnit_concaveOn (w₁ b₁ w₂ b₂ : ℝ)
+    (hw₂ : w₂ ≥ 0) :
+    ConcaveOn ℝ Set.univ
+      (fun x =&gt; nrelu (w₂ * nrelu (w₁ * x + b₁) + b₂)) := by
+  rw [ConcaveOn]
+  refine ⟨convex_univ, ?_⟩
+  intro x _ y _ a c ha hc hac
+  simp only [nrelu, relu, smul_eq_mul]
+  -- Inner concavity: nrelu(w₁*z+b₁) is concave
+  have h_inner := (nrelu_affine_concaveOn w₁ b₁).2
+    (Set.mem_univ x) (Set.mem_univ y) ha hc hac
+  simp only [nrelu, relu, smul_eq_mul] at h_inner
+  set ix := -max 0 (-(w₁ * x + b₁))
+  set iy := -max 0 (-(w₁ * y + b₁))
+  set iz := -max 0 (-(w₁ * (a * x + c * y) + b₁))
+  -- h_inner : a * ix + c * iy ≤ iz
+  -- Need outer nrelu to preserve: suffices to show
+  -- max 0 (-(w₂*iz+b₂)) ≤ a * max 0 (-(w₂*ix+b₂)) + c * max 0 (-(w₂*iy+b₂))
+  suffices h : max 0 (-(w₂ * iz + b₂))
+      ≤ a * max 0 (-(w₂ * ix + b₂)) + c * max 0 (-(w₂ * iy + b₂)) by linarith
+  -- Since iz ≥ a*ix + c*iy and w₂ ≥ 0:
+  -- w₂*iz ≥ w₂*(a*ix + c*iy) = a*w₂*ix + c*w₂*iy
+  -- So -(w₂*iz+b₂) ≤ -(a*w₂*ix + c*w₂*iy + b₂) = a*(-(w₂*ix+b₂)) + c*(-(w₂*iy+b₂))
+  have h_w2_iz : w₂ * (a * ix + c * iy) ≤ w₂ * iz :=
+    mul_le_mul_of_nonneg_left h_inner hw₂
+  have h_neg : -(w₂ * iz + b₂) ≤ a * (-(w₂ * ix + b₂)) + c * (-(w₂ * iy + b₂)) := by
+    have hac1 : a + c = 1 := hac
+    have : b₂ = (a + c) * b₂ := by rw [hac1, one_mul]
+    linarith
+  calc max 0 (-(w₂ * iz + b₂))
+      ≤ max 0 (a * (-(w₂ * ix + b₂)) + c * (-(w₂ * iy + b₂))) :=
+        max_le_max_left 0 h_neg
+    _ ≤ a * max 0 (-(w₂ * ix + b₂)) + c * max 0 (-(w₂ * iy + b₂)) :=
+        max_le
+          (add_nonneg (mul_nonneg ha (le_max_left 0 _)) (mul_nonneg hc (le_max_left 0 _)))
+          (add_le_add (mul_le_mul_of_nonneg_left (le_max_right 0 _) ha)
+                      (mul_le_mul_of_nonneg_left (le_max_right 0 _) hc))
+
+/-- **Two-layer ConcUnit with exp-weights** is concave. -/
+theorem two_layer_concUnit_exp_weight_concaveOn (w₁ b₁ w₂ b₂ : ℝ) :
+    ConcaveOn ℝ Set.univ
+      (fun x =&gt; nrelu (Real.exp w₂ * nrelu (Real.exp w₁ * x + b₁) + b₂)) :=
+  two_layer_concUnit_concaveOn (Real.exp w₁) b₁ (Real.exp w₂) b₂
+    (le_of_lt (exp_pos w₂))
+
+end COMONetProofs</code></pre>
+<pre class="lean"><code>import COMONetProofs.Basics
+import COMONetProofs.Monotonicity
+import COMONetProofs.Convexity
+import COMONetProofs.Concavity
+import Mathlib.Analysis.Convex.Function
+import Mathlib.Order.Monotone.Basic</code></pre>
+<h1 id="composition-theorems-for-comonet">Composition Theorems for
+COMONet</h1>
+<h2 id="key-results-3">Key Results</h2>
+<ol type="1">
+<li><strong>Monotone ∘ Monotone = Monotone</strong>: Standard
+composition rule.</li>
+<li><strong>Positive scaling preserves
+convexity/concavity</strong>.</li>
+<li><strong>COMONet full network guarantees</strong>: 2-hidden + output
+layer.</li>
+<li><strong>Summary theorem</strong>: Collects all architectural
+guarantees.</li>
+</ol>
+<pre class="lean"><code>namespace COMONetProofs</code></pre>
+<h3 id="composition-rules">Composition rules</h3>
+<pre class="lean"><code>/-- **Monotone composition**: standard mathematical fact. -/
+theorem comp_monotone {f g : ℝ → ℝ}
+    (hf : Monotone f) (hg : Monotone g) :
+    Monotone (g ∘ f) :=
+  hg.comp hf
+
+/-- Positive scaling preserves convexity. -/
+theorem pos_scale_convexOn {f : ℝ → ℝ}
+    (hf : ConvexOn ℝ Set.univ f) {α : ℝ} (hα : α ≥ 0) (b : ℝ) :
+    ConvexOn ℝ Set.univ (fun x =&gt; α * f x + b) := by
+  rw [ConvexOn]
+  refine ⟨convex_univ, ?_⟩
+  intro x _ y _ a c ha hc hac
+  simp only [smul_eq_mul]
+  have hf_ineq := hf.2 (Set.mem_univ x) (Set.mem_univ y) ha hc hac
+  simp only [smul_eq_mul] at hf_ineq
+  have h1 : α * f (a * x + c * y) ≤ α * (a * f x + c * f y) :=
+    mul_le_mul_of_nonneg_left hf_ineq hα
+  have hac1 : a + c = 1 := hac
+  have : b = (a + c) * b := by rw [hac1, one_mul]
+  linarith
+
+/-- Positive scaling preserves concavity. -/
+theorem pos_scale_concaveOn {f : ℝ → ℝ}
+    (hf : ConcaveOn ℝ Set.univ f) {α : ℝ} (hα : α ≥ 0) (b : ℝ) :
+    ConcaveOn ℝ Set.univ (fun x =&gt; α * f x + b) := by
+  rw [ConcaveOn]
+  refine ⟨convex_univ, ?_⟩
+  intro x _ y _ a c ha hc hac
+  simp only [smul_eq_mul]
+  have hf_ineq := hf.2 (Set.mem_univ x) (Set.mem_univ y) ha hc hac
+  simp only [smul_eq_mul] at hf_ineq
+  have h1 : α * (a * f x + c * f y) ≤ α * f (a * x + c * y) :=
+    mul_le_mul_of_nonneg_left hf_ineq hα
+  have hac1 : a + c = 1 := hac
+  have : b = (a + c) * b := by rw [hac1, one_mul]
+  linarith</code></pre>
+<h3 id="comonet-output-layer">COMONet output layer</h3>
+<pre class="lean"><code>/-- **COMONet linear output with exp-weight preserves convexity**. -/
+theorem exp_weight_output_preserves_convexOn {f : ℝ → ℝ}
+    (hf : ConvexOn ℝ Set.univ f) (w_tilde b : ℝ) :
+    ConvexOn ℝ Set.univ (fun x =&gt; Real.exp w_tilde * f x + b) :=
+  pos_scale_convexOn hf (le_of_lt (exp_pos w_tilde)) b
+
+/-- **COMONet linear output with exp-weight preserves concavity**. -/
+theorem exp_weight_output_preserves_concaveOn {f : ℝ → ℝ}
+    (hf : ConcaveOn ℝ Set.univ f) (w_tilde b : ℝ) :
+    ConcaveOn ℝ Set.univ (fun x =&gt; Real.exp w_tilde * f x + b) :=
+  pos_scale_concaveOn hf (le_of_lt (exp_pos w_tilde)) b</code></pre>
+<h3 id="full-comonet-architecture-theorems">Full COMONet architecture
+theorems</h3>
+<pre class="lean"><code>/-- **COMONet monotone network (2 hidden + output)**: Monotone for any weights. -/
+theorem comonet_monotone_network_3layer
+    (w₁ b₁ w₂ b₂ w₃ b₃ : ℝ) :
+    Monotone (fun x =&gt;
+      Real.exp w₃ * relu (Real.exp w₂ * relu (Real.exp w₁ * x + b₁) + b₂) + b₃) :=
+  (affine_nonneg_weight_mono (le_of_lt (exp_pos w₃))).comp
+    (relu_monotone.comp
+      ((affine_nonneg_weight_mono (le_of_lt (exp_pos w₂))).comp
+        (relu_monotone.comp (affine_nonneg_weight_mono (le_of_lt (exp_pos w₁))))))
+
+/-- **COMONet convex network (2 hidden + output)**: Convex for any weights. -/
+theorem comonet_convex_network_3layer
+    (w₁ b₁ w₂ b₂ w₃ b₃ : ℝ) :
+    ConvexOn ℝ Set.univ (fun x =&gt;
+      Real.exp w₃ * relu (Real.exp w₂ * relu (Real.exp w₁ * x + b₁) + b₂) + b₃) :=
+  exp_weight_output_preserves_convexOn
+    (two_layer_convUnit_exp_weight_convexOn w₁ b₁ w₂ b₂)
+    w₃ b₃
+
+/-- **COMONet concave network (2 hidden + output)**: Concave for any weights. -/
+theorem comonet_concave_network_3layer
+    (w₁ b₁ w₂ b₂ w₃ b₃ : ℝ) :
+    ConcaveOn ℝ Set.univ (fun x =&gt;
+      Real.exp w₃ * nrelu (Real.exp w₂ * nrelu (Real.exp w₁ * x + b₁) + b₂) + b₃) :=
+  exp_weight_output_preserves_concaveOn
+    (two_layer_concUnit_exp_weight_concaveOn w₁ b₁ w₂ b₂)
+    w₃ b₃
+
+/-- **Summary theorem**: COMONet architectural constraints guarantee
+shape properties for ALL parameter values. No constrained optimization
+needed — the guarantees are structural. -/
+theorem comonet_shape_guarantees :
+    -- 1. Monotonicity: for all weights, the monotone network is monotone
+    (∀ w₁ b₁ w₂ b₂ : ℝ,
+      Monotone (fun x =&gt; relu (Real.exp w₂ * relu (Real.exp w₁ * x + b₁) + b₂))) ∧
+    -- 2. Convexity: for all weights, the convex network is convex
+    (∀ w₁ b₁ w₂ b₂ : ℝ,
+      ConvexOn ℝ Set.univ
+        (fun x =&gt; relu (Real.exp w₂ * relu (Real.exp w₁ * x + b₁) + b₂))) ∧
+    -- 3. Concavity: for all weights, the concave network is concave
+    (∀ w₁ b₁ w₂ b₂ : ℝ,
+      ConcaveOn ℝ Set.univ
+        (fun x =&gt; nrelu (Real.exp w₂ * nrelu (Real.exp w₁ * x + b₁) + b₂))) := by
+  exact ⟨
+    fun w₁ b₁ w₂ b₂ =&gt;
+      relu_monotone.comp
+        ((affine_nonneg_weight_mono (le_of_lt (exp_pos w₂))).comp
+          (relu_monotone.comp (affine_nonneg_weight_mono (le_of_lt (exp_pos w₁))))),
+    fun w₁ b₁ w₂ b₂ =&gt; two_layer_convUnit_exp_weight_convexOn w₁ b₁ w₂ b₂,
+    fun w₁ b₁ w₂ b₂ =&gt; two_layer_concUnit_exp_weight_concaveOn w₁ b₁ w₂ b₂⟩
+
+end COMONetProofs</code></pre>
+</body>
+</html>

@@ -1,0 +1,123 @@
+---
+title: "Probabilistic ODE Solving with DaltonSolver"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+The `DaltonSolver` implements the **Data-Adaptive Likelihood with Transformed Observations** (DALTON) method (Wu & Lysy 2024). Unlike classical ODE solvers that treat the numerical solution as exact, DALTON uses a **probabilistic ODE solver** based on Integrated Brownian Motion (IBM) and Kalman filtering.
+
+The key idea: DALTON computes a **data-adaptive marginal likelihood** p(Y|θ) by running two Kalman filter passes:
+
+1. **Joint pass**: Kalman filter with both ODE constraints and observation data → log p(Y, Z)
+2. **Marginal pass**: Kalman filter with only ODE constraints → log p(Z)
+3. **DALTON likelihood**: log p(Y|Z) = log p(Y, Z) - log p(Z)
+
+This naturally accounts for ODE discretization uncertainty and provides uncertainty estimates for the fitted states.
+
+```{julia}
+using PartiallySpecifiedModels
+using OrdinaryDiffEq
+using Random
+Random.seed!(42)
+```
+
+## Logistic Growth with Unknown Per-Capita Rate
+
+```{julia}
+r_true(N) = 0.5 * (1.0 - N / 10.0)
+
+function logistic!(du, u, p, t)
+    N = u[1]
+    du[1] = p.r(N) * N
+end
+
+sol_true = solve(ODEProblem(logistic!, [1.0], (0.0, 15.0), (; r=r_true)),
+                 Tsit5(); saveat=0.5)
+t_data = collect(sol_true.t)
+data_N = [sol_true.u[i][1] + 0.1 * randn() for i in 1:length(t_data)]
+data_matrix = reshape(max.(data_N, 0.01), :, 1)
+```
+
+### Fit with DaltonSolver
+
+```{julia}
+uf = BSplineApproximator(:r, (0.0, 12.0), 8)
+
+prob = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf];
+    data_times=t_data, data_values=Float64.(data_matrix),
+    obs_to_state=[1], known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+
+sol_dalton = solve(prob, DaltonSolver(n_steps=200, maxiters=100, verbose=false))
+```
+
+### Compare with LAML and RodeoSolver
+
+```{julia}
+sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
+sol_rodeo = solve(prob, RodeoSolver(n_steps=200, method=:fenrir, maxiters=100, verbose=false))
+```
+
+### Recovered Functions
+
+```{julia}
+#| echo: false
+r_dalton = sol_dalton.unknown_functions[:r]
+r_laml = sol_laml.unknown_functions[:r]
+r_rodeo = sol_rodeo.unknown_functions[:r]
+
+println("Per-capita growth rate r(N) comparison:")
+println("  N    |  True   | Dalton  |  LAML   |  Rodeo")
+println("  -----|---------|---------|---------|--------")
+for N in [0.5, 2.0, 5.0, 8.0, 10.0]
+    println("  $(lpad(N, 4)) | $(lpad(round(r_true(N), digits=3), 7)) " *
+            "| $(lpad(round(r_dalton(N), digits=3), 7)) " *
+            "| $(lpad(round(r_laml(N), digits=3), 7)) " *
+            "| $(lpad(round(r_rodeo(N), digits=3), 7))")
+end
+```
+
+### Fitted Trajectories
+
+```{julia}
+#| echo: false
+println("Population trajectory comparison:")
+println("  t    | Observed | Dalton  |  LAML   |  Rodeo")
+println("  -----|----------|---------|---------|--------")
+for i in 1:5:length(t_data)
+    t = t_data[i]
+    println("  $(lpad(round(t, digits=1), 4)) | $(lpad(round(data_N[i], digits=2), 8)) " *
+            "| $(lpad(round(sol_dalton.fitted_values[i,1], digits=2), 7)) " *
+            "| $(lpad(round(sol_laml.fitted_values[i,1], digits=2), 7)) " *
+            "| $(lpad(round(sol_rodeo.fitted_values[i,1], digits=2), 7))")
+end
+```
+
+## Probabilistic vs. Deterministic Solvers
+
+| Feature | LAML | RodeoSolver | DaltonSolver |
+|---------|------|-------------|--------------|
+| **ODE solving** | Deterministic (Tsit5) | Probabilistic (IBM+Kalman) | Probabilistic (IBM+Kalman) |
+| **Likelihood** | Gaussian residuals | Fenrir marginal | DALTON data-adaptive |
+| **Uncertainty** | EDF-based | State covariance | State covariance |
+| **Discretization** | Adaptive step | Fixed grid | Fixed grid |
+| **Smoothing** | LAML (Fellner-Schall) | B-spline penalty | B-spline penalty |
+
+**Key advantage of DALTON over Fenrir (RodeoSolver)**: The DALTON likelihood directly incorporates observations into the Kalman state, giving a tighter data-adaptive estimate of p(Y|θ).
+
+## Summary
+
+The `DaltonSolver` provides a principled probabilistic approach to fitting partially specified models. By treating the ODE solution as uncertain (via an IBM prior and Kalman filtering), it naturally accounts for discretization error and provides state uncertainty estimates alongside the fitted unknown functions.

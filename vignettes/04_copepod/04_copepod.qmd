@@ -1,0 +1,253 @@
+---
+title: "Copepod Stage-Structured Population Model"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+This vignette demonstrates `PartiallySpecifiedModels.jl` on a complex, multivariate ecological model: the **11-stage copepod population model** from Wood (2001). This is the canonical PSM example — the model that motivated the original methodology.
+
+The copepod *Calanus finmarchicus* passes through 11 developmental stages (6 naupliar, 5 copepodite). Stage durations are known from laboratory experiments, but three vital rates are unknown functions of time:
+
+- $R(t)$ — egg recruitment rate
+- $\mu_j(t)$ — naupliar (juvenile) per-capita death rate
+- $\mu_a(t)$ — copepodite (adult) per-capita death rate
+
+With 11 simultaneously observed state variables, 3 unknown functions, and 45 total parameters, this is a substantially more complex problem than the Lotka–Volterra example.
+
+## Setup
+
+```{julia}
+using PartiallySpecifiedModels
+using PartiallySpecifiedModels: solve
+using OrdinaryDiffEq
+using DelimitedFiles
+using Plots
+using Printf
+```
+
+## Data
+
+The data consist of abundance estimates for each of the 11 developmental stages, observed at 10 time points over 90 days:
+
+```{julia}
+#| echo: false
+data_path = joinpath(@__DIR__, "..", "..", "data", "cop.dat")
+raw = readdlm(data_path)
+data_times = Float64.(raw[:, 1])
+data_values = Float64.(raw[:, 2:12])
+
+println("Observations: $(size(data_values, 1)) times × $(size(data_values, 2)) stages")
+println("Time range: $(data_times[1])–$(data_times[end]) days")
+println("Total data points: $(length(data_values))")
+```
+
+```{julia}
+p_data = plot(xlabel="Day", ylabel="Abundance", title="Copepod stage abundances",
+              legend=:topright)
+stage_names = ["N1", "N2", "N3", "N4", "N5", "N6", "C1", "C2", "C3", "C4", "C5"]
+for j in [1, 3, 6, 7, 11]
+    scatter!(p_data, data_times, data_values[:, j], label=stage_names[j], ms=4)
+end
+p_data
+```
+
+## Model
+
+### Stage-structured dynamics
+
+Each stage $i$ has exponential residence time with known mean duration $c_i$. The rate of passage through stage $i$ is $s_i / c_i$:
+
+$$
+\frac{ds_i}{dt} = \text{inflow}_i - \frac{s_i}{c_i} - \mu(t) \cdot s_i
+$$
+
+where:
+
+- $\text{inflow}_1 = R(t) \times 1000$ (recruitment, scaled)
+- $\text{inflow}_i = s_{i-1} / c_{i-1}$ for $i > 1$ (outflow from previous stage)
+- $\mu(t) = \mu_j(t)$ for stages 1–6, $\mu_a(t)$ for stages 7–11
+
+```{julia}
+# Known stage durations (days)
+durations = [0.75, 1.4, 4.55, 2.8, 2.5, 1.7, 3.5, 3.1, 3.2, 3.7, 4.7]
+
+function copepod!(du, u, p, t)
+    R_t = p.R(t) * 1000.0
+    μ_j = p.mu_j(t)
+    μ_a = p.mu_a(t)
+    inflow = R_t
+    for i in 1:11
+        death = i <= 6 ? μ_j : μ_a
+        du[i] = inflow - u[i] / durations[i] - death * u[i]
+        inflow = u[i] / durations[i]
+    end
+end
+```
+
+### Initial conditions
+
+We compute steady-state abundances from the initial values of the unknown functions. This ensures the model starts in a self-consistent state:
+
+```{julia}
+function compute_u0(p)
+    R0 = p.R(0.0) * 1000.0
+    μ_j0 = p.mu_j(0.0)
+    μ_a0 = p.mu_a(0.0)
+    u0 = zeros(Float64, 11)
+    inflow = R0
+    for i in 1:11
+        death = i <= 6 ? μ_j0 : μ_a0
+        u0[i] = inflow / (1.0 / durations[i] + death)
+        inflow = u0[i] / durations[i]
+    end
+    u0
+end
+```
+
+Note that `compute_u0` receives the parameter struct `p` containing callable unknown functions. This means the initial conditions are automatically consistent with the current iterate during the IRLS optimization.
+
+## Unknown Function Approximators
+
+Each unknown function gets 15 B-spline knots over the observation period $[0, 90]$ days:
+
+```{julia}
+#| echo: false
+approx_R = BSplineApproximator(:R, (0.0, 90.0), 15;
+    initial = t -> begin
+        μ, σ = 30.0, 20.0
+        (0.01 + 0.39894228 / σ * exp(-(t - μ)^2 / σ^2)) * 400.0
+    end)
+
+approx_mu_j = BSplineApproximator(:mu_j, (0.0, 90.0), 15;
+    initial = t -> 0.1 * exp(-0.02 * t))
+
+approx_mu_a = BSplineApproximator(:mu_a, (0.0, 90.0), 15;
+    initial = t -> 0.1)
+
+println("Total parameters: ", nparams(approx_R) + nparams(approx_mu_j) + nparams(approx_mu_a))
+```
+
+The initial guesses encode biological prior knowledge:
+
+- **Recruitment** $R(t)$: Gaussian pulse peaking at day 30 (spring spawning)
+- **Naupliar death** $\mu_j(t)$: exponential decay (mortality decreases as conditions improve)
+- **Copepodite death** $\mu_a(t)$: constant (no prior information)
+
+## Building and Solving
+
+```{julia}
+prob = PSMProblem(copepod!, compute_u0, (0.0, 90.0),
+    [approx_R, approx_mu_j, approx_mu_a];
+    data_times = data_times,
+    data_values = data_values,
+    obs_to_state = collect(1:11),
+    known_params = NamedTuple(),
+    likelihood = Gaussian(),
+    solver = BS3(),
+    abstol = 1e-6, reltol = 1e-6, maxiters = 10000)
+```
+
+```{julia}
+#| echo: false
+sol = solve(prob, LAML(maxiters=100, verbose=false))
+
+println("Data loss (SS):  ", @sprintf("%.4e", sol.data_loss))
+println("Penalized obj:   ", @sprintf("%.4e", sol.objective))
+println("EDF:             ", round(sol.edf, digits=2))
+println("Smoothing λ:     ", [round(s, sigdigits=4) for s in sol.smoothing_params])
+```
+
+## Results
+
+### Fitted Trajectories
+
+```{julia}
+pred = sol.fitted_values
+layout = @layout [a b; c d]
+plots_stages = []
+
+for (stages, title) in [([1,2,3], "Naupliar 1–3"), ([4,5,6], "Naupliar 4–6"),
+                          ([7,8,9], "Copepodite 1–3"), ([10,11], "Copepodite 4–5")]
+    p = plot(xlabel="Day", ylabel="Abundance", title=title, legend=:topright)
+    for j in stages
+        scatter!(p, data_times, data_values[:, j], label=stage_names[j], ms=4, alpha=0.7)
+        plot!(p, data_times, pred[:, j], lw=2, label=nothing)
+    end
+    push!(plots_stages, p)
+end
+
+plot(plots_stages..., layout=(2, 2), size=(800, 600))
+```
+
+### Estimated Unknown Functions
+
+```{julia}
+t_grid = range(0.0, 90.0, length=200)
+
+p1 = plot(t_grid, [sol.unknown_functions[:R](t) * 1000.0 for t in t_grid],
+          xlabel="Day", ylabel="R(t) × 1000",
+          title="Recruitment", lw=2, color=:forestgreen, label=nothing)
+
+p2 = plot(t_grid, [sol.unknown_functions[:mu_j](t) for t in t_grid],
+          xlabel="Day", ylabel="μⱼ(t)",
+          title="Naupliar death rate", lw=2, color=:steelblue, label=nothing)
+hline!(p2, [0.0], color=:gray, ls=:dot, label=nothing)
+
+p3 = plot(t_grid, [sol.unknown_functions[:mu_a](t) for t in t_grid],
+          xlabel="Day", ylabel="μₐ(t)",
+          title="Copepodite death rate", lw=2, color=:indianred, label=nothing)
+hline!(p3, [0.0], color=:gray, ls=:dot, label=nothing)
+
+plot(p1, p2, p3, layout=(1, 3), size=(900, 300))
+```
+
+## Discussion
+
+### Model complexity
+
+This model illustrates several features of complex PSMs:
+
+| Feature | Value |
+|---------|-------|
+| State variables | 11 (6 naupliar + 5 copepodite stages) |
+| Unknown functions | 3 ($R$, $\mu_j$, $\mu_a$) |
+| Knots per function | 15 |
+| Total parameters | 45 |
+| Data points | 110 (10 times × 11 stages) |
+
+The ratio of data to parameters (110:45 ≈ 2.4:1) is low, making the smoothing penalty critical. Without it, the model could overfit easily. The LAML-estimated smoothing parameters ensure that the effective model complexity matches what the data can support.
+
+### Dependent initial conditions
+
+The `compute_u0(p)` function demonstrates an important feature: the initial conditions depend on the unknown functions. As the IRLS algorithm iterates and updates the spline coefficients, the initial conditions are automatically recomputed from the current estimate of $R(0)$, $\mu_j(0)$, and $\mu_a(0)$.
+
+### Smoothing parameter interpretation
+
+The three smoothing parameters $\lambda_k$ control the trade-off between data fit and smoothness independently for each unknown function:
+
+- **$\lambda_R$**: typically small (recruitment is complex, needs flexibility)
+- **$\lambda_{\mu_j}$, $\lambda_{\mu_a}$**: often larger (death rates are smoother)
+
+The LAML/REML criterion provides an automatic, principled way to set these parameters, avoiding the need for cross-validation on such a small dataset.
+
+## Summary
+
+The copepod model demonstrates that `PartiallySpecifiedModels.jl` can handle:
+
+- High-dimensional state spaces (11 ODEs)
+- Multiple unknown functions with different smoothing requirements
+- Parameter-dependent initial conditions
+- Real ecological data with complex dynamics

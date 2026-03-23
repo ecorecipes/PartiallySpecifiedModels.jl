@@ -1,0 +1,408 @@
+---
+title: "Alternative Approximators: Neural Networks and Gaussian Processes"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+While B-splines are the default approximator in `PartiallySpecifiedModels.jl`, the package also supports **neural network approximators** via [Lux.jl](https://lux.csail.mit.edu/) and **Gaussian process (GP) approximators** with built-in kernel functions. This vignette compares all three on the same problem: an SIR epidemic model with a density-dependent transmission rate $\beta(I)$.
+
+### When to use each
+
+| Approximator | Strengths | Weaknesses |
+|-------------|-----------|------------|
+| **B-spline** | Built-in penalty, automatic LAML smoothing, fast | Fixed domain, univariate input |
+| **Gaussian process** | Built-in penalty (kernel prior), flexible correlation structure, LAML smoothing | Fixed domain, O(n³) cost in inducing points |
+| **Neural network** | Multi-dimensional input, arbitrary architecture, extrapolation | No automatic smoothing, more parameters |
+
+## Setup
+
+```{julia}
+using PartiallySpecifiedModels
+using PartiallySpecifiedModels: solve
+using OrdinaryDiffEq
+using Lux
+using Plots
+using Random
+Random.seed!(42)
+```
+
+## Synthetic Epidemic Data
+
+We simulate an SIR model where the transmission rate $\beta$ depends on the number of infected individuals — a behavioural response where people reduce contact as the epidemic grows:
+
+$$
+\beta(I) = \beta_0 \, e^{-\kappa I}
+$$
+
+```{julia}
+#| echo: false
+N = 1000.0
+γ = 0.25
+β0 = 0.5
+κ = 0.005
+β_true(I) = β0 * exp(-κ * I)
+
+function sir_true!(du, u, p, t)
+    S, I, R = u
+    β = β_true(I)
+    du[1] = -β * S * I / N
+    du[2] =  β * S * I / N - γ * I
+    du[3] =  γ * I
+end
+
+u0_true = [N - 1.0, 1.0, 0.0]
+tspan = (0.0, 40.0)
+data_times = collect(0.5:0.5:40.0)
+
+prob_true = ODEProblem(sir_true!, u0_true, tspan)
+sol_true = OrdinaryDiffEq.solve(prob_true, Tsit5(); saveat=data_times)
+
+S_obs = [sol_true(t)[1] + 5.0 * randn() for t in data_times]
+I_obs = [max(sol_true(t)[2] + 2.0 * randn(), 0.1) for t in data_times]
+data_values = hcat(S_obs, I_obs)
+
+# Set domain for β(I) to match observed I range (with margin)
+I_domain = (0.0, ceil(maximum(I_obs) / 10) * 10 + 10)
+println("I range in data: ", round(minimum(I_obs), digits=1),
+        " – ", round(maximum(I_obs), digits=1),
+        " → domain: ", I_domain)
+
+plot(data_times, [sol_true(t)[2] for t in data_times], label="True I(t)", lw=2,
+     xlabel="Day", ylabel="Count", title="Synthetic epidemic data")
+scatter!(data_times, I_obs, label="Observed I", ms=3, alpha=0.6)
+```
+
+## Common Dynamics
+
+All three approaches share the same ODE structure — only the approximator for $\beta$ differs:
+
+```{julia}
+function sir!(du, u, p, t)
+    S, I, R = u
+    β = max(p.β(I), 0.001)
+    du[1] = -β * S * I / p.N
+    du[2] =  β * S * I / p.N - p.γ * I
+    du[3] =  p.γ * I
+end
+```
+
+::: {.callout-tip}
+## Domain selection matters
+
+Set the approximator domain to match the **observed data range** of the input variable, not a theoretical maximum. A domain of `(0, 300)` when $I$ never exceeds ~70 wastes knots/inducing points in empty space and degrades extrapolation. We computed `I_domain` above from the observed range.
+:::
+
+## Approach 1: B-Spline Approximator
+
+The B-spline models $\beta(I)$ as a smooth function of the infected count, with automatic smoothing via LAML:
+
+```{julia}
+#| echo: false
+approx_spline = BSplineApproximator(:β, I_domain, 10;
+                                     initial = I -> 0.4)
+
+prob_spline = PSMProblem(sir!, u0_true, tspan, [approx_spline];
+    data_times = data_times,
+    data_values = data_values,
+    obs_to_state = [1, 2],
+    known_params = (γ = γ, N = N),
+    likelihood = Gaussian(),
+    solver = Tsit5())
+
+sol_spline = solve(prob_spline, LAML(maxiters=60, verbose=false))
+println("B-Spline — SS: ", round(sol_spline.data_loss, sigdigits=4),
+        ", EDF: ", round(sol_spline.edf, digits=2))
+```
+
+## Approach 2: Gaussian Process Approximator
+
+The GP approximator models $\beta(I)$ using kernel-based interpolation at inducing points. Different kernel functions control the smoothness of the interpolation, while LAML uses a spline-based penalty for automatic smoothing parameter selection:
+
+```{julia}
+#| echo: false
+approx_gp_sqexp = GPApproximator(:β, I_domain, 10;
+                                  kernel = :sqexp,
+                                  initial = I -> 0.4)
+
+prob_gp = PSMProblem(sir!, u0_true, tspan, [approx_gp_sqexp];
+    data_times = data_times,
+    data_values = data_values,
+    obs_to_state = [1, 2],
+    known_params = (γ = γ, N = N),
+    likelihood = Gaussian(),
+    solver = Tsit5())
+
+sol_gp_sqexp = solve(prob_gp, LAML(maxiters=60, verbose=false))
+println("GP (SqExp) — SS: ", round(sol_gp_sqexp.data_loss, sigdigits=4),
+        ", EDF: ", round(sol_gp_sqexp.edf, digits=2))
+```
+
+We can also try different kernel functions. The **Matérn 3/2** kernel produces rougher functions (once differentiable) while the **Matérn 5/2** is twice differentiable. The kernel choice affects *interpolation* between inducing points — a squared exponential gives infinitely smooth interpolation while Matérn kernels allow more local variation:
+
+```{julia}
+#| echo: false
+approx_gp_m32 = GPApproximator(:β, I_domain, 10;
+                                kernel = :matern32, initial = I -> 0.4)
+approx_gp_m52 = GPApproximator(:β, I_domain, 10;
+                                kernel = :matern52, initial = I -> 0.4)
+
+sol_gp_m32 = solve(PSMProblem(sir!, u0_true, tspan, [approx_gp_m32];
+    data_times=data_times, data_values=data_values, obs_to_state=[1,2],
+    known_params=(γ=γ, N=N), likelihood=Gaussian(), solver=Tsit5()),
+    LAML(maxiters=60, verbose=false))
+
+sol_gp_m52 = solve(PSMProblem(sir!, u0_true, tspan, [approx_gp_m52];
+    data_times=data_times, data_values=data_values, obs_to_state=[1,2],
+    known_params=(γ=γ, N=N), likelihood=Gaussian(), solver=Tsit5()),
+    LAML(maxiters=60, verbose=false))
+
+println("GP (Matérn 3/2) — SS: ", round(sol_gp_m32.data_loss, sigdigits=4),
+        ", EDF: ", round(sol_gp_m32.edf, digits=2))
+println("GP (Matérn 5/2) — SS: ", round(sol_gp_m52.data_loss, sigdigits=4),
+        ", EDF: ", round(sol_gp_m52.edf, digits=2))
+```
+
+## Approach 3: Neural Network Approximator
+
+We define a small neural network: 1 input ($I$) → 8 hidden units (tanh) → 1 output (softplus to ensure $\beta > 0$). The `domain` parameter normalizes the input to $[0, 1]$, which is essential for stable optimization:
+
+```{julia}
+#| echo: false
+nn_model = Lux.Chain(
+    Lux.Dense(1, 8, Lux.tanh),
+    Lux.Dense(8, 1, Lux.softplus)
+)
+
+approx_neural = NeuralApproximator(:β, nn_model;
+                                    domain = I_domain,
+                                    rng_seed = 42)
+println("Neural network parameters: ", nparams(approx_neural))
+
+prob_neural = PSMProblem(sir!, u0_true, tspan, [approx_neural];
+    data_times = data_times,
+    data_values = data_values,
+    obs_to_state = [1, 2],
+    known_params = (γ = γ, N = N),
+    likelihood = Gaussian(),
+    solver = Tsit5())
+
+sol_neural = solve(prob_neural, AdamSolver(maxiters=2000, lr=0.01, verbose=false))
+println("Neural (Adam) — SS: ", round(sol_neural.data_loss, sigdigits=4),
+        ", EDF: ", round(sol_neural.edf, digits=2))
+```
+
+::: {.callout-important}
+## Why AdamSolver, not LAML?
+
+The `LAML` solver uses **IRLS (Iteratively Reweighted Least Squares)**, which linearizes the
+parameter-to-prediction mapping at each step. This works well for B-splines and GPs, where
+the parameters (knot/inducing point values) enter almost linearly into the function evaluation.
+Neural network weights enter **highly nonlinearly** — the linearization is extremely poor and
+IRLS converges in a few iterations having barely moved from initialization.
+
+`AdamSolver` uses **gradient descent with ForwardDiff** through the ODE solver, correctly
+handling the nonlinear dependence on network weights. This is equivalent to the
+**Universal Differential Equation (UDE)** approach.
+:::
+
+## Approach 4: Neural Network with Gradient Matching
+
+**Gradient matching** (Bonnaffé, Sheldon & Bhatt 2023) avoids ODE integration entirely, making the optimization landscape much simpler:
+
+1. **Smooth** the observed data with cubic splines to get $\hat{y}(t)$ and $d\hat{y}/dt$
+2. **Match** the ODE derivatives: minimize $\|d\hat{y}/dt - f(\hat{y}, p, t)\|^2$
+
+Pure gradient matching can struggle at low $I$ where $dI/dt \approx 0$ provides little signal for $\beta(I)$. The `refine_iters` option adds ODE shooting refinement after GM, using the GM solution as a warm start:
+
+```{julia}
+#| echo: false
+nn_gm = Lux.Chain(
+    Lux.Dense(1, 8, Lux.tanh),
+    Lux.Dense(8, 1, Lux.softplus)
+)
+
+approx_gm = NeuralApproximator(:β, nn_gm;
+                                domain = I_domain,
+                                rng_seed = 42)
+
+prob_gm = PSMProblem(sir!, u0_true, tspan, [approx_gm];
+    data_times = data_times,
+    data_values = data_values,
+    obs_to_state = [1, 2],
+    known_params = (γ = γ, N = N),
+    likelihood = Gaussian(),
+    solver = Tsit5())
+
+sol_gm = solve(prob_gm, GradientMatching(maxiters=500, lr=0.05,
+                                          refine_iters=200, verbose=false))
+println("Neural (GM+refine) — deriv_SS: ", round(sol_gm.convergence.deriv_loss, sigdigits=4),
+        ", EDF: ", round(sol_gm.edf, digits=2))
+```
+
+## Comparison
+
+### Fitted Trajectories
+
+```{julia}
+pred_s = sol_spline.fitted_values
+pred_g = sol_gp_sqexp.fitted_values
+pred_n = sol_neural.fitted_values
+I_true_curve = [sol_true(t)[2] for t in data_times]
+
+p1 = plot(data_times, I_true_curve, label="True", lw=2, color=:black, ls=:dash,
+          xlabel="Day", ylabel="Infected", title="I(t) — Fitted trajectories")
+scatter!(p1, data_times, I_obs, label="Data", ms=2, alpha=0.4, color=:gray)
+if size(pred_s, 2) >= 2
+    plot!(p1, data_times, pred_s[:, 2], label="B-Spline", lw=2, color=:blue)
+end
+if size(pred_g, 2) >= 2
+    plot!(p1, data_times, pred_g[:, 2], label="GP (SqExp)", lw=2, color=:green)
+end
+if size(pred_n, 2) >= 2
+    plot!(p1, data_times, pred_n[:, 2], label="Neural", lw=2, color=:red)
+end
+p1
+```
+
+### Recovered $\beta(I)$
+
+```{julia}
+I_grid = range(0.1, I_domain[2], length=200)
+β_truth = [β_true(I) for I in I_grid]
+
+p2 = plot(I_grid, β_truth, label="True β(I)", lw=3, color=:black, ls=:dash,
+          xlabel="Infected (I)", ylabel="β(I)",
+          title="Recovered transmission rate", legend=:topright)
+
+if haskey(sol_spline.unknown_functions, :β)
+    β_spline = [sol_spline.unknown_functions[:β](I) for I in I_grid]
+    plot!(p2, I_grid, β_spline, label="B-Spline", lw=2, color=:blue)
+end
+
+if haskey(sol_gp_sqexp.unknown_functions, :β)
+    β_gp = [sol_gp_sqexp.unknown_functions[:β](I) for I in I_grid]
+    plot!(p2, I_grid, β_gp, label="GP (SqExp)", lw=2, color=:green)
+end
+
+if haskey(sol_neural.unknown_functions, :β)
+    β_nn = [sol_neural.unknown_functions[:β](I) for I in I_grid]
+    plot!(p2, I_grid, β_nn, label="Neural (Adam)", lw=2, color=:red, ls=:dash)
+end
+
+if haskey(sol_gm.unknown_functions, :β)
+    β_gm = [sol_gm.unknown_functions[:β](I) for I in I_grid]
+    plot!(p2, I_grid, β_gm, label="Neural (GM)", lw=2, color=:darkred)
+end
+
+p2
+```
+
+### Kernel Comparison (GP)
+
+```{julia}
+p3 = plot(I_grid, β_truth, label="True", lw=3, color=:black, ls=:dash,
+          xlabel="I", ylabel="β(I)", title="GP kernel comparison")
+
+for (sol, lbl, col) in [(sol_gp_sqexp, "SqExp", :green),
+                         (sol_gp_m32, "Matérn 3/2", :orange),
+                         (sol_gp_m52, "Matérn 5/2", :purple)]
+    β_k = [sol.unknown_functions[:β](I) for I in I_grid]
+    plot!(p3, I_grid, β_k, label=lbl, lw=2, color=col)
+end
+p3
+```
+
+## How Each Approximator Works
+
+### B-Splines
+
+Parameters are **knot values** (function values at evenly-spaced points). The penalty matrix $S$ penalizes the integrated squared second derivative $\int (f'')^2\,dx$, encouraging smoothness. LAML estimates the optimal smoothing parameter $\lambda$.
+
+### Gaussian Processes
+
+Parameters are **function values at inducing points** (like B-spline knots). Prediction at new points uses kernel interpolation:
+
+$$
+f(x_*) = \mathbf{k}(x_*, X)^\top K^{-1} \mathbf{f}
+$$
+
+where $\mathbf{k}(x_*, X)$ is the vector of kernel evaluations between the test point and inducing points. For LAML smoothing, the package uses a **spline-based second-derivative penalty** $\int(f'')^2\,dx$ (same as B-splines) rather than the GP prior $K^{-1}$, because the spline penalty has a much wider eigenvalue spectrum that enables effective automatic smoothing parameter selection. The kernel choice still matters for *evaluation* — it controls how smoothly the function interpolates between inducing points.
+
+Available kernels control the smoothness of the interpolation:
+
+- **Squared exponential** ($C^\infty$): very smooth, good for slowly varying functions
+- **Matérn 5/2** ($C^2$): twice differentiable, good default for physical processes
+- **Matérn 3/2** ($C^1$): once differentiable, captures rougher features
+
+### Neural Networks
+
+Parameters are **weights and biases** of a Lux.jl model. There is no structural smoothing penalty — the network architecture itself provides implicit regularization (a small network cannot overfit). Key considerations:
+
+- **Input normalization** (`domain` argument) is essential for stable optimization
+- **Use `AdamSolver`** (or `MultipleShootingSolver`), not `LAML` — the IRLS linearization used by LAML is fundamentally incompatible with the highly nonlinear weight→trajectory mapping of neural networks
+- The `AdamSolver` uses ForwardDiff through the ODE solver (the UDE approach), correctly computing gradients w.r.t. network weights
+- No LAML smoothing parameter (no penalty matrix) — the network architecture provides implicit regularization
+- Best suited for multi-dimensional inputs where B-splines and GPs cannot be applied
+
+## Summary Table
+
+We compare methods using the **Pearson correlation** between true and recovered $\beta(I)$
+over the observed data range — this is more interpretable than raw SS values which depend on
+data scale.
+
+```{julia}
+#| echo: false
+using Statistics: cor
+
+methods = [
+    ("B-Spline (10 knots)", sol_spline),
+    ("GP — SqExp (10 pts)", sol_gp_sqexp),
+    ("GP — Matérn 3/2", sol_gp_m32),
+    ("GP — Matérn 5/2", sol_gp_m52),
+    ("Neural Adam (25)", sol_neural),
+    ("Neural GM+refine (25)", sol_gm)
+]
+
+# Evaluate β over observed I range for correlation
+I_eval = range(1.0, maximum(I_obs), length=100)
+β_truth_vec = [β_true(I) for I in I_eval]
+
+println(rpad("Method", 25), " ", rpad("SS", 10), " ", rpad("EDF", 6),
+        " ", rpad("cor(β)", 8), " β(1)   β(50)")
+println("-"^72)
+for (name, s) in methods
+    β_hat = [s.unknown_functions[:β](I) for I in I_eval]
+    r = round(cor(β_truth_vec, β_hat), digits=3)
+    β1 = round(s.unknown_functions[:β](1.0), digits=3)
+    β50 = round(s.unknown_functions[:β](min(50.0, I_domain[2] - 5)), digits=3)
+    println(rpad(name, 25), " ", rpad(round(s.data_loss, sigdigits=4), 10),
+            " ", rpad(round(s.edf, digits=1), 6), " ", rpad(r, 8), " $β1   $β50")
+end
+println(rpad("True", 25), " ", rpad("-", 10), " ", rpad("-", 6),
+        " ", rpad("1.0", 8),
+        " $(round(β_true(1.0), digits=3))   $(round(β_true(min(50.0, I_domain[2]-5)), digits=3))")
+```
+
+| Feature | B-Spline | Gaussian Process | Neural Network |
+|---------|----------|------------------|----------------|
+| Smoothing penalty | $\int (f'')^2\,dx$ | $\int (f'')^2\,dx$ (spline-based) | None (architecture-implicit) |
+| Recommended solver | `LAML` | `LAML` | `AdamSolver` or `MultipleShootingSolver` |
+| LAML smoothing | ✓ Automatic | ✓ Automatic | ✗ Use Adam (ForwardDiff through ODE) |
+| Parameters | nknots (e.g., 10) | n_inducing (e.g., 10) | Arch-dependent (e.g., 25) |
+| Input dimension | 1D | 1D | Any |
+| Output guarantee | Smooth (cubic) | Kernel-dependent | Activation-dependent |
+| Extrapolation | Linear | Reverts to prior (0) | Network-dependent |
+| Speed | Fast | Fast | Slower (autodiff through ODE) |

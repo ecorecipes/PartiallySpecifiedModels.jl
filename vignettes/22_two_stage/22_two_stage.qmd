@@ -1,0 +1,115 @@
+---
+title: "Two-Stage Smooth-then-Differentiate"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+The `TwoStageSolver` implements the simplest baseline approach for partially specified models (Wood 2001, Macdonald & Husmeier 2015):
+
+1. **Stage 1 — Smooth**: Fit cubic splines to each observed state independently → $\hat{y}_k(t)$ and $d\hat{y}_k/dt$
+2. **Stage 2 — Match**: Optimize unknown function parameters by minimizing the mismatch between smoothed derivatives and the ODE right-hand side
+
+This avoids ODE integration entirely (like `BNGSolver`), making it fast and robust. The key difference from BNG is its simplicity — no Bayesian interpretation, just penalized least squares matching.
+
+```{julia}
+using PartiallySpecifiedModels
+using OrdinaryDiffEq
+using Plots
+using Random
+Random.seed!(123)
+```
+
+## SIR Model with Unknown Force of Infection
+
+We model an epidemic where the force of infection $\beta(I)$ is unknown:
+
+$$\frac{dS}{dt} = -\beta(I) \cdot S, \qquad \frac{dI}{dt} = \beta(I) \cdot S - \gamma I$$
+
+The true function is frequency-dependent: $\beta(I) = 0.3 I$.
+
+```{julia}
+β_true(I) = 0.3 * I
+
+function sir!(du, u, p, t)
+    S, I = u
+    du[1] = -p.β(I) * S
+    du[2] = p.β(I) * S - 0.1 * I
+end
+
+sol_true = solve(ODEProblem(sir!, [0.99, 0.01], (0.0, 40.0), (; β=β_true)),
+                 Tsit5(); saveat=0.5)
+t_data = collect(sol_true.t)
+data_S = [sol_true.u[i][1] + 0.005 * randn() for i in 1:length(t_data)]
+data_I = [sol_true.u[i][2] + 0.005 * randn() for i in 1:length(t_data)]
+data_matrix = hcat(max.(data_S, 0.001), max.(data_I, 0.001))
+```
+
+## Fit: TwoStage vs BNG vs LAML
+
+```{julia}
+uf = BSplineApproximator(:β, (0.0, 0.5), 10)
+
+prob = PSMProblem(sir!, [0.99, 0.01], (0.0, 40.0), [uf];
+    data_times=t_data, data_values=Float64.(data_matrix),
+    obs_to_state=[1, 2], known_params=NamedTuple())
+
+sol_ts = solve(prob, TwoStageSolver(maxiters=1000, lr=0.01, verbose=false))
+sol_bng = solve(prob, BNGSolver(maxiters=1000, lr=0.01, verbose=false))
+sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
+```
+
+### Recovered Force of Infection
+
+```{julia}
+I_grid = range(0.0, 0.5, length=100)
+β_ts = sol_ts.unknown_functions[:β]
+β_bng = sol_bng.unknown_functions[:β]
+β_laml = sol_laml.unknown_functions[:β]
+
+p1 = plot(I_grid, β_true.(I_grid), label="True β(I)", lw=2, color=:black,
+          xlabel="I (infected fraction)", ylabel="β(I)",
+          title="Force of Infection Recovery")
+plot!(p1, I_grid, [β_ts(x) for x in I_grid], label="TwoStage", lw=2)
+plot!(p1, I_grid, [β_bng(x) for x in I_grid], label="BNG", lw=2, ls=:dash)
+plot!(p1, I_grid, [β_laml(x) for x in I_grid], label="LAML", lw=2, ls=:dot)
+p1
+```
+
+### Trajectory Comparison
+
+```{julia}
+p2 = plot(t_data, data_matrix[:, 2], seriestype=:scatter, label="Data (I)",
+          xlabel="Time", ylabel="Infected", title="Epidemic Curve", ms=3, alpha=0.5)
+plot!(p2, t_data, sol_ts.fitted_values[:, 2], label="TwoStage", lw=2)
+plot!(p2, t_data, sol_laml.fitted_values[:, 2], label="LAML", lw=2, ls=:dash)
+p2
+```
+
+### Summary
+
+```{julia}
+println("TwoStage: loss=$(round(sol_ts.data_loss, digits=4)), β(0.2)=$(round(β_ts(0.2), digits=4))")
+println("BNG:      loss=$(round(sol_bng.data_loss, digits=4)), β(0.2)=$(round(β_bng(0.2), digits=4))")
+println("LAML:     loss=$(round(sol_laml.data_loss, digits=4)), β(0.2)=$(round(β_laml(0.2), digits=4))")
+println("True:     β(0.2)=$(round(β_true(0.2), digits=4))")
+```
+
+## When to Use TwoStage
+
+- **Fastest** solver — no ODE integration, simple spline smoothing + Adam
+- Good for **initial exploration** before switching to more sophisticated methods
+- Works well with **dense, low-noise** data where spline derivatives are accurate
+- Less accurate than LAML when data is sparse or noisy (smoothing artifacts propagate)

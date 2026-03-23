@@ -1,0 +1,207 @@
+---
+title: "Recovering Functional Responses: The Rosenzweig-MacArthur Model"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+A central question in ecology is: **what is the functional form of predator–prey interactions?** The **functional response** — how per-capita prey consumption varies with prey density — determines the stability, oscillations, and persistence of ecological communities. Classical forms include:
+
+- **Type I** (linear): $f(R) = aR$
+- **Type II** (saturating): $f(R) = \frac{aR}{1 + ahR}$ (Holling disc equation)
+- **Type III** (sigmoidal): $f(R) = \frac{aR^2}{1 + ahR^2}$
+
+In practice, the true functional form is rarely known. **Partially specified models** let us estimate $f(R)$ nonparametrically from population time series data, without assuming a specific mathematical form.
+
+This vignette demonstrates how to recover a saturating functional response from a two-species consumer–resource system using `PartiallySpecifiedModels.jl`.
+
+## Setup
+
+```{julia}
+using PartiallySpecifiedModels
+using PartiallySpecifiedModels: solve
+using OrdinaryDiffEq
+using Plots
+using Random
+Random.seed!(42)
+```
+
+## The Consumer–Resource Model
+
+Consider a consumer ($C$) feeding on a resource ($R$) with continuous replenishment (e.g., a chemostat or open ecosystem):
+
+$$
+\begin{aligned}
+\frac{dR}{dt} &= a(R_0 - R) - f(R) \cdot C \\
+\frac{dC}{dt} &= \varepsilon \cdot f(R) \cdot C - d \cdot C
+\end{aligned}
+$$
+
+where:
+
+- $a$ = resource turnover rate
+- $R_0$ = resource supply concentration
+- $f(R)$ = **functional response** (unknown)
+- $\varepsilon$ = conversion efficiency
+- $d$ = consumer death rate
+
+The true functional response is **Holling Type II**: $f(R) = \frac{v_{\max} R}{K_m + R} = \frac{2R}{5 + R}$.
+
+### Visualise the true functional response
+
+```{julia}
+R_grid = range(0, 25, length=200)
+f_true = [2.0 * R / (5.0 + R) for R in R_grid]
+
+plot(R_grid, f_true, lw=3, color=:black,
+     xlabel="Resource density R", ylabel="Per-capita consumption f(R)",
+     title="True functional response (Holling Type II)",
+     label="f(R) = 2R/(5+R)", legend=:bottomright)
+hline!([2.0], ls=:dot, color=:gray, label="vmax = 2.0")
+vline!([5.0], ls=:dot, color=:gray, label="Km = 5.0")
+```
+
+### Generate data
+
+```{julia}
+function cr_true!(du, u, p, t)
+    R, C = u
+    f = 2.0 * R / (5.0 + R)
+    du[1] = 0.5 * (20.0 - R) - f * C
+    du[2] = 0.4 * f * C - 0.3 * C
+end
+
+u0 = [20.0, 2.0]
+tspan = (0.0, 30.0)
+prob_ode = ODEProblem(cr_true!, u0, tspan)
+sol_ode = OrdinaryDiffEq.solve(prob_ode, Tsit5(), saveat=0.5)
+
+data_t = sol_ode.t
+σ_R, σ_C = 0.5, 0.3
+data = max.(hcat(sol_ode[1,:], sol_ode[2,:]) .+
+            hcat(σ_R .* randn(length(data_t)), σ_C .* randn(length(data_t))), 0.01)
+
+p1 = plot(sol_ode.t, sol_ode[1,:], label="True R", lw=2, color=:green, ls=:dash)
+scatter!(p1, data_t, data[:, 1], label="R (obs)", ms=3, alpha=0.6, color=:green)
+p2 = plot(sol_ode.t, sol_ode[2,:], label="True C", lw=2, color=:orange, ls=:dash)
+scatter!(p2, data_t, data[:, 2], label="C (obs)", ms=3, alpha=0.6, color=:orange)
+plot(p1, p2, layout=(1, 2), size=(800, 350),
+     xlabel="Time", ylabel="Density", title=["Resource" "Consumer"])
+```
+
+## Define the PSM
+
+The functional response $f(R)$ is left unspecified and modelled with a B-spline:
+
+```{julia}
+function consumer_resource!(du, u, p, t)
+    R, C = u
+    fR = p.f(max(R, 0.01))
+    du[1] = 0.5 * (20.0 - R) - max(fR, 0.0) * C
+    du[2] = 0.4 * max(fR, 0.0) * C - 0.3 * C
+end
+
+approx_f = BSplineApproximator(:f, (0.0, 22.0), 8; initial=1.0)
+
+prob = PSMProblem(consumer_resource!, u0, tspan, [approx_f];
+    data_times=data_t, data_values=data,
+    obs_to_state=[1, 2],
+    known_params=(a=0.5, R0=20.0, ε=0.4, d=0.3),
+    solver=Tsit5())
+```
+
+## Fit with LAML
+
+```{julia}
+#| echo: false
+sol = solve(prob, LAML(maxiters=100, verbose=true))
+println("Data loss (SS): ", round(sol.data_loss, digits=2))
+println("EDF: ", round(sol.edf, digits=2))
+```
+
+### Fitted trajectories
+
+```{julia}
+p1 = plot(sol_ode.t, sol_ode[1,:], label="True", lw=2, color=:black, ls=:dash,
+          xlabel="Time", ylabel="R", title="Resource")
+scatter!(p1, data_t, data[:, 1], label="Data", ms=3, alpha=0.5, color=:gray)
+plot!(p1, data_t, sol.fitted_values[:, 1], label="LAML fit", lw=2, color=:green)
+
+p2 = plot(sol_ode.t, sol_ode[2,:], label="True", lw=2, color=:black, ls=:dash,
+          xlabel="Time", ylabel="C", title="Consumer")
+scatter!(p2, data_t, data[:, 2], label="Data", ms=3, alpha=0.5, color=:gray)
+plot!(p2, data_t, sol.fitted_values[:, 2], label="LAML fit", lw=2, color=:orange)
+
+plot(p1, p2, layout=(1, 2), size=(800, 350))
+```
+
+### Recovered functional response
+
+The key result: we recover the shape of the Holling Type II functional response **without assuming any parametric form**:
+
+```{julia}
+R_eval = range(1.0, 20.0, length=100)
+f_true_vals = [2.0 * R / (5.0 + R) for R in R_eval]
+f_est = [sol.unknown_functions[:f](R) for R in R_eval]
+
+plot(R_eval, f_true_vals, label="True f(R) = 2R/(5+R)", lw=3, color=:black, ls=:dash,
+     xlabel="Resource density R", ylabel="Functional response f(R)",
+     title="Recovered functional response", legend=:bottomright)
+plot!(R_eval, f_est, label="PSM estimate", lw=2, color=:blue)
+hline!([2.0], ls=:dot, color=:gray, alpha=0.5, label="Asymptote (vmax)")
+```
+
+The PSM correctly recovers:
+
+1. **Near-linear increase** at low R (the "attack rate" region)
+2. **Saturation** at high R (the "handling time" limitation)
+3. **No assumption** about the Type II form was needed
+
+## Comparison Across Solvers
+
+```{julia}
+sol_coll = solve(prob, CollocationLAML(maxiters=50, verbose=false, n_continuation=6))
+sol_rodeo = solve(prob, RodeoSolver(n_steps=200, n_deriv=3, maxiters=200, verbose=false))
+
+p_compare = plot(R_eval, f_true_vals, label="True", lw=3, color=:black, ls=:dash,
+                 xlabel="Resource density R", ylabel="f(R)",
+                 title="Functional response: solver comparison")
+plot!(p_compare, R_eval, f_est, label="LAML", lw=2, color=:blue)
+plot!(p_compare, R_eval, [sol_coll.unknown_functions[:f](R) for R in R_eval],
+      label="CollocationLAML", lw=2, color=:red)
+plot!(p_compare, R_eval, [sol_rodeo.unknown_functions[:f](R) for R in R_eval],
+      label="RodeoSolver", lw=2, color=:green)
+p_compare
+```
+
+## Ecological Interpretation
+
+The nonparametric estimate of $f(R)$ allows biologists to:
+
+1. **Test functional response hypotheses** — Does the estimated curve match Type I, II, or III?
+2. **Detect departures** from classical forms — e.g., a Type II that starts declining at very high densities (interference)
+3. **Predict dynamics** under novel conditions — the fitted PSM can be simulated forward
+
+This is fundamentally different from fitting parametric models (e.g., assuming Holling Type II and estimating $a$ and $h$), because the PSM approach makes no assumption about the functional form and lets the data speak.
+
+## Phase Portrait
+
+```{julia}
+plot(sol_ode[1,:], sol_ode[2,:], label="True trajectory", lw=2, color=:black, ls=:dash,
+     xlabel="Resource R", ylabel="Consumer C",
+     title="Phase portrait")
+plot!(sol.fitted_values[:, 1], sol.fitted_values[:, 2], label="PSM fit", lw=2, color=:blue)
+scatter!([u0[1]], [u0[2]], label="Start", ms=8, color=:red, marker=:star5)
+```
