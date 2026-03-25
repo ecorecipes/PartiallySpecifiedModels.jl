@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://ecorecipes.github.io/PartiallySpecifiedModels.jl/dev/)
-[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A Julia package for fitting **partially specified dynamical models** with nonparametric functional responses.
 
@@ -191,4 +191,4 @@ The `vignettes/` directory contains 26 worked examples:
 
 ## License
 
-GPL-3.0 — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
