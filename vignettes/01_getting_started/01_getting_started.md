@@ -1,6 +1,6 @@
 # Getting Started with PartiallySpecifiedModels.jl
 Simon Frost
-2026-03-22
+2026-03-25
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -16,6 +16,7 @@ Simon Frost
 - [Key Concepts](#key-concepts)
   - [The `PSMProblem`](#the-psmproblem)
   - [Smoothing and EDF](#smoothing-and-edf)
+- [Diagnostic Plots](#diagnostic-plots)
 - [Summary](#summary)
 
 ## Overview
@@ -144,7 +145,7 @@ prob = PSMProblem(
 )
 ```
 
-    PSMProblem{typeof(growth!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(growth!, [0.5], (0.0, 15.0), BSplineApproximator[BSplineApproximator(:r, (0.0, 12.0), 8, var"#5#6"())], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  10.5, 11.0, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0], [0.3909927555644667; 0.7085441461067901; … ; 10.156370498935743; 10.28914446913904;;], [1.0; 1.0; … ; 1.0; 1.0;;], [1], NamedTuple(), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false)
+    PSMProblem{typeof(growth!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(growth!, [0.5], (0.0, 15.0), BSplineApproximator[BSplineApproximator(:r, (0.0, 12.0), 8, var"#5#6"())], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  10.5, 11.0, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0], [0.3909927555644667; 0.7085441461067901; … ; 10.156370498935743; 10.28914446913904;;], [1.0; 1.0; … ; 1.0; 1.0;;], [1], NamedTuple(), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false, Float64[], nothing)
 
 ### Solve with LAML
 
@@ -241,6 +242,48 @@ $\lambda$ to balance fit and smoothness:
 
 For our example, the EDF should be close to 2 (since the true $r(N)$ is
 linear).
+
+## Diagnostic Plots
+
+A standard 4-panel diagnostic display assesses residual behaviour. The
+QQ plot checks normality of standardized residuals, “Residuals vs
+Fitted” detects systematic patterns (a good fit shows random scatter
+around zero), the histogram visualises the residual distribution, and
+“Observed vs Fitted” checks overall calibration (points should lie near
+the diagonal).
+
+``` julia
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+![](01_getting_started_files/figure-commonmark/cell-10-output-1.svg)
+
+    Durbin-Watson: 1.804
 
 ## Summary
 

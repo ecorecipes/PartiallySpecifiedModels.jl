@@ -116,7 +116,8 @@ include("diagnostics.jl")
 export AbstractApproximator, BSplineApproximator, NeuralApproximator, GPApproximator, SPDEApproximator
 export ShapeConstrainedBSplineApproximator, ShapeConstrainedSPDEApproximator, SHAPE_CONSTRAINTS
 export COMONetApproximator, COMONET_CONSTRAINTS
-export AbstractLikelihood, Gaussian, Poisson, NegativeBinomial, CustomLikelihood
+export AbstractLikelihood, Gaussian, Poisson, NegativeBinomial, TruncatedNormal,
+       CustomLikelihood
 export PSMProblem, PSMSolution, LAML, CollocationLAML, GradientMatching
 export AdamSolver, MultipleShootingSolver, AdaptiveGradientMatching
 export RodeoSolver, MCMCSolver, MagiSolver
@@ -130,6 +131,7 @@ export spline_penalty_matrix, penalty_matrix
 export nparams, initial_params
 export optimize_spde_range, with_range_param
 export residual_diagnostics, durbin_watson, residual_acf, semivariogram
+export appraise, deviance_residuals
 
 # Re-export common ODE solvers and problem types
 using OrdinaryDiffEq: Tsit5, BS3, Vern7, Vern9, TRBDF2

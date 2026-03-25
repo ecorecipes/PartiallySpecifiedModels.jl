@@ -19,6 +19,14 @@ const RHO_MAX = 40.0   # exp(40) ≈ 2.4e17
 _variance_function(::Gaussian, mu) = 1.0
 _variance_function(::Poisson, mu) = mu
 _variance_function(fam::NegativeBinomial, mu) = mu + mu^2 / fam.theta
+function _variance_function(fam::TruncatedNormal, mu)
+    # V(μ) = σ²(1 - δ) where δ = λ(ξ)(ξ + λ(ξ)), ξ = (μ-a)/σ, λ = φ/Φ
+    σ = fam.sigma; a = fam.lower
+    ξ = (mu - a) / σ
+    Φξ = max(_normcdf(ξ), 1e-15)
+    λξ = _normpdf(ξ) / Φξ
+    σ^2 * max(1.0 - λξ * (ξ + λξ), 0.01)
+end
 function _variance_function(fam::CustomLikelihood, mu)
     # V(μ) = 1/(-∂²ℓ/∂μ²)
     neg_d2l = -ForwardDiff.derivative(
@@ -263,16 +271,23 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
         H = JWJ + S_lambda
         H_inv = _safe_inv(H)
 
-        # Profiled scale for Gaussian; unit scale for non-Gaussian.
-        # When sigma2_max is finite, cap σ² to prevent oversmoothing from
-        # a poor initial fit that inflates the profiled residual variance.
+        # Profiled scale for Gaussian; Pearson dispersion for non-Gaussian.
+        # For non-Gaussian families with identity link, IRLS weights (1/V(μ))
+        # can be very small for large counts, causing λ to collapse.  The
+        # Pearson dispersion φ̂ acts as an effective scale that keeps the
+        # Fellner-Schall update well-calibrated (Wood & Fasiolo 2017).
+        # When sigma2_max is finite, cap to prevent oversmoothing.
         sigma2 = if family isa Gaussian
             RSS = sum(w_data[i] * (y[i] - mu[i])^2 for i in 1:n)
             pen = dot(beta, S_lambda * beta)
             profiled = max((RSS + pen) / n, 1e-30)
             min(profiled, sigma2_max)
         else
-            1.0
+            pearson = sum(w_data[i] * (y[i] - mu[i])^2 /
+                          max(_variance_function(family, abs(mu[i])), 1e-10)
+                          for i in 1:n)
+            phi = max(pearson / max(n - sum(ranks), 1), 1.0)
+            min(phi, sigma2_max)
         end
 
         all_converged = true
@@ -319,9 +334,14 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
     rho .= clamp.(log.(lambda), RHO_MIN, RHO_MAX)
 
     # ─── Phase 2: Newton refinement ─────────────────────────────
+    # Skip Newton for non-Gaussian: the Fellner-Schall update uses Pearson
+    # dispersion φ̂ as effective scale, but the LAML gradient uses unit scale.
+    # Running Newton would push λ back toward the unit-scale optimum, undoing
+    # the FS calibration.  For Gaussian, FS and Newton are consistent because
+    # both use the profiled σ².
     MAX_STEP = 5.0
     V_prev = -Inf
-    n_newton = max(0, maxiter - n_fs)
+    n_newton = family isa Gaussian ? max(0, maxiter - n_fs) : 0
 
     for iter in 1:min(n_newton, 20)
         V, H, S_lambda, sigma2 = laml_objective(family, beta, J, W_irls, w_data, y, mu,

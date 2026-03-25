@@ -247,6 +247,44 @@ The `interrogate` parameter controls how the ODE residual is linearised:
 - `:kramer` (default) — uses a first-order Taylor expansion of the ODE right-hand side, giving a locally linear observation model. More accurate for nonlinear ODEs.
 - `:schober` — simply evaluates the ODE at the predicted mean. Simpler and faster, but less accurate.
 
+## Diagnostic Plots
+
+A standard 4-panel diagnostic display assesses residual behaviour for the probabilistic fit.
+
+```{julia}
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+```{julia}
+#| echo: false
+println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_watson], ", "))
+```
+
 ## Key Takeaways
 
 1. **RodeoSolver provides automatic uncertainty** via the Kalman smoother posterior

@@ -1,6 +1,6 @@
 # GCV Smoothing Parameter Selection
 Simon Frost
-2026-03-22
+2026-03-25
 
 - [Overview](#overview)
 - [Logistic Growth with Unknown Per-Capita
@@ -10,6 +10,7 @@ Simon Frost
   - [Recovered Unknown Function](#recovered-unknown-function)
   - [Summary](#summary)
 - [Effect of GCV Inflation Factor γ](#effect-of-gcv-inflation-factor-γ)
+- [Diagnostic Plots](#diagnostic-plots)
 - [When to Use GCV vs LAML](#when-to-use-gcv-vs-laml)
 
 ## Overview
@@ -153,6 +154,47 @@ p3
 ```
 
 ![](21_gcv_files/figure-commonmark/cell-8-output-1.svg)
+
+## Diagnostic Plots
+
+A standard 4-panel diagnostic display assesses residual behaviour. The
+QQ plot checks normality of standardized residuals, “Residuals vs
+Fitted” detects systematic patterns, the histogram visualises the
+residual distribution, and “Observed vs Fitted” checks overall
+calibration.
+
+``` julia
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol_gcv)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+![](21_gcv_files/figure-commonmark/cell-9-output-1.svg)
+
+    Durbin-Watson: 0.39
 
 ## When to Use GCV vs LAML
 
