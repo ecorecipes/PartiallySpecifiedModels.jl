@@ -17,7 +17,7 @@ PartiallySpecifiedModels.jl provides a unified interface for specifying and fitt
 - **Basis function approximators** (B-splines, shape-constrained splines, Gaussian processes): fewer parameters, automatic smoothing via LAML/GCV, interpretable, and easy to constrain (monotonicity, convexity, positivity).
 - **Neural network approximators** (Lux.jl networks, COMONet): more flexible for high-dimensional or complex functional forms, compatible with gradient-based UDE-style training.
 
-The package builds on the [SciML ecosystem](https://sciml.ai/) and supports 17 fitting algorithms, 5 approximator types, 4 likelihood families, and 14 shape constraint types.
+The package builds on the [SciML ecosystem](https://sciml.ai/) and supports 17 fitting algorithms, 7 approximator types, 4 likelihood families, and 14 shape constraint types.
 
 ## Installation
 
@@ -110,6 +110,8 @@ PartiallySpecifiedModels.jl provides 17 solvers spanning penalized likelihood, g
 |-------------|-------------|------------|
 | `BSplineApproximator` | Cubic B-spline basis | Spline coefficients |
 | `ShapeConstrainedBSplineApproximator` | SCOP-spline (Pya & Wood 2015) | Constrained coefficients |
+| `SPDEApproximator` | Matérn SPDE penalty (Lindgren et al. 2011) | Mesh node values |
+| `ShapeConstrainedSPDEApproximator` | SPDE + shape constraints | Constrained mesh values |
 | `NeuralApproximator` | Lux.jl neural network | Network weights |
 | `GPApproximator` | Gaussian process | GP hyperparameters |
 | `COMONetApproximator` | Constrained monotone network | exp(W) weights |
@@ -145,7 +147,7 @@ For `ShapeConstrainedBSplineApproximator` (SCOP-splines):
 
 ## Vignettes
 
-The `vignettes/` directory contains 25 worked examples:
+The `vignettes/` directory contains 26 worked examples:
 
 | # | Vignette | Description |
 |---|----------|-------------|
@@ -174,6 +176,7 @@ The `vignettes/` directory contains 25 worked examples:
 | 23 | Derivative-Free | Nelder-Mead and Particle Swarm optimization |
 | 24 | Variational | Fast approximate Bayesian inference via variational methods |
 | 25 | ABC | Likelihood-free inference with ABC-SMC |
+| 26 | SPDE | Matérn SPDE approximator with shape constraints |
 
 ## References
 
@@ -181,6 +184,7 @@ The `vignettes/` directory contains 25 worked examples:
 - Wood, S.N., Pya, N. & Säfken, B. (2016). "Smoothing parameter and model selection for general smooth models." *JASA*, 111(516), 1548–1575.
 - Ramsay, J.O., Hooker, G., Campbell, D. & Cao, J. (2007). "Parameter estimation for differential equations: a generalized smoothing approach." *JRSS-B*, 69(5), 741–796.
 - Pya, N. & Wood, S.N. (2015). "Shape constrained additive models." *Statistics and Computing*, 25(3), 543–559.
+- Lindgren, F., Rue, H. & Lindström, J. (2011). "An explicit link between Gaussian fields and Gaussian Markov random fields: the stochastic partial differential equation approach." *JRSS-B*, 73(4), 423–498.
 - Rackauckas, C. et al. (2020). "Universal differential equations for scientific machine learning." *arXiv:2001.04385*.
 - Yang, S., Wong, S.W.K. & Kou, S.C. (2021). "Inference of dynamic systems from noisy and sparse data via manifold-constrained Gaussian processes." *PNAS*, 118(15).
 - Bonnaffé, W., Sheldon, B.C. & Coulson, T. (2023). "Neural ordinary differential equations for ecological and evolutionary time-series analysis." *Methods in Ecology and Evolution*, 14, 1301–1315.

@@ -31,6 +31,10 @@ This vignette demonstrates `MagiSolver` on two examples: a fully observed system
 
 ```{julia}
 using PartiallySpecifiedModels
+using OrdinaryDiffEq
+using Plots
+using Statistics
+using MCMCChains
 using Random
 Random.seed!(123)
 ```
@@ -54,8 +58,6 @@ end
 ### Generate Data
 
 ```{julia}
-using OrdinaryDiffEq
-
 true_p = (; β = I -> 0.3)
 sol_true = solve(ODEProblem(sir!, [0.99, 0.01, 0.0], (0.0, 40.0), true_p),
                  Tsit5(); saveat=2.0)
@@ -64,6 +66,28 @@ t_data = collect(sol_true.t)
 noise = 0.005
 data_SI = hcat([sol_true.u[i][1:2] .+ noise .* randn(2) for i in 1:length(sol_true.t)]...)'
 data_SI = max.(data_SI, 0.001)
+
+S_true = [sol_true.u[i][1] for i in 1:length(sol_true.t)]
+I_true = [sol_true.u[i][2] for i in 1:length(sol_true.t)]
+```
+
+### Plot the Data
+
+```{julia}
+#| label: fig-sir-data
+#| fig-cap: "SIR data: observed S and I (points) vs true trajectories (lines)"
+t_fine = range(0.0, 40.0, length=200)
+sol_fine = solve(ODEProblem(sir!, [0.99, 0.01, 0.0], (0.0, 40.0), true_p),
+                 Tsit5(); saveat=collect(t_fine))
+S_fine = [sol_fine.u[i][1] for i in 1:length(sol_fine.u)]
+I_fine = [sol_fine.u[i][2] for i in 1:length(sol_fine.u)]
+
+p_sir_data = plot(t_fine, S_fine, label="S (true)", lw=2, color=:steelblue,
+    xlabel="Time", ylabel="Proportion", title="SIR Model — Data")
+plot!(p_sir_data, t_fine, I_fine, label="I (true)", lw=2, color=:firebrick)
+scatter!(p_sir_data, t_data, data_SI[:, 1], label="S (obs)", ms=4, color=:steelblue, alpha=0.6)
+scatter!(p_sir_data, t_data, data_SI[:, 2], label="I (obs)", ms=4, color=:firebrick, alpha=0.6)
+p_sir_data
 ```
 
 ### Set Up and Solve
@@ -84,21 +108,107 @@ sol_sir = solve(prob_sir, MagiSolver(
     obs_var=noise^2, preoptimize=true, verbose=false))
 ```
 
+### Posterior Trajectories
+
+We reconstruct trajectory predictions by forward-solving the ODE for each posterior sample:
+
 ```{julia}
-#| echo: false
 chains_sir = sol_sir.convergence.chains
-println("Chains: $(size(chains_sir, 1)) samples × $(size(chains_sir, 2)) parameters")
+sample_sir = Array(chains_sir)
+n_samp_sir = size(sample_sir, 1)
+np_sir = nparams(uf_β)
+n_traj = min(n_samp_sir, 100)
+
+t_pred_sir = collect(range(0.0, 40.0, length=100))
+traj_S = zeros(n_traj, length(t_pred_sir))
+traj_I = zeros(n_traj, length(t_pred_sir))
+
+knots_sir = collect(range(0.0, 0.5, length=uf_β.nknots))
+for i in 1:n_traj
+    params_i = sample_sir[i, 1:np_sir]
+    ev = PartiallySpecifiedModels.build_bspline_evaluator(knots_sir, params_i)
+    try
+        pred = solve(ODEProblem(sir!, [0.99, 0.01, 0.0], (0.0, 40.0), (; β = ev)),
+                     Tsit5(); saveat=t_pred_sir, abstol=1e-8, reltol=1e-8)
+        traj_S[i, :] = [pred.u[k][1] for k in 1:length(pred.u)]
+        traj_I[i, :] = [pred.u[k][2] for k in 1:length(pred.u)]
+    catch
+        traj_S[i, :] .= NaN
+        traj_I[i, :] .= NaN
+    end
+end
 ```
 
-### Results
+```{julia}
+#| label: fig-sir-traj
+#| fig-cap: "SIR posterior predictive trajectories from MAGI"
+nanmed(x) = median(filter(!isnan, x))
+nanq(x, q) = quantile(filter(!isnan, x), q)
+
+S_med = [nanmed(traj_S[:, j]) for j in 1:length(t_pred_sir)]
+S_lo = [nanq(traj_S[:, j], 0.025) for j in 1:length(t_pred_sir)]
+S_hi = [nanq(traj_S[:, j], 0.975) for j in 1:length(t_pred_sir)]
+I_med = [nanmed(traj_I[:, j]) for j in 1:length(t_pred_sir)]
+I_lo = [nanq(traj_I[:, j], 0.025) for j in 1:length(t_pred_sir)]
+I_hi = [nanq(traj_I[:, j], 0.975) for j in 1:length(t_pred_sir)]
+
+p_sir_fit = plot(t_pred_sir, S_med, ribbon=(S_med .- S_lo, S_hi .- S_med),
+    fillalpha=0.2, color=:steelblue, lw=2, label="S (MAGI 95% CI)",
+    xlabel="Time", ylabel="Proportion", title="SIR — MAGI Posterior Fit")
+plot!(p_sir_fit, t_pred_sir, I_med, ribbon=(I_med .- I_lo, I_hi .- I_med),
+    fillalpha=0.2, color=:firebrick, lw=2, label="I (MAGI 95% CI)")
+plot!(p_sir_fit, t_fine, S_fine, color=:steelblue, lw=1, ls=:dash, label="S (true)")
+plot!(p_sir_fit, t_fine, I_fine, color=:firebrick, lw=1, ls=:dash, label="I (true)")
+scatter!(p_sir_fit, t_data, data_SI[:, 1], ms=3, color=:steelblue, alpha=0.5, label="")
+scatter!(p_sir_fit, t_data, data_SI[:, 2], ms=3, color=:firebrick, alpha=0.5, label="")
+p_sir_fit
+```
+
+### Unknown Function β(I)
 
 ```{julia}
-#| echo: false
-β_fitted = sol_sir.unknown_functions[:β]
-println("Posterior mean β(I) at selected infection levels:")
-for I_val in [0.01, 0.05, 0.1, 0.2]
-    println("  β($(I_val)) = $(round(β_fitted(I_val), digits=4))  (true: 0.3)")
+I_range = range(0.0, 0.5, length=60)
+β_samples = zeros(n_samp_sir, length(I_range))
+for i in 1:n_samp_sir
+    params_i = sample_sir[i, 1:np_sir]
+    ev = PartiallySpecifiedModels.build_bspline_evaluator(knots_sir, params_i)
+    for (j, Iv) in enumerate(I_range)
+        β_samples[i, j] = ev(Iv)
+    end
 end
+
+β_med = [median(β_samples[:, j]) for j in 1:length(I_range)]
+β_lo = [quantile(β_samples[:, j], 0.025) for j in 1:length(I_range)]
+β_hi = [quantile(β_samples[:, j], 0.975) for j in 1:length(I_range)]
+```
+
+```{julia}
+#| label: fig-sir-beta
+#| fig-cap: "Posterior credible interval for β(I) — should be constant at 0.3"
+I_data_max = maximum(data_SI[:, 2])
+p_β = plot(collect(I_range), β_med, ribbon=(β_med .- β_lo, β_hi .- β_med),
+    fillalpha=0.25, color=:purple, lw=2, label="MAGI posterior (median + 95% CI)",
+    xlabel="Infected proportion I", ylabel="β(I)",
+    title="Unknown Function β(I)")
+hline!(p_β, [0.3], color=:black, lw=2, ls=:dash, label="True β = 0.3")
+vspan!(p_β, [I_data_max, 0.5], color=:orange, alpha=0.08, label="Beyond data range")
+p_β
+```
+
+### Trace Plots
+
+```{julia}
+#| label: fig-sir-trace
+#| fig-cap: "Trace plots for SIR β(I) spline coefficients"
+pn_sir = names(chains_sir, :parameters)
+n_show_sir = min(4, length(pn_sir))
+p_tr_sir = plot(layout=(n_show_sir, 1), size=(700, 150 * n_show_sir))
+for i in 1:n_show_sir
+    vals = Array(chains_sir[:, pn_sir[i], :])[:, 1]
+    plot!(p_tr_sir, vals, subplot=i, label="", color=:purple, alpha=0.7,
+        title=string(pn_sir[i]), xlabel= i == n_show_sir ? "Iteration" : "", ylabel="Value")
+end
+p_tr_sir
 ```
 
 ## Example 2: Predator-Prey (Partially Observed Prey Only)
@@ -113,7 +223,7 @@ function lv!(du, u, p, t)
 end
 ```
 
-True functional response: `g(H) = 0.5 * H / (1 + H)` (Holling Type II, saturates at 0.5).
+True functional response: `g(H) = 0.5 H / (1 + H)` (Holling Type II, saturates at 0.5).
 
 ### Generate Data (Prey Only)
 
@@ -125,9 +235,31 @@ sol_true_lv = solve(ODEProblem(lv!, [2.0, 1.0], (0.0, 30.0), true_p_lv),
                     Tsit5(); saveat=1.5)
 
 t_lv = collect(sol_true_lv.t)
-prey_data = [sol_true_lv.u[i][1] + 0.05 * randn() for i in 1:length(sol_true_lv.t)]
+H_true = [sol_true_lv.u[i][1] for i in 1:length(sol_true_lv.t)]
+P_true = [sol_true_lv.u[i][2] for i in 1:length(sol_true_lv.t)]
+prey_data = H_true .+ 0.05 .* randn(length(H_true))
 prey_data = max.(prey_data, 0.01)
 prey_matrix = reshape(prey_data, :, 1)
+```
+
+### Plot the Data
+
+```{julia}
+#| label: fig-lv-data
+#| fig-cap: "Lotka-Volterra data: only prey (H) is observed"
+t_lv_fine = range(0.0, 30.0, length=200)
+sol_lv_fine = solve(ODEProblem(lv!, [2.0, 1.0], (0.0, 30.0), true_p_lv),
+                    Tsit5(); saveat=collect(t_lv_fine))
+H_fine = [sol_lv_fine.u[i][1] for i in 1:length(sol_lv_fine.u)]
+P_fine = [sol_lv_fine.u[i][2] for i in 1:length(sol_lv_fine.u)]
+
+p_lv_data = plot(t_lv_fine, H_fine, label="Prey H (true)", lw=2, color=:forestgreen,
+    xlabel="Time", ylabel="Population", title="Lotka-Volterra — Data")
+plot!(p_lv_data, t_lv_fine, P_fine, label="Predator P (true, unobserved)", lw=2,
+    color=:darkorange, ls=:dash)
+scatter!(p_lv_data, t_lv, prey_data, label="Prey H (observed)", ms=4,
+    color=:forestgreen, alpha=0.7)
+p_lv_data
 ```
 
 ### Fit with MAGI (Observing Only Prey)
@@ -149,22 +281,113 @@ sol_lv = solve(prob_lv, MagiSolver(
     obs_var=0.0025, preoptimize=true, verbose=false))
 ```
 
+### Posterior Trajectories
+
 ```{julia}
-#| echo: false
 chains_lv = sol_lv.convergence.chains
-println("Chains: $(size(chains_lv, 1)) samples × $(size(chains_lv, 2)) parameters")
+sample_lv = Array(chains_lv)
+n_samp_lv = size(sample_lv, 1)
+np_lv = nparams(uf_g)
+n_traj_lv = min(n_samp_lv, 100)
+
+t_pred_lv = collect(range(0.0, 30.0, length=100))
+traj_H = zeros(n_traj_lv, length(t_pred_lv))
+traj_P = zeros(n_traj_lv, length(t_pred_lv))
+
+knots_lv = collect(range(0.0, 5.0, length=uf_g.nknots))
+for i in 1:n_traj_lv
+    params_i = sample_lv[i, 1:np_lv]
+    ev = PartiallySpecifiedModels.build_bspline_evaluator(knots_lv, params_i)
+    try
+        pred = solve(ODEProblem(lv!, [2.0, 1.0], (0.0, 30.0), (; g = ev)),
+                     Tsit5(); saveat=t_pred_lv, abstol=1e-8, reltol=1e-8)
+        traj_H[i, :] = [pred.u[k][1] for k in 1:length(pred.u)]
+        traj_P[i, :] = [pred.u[k][2] for k in 1:length(pred.u)]
+    catch
+        traj_H[i, :] .= NaN
+        traj_P[i, :] .= NaN
+    end
+end
+```
+
+```{julia}
+#| label: fig-lv-traj
+#| fig-cap: "Posterior trajectories: prey (green) and inferred predator (orange)"
+H_med = [nanmed(traj_H[:, j]) for j in 1:length(t_pred_lv)]
+H_lo = [nanq(traj_H[:, j], 0.025) for j in 1:length(t_pred_lv)]
+H_hi = [nanq(traj_H[:, j], 0.975) for j in 1:length(t_pred_lv)]
+P_med = [nanmed(traj_P[:, j]) for j in 1:length(t_pred_lv)]
+P_lo = [nanq(traj_P[:, j], 0.025) for j in 1:length(t_pred_lv)]
+P_hi = [nanq(traj_P[:, j], 0.975) for j in 1:length(t_pred_lv)]
+
+p_lv_fit = plot(t_pred_lv, H_med, ribbon=(H_med .- H_lo, H_hi .- H_med),
+    fillalpha=0.2, color=:forestgreen, lw=2, label="Prey H (MAGI 95% CI)",
+    xlabel="Time", ylabel="Population", title="MAGI Posterior — Prey & Predator")
+plot!(p_lv_fit, t_pred_lv, P_med, ribbon=(P_med .- P_lo, P_hi .- P_med),
+    fillalpha=0.2, color=:darkorange, lw=2, label="Predator P (MAGI 95% CI)")
+plot!(p_lv_fit, t_lv_fine, H_fine, color=:forestgreen, lw=1, ls=:dash, label="H (true)")
+plot!(p_lv_fit, t_lv_fine, P_fine, color=:darkorange, lw=1, ls=:dash, label="P (true)")
+scatter!(p_lv_fit, t_lv, prey_data, ms=3, color=:forestgreen, alpha=0.5, label="H (data)")
+p_lv_fit
 ```
 
 ### Functional Response Recovery
 
 ```{julia}
+H_range = range(0.0, 5.0, length=60)
+g_samples = zeros(n_samp_lv, length(H_range))
+for i in 1:n_samp_lv
+    params_i = sample_lv[i, 1:np_lv]
+    ev = PartiallySpecifiedModels.build_bspline_evaluator(knots_lv, params_i)
+    for (j, Hv) in enumerate(H_range)
+        g_samples[i, j] = ev(Hv)
+    end
+end
+
+g_med = [median(g_samples[:, j]) for j in 1:length(H_range)]
+g_lo = [quantile(g_samples[:, j], 0.025) for j in 1:length(H_range)]
+g_hi = [quantile(g_samples[:, j], 0.975) for j in 1:length(H_range)]
+g_true_vals = [g_true(H) for H in H_range]
+```
+
+```{julia}
+#| label: fig-lv-func
+#| fig-cap: "Posterior credible interval for functional response g(H)"
+H_data_max = maximum(prey_data)
+p_g = plot(collect(H_range), g_med, ribbon=(g_med .- g_lo, g_hi .- g_med),
+    fillalpha=0.25, color=:darkorange, lw=2, label="MAGI posterior (median + 95% CI)",
+    xlabel="Prey density H", ylabel="g(H)",
+    title="Functional Response g(H) — Holling Type II")
+plot!(p_g, collect(H_range), g_true_vals, color=:black, lw=2, ls=:dash, label="True g(H)")
+vspan!(p_g, [H_data_max, 5.0], color=:orange, alpha=0.08, label="Beyond data range")
+p_g
+```
+
+```{julia}
 #| echo: false
-g_fitted = sol_lv.unknown_functions[:g]
 println("Posterior mean g(H) vs. true Holling Type II:")
 for H in [0.5, 1.0, 2.0, 3.0, 4.0]
-    println("  g($(H)) = $(round(g_fitted(H), digits=4))  " *
+    idx = argmin(abs.(collect(H_range) .- H))
+    println("  g($(H)) = $(round(g_med[idx], digits=4))  " *
+            "[$(round(g_lo[idx], digits=4)), $(round(g_hi[idx], digits=4))] " *
             "(true: $(round(g_true(H), digits=4)))")
 end
+```
+
+### Trace Plots
+
+```{julia}
+#| label: fig-lv-trace
+#| fig-cap: "Trace plots for Lotka-Volterra g(H) spline coefficients"
+pn_lv = names(chains_lv, :parameters)
+n_show_lv = min(4, length(pn_lv))
+p_tr_lv = plot(layout=(n_show_lv, 1), size=(700, 150 * n_show_lv))
+for i in 1:n_show_lv
+    vals = Array(chains_lv[:, pn_lv[i], :])[:, 1]
+    plot!(p_tr_lv, vals, subplot=i, label="", color=:darkorange, alpha=0.7,
+        title=string(pn_lv[i]), xlabel= i == n_show_lv ? "Iteration" : "", ylabel="Value")
+end
+p_tr_lv
 ```
 
 ## Comparison: MagiSolver vs MCMCSolver

@@ -454,6 +454,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
             uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
         elseif approx isa COMONetApproximator
             uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
+        elseif approx isa SPDEApproximator
+            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
+        elseif approx isa ShapeConstrainedSPDEApproximator
+            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
         end
     end
 

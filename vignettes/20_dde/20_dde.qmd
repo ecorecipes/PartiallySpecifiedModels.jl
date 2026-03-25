@@ -29,11 +29,12 @@ where $\tau$ is the delay and the history function $h(t)$ provides initial value
 using PartiallySpecifiedModels
 using OrdinaryDiffEq
 using DelayDiffEq
+using Plots; default(fmt=:png)
 using Random
 Random.seed!(42)
 ```
 
-## Example: Delayed Negative Feedback
+## Example 1: Delayed Negative Feedback
 
 We consider a simple model with delayed negative feedback:
 
@@ -59,6 +60,19 @@ t_data = collect(sol_true.t)
 noise = 0.02
 data_vals = [sol_true.u[i][1] + noise * randn() for i in 1:length(t_data)]
 data_matrix = reshape(max.(data_vals, 0.001), :, 1)
+```
+
+### Observed Data
+
+```{julia}
+#| echo: false
+#| label: fig-data-feedback
+#| fig-cap: "Delayed negative feedback: observed data vs true solution"
+plot(t_data, data_vals, seriestype=:scatter, ms=3, alpha=0.6,
+    label="Observed", color=:steelblue, xlabel="Time", ylabel="u(t)")
+plot!(sol_true.t, [sol_true.u[i][1] for i in 1:length(sol_true.t)],
+    label="True", color=:black, lw=2, ls=:dash)
+title!("Delayed Negative Feedback Data")
 ```
 
 ### Define the PSM Problem
@@ -88,40 +102,39 @@ prob = PSMProblem(dde_psm!, [1.0], (0.0, 10.0), [uf];
 ### Fit with LAML
 
 ```{julia}
-sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
+sol_laml = solve(prob, LAML(maxiters=50, verbose=false));
 ```
 
 ### Recovered Function
 
 ```{julia}
 #| echo: false
+#| label: fig-function-feedback
+#| fig-cap: "Recovered unknown function f(x) vs true linear function"
 f_true(x) = 0.5 * x
 f_laml = sol_laml.unknown_functions[:f]
 
-println("Unknown function f(x) comparison:")
-println("  x    |  True   |  LAML")
-println("  -----|---------|--------")
-for x in [0.1, 0.3, 0.5, 0.7, 1.0]
-    println("  $(lpad(x, 4)) | $(lpad(round(f_true(x), digits=3), 7)) " *
-            "| $(lpad(round(f_laml(x), digits=3), 7))")
-end
+x_grid = range(0.01, 1.2, length=200)
+plot(x_grid, f_true.(x_grid), lw=3, label="True f(x) = 0.5x", color=:black, ls=:dash,
+    xlabel="x (delayed state)", ylabel="f(x)", title="Recovered Function — Delayed Feedback")
+plot!(x_grid, [f_laml(x) for x in x_grid], lw=2, label="LAML fit", color=:teal)
 ```
 
 ### Fitted Trajectory
 
 ```{julia}
 #| echo: false
-println("Trajectory comparison (selected time points):")
-println("  t    | Observed | Fitted")
-println("  -----|----------|-------")
-for i in 1:4:length(t_data)
-    t = t_data[i]
-    println("  $(lpad(round(t, digits=2), 5)) | $(lpad(round(data_vals[i], digits=3), 8)) " *
-            "| $(lpad(round(sol_laml.fitted_values[i,1], digits=3), 6))")
-end
+#| label: fig-trajectory-feedback
+#| fig-cap: "Fitted trajectory vs observed data for the delayed feedback model"
+plot(t_data, data_vals, seriestype=:scatter, ms=3, alpha=0.5,
+    label="Data", color=:gray60, xlabel="Time", ylabel="u(t)")
+plot!(t_data, sol_laml.fitted_values[:, 1], lw=2, label="LAML fit", color=:teal)
+plot!(sol_true.t, [sol_true.u[i][1] for i in 1:length(sol_true.t)],
+    lw=2, ls=:dash, label="True", color=:black)
+title!("Trajectory — Delayed Feedback")
 ```
 
-## Example: Blowfly Model with Delayed Reproduction
+## Example 2: Blowfly Model with Delayed Reproduction
 
 A more ecological example: Nicholson's blowfly equation with unknown reproduction function:
 
@@ -147,6 +160,21 @@ data_blow = [max(sol_blow.u[i][1] + 1.0 * randn(), 0.1) for i in 1:length(t_blow
 data_blow_matrix = reshape(data_blow, :, 1)
 ```
 
+### Blowfly Data
+
+```{julia}
+#| echo: false
+#| label: fig-data-blowfly
+#| fig-cap: "Nicholson's blowfly population data"
+plot(t_blow, data_blow, seriestype=:scatter, ms=2, alpha=0.5,
+    label="Observed", color=:steelblue, xlabel="Time", ylabel="Population N")
+plot!(sol_blow.t, [sol_blow.u[i][1] for i in 1:length(sol_blow.t)],
+    label="True", color=:black, lw=2, ls=:dash)
+title!("Blowfly Population Data")
+```
+
+### Fit the Blowfly PSM
+
 ```{julia}
 function blowfly!(du, u, h, p, t)
     N_delayed = h(p, t - 2.0)
@@ -161,22 +189,39 @@ prob_blow_psm = PSMProblem(blowfly!, [20.0], (0.0, 50.0), [uf_blow];
     likelihood=PartiallySpecifiedModels.Gaussian(),
     delays=[2.0], history=h_blow)
 
-sol_blow_fit = solve(prob_blow_psm, LAML(maxiters=50, verbose=false))
+sol_blow_fit = solve(prob_blow_psm, LAML(maxiters=50, verbose=false));
 ```
 
 ### Recovered Reproduction Function
 
 ```{julia}
 #| echo: false
+#| label: fig-reproduction
+#| fig-cap: "Recovered reproduction function g(N) — note the characteristic hump shape"
 g_fitted = sol_blow_fit.unknown_functions[:g]
 
-println("Reproduction function g(N) comparison:")
-println("  N    |  True   |  Fitted")
-println("  -----|---------|--------")
-for N in [5.0, 10.0, 20.0, 40.0, 60.0]
-    println("  $(lpad(N, 4)) | $(lpad(round(g_true(N), digits=2), 7)) " *
-            "| $(lpad(round(g_fitted(N), digits=2), 7))")
-end
+N_grid = range(0.1, 75.0, length=200)
+plot(N_grid, g_true.(N_grid), lw=3, label="True g(N)", color=:black, ls=:dash,
+    xlabel="Delayed population N(t-τ)", ylabel="g(N)",
+    title="Blowfly Reproduction Function")
+plot!(N_grid, [g_fitted(N) for N in N_grid], lw=2, label="LAML fit", color=:teal)
+# Mark data range
+N_range = extrema([sol_blow.u[i][1] for i in 1:length(sol_blow.t)])
+vspan!([N_range...], alpha=0.08, color=:steelblue, label="Data range")
+```
+
+### Fitted Blowfly Trajectory
+
+```{julia}
+#| echo: false
+#| label: fig-trajectory-blowfly
+#| fig-cap: "Fitted blowfly population trajectory vs observed data"
+plot(t_blow, data_blow, seriestype=:scatter, ms=2, alpha=0.4,
+    label="Data", color=:gray60, xlabel="Time", ylabel="Population N")
+plot!(t_blow, sol_blow_fit.fitted_values[:, 1], lw=2, label="LAML fit", color=:teal)
+plot!(sol_blow.t, [sol_blow.u[i][1] for i in 1:length(sol_blow.t)],
+    lw=2, ls=:dash, label="True", color=:black)
+title!("Blowfly Trajectory Fit")
 ```
 
 ## DDE Problem Setup

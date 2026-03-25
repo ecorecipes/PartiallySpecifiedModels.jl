@@ -173,9 +173,31 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     mu = copy(beta0)
     log_sigma = fill(-2.0, n_p)  # σ ≈ 0.135
 
-    # Observation noise variance (estimated from data scale)
-    data_range = maximum(prob.data_values) - minimum(prob.data_values)
-    obs_noise_var = max((0.1 * data_range)^2, 1e-4)
+    # Observation noise variance: user-specified or estimated from data
+    obs_noise_var = if alg.obs_noise_var !== nothing
+        alg.obs_noise_var
+    else
+        # Estimate from short-range variability in data (successive differences)
+        # This is more robust than the data range heuristic
+        n_t = size(prob.data_values, 1)
+        n_obs = size(prob.data_values, 2)
+        if n_t >= 3
+            total_var = 0.0
+            count = 0
+            for j in 1:n_obs
+                for i in 2:n_t-1
+                    # Second differences estimate noise (removes trend)
+                    dd = prob.data_values[i-1, j] - 2*prob.data_values[i, j] + prob.data_values[i+1, j]
+                    total_var += dd^2
+                    count += 1
+                end
+            end
+            max(total_var / (6 * count), 1e-6)  # Var(Δ²y) = 6σ² for white noise
+        else
+            data_range = maximum(prob.data_values) - minimum(prob.data_values)
+            max((0.05 * data_range)^2, 1e-6)
+        end
+    end
 
     if verbose
         println("VariationalSolver: $n_p params, $(alg.maxiters) max iters, " *
@@ -335,6 +357,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
             uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
         elseif approx isa COMONetApproximator
             uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
+        elseif approx isa SPDEApproximator
+            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
+        elseif approx isa ShapeConstrainedSPDEApproximator
+            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
         end
     end
 

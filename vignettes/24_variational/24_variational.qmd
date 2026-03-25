@@ -33,7 +33,7 @@ using OrdinaryDiffEq
 using Plots
 using Statistics
 using Random
-Random.seed!(42)
+Random.seed!(101)
 ```
 
 ## Logistic Growth with Unknown Rate
@@ -53,18 +53,18 @@ data_N = [sol_true.u[i][1] + 0.2 * randn() for i in 1:length(t_data)]
 data_matrix = reshape(max.(data_N, 0.01), :, 1)
 ```
 
-## Variational vs MCMC Comparison
+## Variational vs LAML Comparison
 
 ```{julia}
-uf = BSplineApproximator(:r, (0.0, 12.0), 6)
+uf = BSplineApproximator(:r, (0.5, 10.5), 8)
 
 prob = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf];
     data_times=t_data, data_values=Float64.(data_matrix),
     obs_to_state=[1], known_params=NamedTuple())
 
-sol_vi = solve(prob, VariationalSolver(maxiters=1000, n_elbo_samples=10,
-                                        prior_scale=2.0, verbose=false))
-sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
+sol_vi = solve(prob, VariationalSolver(maxiters=3000, n_elbo_samples=20,
+                                        lr=0.005, prior_scale=2.0, verbose=false))
+sol_laml = solve(prob, LAML(maxiters=100, verbose=false))
 ```
 
 ### Posterior Mean vs LAML Estimate
@@ -72,26 +72,57 @@ sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
 ```{julia}
 r_vi = sol_vi.unknown_functions[:r]
 r_laml = sol_laml.unknown_functions[:r]
-N_grid = range(0.0, 12.0, length=100)
+N_grid = range(0.5, 10.5, length=100)
 
 p1 = plot(N_grid, r_true.(N_grid), label="True r(N)", lw=2, color=:black,
-          xlabel="N", ylabel="r(N)", title="Per-Capita Growth Rate")
+          xlabel="Population N", ylabel="r(N)", title="Per-Capita Growth Rate")
 plot!(p1, N_grid, [r_vi(n) for n in N_grid], label="VI posterior mean", lw=2)
 plot!(p1, N_grid, [r_laml(n) for n in N_grid], label="LAML", lw=2, ls=:dash)
 p1
 ```
 
-### Posterior Uncertainty
+### Posterior Uncertainty Bands
 
-The variational solver provides posterior standard deviations for each parameter:
+The variational solver provides posterior standard deviations for each spline coefficient. We can draw posterior samples to visualize pointwise uncertainty:
 
 ```{julia}
+post_mu = sol_vi.convergence[:posterior_mean]
 post_std = sol_vi.convergence[:posterior_std]
-println("Posterior standard deviations (first 6 params):")
-for i in 1:min(6, length(post_std))
-    println("  β[$i]: μ=$(round(sol_vi.parameters[i], digits=3)) ± $(round(post_std[i], digits=3))")
+
+n_samples = 200
+N_plot = collect(range(0.5, 10.5, length=100))
+r_samples = zeros(n_samples, length(N_plot))
+mesh = collect(range(0.5, 10.5, length=length(post_mu)))
+for s in 1:n_samples
+    beta_s = post_mu .+ post_std .* randn(length(post_mu))
+    itp = PartiallySpecifiedModels.build_bspline_evaluator(mesh, beta_s)
+    for (j, n) in enumerate(N_plot)
+        r_samples[s, j] = itp(n)
+    end
 end
-println("\nMean posterior std: $(round(mean(post_std), digits=4))")
+
+r_lo = [quantile(r_samples[:, j], 0.025) for j in 1:length(N_plot)]
+r_hi = [quantile(r_samples[:, j], 0.975) for j in 1:length(N_plot)]
+r_mean = [mean(r_samples[:, j]) for j in 1:length(N_plot)]
+
+p2 = plot(N_plot, r_true.(N_plot), label="True r(N)", lw=2, color=:black,
+          xlabel="Population N", ylabel="r(N)", title="VI Posterior Uncertainty (95% CI)")
+plot!(p2, N_plot, r_mean, ribbon=(r_mean .- r_lo, r_hi .- r_mean),
+      fillalpha=0.3, label="VI ± 95% CI", lw=2)
+p2
+```
+
+Note how the uncertainty bands are narrowest in the mid-range (N ≈ 2–7) where the trajectory is most dynamic and data is most informative about the per-capita rate. Near carrying capacity (N ≈ 10), the bands widen considerably — this is correct Bayesian behavior because `dN/dt = r(N)·N ≈ 0` when N is near K, making r(N) weakly identified from trajectory data alone.
+
+### Posterior Standard Deviations
+
+```{julia}
+println("Posterior standard deviations per spline coefficient:")
+for i in 1:length(post_std)
+    println("  β[$i]: μ=$(round(post_mu[i], digits=3)) ± $(round(post_std[i], digits=3))")
+end
+println("\nThe last coefficients (controlling r(N) near carrying capacity)")
+println("have the largest uncertainty — reflecting weak identifiability.")
 ```
 
 ### ELBO Convergence
@@ -119,6 +150,6 @@ println("True: r(5)=$(round(r_true(5.0), digits=3))")
 
 - **Speed**: 10-100× faster than MCMC for uncertainty quantification
 - **Scalability**: Works well with many parameters (unlike MCMC which mixes slowly)
-- **Uncertainty**: Provides approximate posterior std for each parameter
-- **Tradeoff**: Mean-field assumption underestimates posterior correlations
+- **Uncertainty**: Provides approximate posterior std for each parameter — correctly wider in data-sparse regions
+- **Tradeoff**: Mean-field assumption underestimates posterior correlations; posterior mean can oscillate where the function is weakly identified (near carrying capacity in this example)
 - Best when you need **quick uncertainty estimates** rather than exact posterior samples

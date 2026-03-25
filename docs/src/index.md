@@ -13,7 +13,7 @@ PartiallySpecifiedModels.jl provides a unified interface for specifying and fitt
 - **Basis function approximators** (B-splines, shape-constrained splines, Gaussian processes): fewer parameters, automatic smoothing via LAML/GCV, interpretable, and easy to constrain (monotonicity, convexity, positivity).
 - **Neural network approximators** (Lux.jl networks, COMONet): more flexible for high-dimensional or complex functional forms, compatible with gradient-based UDE-style training.
 
-The package supports 17 fitting algorithms, 5 approximator types, 4 likelihood families, and 14 shape constraint types.
+The package supports 17 fitting algorithms, 7 approximator types, 4 likelihood families, and 14 shape constraint types.
 
 ## Installation
 
@@ -28,7 +28,7 @@ Requires Julia ≥ 1.10.
 
 A simple example: recover the unknown per-capita growth rate ``r(N)`` from logistic growth data.
 
-```julia
+```@example quickstart
 using PartiallySpecifiedModels
 using PartiallySpecifiedModels: solve
 using OrdinaryDiffEq
@@ -58,7 +58,7 @@ end
 # Approximate r(N) with a penalized cubic B-spline (8 knots)
 approx_r = BSplineApproximator(:r, (0.0, 12.0), 8; initial = x -> 0.3)
 
-# Build problem
+# Build problem and fit with LAML
 prob = PSMProblem(
     growth!, [N0], tspan, [approx_r];
     data_times = data_times,
@@ -67,13 +67,13 @@ prob = PSMProblem(
     likelihood = Gaussian(),
     solver = Tsit5()
 )
-
-# Fit with LAML (≡ REML for Gaussian data)
 sol = solve(prob, LAML())
 
 # Evaluate the recovered unknown function
 r_fitted = sol.unknown_functions[:r]
-r_estimated = [r_fitted(N) for N in range(0.1, 11.0, length=100)]
+for N in [1.0, 5.0, 9.0]
+    println("r($N): estimated=$(round(r_fitted(N), digits=3)), true=$(round(r0*(1-N/K), digits=3))")
+end
 ```
 
 ## Package Features
@@ -106,6 +106,8 @@ r_estimated = [r_fitted(N) for N in range(0.1, 11.0, length=100)]
 |-------------|-------------|------------|
 | [`BSplineApproximator`](@ref) | Cubic B-spline basis | Spline coefficients |
 | [`ShapeConstrainedBSplineApproximator`](@ref) | SCOP-spline (Pya & Wood 2015) | Constrained coefficients |
+| [`SPDEApproximator`](@ref) | Matérn SPDE penalty (Lindgren et al. 2011) | Mesh node values |
+| [`ShapeConstrainedSPDEApproximator`](@ref) | SPDE + shape constraints | Constrained mesh values |
 | [`NeuralApproximator`](@ref) | Lux.jl neural network | Network weights |
 | [`GPApproximator`](@ref) | Gaussian process | GP hyperparameters |
 | [`COMONetApproximator`](@ref) | Constrained monotone network | exp(W) weights |
@@ -117,4 +119,4 @@ r_estimated = [r_fitted(N) for N in range(0.1, 11.0, length=100)]
 - [`NegativeBinomial`](@ref) — Overdispersed counts with estimated dispersion
 - [`CustomLikelihood`](@ref) — User-defined likelihood
 
-See the [Getting Started](@ref) guide for a detailed tutorial, or browse the [Solvers](@ref) and [Approximators](@ref) pages for full documentation.
+See the [Getting Started](getting_started.md) guide for a detailed tutorial, or browse the [Solvers](solvers.md) and [Approximators](approximators.md) pages for full documentation. The [Vignettes](vignettes.md) page has 26 worked examples covering every solver and approximator.

@@ -217,6 +217,210 @@ using OrdinaryDiffEq
         @test abs(r_eval(1.0) - true_r) < 0.1
     end
 
+    @testset "SPDEApproximator — construction" begin
+        a = SPDEApproximator(:f, (0.0, 1.0), 10)
+        @test nparams(a) == 10
+        @test a.name == :f
+        @test a.domain == (0.0, 1.0)
+        @test a.nu ≈ 1.5
+        @test a.range_param ≈ 1.0 / 3.0
+        @test a.kappa ≈ sqrt(8.0 * 1.5) / (1.0 / 3.0)
+        @test length(a.mesh_points) == 10
+
+        p0 = initial_params(a)
+        @test length(p0) == 10
+        @test all(p0 .== 0.0)
+
+        # With initial function
+        a2 = SPDEApproximator(:g, (0.0, 1.0), 5; initial=x -> x^2)
+        p2 = initial_params(a2)
+        @test length(p2) == 5
+        @test p2[1] ≈ 0.0 atol=1e-10
+        @test p2[end] ≈ 1.0 atol=1e-10
+
+        # Custom range
+        a3 = SPDEApproximator(:h, (0.0, 10.0), 8; nu=0.5, range_param=2.0)
+        @test a3.nu ≈ 0.5
+        @test a3.range_param ≈ 2.0
+        @test a3.kappa ≈ sqrt(4.0) / 2.0
+
+        # Validation
+        @test_throws ErrorException SPDEApproximator(:f, (0.0, 1.0), 10; nu=0.7)
+        @test_throws ErrorException SPDEApproximator(:f, (0.0, 1.0), 2)
+    end
+
+    @testset "SPDEApproximator — FEM matrices" begin
+        mesh = collect(range(0.0, 1.0, length=5))
+        C, G = PartiallySpecifiedModels.spde_fem_matrices(mesh)
+        h = 0.25
+
+        # Mass matrix: diagonal with h/2 at boundaries, h at interior
+        @test C[1,1] ≈ h/2
+        @test C[2,2] ≈ h
+        @test C[5,5] ≈ h/2
+        @test all(C[i,j] ≈ 0 for i in 1:5, j in 1:5 if i ≠ j)
+
+        # Stiffness matrix: tridiagonal
+        @test G[1,1] ≈ 1/h
+        @test G[1,2] ≈ -1/h
+        @test G[2,2] ≈ 2/h
+        @test G[2,1] ≈ -1/h
+        @test G[2,3] ≈ -1/h
+        @test maximum(abs.(G .- G')) < 1e-10  # symmetric
+
+        # Stiffness matrix annihilates constant functions: G * ones = 0
+        @test norm(G * ones(5)) < 1e-10
+    end
+
+    @testset "SPDEApproximator — penalty matrix" begin
+        for ν in [0.5, 1.5, 2.5]
+            a = SPDEApproximator(:f, (0.0, 1.0), 10; nu=ν, range_param=0.3)
+            S = penalty_matrix(a)
+            @test size(S) == (10, 10)
+            @test maximum(abs.(S .- S')) < 1e-8  # symmetric
+            evals = eigvals(Symmetric(S))
+            @test all(e -> e >= -1e-8, evals)  # positive semi-definite
+        end
+
+        # Penalty of constant function should be small (not exactly zero due to
+        # mass matrix contribution, but much smaller than wiggly function)
+        a = SPDEApproximator(:f, (0.0, 1.0), 10; nu=1.5)
+        S = penalty_matrix(a)
+        y_const = ones(10)
+        y_wiggly = [sin(10π * x) for x in a.mesh_points]
+        @test dot(y_const, S * y_const) < dot(y_wiggly, S * y_wiggly)
+    end
+
+    @testset "SPDEApproximator — evaluator" begin
+        mesh = collect(range(0.0, 1.0, length=10))
+        params = sin.(mesh)
+        eval_spde = PartiallySpecifiedModels.build_spde_evaluator(mesh, params)
+
+        # Should interpolate at mesh points
+        for (xi, vi) in zip(mesh, params)
+            @test abs(eval_spde(xi) - vi) < 1e-10
+        end
+
+        # Should interpolate smoothly between points
+        x_mid = 0.55
+        @test abs(eval_spde(x_mid) - sin(x_mid)) < 0.05
+    end
+
+    @testset "SPDEApproximator — LAML solver" begin
+        function growth_spde!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+        end
+
+        true_r = 0.3
+        tspan = (0.0, 5.0)
+        data_times = collect(range(0.0, 5.0, length=30))
+        data_values = reshape(exp.(true_r .* data_times), :, 1)
+
+        prob = PSMProblem(growth_spde!, [1.0], tspan,
+            [SPDEApproximator(:r, (0.5, 5.0), 8; nu=1.5, initial=x -> 0.2)];
+            data_times=data_times, data_values=data_values,
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=Gaussian(), solver=Tsit5(),
+            abstol=1e-8, reltol=1e-8, maxiters=10000)
+
+        sol = solve(prob, LAML(maxiters=60, verbose=false))
+        @test sol.data_loss < 1.0
+        @test haskey(sol.unknown_functions, :r)
+        r_eval = sol.unknown_functions[:r]
+        @test abs(r_eval(1.0) - true_r) < 0.1
+    end
+
+    @testset "ShapeConstrainedSPDEApproximator — construction" begin
+        a = ShapeConstrainedSPDEApproximator(:f, (0.0, 5.0), 8, :increasing)
+        @test a.name == :f
+        @test a.domain == (0.0, 5.0)
+        @test a.n_basis == 8
+        @test a.nu == 1.5
+        @test a.constraint == :increasing
+        @test size(a.Sigma) == (8, 8)
+        @test nparams(a) == 8
+        @test length(initial_params(a)) == 8
+
+        # With custom settings
+        a2 = ShapeConstrainedSPDEApproximator(:g, (0.0, 1.0), 6, :dec_positive;
+            nu=0.5, range_param=0.5, initial=x -> 1.0 - x)
+        @test a2.nu == 0.5
+        @test a2.range_param == 0.5
+        @test nparams(a2) == 6
+
+        # Zero-endpoint constraint: one fewer parameter
+        a3 = ShapeConstrainedSPDEApproximator(:h, (0.0, 1.0), 8, :inc_zero_left)
+        @test nparams(a3) == 7
+        @test size(a3.Sigma) == (8, 7)
+
+        # Errors
+        @test_throws ArgumentError ShapeConstrainedSPDEApproximator(:f, (0.0, 1.0), 8, :bad_constraint)
+        @test_throws ErrorException ShapeConstrainedSPDEApproximator(:f, (0.0, 1.0), 3, :increasing)
+    end
+
+    @testset "ShapeConstrainedSPDEApproximator — evaluator" begin
+        a = ShapeConstrainedSPDEApproximator(:f, (0.0, 5.0), 8, :increasing;
+            initial=x -> 0.1 * x)
+        gamma = initial_params(a)
+        eval_fn = PartiallySpecifiedModels.build_constrained_spde_evaluator(a, gamma)
+
+        # Should be callable and increasing
+        vals = [eval_fn(x) for x in range(0.0, 5.0, length=20)]
+        @test all(diff(vals) .>= -1e-10)  # Approximately increasing
+
+        # Positive constraint
+        a_pos = ShapeConstrainedSPDEApproximator(:f, (0.0, 5.0), 8, :positive;
+            initial=x -> 1.0)
+        gamma_pos = initial_params(a_pos)
+        eval_pos = PartiallySpecifiedModels.build_constrained_spde_evaluator(a_pos, gamma_pos)
+        mesh_vals = PartiallySpecifiedModels.gamma_to_mesh_values(a_pos, gamma_pos)
+        @test all(mesh_vals .> 0)  # Positive at mesh nodes
+    end
+
+    @testset "ShapeConstrainedSPDEApproximator — penalty matrix" begin
+        a = ShapeConstrainedSPDEApproximator(:f, (0.0, 1.0), 8, :increasing; nu=1.5)
+        P = penalty_matrix(a)
+        np = nparams(a)
+        @test size(P) == (np, np)
+        @test issymmetric(P)
+        @test all(eigvals(Symmetric(P)) .>= -1e-10)  # Positive semi-definite
+
+        # Zero-endpoint has smaller penalty
+        a_z = ShapeConstrainedSPDEApproximator(:f, (0.0, 1.0), 8, :inc_zero_left; nu=1.5)
+        P_z = penalty_matrix(a_z)
+        @test size(P_z) == (7, 7)
+    end
+
+    @testset "ShapeConstrainedSPDEApproximator — LAML solver" begin
+        function growth_scspde!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+        end
+
+        true_r = 0.3
+        tspan = (0.0, 5.0)
+        data_times = collect(range(0.0, 5.0, length=30))
+        data_values = reshape(exp.(true_r .* data_times), :, 1)
+
+        # Use :positive constraint since r(u) = 0.3 > 0
+        prob = PSMProblem(growth_scspde!, [1.0], tspan,
+            [ShapeConstrainedSPDEApproximator(:r, (0.5, 5.0), 8, :positive;
+                nu=1.5, initial=x -> 0.2)];
+            data_times=data_times, data_values=data_values,
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=Gaussian(), solver=Tsit5(),
+            abstol=1e-8, reltol=1e-8, maxiters=10000)
+
+        sol = solve(prob, LAML(maxiters=60, verbose=false))
+        @test sol.data_loss < 1.0
+        @test haskey(sol.unknown_functions, :r)
+        r_eval = sol.unknown_functions[:r]
+        @test abs(r_eval(1.0) - true_r) < 0.15
+        # Verify positivity at mesh nodes
+        mesh_vals = PartiallySpecifiedModels.gamma_to_mesh_values(
+            prob.approximators[1], collect(sol.parameters[:r]))
+        @test all(mesh_vals .> 0)
+    end
+
     @testset "GradientMatching solver" begin
         function growth_gm!(du, u, p, t)
             du[1] = p.r(u[1]) * u[1]
@@ -1185,6 +1389,55 @@ using OrdinaryDiffEq
         @test_throws ErrorException solve(prob_disc, MagiSolver(verbose=false))
         @test_throws ErrorException solve(prob_disc, DaltonSolver(verbose=false))
         @test_throws ErrorException solve(prob_disc, PseudoMarginalSolver(verbose=false))
+    end
+
+    @testset "with_range_param" begin
+        a_spde = SPDEApproximator(:f, (0.0, 1.0), 8; nu=1.5, range_param=0.2)
+        a2 = with_range_param(a_spde, 0.5)
+        @test a2 isa SPDEApproximator
+        @test a2.range_param ≈ 0.5
+        @test a2.name == :f
+        @test a2.n_basis == 8
+        @test a2.nu ≈ 1.5
+
+        a_sc = ShapeConstrainedSPDEApproximator(:g, (0.0, 2.0), 8, :increasing; nu=1.5)
+        a_sc2 = with_range_param(a_sc, 1.0)
+        @test a_sc2 isa ShapeConstrainedSPDEApproximator
+        @test a_sc2.range_param ≈ 1.0
+        @test a_sc2.constraint == :increasing
+
+        # Non-SPDE returns unchanged
+        a_bs = BSplineApproximator(:h, (0.0, 1.0), 8)
+        @test with_range_param(a_bs, 0.5) === a_bs
+    end
+
+    @testset "optimize_spde_range" begin
+        Random.seed!(42)
+        r_true(u) = 0.5 * u
+        function decay!(du, u, p, t)
+            du[1] = -p.r(u[1]) * u[1]
+        end
+        u0 = [5.0]
+        tspan = (0.0, 5.0)
+        sol_true = solve(ODEProblem(decay!, u0, tspan, (; r=r_true)), Tsit5(); saveat=0.25)
+        t_obs = collect(sol_true.t)
+        data = reshape([sol_true.u[i][1] + 0.05 * randn() for i in 1:length(t_obs)], :, 1)
+
+        uf = SPDEApproximator(:r, (0.01, 5.5), 8; nu=1.5, initial=x -> 0.5)
+        prob = PSMProblem(decay!, u0, tspan, [uf];
+            data_times=t_obs, data_values=Float64.(data),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+
+        result = optimize_spde_range(prob, LAML(maxiters=50, verbose=false);
+            range_multipliers=[0.5, 1.0, 2.0], verbose=false)
+
+        @test result.solution isa PSMSolution
+        @test result.range_param > 0
+        @test length(result.gcv_scores) == 3
+        @test length(result.range_values) == 3
+        @test all(isfinite, result.gcv_scores)
+        @test result.solution.data_loss < 5.0
     end
 
 end

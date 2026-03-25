@@ -75,6 +75,10 @@ function _magi_kalman_loglik(ld::MAGILogDensity, theta::AbstractVector{T}) where
             push!(uf_entries, approx.name => build_constrained_bspline_evaluator(approx, params_k))
         elseif approx isa COMONetApproximator
             push!(uf_entries, approx.name => build_comonet_evaluator(approx, params_k))
+        elseif approx isa SPDEApproximator
+            push!(uf_entries, approx.name => build_spde_evaluator(approx.mesh_points, params_k))
+        elseif approx isa ShapeConstrainedSPDEApproximator
+            push!(uf_entries, approx.name => build_constrained_spde_evaluator(approx, params_k))
         elseif approx isa GPApproximator
             push!(uf_entries, approx.name => build_gp_evaluator(approx, params_k))
         elseif approx isa NeuralApproximator
@@ -256,7 +260,7 @@ function LogDensityProblems.logdensity(ld::MAGILogDensity, theta::AbstractVector
         offset += np
         # Penalty matrix prior if available
         if approx isa BSplineApproximator || approx isa ShapeConstrainedBSplineApproximator ||
-           approx isa GPApproximator || approx isa COMONetApproximator
+           approx isa GPApproximator || approx isa COMONetApproximator || approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator
             S = penalty_matrix(approx)
             prior += T(-0.5) / T(ld.prior_scale) * dot(params_k, T.(S) * params_k)
         end
@@ -430,6 +434,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
             uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
         elseif approx isa COMONetApproximator
             uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
+        elseif approx isa SPDEApproximator
+            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
+        elseif approx isa ShapeConstrainedSPDEApproximator
+            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa NeuralApproximator

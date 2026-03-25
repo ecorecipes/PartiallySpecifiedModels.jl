@@ -1,0 +1,375 @@
+---
+title: "Matérn SPDE Approximator"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+The `SPDEApproximator` represents unknown functions using a **Matérn SPDE penalty** derived from the stochastic partial differential equation (Lindgren et al. 2011):
+
+$$(\kappa^2 - \Delta)^{\alpha/2} \, \tau \, u(x) = \mathcal{W}(x)$$
+
+where $\mathcal{W}$ is Gaussian white noise. This gives a smoothing penalty equivalent to placing a **Matérn Gaussian process prior** on the unknown function, but computed via sparse finite element matrices rather than dense covariance matrices.
+
+The key parameters are:
+
+- **Smoothness** $\nu$: controls differentiability ($\nu = 0.5$: rough, $\nu = 1.5$: moderate, $\nu = 2.5$: smooth)
+- **Range** $\rho = \sqrt{8\nu}/\kappa$: the correlation length — how far apart inputs must be before function values become approximately uncorrelated
+
+Unlike the B-spline penalty ($\int f''(x)^2 \, dx$), the Matérn SPDE penalty has a **physically interpretable range parameter** and offers control over smoothness class.
+
+```{julia}
+using PartiallySpecifiedModels
+using OrdinaryDiffEq
+using Plots; default(fmt=:png)
+using Random
+Random.seed!(42)
+```
+
+## Logistic Growth with Unknown Growth Rate
+
+We fit a logistic growth model where the per-capita growth rate $r(N)$ is unknown:
+
+$$\frac{dN}{dt} = r(N) \cdot N$$
+
+The true growth rate is $r(N) = r_0(1 - N/K)$ with $r_0 = 0.5$ and $K = 10$.
+
+```{julia}
+r_true(N) = 0.5 * (1.0 - N / 10.0)
+
+function logistic!(du, u, p, t)
+    du[1] = p.r(u[1]) * u[1]
+end
+
+sol_true = solve(ODEProblem(logistic!, [0.5], (0.0, 15.0), (; r=r_true)),
+                 Tsit5(); saveat=0.5)
+t_data = collect(sol_true.t)
+data_clean = [sol_true.u[i][1] for i in 1:length(t_data)]
+data_noisy = max.(data_clean .+ 0.15 * randn(length(t_data)), 0.01)
+data_matrix = reshape(data_noisy, :, 1);
+```
+
+### Observed Data
+
+```{julia}
+#| echo: false
+#| label: fig-data
+#| fig-cap: "Simulated logistic growth data"
+plot(t_data, data_noisy, seriestype=:scatter, ms=4, alpha=0.7,
+    label="Noisy data", color=:steelblue, xlabel="Time", ylabel="Population N")
+plot!(sol_true.t, data_clean, lw=2, ls=:dash, label="True trajectory", color=:black)
+title!("Logistic Growth Data")
+```
+
+## Fitting with SPDE vs B-Spline
+
+We compare the SPDE approximator (Matérn 3/2 penalty) against the standard B-spline approximator (integrated squared second derivative penalty), and a shape-constrained SPDE with a `:decreasing` constraint — since we know the per-capita growth rate must decrease with population size.
+
+```{julia}
+uf_spde = SPDEApproximator(:r, (0.5, 10.5), 10; nu=1.5, initial=x -> 0.3)
+uf_bspline = BSplineApproximator(:r, (0.5, 10.5), 10; initial=x -> 0.3)
+uf_scspde = ShapeConstrainedSPDEApproximator(:r, (0.5, 10.5), 10, :decreasing;
+    nu=1.5, initial=x -> 0.3)
+
+prob_spde = PSMProblem(logistic!, [0.5], (0.0, 15.0), [uf_spde];
+    data_times=t_data, data_values=data_matrix,
+    obs_to_state=[1], known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+
+prob_bspline = PSMProblem(logistic!, [0.5], (0.0, 15.0), [uf_bspline];
+    data_times=t_data, data_values=data_matrix,
+    obs_to_state=[1], known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+
+prob_scspde = PSMProblem(logistic!, [0.5], (0.0, 15.0), [uf_scspde];
+    data_times=t_data, data_values=data_matrix,
+    obs_to_state=[1], known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+
+sol_spde = solve(prob_spde, LAML(maxiters=100, verbose=false));
+sol_bspline = solve(prob_bspline, LAML(maxiters=100, verbose=false));
+sol_scspde = solve(prob_scspde, LAML(maxiters=100, verbose=false));
+```
+
+### Recovered Growth Rate
+
+```{julia}
+#| echo: false
+#| label: fig-growth-rate
+#| fig-cap: "Recovered r(N): SPDE vs B-spline vs constrained SPDE"
+N_grid = range(0.5, 10.5, length=200)
+r_spde = sol_spde.unknown_functions[:r]
+r_bspline = sol_bspline.unknown_functions[:r]
+r_scspde = sol_scspde.unknown_functions[:r]
+
+plot(N_grid, r_true.(N_grid), lw=3, label="True r(N)", color=:black, ls=:dash,
+    xlabel="Population N", ylabel="r(N)", title="Growth Rate Recovery")
+plot!(N_grid, [r_spde(N) for N in N_grid], lw=2, label="SPDE (ν=1.5)", color=:teal)
+plot!(N_grid, [r_bspline(N) for N in N_grid], lw=2, label="B-spline", color=:coral)
+plot!(N_grid, [r_scspde(N) for N in N_grid], lw=2, label="SPDE+decreasing", color=:purple)
+```
+
+### Fitted Trajectories
+
+```{julia}
+#| echo: false
+#| label: fig-trajectories
+#| fig-cap: "Fitted trajectories: SPDE vs B-spline vs constrained SPDE"
+p1 = plot(t_data, data_noisy, seriestype=:scatter, ms=3, alpha=0.5,
+    label="Data", color=:gray60, xlabel="Time", ylabel="N", title="SPDE (ν=1.5)")
+plot!(p1, t_data, sol_spde.fitted_values[:, 1], lw=2, label="Fitted", color=:teal)
+plot!(p1, sol_true.t, data_clean, lw=1.5, ls=:dash, label="True", color=:black)
+
+p2 = plot(t_data, data_noisy, seriestype=:scatter, ms=3, alpha=0.5,
+    label="Data", color=:gray60, xlabel="Time", ylabel="N", title="B-spline")
+plot!(p2, t_data, sol_bspline.fitted_values[:, 1], lw=2, label="Fitted", color=:coral)
+plot!(p2, sol_true.t, data_clean, lw=1.5, ls=:dash, label="True", color=:black)
+
+p3 = plot(t_data, data_noisy, seriestype=:scatter, ms=3, alpha=0.5,
+    label="Data", color=:gray60, xlabel="Time", ylabel="N", title="SPDE+decreasing")
+plot!(p3, t_data, sol_scspde.fitted_values[:, 1], lw=2, label="Fitted", color=:purple)
+plot!(p3, sol_true.t, data_clean, lw=1.5, ls=:dash, label="True", color=:black)
+
+plot(p1, p2, p3, layout=(1, 3), size=(1100, 350), link=:y)
+```
+
+## Effect of Smoothness Parameter $\nu$
+
+The Matérn smoothness $\nu$ controls the differentiability of the fitted function. Lower values give rougher fits; higher values give smoother fits.
+
+```{julia}
+sols = Dict{Float64, Any}()
+for ν in [0.5, 1.5, 2.5]
+    uf = SPDEApproximator(:r, (0.5, 10.5), 10; nu=ν, initial=x -> 0.3)
+    prob = PSMProblem(logistic!, [0.5], (0.0, 15.0), [uf];
+        data_times=t_data, data_values=data_matrix,
+        obs_to_state=[1], known_params=NamedTuple(),
+        likelihood=PartiallySpecifiedModels.Gaussian())
+    sols[ν] = solve(prob, LAML(maxiters=100, verbose=false))
+end
+```
+
+```{julia}
+#| echo: false
+#| label: fig-smoothness
+#| fig-cap: "Effect of Matérn smoothness ν on recovered growth rate"
+colors = Dict(0.5 => :orange, 1.5 => :teal, 2.5 => :purple)
+labels = Dict(0.5 => "ν=0.5 (rough)", 1.5 => "ν=1.5 (moderate)", 2.5 => "ν=2.5 (smooth)")
+
+plot(N_grid, r_true.(N_grid), lw=3, label="True r(N)", color=:black, ls=:dash,
+    xlabel="Population N", ylabel="r(N)", title="Effect of Smoothness ν")
+for ν in [0.5, 1.5, 2.5]
+    r_eval = sols[ν].unknown_functions[:r]
+    plot!(N_grid, [r_eval(N) for N in N_grid], lw=2, label=labels[ν], color=colors[ν])
+end
+plot!()
+```
+
+## Effect of Range Parameter $\rho$
+
+The range parameter $\rho$ controls the correlation length. Smaller ranges allow more local variation; larger ranges enforce longer-range smoothness.
+
+```{julia}
+domain_width = 10.0
+sols_range = Dict{Float64, Any}()
+for ρ in [1.0, 3.0, 8.0]
+    uf = SPDEApproximator(:r, (0.5, 10.5), 10; nu=1.5, range_param=ρ, initial=x -> 0.3)
+    prob = PSMProblem(logistic!, [0.5], (0.0, 15.0), [uf];
+        data_times=t_data, data_values=data_matrix,
+        obs_to_state=[1], known_params=NamedTuple(),
+        likelihood=PartiallySpecifiedModels.Gaussian())
+    sols_range[ρ] = solve(prob, LAML(maxiters=100, verbose=false))
+end
+```
+
+```{julia}
+#| echo: false
+#| label: fig-range
+#| fig-cap: "Effect of range parameter ρ on recovered growth rate"
+colors_r = Dict(1.0 => :orange, 3.0 => :teal, 8.0 => :purple)
+labels_r = Dict(1.0 => "ρ=1 (short range)", 3.0 => "ρ=3 (medium)", 8.0 => "ρ=8 (long range)")
+
+plot(N_grid, r_true.(N_grid), lw=3, label="True r(N)", color=:black, ls=:dash,
+    xlabel="Population N", ylabel="r(N)", title="Effect of Range ρ")
+for ρ in [1.0, 3.0, 8.0]
+    r_eval = sols_range[ρ].unknown_functions[:r]
+    plot!(N_grid, [r_eval(N) for N in N_grid], lw=2, label=labels_r[ρ], color=colors_r[ρ])
+end
+plot!()
+```
+
+## Lotka-Volterra with SPDE
+
+The SPDE approximator also works in multi-variable systems. Here we fit a Rosenzweig-MacArthur predator-prey model with an unknown Holling Type II functional response. The parameters are chosen to produce sustained limit-cycle oscillations (H*/K ≈ 0.25, past the Hopf bifurcation), so that prey density H spans a range from ~0.5 to ~2.6 — providing good coverage for identifying g(H).
+
+```{julia}
+g_true(H) = H / (1.0 + 0.5 * H)
+
+function lv!(du, u, p, t)
+    H, P = u
+    du[1] = 0.8 * H * (1.0 - H / 5.0) - p.g(H) * P
+    du[2] = 0.9 * p.g(H) * P - 0.7 * P
+end
+
+sol_lv = solve(ODEProblem(lv!, [2.5, 1.0], (0.0, 60.0), (; g=g_true)),
+               Tsit5(); saveat=0.5)
+t_lv = collect(sol_lv.t)
+data_H = [sol_lv.u[i][1] + 0.05 * randn() for i in 1:length(t_lv)]
+data_P = [sol_lv.u[i][2] + 0.05 * randn() for i in 1:length(t_lv)]
+data_lv = hcat(max.(data_H, 0.01), max.(data_P, 0.01));
+```
+
+```{julia}
+uf_lv_spde = SPDEApproximator(:g, (0.3, 3.0), 10; nu=1.5, initial=x -> 0.3)
+uf_lv_bspline = BSplineApproximator(:g, (0.3, 3.0), 10; initial=x -> 0.3)
+uf_lv_scspde = ShapeConstrainedSPDEApproximator(:g, (0.3, 3.0), 10, :inc_concave;
+    nu=1.5, initial=x -> 0.2)
+
+prob_lv_spde = PSMProblem(lv!, [2.5, 1.0], (0.0, 60.0), [uf_lv_spde];
+    data_times=t_lv, data_values=Float64.(data_lv),
+    obs_to_state=[1, 2], known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+
+prob_lv_bspline = PSMProblem(lv!, [2.5, 1.0], (0.0, 60.0), [uf_lv_bspline];
+    data_times=t_lv, data_values=Float64.(data_lv),
+    obs_to_state=[1, 2], known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+
+prob_lv_scspde = PSMProblem(lv!, [2.5, 1.0], (0.0, 60.0), [uf_lv_scspde];
+    data_times=t_lv, data_values=Float64.(data_lv),
+    obs_to_state=[1, 2], known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+
+sol_lv_spde = solve(prob_lv_spde, LAML(maxiters=100, verbose=false));
+sol_lv_bspline = solve(prob_lv_bspline, LAML(maxiters=100, verbose=false, initial_lambda=0.1));
+sol_lv_scspde = solve(prob_lv_scspde, LAML(maxiters=100, verbose=false));
+```
+
+### Functional Response Recovery
+
+```{julia}
+#| echo: false
+#| label: fig-lv-functional-response
+#| fig-cap: "Recovered functional response g(H): SPDE vs B-spline vs constrained SPDE"
+H_grid = range(0.3, 3.0, length=200)
+g_spde = sol_lv_spde.unknown_functions[:g]
+g_bspline = sol_lv_bspline.unknown_functions[:g]
+g_scspde = sol_lv_scspde.unknown_functions[:g]
+
+plot(H_grid, g_true.(H_grid), lw=3, label="True g(H)", color=:black, ls=:dash,
+    xlabel="Prey density H", ylabel="g(H)", title="Functional Response")
+plot!(H_grid, [g_spde(H) for H in H_grid], lw=2, label="SPDE (ν=1.5)", color=:teal)
+plot!(H_grid, [g_bspline(H) for H in H_grid], lw=2, label="B-spline", color=:coral)
+plot!(H_grid, [g_scspde(H) for H in H_grid], lw=2, label="SPDE+inc_concave", color=:purple)
+```
+
+### Fitted Trajectories
+
+```{julia}
+#| echo: false
+#| label: fig-lv-trajectories
+#| fig-cap: "Fitted Lotka-Volterra trajectories"
+p_h = plot(t_lv, data_lv[:, 1], seriestype=:scatter, ms=2, alpha=0.4,
+    label="Data", color=:gray60, xlabel="Time", ylabel="Prey (H)")
+plot!(p_h, t_lv, sol_lv_spde.fitted_values[:, 1], lw=2, label="SPDE", color=:teal)
+plot!(p_h, t_lv, sol_lv_bspline.fitted_values[:, 1], lw=2, label="B-spline", color=:coral)
+plot!(p_h, t_lv, sol_lv_scspde.fitted_values[:, 1], lw=2, label="SPDE+constr.", color=:purple)
+title!(p_h, "Prey")
+
+p_p = plot(t_lv, data_lv[:, 2], seriestype=:scatter, ms=2, alpha=0.4,
+    label="Data", color=:gray60, xlabel="Time", ylabel="Predator (P)")
+plot!(p_p, t_lv, sol_lv_spde.fitted_values[:, 2], lw=2, label="SPDE", color=:teal)
+plot!(p_p, t_lv, sol_lv_bspline.fitted_values[:, 2], lw=2, label="B-spline", color=:coral)
+plot!(p_p, t_lv, sol_lv_scspde.fitted_values[:, 2], lw=2, label="SPDE+constr.", color=:purple)
+title!(p_p, "Predator")
+
+plot(p_h, p_p, layout=(2, 1), size=(700, 500))
+```
+
+## Comparison Table
+
+```{julia}
+#| echo: false
+#| output: asis
+using Printf
+
+println("| Approximator | Data Loss | Objective |")
+println("|:---|---:|---:|")
+@printf("| SPDE (ν=1.5) | %.4f | %.4f |\n", sol_spde.data_loss, sol_spde.objective)
+@printf("| SPDE+decreasing | %.4f | %.4f |\n", sol_scspde.data_loss, sol_scspde.objective)
+@printf("| B-spline | %.4f | %.4f |\n", sol_bspline.data_loss, sol_bspline.objective)
+for ν in [0.5, 1.5, 2.5]
+    @printf("| SPDE (ν=%.1f) | %.4f | %.4f |\n", ν, sols[ν].data_loss, sols[ν].objective)
+end
+@printf("| SPDE+inc_concave (LV) | %.4f | %.4f |\n", sol_lv_scspde.data_loss, sol_lv_scspde.objective)
+@printf("| SPDE unconstrained (LV) | %.4f | %.4f |\n", sol_lv_spde.data_loss, sol_lv_spde.objective)
+@printf("| B-spline (LV) | %.4f | %.4f |\n", sol_lv_bspline.data_loss, sol_lv_bspline.objective)
+```
+
+## Profile Range Optimization
+
+The SPDE range parameter $\rho$ controls the Matérn correlation length and is fixed by default at $1/3$ of the domain width. We can optimize it via profile GCV — running LAML for a grid of $\rho$ values and selecting the one with the lowest Generalized Cross-Validation score.
+
+```{julia}
+result = optimize_spde_range(prob_spde, LAML(maxiters=100, verbose=false);
+    n_grid=8, verbose=true)
+```
+
+```{julia}
+#| echo: false
+#| label: fig-profile-range
+#| fig-cap: "Profile GCV over SPDE range parameter"
+using Plots
+
+valid = result.gcv_scores .< Inf
+plot(result.range_values[valid], result.gcv_scores[valid],
+    xlabel="Range parameter ρ", ylabel="GCV score",
+    lw=2, marker=:circle, ms=4, legend=false, title="Profile GCV")
+vline!([result.range_param], ls=:dash, color=:red, lw=1.5,
+    label="Best ρ=$(round(result.range_param, digits=2))")
+```
+
+The optimized range parameter is $\rho = `{julia} round(result.range_param, digits=2)`$ with data loss `{julia} round(result.solution.data_loss, digits=4)` (vs `{julia} round(sol_spde.data_loss, digits=4)` for the default range).
+
+## When to Use SPDEApproximator
+
+**Advantages over B-splines:**
+
+- **Interpretable range parameter**: $\rho$ has a direct physical meaning as the correlation length
+- **Smoothness control**: $\nu$ controls differentiability separately from the smoothing parameter
+- **Principled prior**: Equivalent to a Matérn GP prior, connecting to spatial statistics theory
+- **Sparse FEM penalty**: Tridiagonal matrices in 1D — efficient for large basis dimensions
+
+**Shape-constrained variant (`ShapeConstrainedSPDEApproximator`):**
+
+When the unknown function has known qualitative properties (e.g., a Holling Type II response is increasing), use `ShapeConstrainedSPDEApproximator` with the appropriate constraint (`:increasing`, `:decreasing`, etc.). Simpler constraints like `:increasing` or `:decreasing` tend to converge more reliably than combined constraints like `:inc_concave`, which can trap the optimizer. Constraints are enforced at mesh nodes; cubic spline interpolation between nodes may slightly overshoot. Use more basis functions to reduce this.
+
+**When to prefer B-splines:**
+
+- Simpler setup (no range or smoothness parameters to choose)
+- Well-established theory for penalized regression splines (Wood 2017)
+- Slightly lower computational overhead for small problems
+
+**Parameter guidelines:**
+
+- `nu=1.5` (Matérn 3/2) is a good default — once differentiable, matching most ecological responses
+- Set `range_param` to roughly the scale over which you expect the unknown function to vary, or use `optimize_spde_range` to select it automatically via profile GCV
+- The overall smoothing strength (τ²) is still estimated automatically via LAML/GCV
+
+## References
+
+- Lindgren, F., Rue, H. & Lindström, J. (2011). An explicit link between Gaussian fields and Gaussian Markov random fields: the stochastic partial differential equation approach. *JRSS-B*, 73(4), 423–498.
+- Miller, D.L., Glennie, R. & Seaton, A.E. (2020). Understanding the stochastic partial differential equation approach to smoothing. *JABES*.
+- Wood, S.N. (2017). *Generalized Additive Models: An Introduction with R*. 2nd ed. CRC Press.

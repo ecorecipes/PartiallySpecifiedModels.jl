@@ -258,6 +258,12 @@ function agm_loss(prob::PSMProblem, beta::AbstractVector,
             elseif approx isa COMONetApproximator
                 S = penalty_matrix(approx)
                 total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
+            elseif approx isa SPDEApproximator
+                S = penalty_matrix(approx)
+                total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
+            elseif approx isa ShapeConstrainedSPDEApproximator
+                S = penalty_matrix(approx)
+                total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
             end
         end
     end
@@ -511,6 +517,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
             uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
         elseif approx isa COMONetApproximator
             uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
+        elseif approx isa SPDEApproximator
+            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
+        elseif approx isa ShapeConstrainedSPDEApproximator
+            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
         end
     end
 

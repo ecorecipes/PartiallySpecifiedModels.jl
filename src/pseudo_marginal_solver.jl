@@ -8,8 +8,9 @@
 # log-likelihood is computed via a Kalman-filter-based marginal likelihood
 # (Tronarp et al 2022), which accounts for ODE discretization uncertainty.
 #
-# Uses the same LogDensityProblems.jl + AdvancedHMC.jl infrastructure as
-# MCMCSolver.
+# NOTE: The Kalman-filter-based fenrir_loglik uses in-place Float64 arrays
+# that are not ForwardDiff-compatible. We use finite-difference gradients
+# instead, following the same approach as RodeoSolver.
 #
 # Reference: Chkrebtii et al (2016), Tronarp et al (2022)
 
@@ -28,6 +29,7 @@ struct PseudoMarginalLogDensity
     param_offsets::Vector{Int}
     n_params::Int
     sigma::Vector{Float64}
+    obs_var::Float64
 end
 
 function LogDensityProblems.capabilities(::Type{PseudoMarginalLogDensity})
@@ -41,12 +43,12 @@ end
 function LogDensityProblems.logdensity(ld::PseudoMarginalLogDensity, theta)
     prob = ld.prob
     alg = ld.alg
-    T = eltype(theta)
+    T = Float64  # fenrir_loglik is not AD-compatible; always use Float64
 
-    beta = theta[1:ld.n_params]
+    beta = Float64.(theta[1:ld.n_params])
 
-    # Build parameter struct compatible with autodiff (Dual numbers)
-    p = build_autodiff_param_struct(prob, beta)
+    # Build parameter struct
+    p = build_param_struct(prob, beta)
 
     function ode_rhs!(du, u, p_unused, t)
         prob.dynamics!(du, u, p, t)
@@ -59,29 +61,77 @@ function LogDensityProblems.logdensity(ld::PseudoMarginalLogDensity, theta)
         loglik_fn(ode_rhs!, nothing, Float64.(prob.u0), prob.tspan,
                   alg.n_steps, alg.n_deriv, ld.sigma,
                   Float64.(prob.data_values), Float64.(prob.data_times),
-                  prob.obs_to_state, alg.obs_var;
+                  prob.obs_to_state, ld.obs_var;
                   interrogate=:kramer)
     catch e
-        return T(-1e20)
+        return -1e20
     end
 
     if !isfinite(ll)
-        return T(-1e20)
+        return -1e20
     end
 
     # Log-prior: smoothing penalty from penalty matrices
-    lp = zero(T)
+    lp = 0.0
     for (idx, S) in enumerate(ld.penalty_matrices)
         np = size(S, 1)
         off = ld.param_offsets[idx]
         beta_k = beta[off+1:off+np]
-        lp -= T(0.5) / T(alg.prior_scale) * dot(beta_k, S * beta_k)
+        lp -= 0.5 / alg.prior_scale * dot(beta_k, S * beta_k)
     end
 
     # Broad Gaussian prior on all parameters
-    lp -= T(0.5) * sum(beta .^ 2) / T(100.0 * alg.prior_scale)
+    lp -= 0.5 * sum(beta .^ 2) / (100.0 * alg.prior_scale)
 
-    return T(ll) + lp
+    return ll + lp
+end
+
+# ─── Finite-difference gradient wrapper ──────────────────────────
+#
+# fenrir_loglik uses in-place Float64 Kalman filter arrays that are not
+# compatible with ForwardDiff. We compute gradients via central finite
+# differences, following the same approach as RodeoSolver.
+
+struct PseudoMarginalFDGradient
+    ld::PseudoMarginalLogDensity
+    fd_eps::Float64
+end
+
+function LogDensityProblems.capabilities(::Type{PseudoMarginalFDGradient})
+    LogDensityProblems.LogDensityOrder{1}()
+end
+
+function LogDensityProblems.dimension(g::PseudoMarginalFDGradient)
+    g.ld.n_params
+end
+
+function LogDensityProblems.logdensity(g::PseudoMarginalFDGradient, theta)
+    LogDensityProblems.logdensity(g.ld, theta)
+end
+
+function LogDensityProblems.logdensity_and_gradient(g::PseudoMarginalFDGradient, theta)
+    ld = g.ld
+    ε = g.fd_eps
+    D = length(theta)
+    f0 = LogDensityProblems.logdensity(ld, theta)
+    grad = zeros(D)
+    for i in 1:D
+        θp = copy(theta); θp[i] += ε
+        θm = copy(theta); θm[i] -= ε
+        fp = LogDensityProblems.logdensity(ld, θp)
+        fm = LogDensityProblems.logdensity(ld, θm)
+        if isfinite(fp) && isfinite(fm)
+            grad[i] = (fp - fm) / (2ε)
+        else
+            grad[i] = 0.0
+        end
+    end
+    # Clip gradient norm to prevent extreme proposals
+    gnorm = norm(grad)
+    if gnorm > 1e4
+        grad .*= 1e4 / gnorm
+    end
+    return f0, grad
 end
 
 # ─── Solve method ────────────────────────────────────────────────
@@ -117,15 +167,19 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
     n_obs = size(prob.data_values, 2)
     n_t = length(prob.data_times)
 
-    # Initialize parameters
-    beta0 = Float64[]
-    for approx in prob.approximators
-        if approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            append!(beta0, init_mlp_params(spec, rng))
-        else
-            append!(beta0, initial_params(approx))
+    # Initialize parameters (use provided initial_params or default)
+    if alg.initial_params !== nothing
+        beta0 = copy(alg.initial_params)
+    else
+        beta0 = Float64[]
+        for approx in prob.approximators
+            if approx isa NeuralApproximator
+                spec = mlp_spec_from_lux(approx.model)
+                rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
+                append!(beta0, init_mlp_params(spec, rng))
+            else
+                append!(beta0, initial_params(approx))
+            end
         end
     end
     n_beta = length(beta0)
@@ -148,6 +202,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
         alg.sigma
     end
 
+    # Observation variance: auto-scale from data variance if not provided
+    obs_var = if alg.obs_var === nothing
+        total_var = 0.0
+        for j in 1:n_obs
+            total_var += var(prob.data_values[:, j])
+        end
+        max(total_var / n_obs * 0.01, 1e-4)
+    else
+        alg.obs_var
+    end
+
     # Build penalty matrices (reuse helper from mcmc_solver.jl)
     penalties, offsets, _ = _build_penalty_info(prob)
 
@@ -156,29 +221,33 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
                 "inner=$(alg.inner_method), n_steps=$(alg.n_steps), " *
                 "n_deriv=$(alg.n_deriv)")
         println("  σ (IBM scale): $(round.(sigma, sigdigits=3))")
-        println("  obs_var: $(alg.obs_var)")
-        println("  $(alg.n_warmup) warmup + $(alg.n_samples) samples")
+        println("  obs_var: $(round(obs_var, sigdigits=3))")
+        println("  prior_scale: $(alg.prior_scale)")
+        init_label = alg.initial_params !== nothing ? "user-provided" : "default"
+        println("  init: $init_label, $(alg.n_warmup) warmup + $(alg.n_samples) samples")
     end
 
     # Build log-density problem
-    ld = PseudoMarginalLogDensity(prob, alg, penalties, offsets, n_beta, sigma)
+    ld = PseudoMarginalLogDensity(prob, alg, penalties, offsets, n_beta, sigma, obs_var)
 
     D = LogDensityProblems.dimension(ld)
     theta0 = copy(beta0)
 
-    # Wrap with ForwardDiff AD
-    ld_ad = ADgradient(Val(:ForwardDiff), ld)
+    # Use finite-difference gradient wrapper (fenrir_loglik is not AD-compatible)
+    ld_fd = PseudoMarginalFDGradient(ld, 1e-5)
 
     # Set up NUTS sampler
     nuts = NUTS(alg.target_accept)
 
     if verbose
-        println("  Running NUTS sampler...")
+        init_ll = LogDensityProblems.logdensity(ld, theta0)
+        println("  Initial log-density: $(round(init_ll, sigdigits=5))")
+        println("  Running NUTS sampler (finite-difference gradients)...")
     end
 
     # Run sampler using AbstractMCMC interface
     chain_raw = AbstractMCMC.sample(
-        ld_ad, nuts, alg.n_warmup + alg.n_samples;
+        ld_fd, nuts, alg.n_warmup + alg.n_samples;
         initial_params=theta0,
         progress=verbose, verbose=false)
 
@@ -247,6 +316,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
             uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
         elseif approx isa COMONetApproximator
             uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
+        elseif approx isa SPDEApproximator
+            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
+        elseif approx isa ShapeConstrainedSPDEApproximator
+            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
         elseif approx isa NeuralApproximator
             spec = mlp_spec_from_lux(approx.model)
             lo = approx.domain === nothing ? nothing : approx.domain[1]

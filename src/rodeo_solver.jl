@@ -110,6 +110,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
             S = spline_penalty_matrix(knots_x)
             push!(smooth_mats, S)
             push!(smooth_offsets, offset_acc)
+        elseif approx isa SPDEApproximator
+            S = penalty_matrix(approx)
+            if S !== nothing
+                push!(smooth_mats, S)
+                push!(smooth_offsets, offset_acc)
+            end
+        elseif approx isa ShapeConstrainedSPDEApproximator
+            S = penalty_matrix(approx)
+            if S !== nothing
+                push!(smooth_mats, S)
+                push!(smooth_offsets, offset_acc)
+            end
         end
         offset_acc += np
     end
@@ -271,6 +283,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
             uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
         elseif approx isa COMONetApproximator
             uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
+        elseif approx isa SPDEApproximator
+            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
+        elseif approx isa ShapeConstrainedSPDEApproximator
+            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
         end
     end
 

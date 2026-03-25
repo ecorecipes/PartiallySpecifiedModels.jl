@@ -140,6 +140,14 @@ function build_autodiff_param_struct(prob::PSMProblem, beta)
         elseif approx isa COMONetApproximator
             evaluator = build_comonet_evaluator(approx, params_k)
             push!(uf_entries, approx.name => evaluator)
+        elseif approx isa SPDEApproximator
+            evaluator = build_spde_evaluator(approx.mesh_points, params_k)
+            push!(uf_entries, approx.name => evaluator)
+        elseif approx isa ShapeConstrainedSPDEApproximator
+            ν_vals = [PartiallySpecifiedModels._softplus(g) for g in params_k]
+            mesh_values = approx.Sigma * ν_vals
+            evaluator = build_spde_evaluator(approx.mesh_points, mesh_values)
+            push!(uf_entries, approx.name => evaluator)
         end
     end
 
@@ -517,6 +525,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
             uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
         elseif approx isa COMONetApproximator
             uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
+        elseif approx isa SPDEApproximator
+            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
+        elseif approx isa ShapeConstrainedSPDEApproximator
+            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
         end
     end
 

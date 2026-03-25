@@ -106,6 +106,12 @@ function build_param_struct(prob::PSMProblem, beta::AbstractVector)
         elseif approx isa COMONetApproximator
             evaluator = build_comonet_evaluator(approx, params_k)
             push!(uf_entries, approx.name => evaluator)
+        elseif approx isa SPDEApproximator
+            evaluator = build_spde_evaluator(approx.mesh_points, params_k)
+            push!(uf_entries, approx.name => evaluator)
+        elseif approx isa ShapeConstrainedSPDEApproximator
+            evaluator = build_constrained_spde_evaluator(approx, params_k)
+            push!(uf_entries, approx.name => evaluator)
         end
     end
 
@@ -721,6 +727,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
         elseif approx isa COMONetApproximator
             uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
+        elseif approx isa SPDEApproximator
+            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
+        elseif approx isa ShapeConstrainedSPDEApproximator
+            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
         end
     end
 

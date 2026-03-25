@@ -9,36 +9,41 @@ PSMSolution
 
 ## Approximator Types
 
+Detailed documentation for each approximator is on the [Approximators](approximators.md) page.
+
 ```@docs
 AbstractApproximator
-BSplineApproximator
-ShapeConstrainedBSplineApproximator
-NeuralApproximator
-GPApproximator
-COMONetApproximator
 ```
+
+- [`BSplineApproximator`](@ref)
+- [`ShapeConstrainedBSplineApproximator`](@ref)
+- [`SPDEApproximator`](@ref)
+- [`ShapeConstrainedSPDEApproximator`](@ref)
+- [`NeuralApproximator`](@ref)
+- [`GPApproximator`](@ref)
+- [`COMONetApproximator`](@ref)
 
 ## Solver Types
 
-```@docs
-LAML
-GCVSolver
-CollocationLAML
-GradientMatching
-TwoStageSolver
-BNGSolver
-AdaptiveGradientMatching
-AdamSolver
-MultipleShootingSolver
-DerivativeFreeSolver
-RodeoSolver
-DaltonSolver
-MCMCSolver
-MagiSolver
-PseudoMarginalSolver
-VariationalSolver
-ABCSolver
-```
+Detailed documentation for each solver is on the [Solvers](solvers.md) page.
+
+- [`LAML`](@ref)
+- [`GCVSolver`](@ref)
+- [`CollocationLAML`](@ref)
+- [`GradientMatching`](@ref)
+- [`TwoStageSolver`](@ref)
+- [`BNGSolver`](@ref)
+- [`AdaptiveGradientMatching`](@ref)
+- [`AdamSolver`](@ref)
+- [`MultipleShootingSolver`](@ref)
+- [`DerivativeFreeSolver`](@ref)
+- [`RodeoSolver`](@ref)
+- [`DaltonSolver`](@ref)
+- [`MCMCSolver`](@ref)
+- [`MagiSolver`](@ref)
+- [`PseudoMarginalSolver`](@ref)
+- [`VariationalSolver`](@ref)
+- [`ABCSolver`](@ref)
 
 ## Likelihood Types
 
@@ -65,6 +70,8 @@ nparams
 initial_params
 penalty_matrix
 spline_penalty_matrix
+optimize_spde_range
+with_range_param
 ```
 
 ## Diagnostics

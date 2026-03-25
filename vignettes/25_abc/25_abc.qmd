@@ -43,7 +43,7 @@ function decay!(du, u, p, t)
 end
 
 sol_true = solve(ODEProblem(decay!, [5.0], (0.0, 10.0), (; f=x -> 0.5*x)),
-                 Tsit5(); saveat=1.0)
+                 Tsit5(); saveat=0.5)
 t_data = collect(sol_true.t)
 data_vals = [sol_true.u[i][1] + 0.1 * randn() for i in 1:length(t_data)]
 data_matrix = reshape(max.(data_vals, 0.01), :, 1)
@@ -52,13 +52,13 @@ data_matrix = reshape(max.(data_vals, 0.01), :, 1)
 ## ABC-SMC Fit
 
 ```{julia}
-uf = BSplineApproximator(:f, (0.0, 6.0), 6)
+uf = BSplineApproximator(:f, (0.01, 5.5), 6)
 
 prob = PSMProblem(decay!, [5.0], (0.0, 10.0), [uf];
     data_times=t_data, data_values=Float64.(data_matrix),
     obs_to_state=[1], known_params=NamedTuple())
 
-sol_abc = solve(prob, ABCSolver(n_particles=200, n_generations=8,
+sol_abc = solve(prob, ABCSolver(n_particles=500, n_generations=10,
                                  prior_scale=2.0, verbose=false))
 sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
 ```
@@ -69,7 +69,7 @@ sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
 f_abc = sol_abc.unknown_functions[:f]
 f_laml = sol_laml.unknown_functions[:f]
 f_true(u) = 0.5 * u
-u_grid = range(0.0, 6.0, length=100)
+u_grid = range(0.01, 5.5, length=100)
 
 p1 = plot(u_grid, f_true.(u_grid), label="True f(u)", lw=2, color=:black,
           xlabel="u", ylabel="f(u)", title="ABC vs LAML: Decay Rate")
@@ -77,6 +77,8 @@ plot!(p1, u_grid, [f_abc(x) for x in u_grid], label="ABC-SMC", lw=2)
 plot!(p1, u_grid, [f_laml(x) for x in u_grid], label="LAML", lw=2, ls=:dash)
 p1
 ```
+
+Note that ABC-SMC may underestimate f(u) at high u values (near u=5). This is expected: in exponential decay, the trajectory passes through high u values very quickly (only at the start), providing little data to constrain f there. ABC-SMC, being a sampling method with finite particles, struggles to pin down regions of the parameter space that weakly influence the trajectory. LAML, using gradient-based optimization and automatic smoothing, extrapolates more effectively from the data-rich low-u region.
 
 ### Trajectory Fit
 

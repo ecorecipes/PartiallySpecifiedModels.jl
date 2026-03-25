@@ -169,6 +169,163 @@ function build_gp_evaluator(a::GPApproximator, params::AbstractVector)
     end
 end
 
+# ─── SPDE (Matérn) FEM matrices and evaluation ────────────────────
+
+"""
+    spde_fem_matrices(mesh_points)
+
+Compute the 1D finite element matrices for the Matérn SPDE on a mesh.
+
+Returns `(C, G)` where:
+- `C` is the lumped (diagonal) mass matrix: `C[i,i] = ∫ φᵢ dx`
+- `G` is the stiffness matrix: `G[i,j] = ∫ φᵢ' φⱼ' dx`
+
+For piecewise linear hat functions on a mesh with spacings `h`.
+"""
+function spde_fem_matrices(mesh::AbstractVector)
+    n = length(mesh)
+    h = diff(mesh)
+
+    # Lumped mass matrix (diagonal)
+    C = zeros(n, n)
+    C[1, 1] = h[1] / 2.0
+    for i in 2:n-1
+        C[i, i] = (h[i-1] + h[i]) / 2.0
+    end
+    C[n, n] = h[n-1] / 2.0
+
+    # Stiffness matrix (tridiagonal)
+    G = zeros(n, n)
+    G[1, 1] = 1.0 / h[1]
+    G[1, 2] = -1.0 / h[1]
+    for i in 2:n-1
+        G[i, i-1] = -1.0 / h[i-1]
+        G[i, i]   = 1.0 / h[i-1] + 1.0 / h[i]
+        G[i, i+1] = -1.0 / h[i]
+    end
+    G[n, n-1] = -1.0 / h[n-1]
+    G[n, n]   = 1.0 / h[n-1]
+
+    return C, G
+end
+
+"""
+    spde_penalty_matrix(a::SPDEApproximator)
+
+Compute the Matérn SPDE penalty matrix.
+
+For ν = 0.5 (α = 1): `P = κ² C + G`
+For ν = 1.5 (α = 2): `P = κ⁴ C + 2κ² G + G₂` where `G₂ = G C⁻¹ G`
+For ν = 2.5 (α = 3): `P = κ⁶ C + 3κ⁴ G + 3κ² G₂ + G₃`
+  where `G₂ = G C⁻¹ G` and `G₃ = G C⁻¹ G₂`
+"""
+function spde_penalty_matrix(a::SPDEApproximator)
+    C, G = spde_fem_matrices(a.mesh_points)
+    κ = a.kappa
+
+    # C is diagonal (lumped mass), so C⁻¹ is just element-wise reciprocal
+    C_inv_diag = 1.0 ./ diag(C)
+    C_inv = Diagonal(C_inv_diag)
+
+    if a.nu ≈ 0.5
+        # α = 1: P = κ² C + G
+        return κ^2 * C + G
+    elseif a.nu ≈ 1.5
+        # α = 2: P = κ⁴ C + 2κ² G + G₂
+        G2 = G * C_inv * G
+        return κ^4 * C + 2.0 * κ^2 * G + G2
+    elseif a.nu ≈ 2.5
+        # α = 3: P = κ⁶ C + 3κ⁴ G + 3κ² G₂ + G₃
+        G2 = G * C_inv * G
+        G3 = G * C_inv * G2
+        return κ^6 * C + 3.0 * κ^4 * G + 3.0 * κ^2 * G2 + G3
+    else
+        error("Unsupported nu=$(a.nu), must be 0.5, 1.5, or 2.5")
+    end
+end
+
+"""
+    penalty_matrix(a::SPDEApproximator)
+
+Return the Matérn SPDE penalty matrix.
+"""
+function penalty_matrix(a::SPDEApproximator)
+    spde_penalty_matrix(a)
+end
+
+"""
+    build_spde_evaluator(mesh_x, params)
+
+Build a callable cubic spline evaluator for the SPDE mesh node values.
+Uses cubic spline interpolation for smooth ODE-compatible evaluation.
+"""
+function build_spde_evaluator(mesh_x::AbstractVector, params::AbstractVector)
+    CubicSpline(params, mesh_x; extrapolation=ExtrapolationType.Extension)
+end
+
+# ─── Shape-constrained SPDE: evaluator and penalty ────────────────
+
+"""
+    build_constrained_spde_evaluator(a::ShapeConstrainedSPDEApproximator, gamma)
+
+Build a callable evaluator from unconstrained parameters γ.
+
+Applies the SCOP-spline reparameterization: mesh node values are computed
+as `β = Σ * softplus(γ)`, then interpolated with a cubic spline.
+Shape constraints are enforced at mesh nodes; the cubic spline interpolation
+between nodes may slightly overshoot.
+"""
+function build_constrained_spde_evaluator(a::ShapeConstrainedSPDEApproximator,
+                                          gamma::AbstractVector)
+    ν = [_softplus(g) for g in gamma]
+    mesh_values = a.Sigma * ν
+    CubicSpline(mesh_values, a.mesh_points; extrapolation=ExtrapolationType.Extension)
+end
+
+"""
+    gamma_to_mesh_values(a::ShapeConstrainedSPDEApproximator, gamma)
+
+Transform unconstrained parameters γ to mesh node values β = Σ * softplus(γ).
+"""
+function gamma_to_mesh_values(a::ShapeConstrainedSPDEApproximator,
+                              gamma::AbstractVector)
+    ν = [_softplus(g) for g in gamma]
+    a.Sigma * ν
+end
+
+"""
+    penalty_matrix(a::ShapeConstrainedSPDEApproximator)
+
+Compute the Matérn SPDE penalty matrix for the constrained approximator.
+The penalty operates in the unconstrained parameter space (γ), so it is
+transformed as P_γ = Σᵀ P_β Σ where P_β is the SPDE FEM penalty.
+"""
+function penalty_matrix(a::ShapeConstrainedSPDEApproximator)
+    # Build the SPDE penalty in mesh-value space
+    C, G = spde_fem_matrices(a.mesh_points)
+    κ = a.kappa
+    C_inv = Diagonal(1.0 ./ diag(C))
+
+    P_beta = if a.nu ≈ 0.5
+        κ^2 * C + G
+    elseif a.nu ≈ 1.5
+        G2 = G * C_inv * G
+        κ^4 * C + 2.0 * κ^2 * G + G2
+    elseif a.nu ≈ 2.5
+        G2 = G * C_inv * G
+        G3 = G * C_inv * G2
+        κ^6 * C + 3.0 * κ^4 * G + 3.0 * κ^2 * G2 + G3
+    else
+        error("Unsupported nu=$(a.nu)")
+    end
+
+    # Transform penalty to unconstrained parameter space: Σᵀ P Σ
+    Sig = a.Sigma
+    P_gamma = Matrix(Sig' * P_beta * Sig)
+    # Symmetrize to eliminate floating-point asymmetry
+    (P_gamma + P_gamma') / 2
+end
+
 # ─── Shape-constrained B-spline: Sigma matrices and evaluation ────
 
 """Softplus function: log(1 + exp(x)), numerically stable."""
@@ -479,18 +636,22 @@ function _comonet_unpack(a::COMONetApproximator, theta::AbstractVector{T}) where
 end
 
 """
-    _comonet_forward(layers, x_norm, constraint)
+    _comonet_forward(layers, x_norm, constraint, activation)
 
 Forward pass through COMONet. `x_norm` is normalized to [0,1].
-All hidden layers use exp(W̃) for positive weights + ReLU.
+All hidden layers use exp(W̃) for positive weights + activation function.
 Output layer uses exp(W̃) + identity (no activation).
+
+Activations:
+- `:relu`: ReLU / min(0,·) — piecewise linear (C⁰), exact theoretical match
+- `:softplus`: softplus / -softplus(-·) — smooth (C∞), same guarantees
 
 Constraint-specific input/output transforms:
 - `:decreasing` / `:dec_*`: negate input
-- `:concave` / `:inc_concave` / `:dec_concave`: negate output of convex net
+- `:concave` / `:inc_concave` / `:dec_concave`: concave-branch activation
 - `:positive`: apply exp to output
 """
-function _comonet_forward(layers, x_norm, constraint::Symbol)
+function _comonet_forward(layers, x_norm, constraint::Symbol, activation::Symbol=:relu)
     # Input transform for decreasing constraints
     x = if constraint in (:decreasing, :dec_convex, :dec_concave)
         -x_norm
@@ -509,10 +670,20 @@ function _comonet_forward(layers, x_norm, constraint::Symbol)
         z = W_pos * h .+ b
         if i < n_layers
             # Hidden layer activation
-            if use_concave
-                h = [-max(zero(eltype(z)), -zi) for zi in z]
-            else
-                h = [max(zero(eltype(z)), zi) for zi in z]
+            if activation == :softplus
+                if use_concave
+                    # -softplus(-z): smooth, concave, non-decreasing, ≤ 0
+                    h = [-_softplus(-zi) for zi in z]
+                else
+                    # softplus(z): smooth, convex, non-decreasing, ≥ 0
+                    h = [_softplus(zi) for zi in z]
+                end
+            else  # :relu (default)
+                if use_concave
+                    h = [-max(zero(eltype(z)), -zi) for zi in z]
+                else
+                    h = [max(zero(eltype(z)), zi) for zi in z]
+                end
             end
         else
             # Output layer: linear (no activation)
@@ -540,10 +711,11 @@ function build_comonet_evaluator(a::COMONetApproximator, theta::AbstractVector)
     layers = _comonet_unpack(a, theta)
     lo, hi = a.domain
     span = hi - lo
+    act = a.activation
 
     function evaluator(x)
         x_norm = (x - lo) / span  # normalize to ~[0, 1]
-        return _comonet_forward(layers, x_norm, a.constraint)
+        return _comonet_forward(layers, x_norm, a.constraint, act)
     end
     return evaluator
 end
