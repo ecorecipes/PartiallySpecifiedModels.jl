@@ -30,6 +30,7 @@ using PartiallySpecifiedModels
 using OrdinaryDiffEq
 using MCMCChains
 using Statistics
+using Plots; default(fmt=:png)
 using Random
 Random.seed!(42)
 ```
@@ -51,9 +52,24 @@ data_N = [sol_true.u[i][1] + 0.1 * randn() for i in 1:length(t_data)]
 data_matrix = reshape(max.(data_N, 0.01), :, 1)
 ```
 
+### Observed Data
+
+```{julia}
+#| echo: false
+#| label: fig-data
+#| fig-cap: "Simulated logistic growth data"
+plot(t_data, data_N, seriestype=:scatter, ms=5, alpha=0.7,
+    label="Observed", color=:steelblue, xlabel="Time", ylabel="Population N")
+plot!(sol_true.t, [sol_true.u[i][1] for i in 1:length(sol_true.t)],
+    label="True", color=:black, lw=2, ls=:dash)
+title!("Logistic Growth Data")
+```
+
 ### Fit with PseudoMarginalSolver
 
-We use the fenrir inner method with a coarse grid (50 steps) for speed.
+We use the fenrir inner method for the probabilistic likelihood. Since the
+Kalman-filter-based likelihood requires good initialization, we first run
+LAML to get a point estimate and use it to warm-start the sampler.
 
 ```{julia}
 uf = BSplineApproximator(:r, (0.0, 12.0), 6)
@@ -63,66 +79,109 @@ prob = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf];
     obs_to_state=[1], known_params=NamedTuple(),
     likelihood=PartiallySpecifiedModels.Gaussian())
 
+# LAML first for initialization
+sol_laml = solve(prob, LAML(maxiters=50, verbose=false));
+laml_init = Float64.(collect(sol_laml.parameters))
+
 sol_pm = solve(prob, PseudoMarginalSolver(
     n_samples=200, n_warmup=100,
-    n_steps=50, n_deriv=3,
+    n_steps=200, n_deriv=3,
     inner_method=:fenrir,
-    verbose=false))
-```
-
-### Posterior Summary
-
-The result contains an `MCMCChains.Chains` object with posterior samples.
-
-```{julia}
-chain = sol_pm.convergence
-println("Chain dimensions: $(size(chain, 1)) samples × $(size(chain, 2)) parameters")
-println()
-println("Parameter summary (first 3 coefficients):")
-param_names = names(chain, :parameters)
-for i in 1:min(3, length(param_names))
-    vals = vec(Array(chain[:, param_names[i], :]))
-    println("  $(param_names[i]): mean=$(round(mean(vals), digits=3)), " *
-            "std=$(round(std(vals), digits=3))")
-end
-```
-
-### Recovered Function with Uncertainty
-
-We can evaluate the unknown function at each posterior sample to get credible intervals.
-
-```{julia}
-#| echo: false
-r_fitted = sol_pm.unknown_functions[:r]
-println("Posterior mean r(N) vs true:")
-println("  N    |  True   |  Mean")
-println("  -----|---------|--------")
-for N in [1.0, 3.0, 5.0, 7.0, 9.0]
-    println("  $(lpad(N, 4)) | $(lpad(round(r_true(N), digits=3), 7)) " *
-            "| $(lpad(round(r_fitted(N), digits=3), 7))")
-end
+    initial_params=laml_init,
+    verbose=false));
 ```
 
 ### Compare with MCMCSolver
 
 ```{julia}
 sol_mcmc = solve(prob, MCMCSolver(
-    n_samples=200, n_warmup=100, verbose=false))
-
-chain_mcmc = sol_mcmc.convergence
+    n_samples=200, n_warmup=100, verbose=false));
 ```
+
+### Posterior Function with Credible Intervals
 
 ```{julia}
 #| echo: false
-r_mcmc = sol_mcmc.unknown_functions[:r]
-println("Comparison of posterior means:")
-println("  N    |  True   | PseudoM |  MCMC")
-println("  -----|---------|---------|--------")
-for N in [1.0, 3.0, 5.0, 7.0, 9.0]
-    println("  $(lpad(N, 4)) | $(lpad(round(r_true(N), digits=3), 7)) " *
-            "| $(lpad(round(r_fitted(N), digits=3), 7)) " *
-            "| $(lpad(round(r_mcmc(N), digits=3), 7))")
+#| label: fig-posterior-function
+#| fig-cap: "Posterior r(N) with 95% credible intervals from both Bayesian solvers"
+chain_pm = sol_pm.convergence
+chain_mcmc = sol_mcmc.convergence
+
+N_grid = range(0.5, 10.0, length=150)
+param_names_pm = names(chain_pm, :parameters)
+param_names_mcmc = names(chain_mcmc, :parameters)
+
+# Knot x-positions for the BSpline (6 knots over domain [0, 12])
+knots_x = collect(range(0.0, 12.0, length=6))
+
+# Helper: evaluate r(N) across N_grid for each posterior sample
+function eval_posterior_curves(chain, pnames, knots_x, N_grid)
+    # Get only the r[...] parameter columns
+    r_names = filter(n -> startswith(string(n), "r["), pnames)
+    samples = hcat([vec(Array(chain[:, n, :])) for n in r_names]...)
+    curves = zeros(size(samples, 1), length(N_grid))
+    for i in 1:size(samples, 1)
+        evaluator = PartiallySpecifiedModels.build_bspline_evaluator(knots_x, samples[i, :])
+        for (j, N) in enumerate(N_grid)
+            curves[i, j] = evaluator(N)
+        end
+    end
+    return curves
 end
+
+r_pm_curves = eval_posterior_curves(chain_pm, param_names_pm, knots_x, N_grid)
+r_mcmc_curves = eval_posterior_curves(chain_mcmc, param_names_mcmc, knots_x, N_grid)
+
+# Compute quantiles
+pm_med = [quantile(r_pm_curves[:, j], 0.5) for j in 1:length(N_grid)]
+pm_lo = [quantile(r_pm_curves[:, j], 0.025) for j in 1:length(N_grid)]
+pm_hi = [quantile(r_pm_curves[:, j], 0.975) for j in 1:length(N_grid)]
+
+mcmc_med = [quantile(r_mcmc_curves[:, j], 0.5) for j in 1:length(N_grid)]
+mcmc_lo = [quantile(r_mcmc_curves[:, j], 0.025) for j in 1:length(N_grid)]
+mcmc_hi = [quantile(r_mcmc_curves[:, j], 0.975) for j in 1:length(N_grid)]
+
+p = plot(N_grid, r_true.(N_grid), lw=3, label="True r(N)", color=:black, ls=:dash,
+    xlabel="Population N", ylabel="r(N)", title="Posterior Unknown Function")
+plot!(p, N_grid, pm_med, ribbon=(pm_med .- pm_lo, pm_hi .- pm_med),
+    fillalpha=0.2, lw=2, label="Pseudo-Marginal", color=:teal)
+plot!(p, N_grid, mcmc_med, ribbon=(mcmc_med .- mcmc_lo, mcmc_hi .- mcmc_med),
+    fillalpha=0.2, lw=2, label="MCMC", color=:coral)
+p
+```
+
+### Trace Plots
+
+```{julia}
+#| echo: false
+#| label: fig-traces
+#| fig-cap: "Trace plots for first three spline coefficients"
+n_show = min(3, length(param_names_pm))
+plts = []
+for i in 1:n_show
+    p = plot(vec(Array(chain_pm[:, param_names_pm[i], :])),
+        label="Pseudo-Marginal", color=:teal, alpha=0.7,
+        xlabel="Iteration", ylabel=string(param_names_pm[i]))
+    plot!(p, vec(Array(chain_mcmc[:, param_names_mcmc[i], :])),
+        label="MCMC", color=:coral, alpha=0.7)
+    push!(plts, p)
+end
+plot(plts..., layout=(n_show, 1), size=(700, 200 * n_show))
+```
+
+### Fitted Trajectories
+
+```{julia}
+#| echo: false
+#| label: fig-trajectories
+#| fig-cap: "Fitted population trajectories"
+plot(t_data, data_N, seriestype=:scatter, ms=5, alpha=0.5,
+    label="Data", color=:gray60, xlabel="Time", ylabel="Population N",
+    title="Fitted Trajectories")
+plot!(t_data, sol_pm.fitted_values[:, 1], lw=2, label="Pseudo-Marginal", color=:teal)
+plot!(t_data, sol_mcmc.fitted_values[:, 1], lw=2, label="MCMC", color=:coral)
+plot!(sol_true.t, [sol_true.u[i][1] for i in 1:length(sol_true.t)],
+    lw=2, ls=:dash, label="True", color=:black)
 ```
 
 ## Bayesian Solver Comparison

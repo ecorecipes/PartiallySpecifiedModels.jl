@@ -69,9 +69,19 @@ function NeuralApproximator(name::Union{Symbol,String}, model;
     NeuralApproximator(Symbol(name), model, penalty_weight, d, rng_seed)
 end
 
+"""
+    nparams(approx::AbstractApproximator) -> Int
+
+Return the number of free parameters for the given approximator.
+"""
 nparams(a::BSplineApproximator) = a.nknots
 nparams(a::NeuralApproximator) = Lux.parameterlength(a.model)
 
+"""
+    initial_params(approx::AbstractApproximator) -> Vector{Float64}
+
+Return a vector of initial parameter values for the given approximator.
+"""
 function initial_params(a::BSplineApproximator)
     xs = range(a.domain[1], a.domain[2], length=a.nknots)
     Float64[a.initial_func(x) for x in xs]
@@ -180,6 +190,193 @@ nparams(a::GPApproximator) = a.n_inducing
 
 function initial_params(a::GPApproximator)
     Float64[a.initial_func(x) for x in a.inducing_points]
+end
+
+# ─── SPDE (Matérn) approximator ───────────────────────────────────
+
+"""
+Matérn SPDE approximator using finite element basis functions.
+
+Represents an unknown function as a linear combination of piecewise linear
+hat functions on a 1D mesh, with a Matérn SPDE penalty derived from the
+stochastic PDE `(κ² - Δ)^(α/2) τu = W` (Lindgren et al. 2011).
+
+The penalty matrix is `κ⁴C + 2κ²G + G₂` where C is the FEM mass matrix,
+G is the stiffness matrix, and G₂ = G C⁻¹ G approximates the biharmonic
+operator. The overall smoothing parameter τ² is estimated via LAML/GCV.
+
+The correlation range `ρ = √(8ν)/κ` controls the effective smoothing scale,
+providing a physically interpretable alternative to the abstract smoothing
+parameter of B-spline penalties.
+
+# Arguments
+- `name`: symbol for the unknown function
+- `domain`: `(lo, hi)` range of the input variable
+- `n_basis`: number of mesh nodes (basis functions)
+- `nu`: Matérn smoothness parameter (default: 1.5, i.e. Matérn 3/2)
+  - 0.5: rough (exponential covariance, penalty = κ²C + G)
+  - 1.5: moderate smoothness (Matérn 3/2, penalty = κ⁴C + 2κ²G + G₂)
+  - 2.5: smooth (Matérn 5/2, penalty uses G₃ — requires α=3)
+- `range_param`: correlation range ρ (default: 1/3 of domain width).
+  Larger values → smoother functions; κ = √(8ν)/ρ.
+- `initial`: optional initial function `x -> y`
+
+# References
+- Lindgren, Rue & Lindström (2011). An explicit link between Gaussian fields
+  and Gaussian Markov random fields. JRSS-B 73(4):423–498.
+- Miller, Glennie & Seaton (2020). Understanding the SPDE approach to smoothing.
+  JABES.
+"""
+struct SPDEApproximator <: AbstractApproximator
+    name::Symbol
+    domain::Tuple{Float64, Float64}
+    n_basis::Int
+    nu::Float64
+    kappa::Float64
+    range_param::Float64
+    mesh_points::Vector{Float64}
+    initial_func::Function
+end
+
+"""Supported Matérn smoothness values for SPDE approximator."""
+const SPDE_SMOOTHNESS = (0.5, 1.5, 2.5)
+
+function SPDEApproximator(name::Union{Symbol,String},
+                          domain::Tuple{<:Real, <:Real},
+                          n_basis::Int;
+                          nu::Real=1.5,
+                          range_param::Union{Nothing, Real}=nothing,
+                          initial=nothing)
+    name_s = Symbol(name)
+    d = (Float64(domain[1]), Float64(domain[2]))
+    ν = Float64(nu)
+    ν ∈ SPDE_SMOOTHNESS || error("nu must be one of $SPDE_SMOOTHNESS, got $ν")
+    n_basis >= 3 || error("n_basis must be ≥ 3, got $n_basis")
+
+    # Default range: 1/3 of domain width
+    ρ = if range_param === nothing
+        (d[2] - d[1]) / 3.0
+    else
+        Float64(range_param)
+    end
+    ρ > 0 || error("range_param must be positive, got $ρ")
+    κ = sqrt(8.0 * ν) / ρ
+
+    mesh = collect(range(d[1], d[2], length=n_basis))
+
+    init_func = if initial === nothing
+        x -> 0.0
+    elseif initial isa Function
+        initial
+    else
+        x -> Float64(initial)
+    end
+
+    SPDEApproximator(name_s, d, n_basis, ν, κ, ρ, mesh, init_func)
+end
+
+nparams(a::SPDEApproximator) = a.n_basis
+
+function initial_params(a::SPDEApproximator)
+    Float64[a.initial_func(x) for x in a.mesh_points]
+end
+
+# ─── Shape-constrained SPDE approximator ──────────────────────────
+
+"""
+    ShapeConstrainedSPDEApproximator(name, domain, n_basis, constraint;
+                                     nu=1.5, range_param=nothing, initial=nothing)
+
+SPDE (Matérn) approximator with a shape constraint enforced via the SCOP-spline
+reparameterization of Pya & Wood (2015).
+
+Combines the Matérn SPDE penalty (interpretable range and smoothness parameters)
+with shape constraints (monotonicity, positivity, convexity, etc.). Parameters
+are stored in unconstrained space (γ). During evaluation, mesh node values are
+computed as `β = Σ * softplus(γ)` where Σ is a constraint matrix, then
+interpolated with a cubic spline.
+
+**Note:** Shape constraints are enforced at mesh nodes. The cubic spline
+interpolation between nodes can slightly overshoot, so constraints hold
+approximately (not exactly) between nodes. Use more basis functions to
+reduce overshoot.
+
+# Arguments
+- `name`: symbol for the unknown function
+- `domain`: `(lo, hi)` range of the input variable
+- `n_basis`: number of mesh nodes (≥ 4)
+- `constraint`: one of `SHAPE_CONSTRAINTS`
+- `nu`: Matérn smoothness parameter (0.5, 1.5, or 2.5)
+- `range_param`: correlation length ρ (default: 1/3 of domain width)
+- `initial`: optional initial function `x -> y` or constant
+
+# Example
+```julia
+# Monotone increasing functional response (Holling-type)
+approx = ShapeConstrainedSPDEApproximator(:g, (0.0, 5.0), 10, :inc_concave;
+    nu=1.5, initial=x -> 0.1*x)
+```
+"""
+struct ShapeConstrainedSPDEApproximator <: AbstractApproximator
+    name::Symbol
+    domain::Tuple{Float64, Float64}
+    n_basis::Int
+    nu::Float64
+    kappa::Float64
+    range_param::Float64
+    mesh_points::Vector{Float64}
+    constraint::Symbol
+    Sigma::Matrix{Float64}
+    initial_func::Function
+end
+
+function ShapeConstrainedSPDEApproximator(name::Union{Symbol,String},
+                                          domain::Tuple{<:Real, <:Real},
+                                          n_basis::Int,
+                                          constraint::Symbol;
+                                          nu::Real=1.5,
+                                          range_param::Union{Nothing, Real}=nothing,
+                                          initial=nothing)
+    name_s = Symbol(name)
+    d = (Float64(domain[1]), Float64(domain[2]))
+    ν = Float64(nu)
+    ν ∈ SPDE_SMOOTHNESS || error("nu must be one of $SPDE_SMOOTHNESS, got $ν")
+    n_basis >= 4 || error("n_basis must be ≥ 4 for shape-constrained SPDE, got $n_basis")
+    constraint in SHAPE_CONSTRAINTS || throw(ArgumentError(
+        "Unknown constraint :$constraint. Must be one of $SHAPE_CONSTRAINTS"))
+
+    ρ = if range_param === nothing
+        (d[2] - d[1]) / 3.0
+    else
+        Float64(range_param)
+    end
+    ρ > 0 || error("range_param must be positive, got $ρ")
+    κ = sqrt(8.0 * ν) / ρ
+
+    mesh = collect(range(d[1], d[2], length=n_basis))
+    Sig = _build_sigma_matrix(constraint, n_basis)
+
+    init_func = if initial === nothing
+        x -> 0.0
+    elseif initial isa Function
+        initial
+    else
+        x -> Float64(initial)
+    end
+
+    ShapeConstrainedSPDEApproximator(name_s, d, n_basis, ν, κ, ρ, mesh,
+                                     constraint, Sig, init_func)
+end
+
+function nparams(a::ShapeConstrainedSPDEApproximator)
+    a.constraint in _ZERO_ENDPOINT_CONSTRAINTS ? a.n_basis - 1 : a.n_basis
+end
+
+function initial_params(a::ShapeConstrainedSPDEApproximator)
+    beta_target = Float64[a.initial_func(x) for x in a.mesh_points]
+    ν = a.Sigma \ beta_target
+    ν = max.(ν, 0.01)
+    return [v > 20.0 ? v : log(exp(v) - 1.0) for v in ν]
 end
 
 # ─── Shape-constrained B-spline approximator ──────────────────────
@@ -343,7 +540,7 @@ const COMONET_CONSTRAINTS = (
 
 """
     COMONetApproximator(name, domain, hidden_sizes, constraint;
-                        penalty_weight=0.01)
+                        penalty_weight=0.01, activation=:relu)
 
 Shape-constrained neural network approximator using the COMONet architecture.
 Constraints are enforced architecturally via `exp(W)` weights and specialized
@@ -359,11 +556,24 @@ functions while still guaranteeing shape constraints.
 - `hidden_sizes`: tuple of hidden layer widths, e.g. `(16, 16)`
 - `constraint`: one of `COMONET_CONSTRAINTS`
 - `penalty_weight`: L2 regularization on unconstrained weights (for LAML)
+- `activation`: `:relu` (default, piecewise linear C⁰) or `:softplus` (smooth C∞).
+  Both preserve monotonicity/convexity guarantees. Use `:softplus` when smooth
+  derivatives are needed.
 
 # Example
 ```julia
 uf = COMONetApproximator(:f, (0.0, 100.0), (16, 16), :increasing)
+uf_smooth = COMONetApproximator(:f, (0.0, 100.0), (16, 16), :increasing;
+                                activation=:softplus)
 ```
+"""
+const COMONET_ACTIVATIONS = (:relu, :softplus)
+
+"""
+    COMONetApproximator <: AbstractApproximator
+
+Shape-constrained neural network approximator (COMONet architecture).
+See [`COMONetApproximator(name, domain, hidden_sizes, constraint)`](@ref) for constructor docs.
 """
 struct COMONetApproximator <: AbstractApproximator
     name::Symbol
@@ -371,20 +581,24 @@ struct COMONetApproximator <: AbstractApproximator
     hidden_sizes::Tuple{Vararg{Int}}
     constraint::Symbol
     penalty_weight::Float64
+    activation::Symbol
 end
 
 function COMONetApproximator(name::Union{Symbol,String},
                              domain::Tuple{<:Real, <:Real},
                              hidden_sizes::Union{Tuple{Vararg{Int}}, Vector{Int}},
                              constraint::Symbol;
-                             penalty_weight::Float64=0.01)
+                             penalty_weight::Float64=0.01,
+                             activation::Symbol=:relu)
     name = Symbol(name)
     d = (Float64(domain[1]), Float64(domain[2]))
     constraint in COMONET_CONSTRAINTS || throw(ArgumentError(
         "Unknown constraint :$constraint. Must be one of $COMONET_CONSTRAINTS"))
+    activation in COMONET_ACTIVATIONS || throw(ArgumentError(
+        "Unknown activation :$activation. Must be one of $COMONET_ACTIVATIONS"))
     hs = hidden_sizes isa Vector ? Tuple(hidden_sizes...) : hidden_sizes
     length(hs) >= 1 || throw(ArgumentError("Need at least 1 hidden layer"))
-    COMONetApproximator(name, d, hs, constraint, penalty_weight)
+    COMONetApproximator(name, d, hs, constraint, penalty_weight, activation)
 end
 
 function nparams(a::COMONetApproximator)
@@ -919,21 +1133,25 @@ struct PseudoMarginalSolver
     n_steps::Int
     n_deriv::Int
     sigma::Union{Nothing, Vector{Float64}}
-    obs_var::Float64
+    obs_var::Union{Nothing, Float64}
     target_accept::Float64
     prior_scale::Float64
     inner_method::Symbol
+    initial_params::Union{Nothing, Vector{Float64}}
     verbose::Bool
 end
 
 PseudoMarginalSolver(; n_samples::Int=1000, n_warmup::Int=500,
                        n_steps::Int=200, n_deriv::Int=3,
                        sigma::Union{Nothing, Vector{Float64}}=nothing,
-                       obs_var::Float64=0.01,
+                       obs_var::Union{Nothing, Float64}=nothing,
                        target_accept::Float64=0.8, prior_scale::Float64=1.0,
-                       inner_method::Symbol=:fenrir, verbose::Bool=false) =
+                       inner_method::Symbol=:fenrir,
+                       initial_params::Union{Nothing, Vector{Float64}}=nothing,
+                       verbose::Bool=false) =
     PseudoMarginalSolver(n_samples, n_warmup, n_steps, n_deriv, sigma, obs_var,
-                          target_accept, prior_scale, inner_method, verbose)
+                          target_accept, prior_scale, inner_method,
+                          initial_params, verbose)
 
 # ─── GCV solver (Wood 2001 / ddefit504) ────────────────────────────
 
@@ -1051,13 +1269,15 @@ struct VariationalSolver
     lr::Float64
     n_elbo_samples::Int
     prior_scale::Float64
+    obs_noise_var::Union{Nothing, Float64}
     verbose::Bool
 end
 
 VariationalSolver(; maxiters::Int=2000, lr::Float64=0.01,
                     n_elbo_samples::Int=10, prior_scale::Float64=1.0,
+                    obs_noise_var::Union{Nothing, Float64}=nothing,
                     verbose::Bool=false) =
-    VariationalSolver(maxiters, lr, n_elbo_samples, prior_scale, verbose)
+    VariationalSolver(maxiters, lr, n_elbo_samples, prior_scale, obs_noise_var, verbose)
 
 # ─── ABC solver (Approximate Bayesian Computation) ─────────────────
 

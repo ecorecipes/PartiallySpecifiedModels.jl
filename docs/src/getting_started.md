@@ -16,15 +16,16 @@ The basic workflow is:
 
 ## Setup
 
-```julia
+```@example getting_started
 using PartiallySpecifiedModels
 using PartiallySpecifiedModels: solve
 using OrdinaryDiffEq
 using Random
 Random.seed!(42)
+nothing # hide
 ```
 
-## A Simple Example: Exponential Growth
+## A Simple Example: Logistic Growth
 
 Consider a population ``N(t)`` growing according to
 
@@ -38,7 +39,7 @@ where ``r(N)`` is the per-capita growth rate as a function of population size. I
 
 We generate data from a logistic model with ``r_0 = 0.5`` and ``K = 10``, observed with Gaussian noise:
 
-```julia
+```@example getting_started
 r0, K, N0 = 0.5, 10.0, 0.5
 tspan = (0.0, 15.0)
 data_times = collect(0.0:0.5:15.0)
@@ -53,24 +54,26 @@ true_N = [true_sol(t)[1] for t in data_times]
 σ_noise = 0.3
 observed_N = true_N .+ σ_noise .* randn(length(data_times))
 observed_N = max.(observed_N, 0.01)  # ensure positive
+nothing # hide
 ```
 
 ### Define the PSM
 
 The ODE function receives a parameter struct `p` containing callable unknown functions and any known parameters. Here, `p.r` is the unknown growth rate function:
 
-```julia
+```@example getting_started
 function growth!(du, u, p, t)
     N = u[1]
     du[1] = p.r(N) * N
 end
+nothing # hide
 ```
 
 ### Choose an approximator
 
 We model ``r(N)`` with a **penalized cubic B-spline** having 8 evenly-spaced knots over the range of population sizes:
 
-```julia
+```@example getting_started
 approx_r = BSplineApproximator(:r, (0.0, 12.0), 8;
                                 initial = x -> 0.3)
 ```
@@ -84,7 +87,7 @@ This creates a spline approximator with:
 
 ### Build the problem
 
-```julia
+```@example getting_started
 prob = PSMProblem(
     growth!,                        # ODE dynamics
     [N0],                           # initial conditions
@@ -96,30 +99,37 @@ prob = PSMProblem(
     likelihood = Gaussian(),        # Gaussian errors
     solver = Tsit5()                # ODE solver
 )
+nothing # hide
 ```
 
 ### Solve with LAML
 
 The [`LAML`](@ref) algorithm estimates the spline coefficients and the smoothing parameter ``\lambda`` simultaneously. For Gaussian data, LAML is equivalent to **Restricted Maximum Likelihood (REML)**.
 
-```julia
+```@example getting_started
 sol = solve(prob, LAML())
+nothing # hide
 ```
 
 ### Inspect the solution
 
 The solution contains fitted values, estimated unknown functions, and diagnostics:
 
-```julia
-# Fitted trajectory
-sol.fitted_values[:, 1]
+```@example getting_started
+println("Data loss: ", round(sol.data_loss, digits=4))
+println("EDF: ", round(sol.edf, digits=2))
+println("Smoothing params: ", round.(sol.smoothing_params, digits=4))
+```
 
-# Estimated unknown function
+```@example getting_started
 r_fitted = sol.unknown_functions[:r]
 
-# Evaluate at new points
-N_grid = range(0.1, 11.0, length=100)
-r_estimated = [r_fitted(N) for N in N_grid]
+N_grid = [1.0, 3.0, 5.0, 7.0, 9.0]
+for N in N_grid
+    r_est = round(r_fitted(N), digits=3)
+    r_true = round(r0 * (1 - N / K), digits=3)
+    println("r($N): estimated=$r_est, true=$r_true")
+end
 ```
 
 The fitted ``r(N)`` should resemble the true logistic form ``r(N) = r_0(1 - N/K)`` — an approximately linear decline — without assuming any parametric form.
@@ -135,23 +145,11 @@ A [`PSMProblem`](@ref) combines:
 | `dynamics!`     | ODE right-hand side `f!(du, u, p, t)`                   |
 | `u0`            | Initial conditions (vector or function of `p`)          |
 | `tspan`         | Time interval `(t₀, t₁)`                                |
-| `approximators` | Vector of [`AbstractApproximator`] (splines, neural nets) |
+| `approximators` | Vector of [`AbstractApproximator`](@ref) (splines, neural nets) |
 | `data_times`    | Observation times                                       |
 | `data_values`   | Data matrix (n\_times × n\_obs)                         |
 | `likelihood`    | Error distribution ([`Gaussian`](@ref), [`Poisson`](@ref), etc.) |
 | `solver`        | ODE solver from OrdinaryDiffEq.jl                       |
-
-You can also construct a `PSMProblem` from SciML problem types:
-
-```julia
-# Continuous-time (ODEProblem)
-ode = ODEProblem(dynamics!, u0, tspan)
-prob = PSMProblem(ode, approximators; data_times=..., data_values=...)
-
-# Discrete-time (DiscreteProblem)
-disc = DiscreteProblem(map!, u0, tspan)
-prob = PSMProblem(disc, approximators; data_times=..., data_values=...)
-```
 
 ### Smoothing and EDF
 
@@ -172,4 +170,4 @@ The basic workflow is:
 4. Call `solve(prob, LAML())`
 5. Access `sol.unknown_functions[:name]` for the fitted functions
 
-See the [Approximators](@ref) and [Solvers](@ref) pages for detailed documentation of all available options.
+See the [Approximators](approximators.md) and [Solvers](solvers.md) pages for detailed documentation of all available options, or the [Vignettes](vignettes.md) page for 26 worked examples.

@@ -52,14 +52,14 @@ data_matrix = reshape(max.(data_vals, 0.01), :, 1)
 ## Nelder-Mead vs Adam Comparison
 
 ```{julia}
-uf = BSplineApproximator(:f, (0.0, 6.0), 8)
+uf = BSplineApproximator(:f, (0.01, 5.5), 8)
 
 prob = PSMProblem(decay!, [5.0], (0.0, 10.0), [uf];
     data_times=t_data, data_values=Float64.(data_matrix),
     obs_to_state=[1], known_params=NamedTuple())
 
 sol_nm = solve(prob, DerivativeFreeSolver(method=:nelder_mead, maxiters=5000, verbose=false))
-sol_adam = solve(prob, AdamSolver(lr=0.01, maxiters=2000, verbose=false))
+sol_adam = solve(prob, AdamSolver(lr=0.01, maxiters=3000, verbose=false))
 sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
 ```
 
@@ -69,7 +69,7 @@ sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
 f_nm = sol_nm.unknown_functions[:f]
 f_adam = sol_adam.unknown_functions[:f]
 f_laml = sol_laml.unknown_functions[:f]
-u_grid = range(0.0, 6.0, length=100)
+u_grid = range(0.01, 5.5, length=100)
 f_true(u) = 0.5 * u
 
 p1 = plot(u_grid, f_true.(u_grid), label="True f(u)", lw=2, color=:black,

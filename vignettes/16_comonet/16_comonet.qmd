@@ -28,6 +28,7 @@ This vignette compares both constrained approximators against an unconstrained B
 ```{julia}
 using PartiallySpecifiedModels
 using OrdinaryDiffEq
+using Plots
 using Random
 Random.seed!(123)
 ```
@@ -53,121 +54,238 @@ We simulate the logistic model and add Gaussian observation noise.
 
 ```{julia}
 true_p = (; r = r_true)
-sol_true = solve(ODEProblem(logistic!, [1.0], (0.0, 15.0), true_p),
+tspan = (0.0, 15.0)
+sol_true = solve(ODEProblem(logistic!, [1.0], tspan, true_p),
                  Tsit5(); saveat=0.5)
 
 t_data = collect(sol_true.t)
+N_true = [sol_true.u[i][1] for i in 1:length(sol_true.t)]
 noise = 0.1
-data_N = [sol_true.u[i][1] + noise * randn() for i in 1:length(sol_true.t)]
+data_N = N_true .+ noise .* randn(length(N_true))
 data_N = max.(data_N, 0.01)
 data_matrix = reshape(data_N, :, 1)
 ```
 
-### Approach 1: Unconstrained B-Spline (Baseline)
-
-A standard B-spline approximator with no shape constraints. This serves as a baseline to assess the benefit of enforcing monotonicity.
+### Plot the Data
 
 ```{julia}
-uf_bs = BSplineApproximator(:r, (0.0, 12.0), 10)
+#| label: fig-data
+#| fig-cap: "Observed data (circles) vs true trajectory (line)"
+t_fine = range(tspan..., length=200)
+sol_fine = solve(ODEProblem(logistic!, [1.0], tspan, true_p), Tsit5(); saveat=collect(t_fine))
+N_fine = [sol_fine.u[i][1] for i in 1:length(sol_fine.u)]
 
-prob_bs = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf_bs];
+p_data = plot(t_fine, N_fine, label="True trajectory", lw=2, color=:black,
+    xlabel="Time", ylabel="Population N",
+    title="Logistic Growth — Data (K=10)")
+scatter!(p_data, t_data, data_N, label="Observed (σ=$noise)", ms=4,
+    color=:steelblue, alpha=0.7)
+p_data
+```
+
+### Approach 1: Unconstrained B-Spline (Baseline)
+
+A standard B-spline approximator with no shape constraints, fitted via LAML for automatic smoothing.
+
+```{julia}
+uf_bs = BSplineApproximator(:r, (0.5, 10.5), 10)
+
+prob_bs = PSMProblem(logistic!, [1.0], tspan, [uf_bs];
     data_times=t_data, data_values=Float64.(data_matrix),
     obs_to_state=[1], known_params=NamedTuple(),
     likelihood=PartiallySpecifiedModels.Gaussian())
 
-sol_bs = solve(prob_bs, AdamSolver(lr=0.01, maxiters=2000))
+sol_bs = solve(prob_bs, LAML(maxiters=60, verbose=false))
 ```
 
 ### Approach 2: Shape-Constrained B-Spline (Decreasing)
 
-The SCBS reparameterizes B-spline coefficients via a Σ matrix and `softplus` transform to guarantee the function is decreasing everywhere.
+The SCBS reparameterizes B-spline coefficients via a Σ matrix and `softplus` transform to guarantee the function is decreasing everywhere. We use LAML for automatic smoothing parameter selection.
 
 ```{julia}
-uf_scbs = ShapeConstrainedBSplineApproximator(:r, (0.0, 12.0), 10, :decreasing)
+uf_scbs = ShapeConstrainedBSplineApproximator(:r, (0.5, 10.5), 10, :decreasing)
 
-prob_scbs = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf_scbs];
+prob_scbs = PSMProblem(logistic!, [1.0], tspan, [uf_scbs];
     data_times=t_data, data_values=Float64.(data_matrix),
     obs_to_state=[1], known_params=NamedTuple(),
     likelihood=PartiallySpecifiedModels.Gaussian())
 
-sol_scbs = solve(prob_scbs, AdamSolver(lr=0.01, maxiters=2000))
+sol_scbs = solve(prob_scbs, LAML(maxiters=60, verbose=false))
 ```
 
 ### Approach 3: COMONet (Decreasing)
 
-COMONet uses a neural network with positive weights (`exp(W̃)`) and ReLU activations. For a `:decreasing` constraint, the input is negated before the forward pass. A single hidden layer with 8 units gives 25 parameters.
+COMONet uses a neural network with positive weights (`exp(W̃)`) and monotone activations. For a `:decreasing` constraint, the input is negated before the forward pass. The default ReLU activation gives fast convergence; the optional `activation=:softplus` gives smoother (C∞) derivatives but is harder to optimize.
 
 ```{julia}
-uf_como = COMONetApproximator(:r, (0.0, 12.0), (8,), :decreasing;
+uf_como = COMONetApproximator(:r, (0.5, 10.5), (8,), :decreasing;
     penalty_weight=0.001)
 
-prob_como = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf_como];
+prob_como = PSMProblem(logistic!, [1.0], tspan, [uf_como];
     data_times=t_data, data_values=Float64.(data_matrix),
     obs_to_state=[1], known_params=NamedTuple(),
     likelihood=PartiallySpecifiedModels.Gaussian())
 
-sol_como = solve(prob_como, AdamSolver(lr=0.01, maxiters=2000))
+sol_como = solve(prob_como, AdamSolver(lr=0.01, maxiters=3000, verbose=false))
 ```
 
-### Compare Recovered Functions
+## Comparison of Recovered Functions
+
+### Unknown Function r(N)
 
 ```{julia}
-#| echo: false
 r_bs = sol_bs.unknown_functions[:r]
 r_scbs = sol_scbs.unknown_functions[:r]
 r_como = sol_como.unknown_functions[:r]
 
-println("Per-capita growth rate r(N) comparison:")
-println("  N    |  True   | BSpline |  SCBS   | COMONet")
-println("  -----|---------|---------|---------|--------")
-for N in [0.5, 2.0, 4.0, 6.0, 8.0, 10.0]
-    println("  $(lpad(N, 4)) | $(lpad(round(r_true(N), digits=3), 7)) " *
-            "| $(lpad(round(r_bs(N), digits=3), 7)) " *
-            "| $(lpad(round(r_scbs(N), digits=3), 7)) " *
-            "| $(lpad(round(r_como(N), digits=3), 7))")
-end
+N_range = range(0.5, 10.5, length=100)
+r_true_vals = [r_true(N) for N in N_range]
+r_bs_vals = [r_bs(N) for N in N_range]
+r_scbs_vals = [r_scbs(N) for N in N_range]
+r_como_vals = [r_como(N) for N in N_range]
 ```
+
+```{julia}
+#| label: fig-functions
+#| fig-cap: "Recovered r(N): unconstrained B-spline vs shape-constrained methods"
+N_data_max = maximum(data_N)
+p_fn = plot(collect(N_range), r_true_vals, color=:black, lw=2, ls=:dash, label="True r(N)",
+    xlabel="Population N", ylabel="r(N)",
+    title="Unknown Function r(N) — Comparison")
+plot!(p_fn, collect(N_range), r_bs_vals, color=:steelblue, lw=2, label="BSpline (unconstrained)")
+plot!(p_fn, collect(N_range), r_scbs_vals, color=:firebrick, lw=2, label="SCBS (decreasing)")
+plot!(p_fn, collect(N_range), r_como_vals, color=:purple, lw=2, label="COMONet (decreasing)")
+hline!(p_fn, [0.0], color=:grey, ls=:dot, label="")
+vspan!(p_fn, [N_data_max, 10.5], color=:orange, alpha=0.08, label="Beyond data range")
+p_fn
+```
+
+### Edge Saturation in COMONet
+
+Notice that COMONet **saturates at the domain edges**: it flattens out near N=0.5 (overestimates r) and cannot produce negative values near N=10 (where the true r crosses zero). This is an architectural property, not a fitting failure — with `:decreasing`, COMONet computes `g(-x)` where `g` uses ReLU/softplus activations with positive weights, which are bounded below by zero. The function therefore has a floor it cannot cross.
+
+SCBS and unconstrained B-splines do not have this limitation — they can represent functions that cross zero freely. This makes COMONet best suited for functional responses that are **strictly positive** (e.g., Holling-type responses) or where edge behavior is less important than guaranteed monotonicity in the interior.
 
 ### Verify Monotonicity
 
 Both constrained methods should produce strictly decreasing functions. The unconstrained B-spline may violate monotonicity.
 
 ```{julia}
-#| echo: false
-test_N = collect(range(0.5, 11.0, length=100))
+test_N = collect(range(0.5, 11.0, length=200))
+bs_test = [r_bs(N) for N in test_N]
+scbs_test = [r_scbs(N) for N in test_N]
+como_test = [r_como(N) for N in test_N]
 
-bs_vals = [r_bs(N) for N in test_N]
-scbs_vals = [r_scbs(N) for N in test_N]
-como_vals = [r_como(N) for N in test_N]
-
-bs_decreasing = all(diff(bs_vals) .<= 1e-10)
-scbs_decreasing = all(diff(scbs_vals) .<= 1e-10)
-como_decreasing = all(diff(como_vals) .<= 1e-10)
-
+bs_mono = all(diff(bs_test) .<= 1e-10)
+scbs_mono = all(diff(scbs_test) .<= 1e-10)
+como_mono = all(diff(como_test) .<= 1e-10)
 println("Monotonicity check (decreasing):")
-println("  BSpline (unconstrained): $bs_decreasing")
-println("  SCBS:    $scbs_decreasing")
-println("  COMONet: $como_decreasing")
+println("  BSpline (unconstrained): $bs_mono")
+println("  SCBS:    $scbs_mono")
+println("  COMONet: $como_mono")
+```
+
+### Derivative Visualization
+
+We can directly visualize whether the constraint is satisfied by plotting the numerical derivative:
+
+```{julia}
+#| label: fig-derivatives
+#| fig-cap: "Numerical derivative dr/dN — constrained methods stay non-positive"
+Δ = test_N[2] - test_N[1]
+dr_bs = diff(bs_test) ./ Δ
+dr_scbs = diff(scbs_test) ./ Δ
+dr_como = diff(como_test) ./ Δ
+N_mid = test_N[1:end-1] .+ Δ/2
+
+p_deriv = plot(N_mid, dr_bs, color=:steelblue, lw=2, label="BSpline",
+    xlabel="Population N", ylabel="dr/dN",
+    title="Derivative of r(N) — Monotonicity Check")
+plot!(p_deriv, N_mid, dr_scbs, color=:firebrick, lw=2, label="SCBS")
+plot!(p_deriv, N_mid, dr_como, color=:purple, lw=2, label="COMONet")
+hline!(p_deriv, [0.0], color=:black, lw=1, ls=:dash, label="Zero (must stay below)")
+hline!(p_deriv, [-0.05], color=:grey, lw=1, ls=:dot, label="True dr/dN = -0.05")
+p_deriv
 ```
 
 ### Fitted Trajectories
 
 ```{julia}
+#| label: fig-trajectories
+#| fig-cap: "Fitted population trajectories compared to data — one panel per method"
+t_pred = collect(range(tspan..., length=200))
+
+traj_bs = solve(ODEProblem(logistic!, [1.0], tspan, (; r = r_bs)), Tsit5();
+    saveat=t_pred, abstol=1e-8, reltol=1e-8)
+traj_scbs = solve(ODEProblem(logistic!, [1.0], tspan, (; r = r_scbs)), Tsit5();
+    saveat=t_pred, abstol=1e-8, reltol=1e-8)
+traj_como = solve(ODEProblem(logistic!, [1.0], tspan, (; r = r_como)), Tsit5();
+    saveat=t_pred, abstol=1e-8, reltol=1e-8)
+
+N_bs = [traj_bs.u[k][1] for k in 1:length(traj_bs.u)]
+N_scbs = [traj_scbs.u[k][1] for k in 1:length(traj_scbs.u)]
+N_como = [traj_como.u[k][1] for k in 1:length(traj_como.u)]
+
+p1 = plot(t_fine, N_fine, color=:black, lw=2, ls=:dash, label="True",
+    xlabel="Time", ylabel="Population N", title="BSpline (unconstrained)")
+scatter!(p1, t_data, data_N, ms=3, color=:grey, alpha=0.5, label="Data")
+plot!(p1, t_pred, N_bs, color=:steelblue, lw=2, label="Fitted")
+
+p2 = plot(t_fine, N_fine, color=:black, lw=2, ls=:dash, label="True",
+    xlabel="Time", ylabel="", title="SCBS (decreasing)")
+scatter!(p2, t_data, data_N, ms=3, color=:grey, alpha=0.5, label="Data")
+plot!(p2, t_pred, N_scbs, color=:firebrick, lw=2, label="Fitted")
+
+p3 = plot(t_fine, N_fine, color=:black, lw=2, ls=:dash, label="True",
+    xlabel="Time", ylabel="", title="COMONet (decreasing)")
+scatter!(p3, t_data, data_N, ms=3, color=:grey, alpha=0.5, label="Data")
+plot!(p3, t_pred, N_como, color=:purple, lw=2, label="Fitted")
+
+plot(p1, p2, p3, layout=(1, 3), size=(1000, 350), link=:y)
+```
+
+### Residuals
+
+```{julia}
+#| label: fig-residuals
+#| fig-cap: "Residuals (observed − fitted) for each method"
+res_bs = data_N .- sol_bs.fitted_values[:, 1]
+res_scbs = data_N .- sol_scbs.fitted_values[:, 1]
+res_como = data_N .- sol_como.fitted_values[:, 1]
+
+p_res = plot(layout=(1, 3), size=(900, 300), link=:y)
+scatter!(p_res, t_data, res_bs, subplot=1, ms=3, color=:steelblue, label="",
+    xlabel="Time", ylabel="Residual", title="BSpline")
+hline!(p_res, [0.0], subplot=1, color=:black, ls=:dash, label="")
+scatter!(p_res, t_data, res_scbs, subplot=2, ms=3, color=:firebrick, label="",
+    xlabel="Time", title="SCBS")
+hline!(p_res, [0.0], subplot=2, color=:black, ls=:dash, label="")
+scatter!(p_res, t_data, res_como, subplot=3, ms=3, color=:purple, label="",
+    xlabel="Time", title="COMONet")
+hline!(p_res, [0.0], subplot=3, color=:black, ls=:dash, label="")
+p_res
+```
+
+### Numerical Summary
+
+```{julia}
 #| echo: false
-println("Population trajectory comparison (selected time points):")
-println("  t    | Observed | BSpline |  SCBS   | COMONet")
-println("  -----|----------|---------|---------|--------")
-for (i, t) in enumerate(t_data)
-    if i == 1 || (i-1) % 5 == 0 || i == length(t_data)
-        bs_val = sol_bs.fitted_values[i, 1]
-        scbs_val = sol_scbs.fitted_values[i, 1]
-        como_val = sol_como.fitted_values[i, 1]
-        println("  $(lpad(round(t, digits=1), 4)) | $(lpad(round(data_N[i], digits=2), 8)) " *
-                "| $(lpad(round(bs_val, digits=2), 7)) " *
-                "| $(lpad(round(scbs_val, digits=2), 7)) " *
-                "| $(lpad(round(como_val, digits=2), 7))")
-    end
+using Printf
+println("Per-capita growth rate r(N) comparison:")
+println("  N    |  True   | BSpline |  SCBS   | COMONet")
+println("  -----|---------|---------|---------|--------")
+for N in [0.5, 2.0, 4.0, 6.0, 8.0, 10.0]
+    @printf("  %4.1f | %7.3f | %7.3f | %7.3f | %7.3f\n",
+        N, r_true(N), r_bs(N), r_scbs(N), r_como(N))
 end
+
+println("\nData fit (RMSE):")
+rmse_bs = sqrt(sum(res_bs.^2) / length(res_bs))
+rmse_scbs = sqrt(sum(res_scbs.^2) / length(res_scbs))
+rmse_como = sqrt(sum(res_como.^2) / length(res_como))
+@printf("  BSpline: %.4f\n", rmse_bs)
+@printf("  SCBS:    %.4f\n", rmse_scbs)
+@printf("  COMONet: %.4f\n", rmse_como)
 ```
 
 ## Method Comparison
@@ -176,7 +294,7 @@ end
 |---------|---------|------|---------|
 | **Constraint** | None | Coefficient reparameterization | Positive weights + monotone activations |
 | **Parameters** | 10 (knot coefficients) | 10 (unconstrained γ) | 25 (weights + biases) |
-| **Smoothness** | Cubic (C²) | Cubic (C²) | Piecewise linear (C⁰) |
+| **Smoothness** | Cubic (C²) | Cubic (C²) | ReLU: piecewise linear (C⁰); `activation=:softplus`: smooth (C∞) but slower to converge |
 | **Monotonicity** | Not guaranteed | Guaranteed | Guaranteed |
 | **Compatible solvers** | All (LAML, Adam, MCMC, ...) | All (LAML preferred) | Adam, MCMC, GradientMatching |
 | **Formal proofs** | — | Convex hull property | Lean 4 verified (43 theorems) |
@@ -196,10 +314,11 @@ end
 **When to use COMONet:**
 
 - Need formally verified constraint guarantees
-- Complex constraints (e.g., combinations)
-- Integration with neural-network-based workflows
-- When C² smoothness is not required
+- Unknown function is **strictly positive** (e.g., functional responses, mortality rates) — COMONet's ReLU architecture naturally enforces non-negativity
+- Complex constraints (e.g., combinations of monotonicity and convexity)
+- Choose `activation=:softplus` when smooth derivatives are needed, or `:relu` (default) for faster convergence
+- **Caveat**: COMONet saturates at domain edges and cannot represent functions that cross zero — use SCBS instead if the function may change sign
 
 ## Summary
 
-Shape constraints significantly improve function recovery, especially near domain boundaries where data is sparse. Both `ShapeConstrainedBSplineApproximator` and `COMONetApproximator` correctly enforce the decreasing constraint, while the unconstrained `BSplineApproximator` may violate it. The SCBS approach offers parsimony and smoothness, while COMONet provides a neural network alternative with formally verified constraint guarantees.
+Shape constraints significantly improve function recovery, especially near domain boundaries where data is sparse. Both `ShapeConstrainedBSplineApproximator` and `COMONetApproximator` correctly enforce the decreasing constraint, while the unconstrained `BSplineApproximator` may violate it. The SCBS approach offers parsimony, smoothness, and the ability to represent sign-changing functions, while COMONet provides a neural network alternative with formally verified constraint guarantees and natural non-negativity — best suited for inherently positive functional responses.

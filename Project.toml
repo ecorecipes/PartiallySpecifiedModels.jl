@@ -1,7 +1,7 @@
 name = "PartiallySpecifiedModels"
 uuid = "15ae6619-3517-4aad-88ea-30ec1d16fab1"
 version = "0.1.0"
-authors = ["Simon Frost <sdwfrost@gmail.com>"]
+authors = ["Simon Frost"]
 
 [deps]
 AbstractMCMC = "80f14c24-f653-4e6a-9b94-39d6b0f70001"

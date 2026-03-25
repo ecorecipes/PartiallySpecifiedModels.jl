@@ -22,23 +22,33 @@ While point estimation via LAML or Adam is fast, **fully Bayesian inference** qu
 This vignette demonstrates:
 
 1. Setting up a PSM for Bayesian inference
-2. Running `MCMCSolver` with NUTS/HMC
-3. Posterior diagnostics (trace plots, effective sample size)
-4. Credible intervals for unknown functions
+2. Calibrating the MCMC prior using LAML's smoothing parameter
+3. Posterior trajectory predictions and credible intervals
+4. Computing the posterior distribution of effective degrees of freedom (EDF)
+5. Comparing MCMC and LAML estimates
 
 ## Example: Logistic Growth with Unknown Carrying Capacity
 
 We model population growth where the per-capita growth rate `r(N)` is unknown — it should decrease as N approaches carrying capacity K.
 
-True model: `dN/dt = r₀ N (1 - N/K)` with `r₀ = 0.5`, `K = 100`.
+True model: `dN/dt = r(N) · N` where `r(N) = r₀(1 - N/K)` with `r₀ = 0.5`, `K = 100`.
 
 ```{julia}
 using PartiallySpecifiedModels
+using OrdinaryDiffEq
+using Plots
+using Statistics
+using LinearAlgebra
+using MCMCChains
 using Random
 Random.seed!(42)
+
+# NaN-safe helpers
+nanmedian(x) = median(filter(!isnan, x))
+nanquantile(x, q) = quantile(filter(!isnan, x), q)
 ```
 
-### Generate Data
+### Generate Synthetic Data
 
 ```{julia}
 function logistic!(du, u, p, t)
@@ -48,22 +58,46 @@ end
 # True per-capita rate: r(N) = 0.5 * (1 - N/100)
 r_true(N) = 0.5 * (1.0 - N / 100.0)
 
-using OrdinaryDiffEq
 true_p = (; r = r_true)
-sol_true = solve(ODEProblem(logistic!, [10.0], (0.0, 20.0), true_p), Tsit5();
-                 saveat=0.5)
+tspan = (0.0, 20.0)
+sol_true = solve(ODEProblem(logistic!, [10.0], tspan, true_p), Tsit5(); saveat=0.5)
 t_data = sol_true.t
-u_data = hcat(sol_true.u...) .+ 2.0 .* randn(1, length(sol_true.t))
-u_data = max.(u_data, 0.1)  # keep positive
-data_matrix = reshape(u_data[1, :], :, 1)
+N_true = [u[1] for u in sol_true.u]
+σ_noise = 3.0
+N_obs = N_true .+ σ_noise .* randn(length(N_true))
+N_obs = max.(N_obs, 0.1)  # keep positive
+data_matrix = reshape(N_obs, :, 1)
+println("Population range in data: [$(round(minimum(N_obs), digits=1)), $(round(maximum(N_obs), digits=1))]")
+```
+
+### Plot the Data
+
+```{julia}
+#| label: fig-data
+#| fig-cap: "Observed data (circles) vs true trajectory (line)"
+t_fine = range(tspan..., length=200)
+sol_fine = solve(ODEProblem(logistic!, [10.0], tspan, true_p), Tsit5(); saveat=collect(t_fine))
+N_fine = [u[1] for u in sol_fine.u]
+
+p_data = plot(t_fine, N_fine, label="True trajectory", lw=2, color=:black,
+    xlabel="Time", ylabel="Population N",
+    title="Logistic Growth — Data")
+scatter!(p_data, t_data, N_obs, label="Observed (σ=$σ_noise)", ms=4, color=:steelblue, alpha=0.7)
+p_data
 ```
 
 ### Set Up PSM Problem
 
-```{julia}
-uf_r = BSplineApproximator(:r, (0.0, 120.0), 8; initial=0.3)
+An important consideration with nonparametric unknown functions is that **estimation is only reliable where data is informative**. The population in this model ranges from ~10 to ~105, so we set the B-spline domain to `(5, 110)` — slightly beyond the observed data range, but not so far that large extrapolation regions dominate the fit.
 
-prob = PSMProblem(logistic!, [10.0], (0.0, 20.0), [uf_r];
+We use 12 knots to give the spline enough flexibility to capture the shape of `r(N)` across the full data range.
+
+```{julia}
+N_lo, N_hi = 5.0, 110.0
+n_knots = 12
+uf_r = BSplineApproximator(:r, (N_lo, N_hi), n_knots; initial=0.3)
+
+prob = PSMProblem(logistic!, [10.0], tspan, [uf_r];
     data_times=collect(t_data),
     data_values=Float64.(data_matrix),
     obs_to_state=[1],
@@ -71,62 +105,98 @@ prob = PSMProblem(logistic!, [10.0], (0.0, 20.0), [uf_r];
     likelihood=PartiallySpecifiedModels.Gaussian())
 ```
 
-### Run MCMCSolver
+### Step 1: Run LAML to Calibrate Smoothing
+
+Before running MCMC, we first fit with LAML to obtain the data-driven smoothing parameter λ. This will inform the MCMC prior.
+
+```{julia}
+sol_laml = solve(prob, LAML(maxiters=200, verbose=false))
+λ_laml = sol_laml.smoothing_params[1]
+edf_laml = sol_laml.edf
+println("LAML smoothing parameter: λ = $(round(λ_laml, digits=4))")
+println("LAML effective degrees of freedom: EDF = $(round(edf_laml, digits=2))")
+```
+
+### Why Smoothing Matters for MCMC
+
+The `MCMCSolver` places a smoothing prior on the B-spline coefficients:
+
+$$\log p(\boldsymbol{\beta} | \lambda) \propto -\frac{\lambda}{2} \boldsymbol{\beta}^\top \mathbf{S} \boldsymbol{\beta}$$
+
+where **S** is the second-derivative penalty matrix. The `prior_scale` parameter controls this: the effective λ = 1/`prior_scale`. If `prior_scale` is too large (penalty too weak), the posterior samples will be **wigglier** than the LAML estimate, because there is insufficient smoothing.
+
+We calibrate `prior_scale = 1/λ_LAML` so the MCMC prior matches the data-driven smoothing:
+
+```{julia}
+prior_scale_calibrated = 1.0 / λ_laml
+println("Calibrated prior_scale = 1/λ = $(round(prior_scale_calibrated, digits=6))")
+```
+
+### Step 2: Run MCMCSolver with Calibrated Prior
 
 ```{julia}
 sol = solve(prob, MCMCSolver(
-    n_samples=500, n_warmup=200,
-    target_accept=0.8, prior_scale=1.0,
+    n_samples=1000, n_warmup=500,
+    target_accept=0.8,
+    prior_scale=prior_scale_calibrated,
     verbose=false))
 ```
 
-### Posterior Diagnostics
+### Posterior Trajectory Predictions
 
-The solution stores an `MCMCChains.Chains` object:
+We draw posterior predictive trajectories by simulating the ODE for each MCMC sample:
 
 ```{julia}
 chains = sol.convergence
-```
+sample_matrix = Array(chains)
+n_samp = size(sample_matrix, 1)
+np = nparams(uf_r)
+n_plot = min(n_samp, 200)
 
-```{julia}
-#| echo: false
-using MCMCChains
-println("Chain size: ", size(chains))
-println("Parameter names: ", names(chains, :parameters))
-```
+t_pred = collect(range(tspan..., length=100))
+trajectories = zeros(n_plot, length(t_pred))
 
-### Unknown Function Reconstruction
+knots_x = collect(range(N_lo, N_hi, length=uf_r.nknots))
 
-The posterior mean gives a point estimate for `r(N)`:
-
-```{julia}
-r_fitted = sol.unknown_functions[:r]
-N_range = range(0.0, 120.0, length=50)
-r_fit_vals = [r_fitted(N) for N in N_range]
-r_true_vals = [r_true(N) for N in N_range]
-```
-
-```{julia}
-#| echo: false
-println("Posterior mean r(N) at selected points:")
-for N in [0.0, 25.0, 50.0, 75.0, 100.0]
-    println("  r($(Int(N))) = $(round(r_fitted(N), digits=4))  " *
-            "(true: $(round(r_true(N), digits=4)))")
+for i in 1:n_plot
+    params_i = sample_matrix[i, 1:np]
+    ev = PartiallySpecifiedModels.build_bspline_evaluator(knots_x, params_i)
+    try
+        pred = solve(ODEProblem(logistic!, [10.0], tspan, (; r = ev)), Tsit5();
+                     saveat=t_pred, abstol=1e-8, reltol=1e-8)
+        trajectories[i, :] = [u[1] for u in pred.u]
+    catch
+        trajectories[i, :] .= NaN
+    end
 end
 ```
 
-### Credible Intervals
+```{julia}
+#| label: fig-posterior-traj
+#| fig-cap: "Posterior predictive trajectories (grey) with data and true trajectory"
+p_traj = plot(xlabel="Time", ylabel="Population N",
+    title="Posterior Predictive Trajectories", legend=:bottomright)
+for i in 1:n_plot
+    plot!(p_traj, t_pred, trajectories[i, :], color=:grey, alpha=0.05, label="")
+end
+traj_med = [nanmedian(trajectories[:, j]) for j in 1:length(t_pred)]
+traj_lo = [nanquantile(trajectories[:, j], 0.025) for j in 1:length(t_pred)]
+traj_hi = [nanquantile(trajectories[:, j], 0.975) for j in 1:length(t_pred)]
+plot!(p_traj, t_pred, traj_med, ribbon=(traj_med .- traj_lo, traj_hi .- traj_med),
+    fillalpha=0.2, color=:dodgerblue, lw=2, label="Posterior median + 95% CI")
+plot!(p_traj, t_fine, N_fine, color=:black, lw=2, ls=:dash, label="True")
+scatter!(p_traj, t_data, N_obs, ms=4, color=:steelblue, alpha=0.7, label="Data")
+p_traj
+```
 
-We can compute pointwise credible intervals by evaluating the unknown function at each posterior sample:
+### Unknown Function Credible Intervals
 
 ```{julia}
-sample_matrix = Array(chains)
-n_samp = size(sample_matrix, 1)
-
+N_range = range(N_lo, N_hi, length=80)
 r_samples = zeros(n_samp, length(N_range))
+
 for i in 1:n_samp
-    params_i = sample_matrix[i, 1:nparams(uf_r)]
-    knots_x = collect(range(0.0, 120.0, length=uf_r.nknots))
+    params_i = sample_matrix[i, 1:np]
     ev = PartiallySpecifiedModels.build_bspline_evaluator(knots_x, params_i)
     for (j, N) in enumerate(N_range)
         r_samples[i, j] = ev(N)
@@ -136,20 +206,177 @@ end
 r_lower = [quantile(r_samples[:, j], 0.025) for j in 1:length(N_range)]
 r_upper = [quantile(r_samples[:, j], 0.975) for j in 1:length(N_range)]
 r_median = [quantile(r_samples[:, j], 0.5) for j in 1:length(N_range)]
+r_true_vals = [r_true(N) for N in N_range]
+```
+
+```{julia}
+#| label: fig-uf-ci
+#| fig-cap: "Posterior credible interval for the unknown function r(N)"
+N_data_max = maximum(N_obs)
+p_uf = plot(collect(N_range), r_median, ribbon=(r_median .- r_lower, r_upper .- r_median),
+    fillalpha=0.25, color=:dodgerblue, lw=2, label="Posterior median + 95% CI",
+    xlabel="Population N", ylabel="r(N)",
+    title="Unknown Function r(N) — Posterior")
+plot!(p_uf, collect(N_range), r_true_vals, color=:black, lw=2, ls=:dash, label="True r(N)")
+hline!(p_uf, [0.0], color=:grey, ls=:dot, label="")
+vspan!(p_uf, [N_data_max, N_hi], color=:orange, alpha=0.08, label="Beyond data range")
+p_uf
+```
+
+### Posterior Distribution of Effective Degrees of Freedom
+
+The effective degrees of freedom (EDF) measures the complexity of the fitted spline. For a penalized spline with penalty matrix **S** and smoothing parameter λ, the EDF is:
+
+$$\text{EDF} = \text{tr}\left[(\mathbf{J}^\top \mathbf{W} \mathbf{J} + \lambda \mathbf{S})^{-1} \mathbf{J}^\top \mathbf{W} \mathbf{J}\right]$$
+
+We compute a posterior distribution of EDF by evaluating this at each MCMC sample. Since the Jacobian **J** depends on the ODE solution (which changes with each sample), we use a finite-difference approximation:
+
+```{julia}
+# Penalty matrix — must use penalty_matrix(uf_r) which uses unit-interval
+# knots, matching what the LAML solver uses internally
+S = penalty_matrix(uf_r)
+λ_eff = λ_laml  # effective λ = 1/prior_scale_calibrated = λ_laml
+
+# Compute posterior EDF for each sample
+edf_posterior = zeros(n_samp)
+roughness = zeros(n_samp)
+
+for i in 1:n_samp
+    beta_i = sample_matrix[i, 1:np]
+    roughness[i] = dot(beta_i, S * beta_i)
+
+    ev_i = PartiallySpecifiedModels.build_bspline_evaluator(knots_x, beta_i)
+    try
+        pred_i = solve(ODEProblem(logistic!, [10.0], tspan, (; r = ev_i)), Tsit5();
+                       saveat=collect(t_data), abstol=1e-8, reltol=1e-8)
+        y_base = [pred_i[1, k] for k in 1:length(t_data)]
+
+        # Jacobian via forward finite differences
+        J_i = zeros(length(t_data), np)
+        ε = 1e-5
+        for p_idx in 1:np
+            beta_pert = copy(beta_i)
+            beta_pert[p_idx] += ε
+            ev_pert = PartiallySpecifiedModels.build_bspline_evaluator(knots_x, beta_pert)
+            pred_pert = solve(ODEProblem(logistic!, [10.0], tspan, (; r = ev_pert)), Tsit5();
+                              saveat=collect(t_data), abstol=1e-8, reltol=1e-8)
+            J_i[:, p_idx] = ([pred_pert[1, k] for k in 1:length(t_data)] .- y_base) ./ ε
+        end
+
+        JWJ = J_i' * J_i
+        H_i = JWJ + λ_eff * S
+        edf_posterior[i] = tr(H_i \ JWJ)
+    catch
+        edf_posterior[i] = NaN
+    end
+end
+edf_valid = filter(!isnan, edf_posterior)
+```
+
+```{julia}
+#| label: fig-edf-posterior
+#| fig-cap: "Posterior distribution of effective degrees of freedom (EDF)"
+p_edf = histogram(edf_valid, bins=30, normalize=:pdf, alpha=0.6, color=:dodgerblue,
+    xlabel="Effective Degrees of Freedom", ylabel="Density",
+    title="Posterior Distribution of EDF", label="Posterior EDF")
+vline!(p_edf, [edf_laml], color=:red, lw=2, ls=:dash,
+    label="LAML EDF = $(round(edf_laml, digits=2))")
+vline!(p_edf, [median(edf_valid)], color=:dodgerblue, lw=2,
+    label="Posterior median = $(round(median(edf_valid), digits=2))")
+p_edf
 ```
 
 ```{julia}
 #| echo: false
-using Statistics
-println("95% credible intervals for r(N):")
-for (k, N) in enumerate([0.0, 50.0, 100.0])
+println("EDF summary:")
+println("  LAML point estimate: $(round(edf_laml, digits=2))")
+println("  Posterior median:    $(round(median(edf_valid), digits=2))")
+println("  Posterior mean:      $(round(mean(edf_valid), digits=2))")
+println("  95% CI:              [$(round(quantile(edf_valid, 0.025), digits=2)), $(round(quantile(edf_valid, 0.975), digits=2))]")
+```
+
+### Posterior Roughness
+
+The roughness penalty `β'Sβ` provides a direct measure of function complexity — higher values mean a wigglier estimated function:
+
+```{julia}
+#| label: fig-roughness
+#| fig-cap: "Posterior distribution of spline roughness β'Sβ"
+p_rough = histogram(roughness, bins=30, normalize=:pdf, alpha=0.6, color=:teal,
+    xlabel="Roughness (β'Sβ)", ylabel="Density",
+    title="Posterior Distribution of Roughness", label="Posterior")
+β_laml = collect(sol_laml.parameters)[1:np]
+roughness_laml = dot(β_laml, S * β_laml)
+vline!(p_rough, [roughness_laml], color=:red, lw=2, ls=:dash,
+    label="LAML = $(round(roughness_laml, digits=4))")
+vline!(p_rough, [median(roughness)], color=:teal, lw=2,
+    label="Posterior median = $(round(median(roughness), digits=4))")
+p_rough
+```
+
+### Posterior Diagnostics
+
+#### Trace Plots
+
+```{julia}
+#| label: fig-trace
+#| fig-cap: "Trace plots for selected B-spline coefficients"
+param_names = names(chains, :parameters)
+n_show = min(4, length(param_names))
+p_traces = plot(layout=(n_show, 1), size=(700, 150 * n_show))
+for i in 1:n_show
+    vals = Array(chains[:, param_names[i], :])[:, 1]
+    plot!(p_traces, vals, subplot=i, label="", color=:steelblue, alpha=0.7,
+        title="β[$i]",
+        xlabel= i == n_show ? "Iteration" : "", ylabel="Value")
+end
+p_traces
+```
+
+#### Numerical Summary
+
+```{julia}
+#| echo: false
+println("Posterior r(N) at selected points:")
+for N in [10.0, 25.0, 50.0, 75.0, 100.0]
     idx = argmin(abs.(collect(N_range) .- N))
-    println("  r($(Int(N))): [$(round(r_lower[idx], digits=3)), " *
-            "$(round(r_upper[idx], digits=3))] " *
-            "(median: $(round(r_median[idx], digits=3)), " *
-            "true: $(round(r_true(N), digits=3)))")
+    println("  r($(Int(N))): median=$(round(r_median[idx], digits=4)) " *
+            "[$(round(r_lower[idx], digits=4)), $(round(r_upper[idx], digits=4))] " *
+            "(true: $(round(r_true(N), digits=4)))")
 end
 ```
+
+### Comparison with LAML
+
+```{julia}
+r_laml = sol_laml.unknown_functions[:r]
+r_laml_vals = [r_laml(N) for N in N_range]
+```
+
+```{julia}
+#| label: fig-comparison
+#| fig-cap: "MCMC posterior vs LAML point estimate for r(N)"
+p_comp = plot(collect(N_range), r_median, ribbon=(r_median .- r_lower, r_upper .- r_median),
+    fillalpha=0.2, color=:dodgerblue, lw=2, label="MCMC (median + 95% CI)",
+    xlabel="Population N", ylabel="r(N)",
+    title="MCMC vs LAML — Unknown Function r(N)")
+plot!(p_comp, collect(N_range), r_laml_vals, color=:red, lw=2, label="LAML")
+plot!(p_comp, collect(N_range), r_true_vals, color=:black, lw=2, ls=:dash, label="True r(N)")
+hline!(p_comp, [0.0], color=:grey, ls=:dot, label="")
+vspan!(p_comp, [N_data_max, N_hi], color=:orange, alpha=0.08, label="Beyond data range")
+p_comp
+```
+
+### Discussion
+
+**Why MCMC can be wigglier than LAML:** The key difference is how smoothing is handled:
+
+- **LAML** optimizes the smoothing parameter λ by maximizing the Laplace-approximate marginal likelihood. This automatically balances data fit against complexity, and λ is estimated from the data.
+- **MCMCSolver** uses λ as a fixed prior hyperparameter (`prior_scale = 1/λ`). If this is set too low (weak penalty), the posterior samples will be undersmoothed and wiggly.
+
+The solution demonstrated here is to **calibrate the MCMC prior using LAML's estimate**: run LAML first, extract the optimal λ, then set `prior_scale = 1/λ`. This gives MCMC posterior samples with comparable smoothness, while still providing full uncertainty quantification.
+
+**Posterior EDF interpretation:** The EDF distribution shows how much complexity the data supports. Values close to the number of knots indicate overfitting risk, while low values suggest the function is well-constrained. The posterior spread in EDF reflects **uncertainty about model complexity** — a feature unique to Bayesian approaches.
 
 ## Summary
 
@@ -158,7 +385,8 @@ end
 | **Inference type** | Fully Bayesian (NUTS/HMC) |
 | **Output** | `MCMCChains.Chains` |
 | **Uncertainty** | Full posterior, credible intervals |
-| **Speed** | Slower than LAML/Adam (ODE solve per sample) |
+| **Prior calibration** | Use `prior_scale = 1/λ_LAML` for appropriate smoothing |
+| **EDF** | Posterior distribution via hat matrix at each sample |
 | **Best for** | Uncertainty quantification, model comparison |
 
-`MCMCSolver` complements the point estimation solvers (LAML, Adam) by providing full posterior distributions. Use it when uncertainty quantification is important, or when you need to propagate parameter uncertainty into predictions.
+`MCMCSolver` complements the point estimation solvers (LAML, Adam) by providing full posterior distributions. For best results, calibrate the smoothing prior using LAML's data-driven λ estimate.

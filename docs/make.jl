@@ -17,6 +17,7 @@ makedocs(
         "Getting Started" => "getting_started.md",
         "Approximators" => "approximators.md",
         "Solvers" => "solvers.md",
+        "Vignettes" => "vignettes.md",
         "API Reference" => "api.md",
     ]
 )

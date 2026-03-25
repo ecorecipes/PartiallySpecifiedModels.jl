@@ -2,8 +2,21 @@
 
 PartiallySpecifiedModels.jl provides 17 solvers for fitting partially specified models. Solvers are passed as the second argument to `solve`:
 
-```julia
+```@example solvers
+using PartiallySpecifiedModels # hide
+using PartiallySpecifiedModels: solve # hide
+using OrdinaryDiffEq, Random # hide
+Random.seed!(42) # hide
+function growth!(du, u, p, t) # hide
+    du[1] = p.r(u[1]) * u[1] # hide
+end # hide
+approx_r = BSplineApproximator(:r, (0.0, 12.0), 8; initial = x -> 0.3) # hide
+r0, K, N0 = 0.5, 10.0, 0.5 # hide
+true_sol = OrdinaryDiffEq.solve(ODEProblem((du,u,p,t) -> du[1] = r0*(1-u[1]/K)*u[1], [N0], (0.0,15.0)), Tsit5(); saveat=0.5) # hide
+obs = max.([true_sol.u[i][1] + 0.3*randn() for i in 1:length(true_sol.t)], 0.01) # hide
+prob = PSMProblem(growth!, [N0], (0.0,15.0), [approx_r]; data_times=collect(true_sol.t), data_values=reshape(obs,:,1), obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5()) # hide
 sol = solve(prob, LAML())
+println("Data loss: ", round(sol.data_loss, digits=4), ", EDF: ", round(sol.edf, digits=2))
 ```
 
 ## Penalized Likelihood Solvers

@@ -159,7 +159,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
             params_k = β_eval[offset+1:offset+np]
             offset += np
 
-            if approx isa BSplineApproximator || approx isa GPApproximator
+            if approx isa BSplineApproximator || approx isa GPApproximator || approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator
                 S = penalty_matrix(approx)
                 if S !== nothing
                     loss_val += lambda_smooth * dot(params_k, S * params_k)
@@ -278,6 +278,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
             uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
         elseif approx isa COMONetApproximator
             uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
+        elseif approx isa SPDEApproximator
+            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
+        elseif approx isa ShapeConstrainedSPDEApproximator
+            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
         end
     end
 

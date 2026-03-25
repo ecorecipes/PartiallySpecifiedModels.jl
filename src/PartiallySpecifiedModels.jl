@@ -8,8 +8,8 @@ penalized B-splines, Gaussian processes, or neural networks.
 Provides 17 solvers (LAML, collocation, gradient matching, Adam, multiple
 shooting, adaptive gradient matching, rodeo, MCMC/HMC, MAGI, BNG, DALTON,
 pseudo-marginal, GCV, two-stage, derivative-free, variational, and ABC-SMC)
-and 5 approximator types (B-spline, neural network, Gaussian process,
-shape-constrained B-spline, and COMONet).
+and 7 approximator types (B-spline, shape-constrained B-spline, SPDE,
+shape-constrained SPDE, neural network, Gaussian process, and COMONet).
 
 Uses Laplace Approximate Marginal Likelihood (LAML) for automatic smoothing
 parameter estimation, following:
@@ -106,12 +106,15 @@ include("variational_solver.jl")
 # ABC-SMC solver (likelihood-free)
 include("abc_solver.jl")
 
+# Profile range parameter optimization for SPDE
+include("profile_range.jl")
+
 # Residual diagnostics
 include("diagnostics.jl")
 
 # Exports — types
-export AbstractApproximator, BSplineApproximator, NeuralApproximator, GPApproximator
-export ShapeConstrainedBSplineApproximator, SHAPE_CONSTRAINTS
+export AbstractApproximator, BSplineApproximator, NeuralApproximator, GPApproximator, SPDEApproximator
+export ShapeConstrainedBSplineApproximator, ShapeConstrainedSPDEApproximator, SHAPE_CONSTRAINTS
 export COMONetApproximator, COMONET_CONSTRAINTS
 export AbstractLikelihood, Gaussian, Poisson, NegativeBinomial, CustomLikelihood
 export PSMProblem, PSMSolution, LAML, CollocationLAML, GradientMatching
@@ -125,6 +128,7 @@ export VariationalSolver, ABCSolver
 export solve, simulate, predict
 export spline_penalty_matrix, penalty_matrix
 export nparams, initial_params
+export optimize_spde_range, with_range_param
 export residual_diagnostics, durbin_watson, residual_acf, semivariogram
 
 # Re-export common ODE solvers and problem types

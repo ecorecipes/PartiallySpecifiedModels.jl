@@ -30,6 +30,7 @@ This naturally accounts for ODE discretization uncertainty and provides uncertai
 ```{julia}
 using PartiallySpecifiedModels
 using OrdinaryDiffEq
+using Plots; default(fmt=:png)
 using Random
 Random.seed!(42)
 ```
@@ -51,59 +52,110 @@ data_N = [sol_true.u[i][1] + 0.1 * randn() for i in 1:length(t_data)]
 data_matrix = reshape(max.(data_N, 0.01), :, 1)
 ```
 
+### Observed Data
+
+```{julia}
+#| echo: false
+#| label: fig-data
+#| fig-cap: "Simulated logistic growth data with noise"
+plot(t_data, data_N, seriestype=:scatter, ms=4, alpha=0.6,
+    label="Observed", color=:steelblue, xlabel="Time", ylabel="Population N")
+plot!(sol_true.t, [sol_true.u[i][1] for i in 1:length(sol_true.t)],
+    label="True", color=:black, lw=2, ls=:dash)
+title!("Logistic Growth Data")
+```
+
 ### Fit with DaltonSolver
 
 ```{julia}
-uf = BSplineApproximator(:r, (0.0, 12.0), 8)
+uf = BSplineApproximator(:r, (0.5, 10.5), 8)
 
 prob = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf];
     data_times=t_data, data_values=Float64.(data_matrix),
     obs_to_state=[1], known_params=NamedTuple(),
     likelihood=PartiallySpecifiedModels.Gaussian())
 
-sol_dalton = solve(prob, DaltonSolver(n_steps=200, maxiters=100, verbose=false))
+sol_dalton = solve(prob, DaltonSolver(n_steps=200, maxiters=500, verbose=false));
 ```
 
 ### Compare with LAML and RodeoSolver
 
 ```{julia}
-sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
-sol_rodeo = solve(prob, RodeoSolver(n_steps=200, method=:fenrir, maxiters=100, verbose=false))
+sol_laml = solve(prob, LAML(maxiters=50, verbose=false));
+sol_rodeo = solve(prob, RodeoSolver(n_steps=200, method=:fenrir, maxiters=500, verbose=false));
 ```
 
-### Recovered Functions
+### Recovered Per-Capita Growth Rate
 
 ```{julia}
 #| echo: false
+#| label: fig-growth-rate
+#| fig-cap: "Recovered per-capita growth rate r(N) — one panel per solver"
 r_dalton = sol_dalton.unknown_functions[:r]
 r_laml = sol_laml.unknown_functions[:r]
 r_rodeo = sol_rodeo.unknown_functions[:r]
 
-println("Per-capita growth rate r(N) comparison:")
-println("  N    |  True   | Dalton  |  LAML   |  Rodeo")
-println("  -----|---------|---------|---------|--------")
-for N in [0.5, 2.0, 5.0, 8.0, 10.0]
-    println("  $(lpad(N, 4)) | $(lpad(round(r_true(N), digits=3), 7)) " *
-            "| $(lpad(round(r_dalton(N), digits=3), 7)) " *
-            "| $(lpad(round(r_laml(N), digits=3), 7)) " *
-            "| $(lpad(round(r_rodeo(N), digits=3), 7))")
-end
+N_grid = range(0.5, 10.0, length=200)
+
+p1 = plot(N_grid, r_true.(N_grid), lw=2, label="True", color=:black, ls=:dash,
+    xlabel="N", ylabel="r(N)", title="DALTON")
+plot!(p1, N_grid, [r_dalton(N) for N in N_grid], lw=2, label="Fitted", color=:teal)
+
+p2 = plot(N_grid, r_true.(N_grid), lw=2, label="True", color=:black, ls=:dash,
+    xlabel="N", ylabel="", title="LAML")
+plot!(p2, N_grid, [r_laml(N) for N in N_grid], lw=2, label="Fitted", color=:coral)
+
+p3 = plot(N_grid, r_true.(N_grid), lw=2, label="True", color=:black, ls=:dash,
+    xlabel="N", ylabel="", title="Rodeo (Fenrir)")
+plot!(p3, N_grid, [r_rodeo(N) for N in N_grid], lw=2, label="Fitted", color=:purple)
+
+plot(p1, p2, p3, layout=(1, 3), size=(1000, 350), link=:y)
 ```
 
 ### Fitted Trajectories
 
 ```{julia}
 #| echo: false
-println("Population trajectory comparison:")
-println("  t    | Observed | Dalton  |  LAML   |  Rodeo")
-println("  -----|----------|---------|---------|--------")
-for i in 1:5:length(t_data)
-    t = t_data[i]
-    println("  $(lpad(round(t, digits=1), 4)) | $(lpad(round(data_N[i], digits=2), 8)) " *
-            "| $(lpad(round(sol_dalton.fitted_values[i,1], digits=2), 7)) " *
-            "| $(lpad(round(sol_laml.fitted_values[i,1], digits=2), 7)) " *
-            "| $(lpad(round(sol_rodeo.fitted_values[i,1], digits=2), 7))")
-end
+#| label: fig-trajectories
+#| fig-cap: "Fitted population trajectories — one panel per solver"
+p1 = plot(t_data, data_N, seriestype=:scatter, ms=3, alpha=0.5,
+    label="Data", color=:gray60, xlabel="Time", ylabel="Population N", title="DALTON")
+plot!(p1, t_data, sol_dalton.fitted_values[:, 1], lw=2, label="Fitted", color=:teal)
+
+p2 = plot(t_data, data_N, seriestype=:scatter, ms=3, alpha=0.5,
+    label="Data", color=:gray60, xlabel="Time", ylabel="", title="LAML")
+plot!(p2, t_data, sol_laml.fitted_values[:, 1], lw=2, label="Fitted", color=:coral)
+
+p3 = plot(t_data, data_N, seriestype=:scatter, ms=3, alpha=0.5,
+    label="Data", color=:gray60, xlabel="Time", ylabel="", title="Rodeo (Fenrir)")
+plot!(p3, t_data, sol_rodeo.fitted_values[:, 1], lw=2, label="Fitted", color=:purple)
+
+plot(p1, p2, p3, layout=(1, 3), size=(1000, 350), link=:y)
+```
+
+### Residuals
+
+```{julia}
+#| echo: false
+#| label: fig-residuals
+#| fig-cap: "Residuals by solver"
+resid_dalton = data_matrix[:, 1] .- sol_dalton.fitted_values[:, 1]
+resid_laml = data_matrix[:, 1] .- sol_laml.fitted_values[:, 1]
+resid_rodeo = data_matrix[:, 1] .- sol_rodeo.fitted_values[:, 1]
+
+p1 = scatter(t_data, resid_dalton, ms=4, label="", color=:teal,
+    xlabel="Time", ylabel="Residual", title="DALTON", alpha=0.7)
+hline!(p1, [0], color=:gray, ls=:dash, label="")
+
+p2 = scatter(t_data, resid_laml, ms=4, label="", color=:coral,
+    xlabel="Time", ylabel="", title="LAML", alpha=0.7)
+hline!(p2, [0], color=:gray, ls=:dash, label="")
+
+p3 = scatter(t_data, resid_rodeo, ms=4, label="", color=:purple,
+    xlabel="Time", ylabel="", title="Rodeo", alpha=0.7)
+hline!(p3, [0], color=:gray, ls=:dash, label="")
+
+plot(p1, p2, p3, layout=(1, 3), size=(1000, 300), link=:y)
 ```
 
 ## Probabilistic vs. Deterministic Solvers
@@ -116,7 +168,105 @@ end
 | **Discretization** | Adaptive step | Fixed grid | Fixed grid |
 | **Smoothing** | LAML (Fellner-Schall) | B-spline penalty | B-spline penalty |
 
-**Key advantage of DALTON over Fenrir (RodeoSolver)**: The DALTON likelihood directly incorporates observations into the Kalman state, giving a tighter data-adaptive estimate of p(Y|θ).
+### Why DALTON and Rodeo look identical here
+
+On this simple logistic growth problem, all three solvers converge to nearly the same optimum. This is expected: when the data are informative and the dynamics are smooth, both the DALTON two-filter decomposition (log p(Y,Z) - log p(Z)) and the Fenrir forward-backward approach compute very similar marginal likelihoods, and the same optimizer (Nelder-Mead → L-BFGS) finds the same minimum. The differences between these solvers become visible on **harder problems** — oscillatory dynamics, sparse data, or high noise — where their different treatments of ODE discretization uncertainty lead to different solutions.
+
+## Oscillatory Example: Lotka-Volterra
+
+To show where DALTON and Rodeo diverge, we fit a predator-prey system with moderately noisy observations. We use initial conditions that produce wide-amplitude oscillations, so that prey density H spans a range from ~0.5 to ~5, exercising both the increasing and saturating parts of the functional response.
+
+```{julia}
+g_true(H) = 0.5 * H / (1.0 + 1.0 * H)
+
+function lv!(du, u, p, t)
+    H, P = u
+    du[1] = 0.4 * H * (1.0 - H / 5.0) - p.g(H) * P
+    du[2] = 0.5 * p.g(H) * P - 0.3 * P
+end
+
+sol_lv = solve(ODEProblem(lv!, [0.5, 0.5], (0.0, 30.0), (; g=g_true)),
+               Tsit5(); saveat=0.75)
+t_lv = collect(sol_lv.t)
+data_H = [sol_lv.u[i][1] + 0.1 * randn() for i in 1:length(t_lv)]
+data_P = [sol_lv.u[i][2] + 0.1 * randn() for i in 1:length(t_lv)]
+data_lv = hcat(max.(data_H, 0.01), max.(data_P, 0.01))
+```
+
+```{julia}
+uf_lv = BSplineApproximator(:g, (0.3, 5.5), 10; initial=x -> 0.1)
+
+prob_lv = PSMProblem(lv!, [0.5, 0.5], (0.0, 30.0), [uf_lv];
+    data_times=t_lv, data_values=Float64.(data_lv),
+    obs_to_state=[1, 2], known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+
+sol_lv_dalton = solve(prob_lv, DaltonSolver(n_steps=300, maxiters=500, verbose=false));
+sol_lv_rodeo = solve(prob_lv, RodeoSolver(n_steps=300, method=:fenrir, maxiters=500, verbose=false));
+sol_lv_laml = solve(prob_lv, LAML(maxiters=60, verbose=false));
+```
+
+### Functional Response Recovery (Oscillatory)
+
+```{julia}
+#| echo: false
+#| label: fig-lv-growth-rate
+#| fig-cap: "Recovered functional response g(H) on harder oscillatory problem"
+H_grid = range(0.3, 5.5, length=200)
+g_dalton = sol_lv_dalton.unknown_functions[:g]
+g_rodeo = sol_lv_rodeo.unknown_functions[:g]
+g_laml = sol_lv_laml.unknown_functions[:g]
+
+p1 = plot(H_grid, g_true.(H_grid), lw=2, label="True", color=:black, ls=:dash,
+    xlabel="H", ylabel="g(H)", title="DALTON")
+plot!(p1, H_grid, [g_dalton(H) for H in H_grid], lw=2, label="Fitted", color=:teal)
+
+p2 = plot(H_grid, g_true.(H_grid), lw=2, label="True", color=:black, ls=:dash,
+    xlabel="H", ylabel="", title="LAML")
+plot!(p2, H_grid, [g_laml(H) for H in H_grid], lw=2, label="Fitted", color=:coral)
+
+p3 = plot(H_grid, g_true.(H_grid), lw=2, label="True", color=:black, ls=:dash,
+    xlabel="H", ylabel="", title="Rodeo (Fenrir)")
+plot!(p3, H_grid, [g_rodeo(H) for H in H_grid], lw=2, label="Fitted", color=:purple)
+
+plot(p1, p2, p3, layout=(1, 3), size=(1000, 350), link=:y)
+```
+
+### Fitted Trajectories (Oscillatory)
+
+```{julia}
+#| echo: false
+#| label: fig-lv-trajectories
+#| fig-cap: "Fitted Lotka-Volterra trajectories — sparse noisy data"
+p_h1 = plot(t_lv, data_lv[:, 1], seriestype=:scatter, ms=4, alpha=0.5,
+    label="Data", color=:gray60, ylabel="Prey (H)", title="DALTON")
+plot!(p_h1, t_lv, sol_lv_dalton.fitted_values[:, 1], lw=2, label="Fitted", color=:teal)
+
+p_h2 = plot(t_lv, data_lv[:, 1], seriestype=:scatter, ms=4, alpha=0.5,
+    label="Data", color=:gray60, ylabel="", title="LAML")
+plot!(p_h2, t_lv, sol_lv_laml.fitted_values[:, 1], lw=2, label="Fitted", color=:coral)
+
+p_h3 = plot(t_lv, data_lv[:, 1], seriestype=:scatter, ms=4, alpha=0.5,
+    label="Data", color=:gray60, ylabel="", title="Rodeo (Fenrir)")
+plot!(p_h3, t_lv, sol_lv_rodeo.fitted_values[:, 1], lw=2, label="Fitted", color=:purple)
+
+p_p1 = plot(t_lv, data_lv[:, 2], seriestype=:scatter, ms=4, alpha=0.5,
+    label="Data", color=:gray60, xlabel="Time", ylabel="Predator (P)")
+plot!(p_p1, t_lv, sol_lv_dalton.fitted_values[:, 2], lw=2, label="Fitted", color=:teal)
+
+p_p2 = plot(t_lv, data_lv[:, 2], seriestype=:scatter, ms=4, alpha=0.5,
+    label="Data", color=:gray60, xlabel="Time", ylabel="")
+plot!(p_p2, t_lv, sol_lv_laml.fitted_values[:, 2], lw=2, label="Fitted", color=:coral)
+
+p_p3 = plot(t_lv, data_lv[:, 2], seriestype=:scatter, ms=4, alpha=0.5,
+    label="Data", color=:gray60, xlabel="Time", ylabel="")
+plot!(p_p3, t_lv, sol_lv_rodeo.fitted_values[:, 2], lw=2, label="Fitted", color=:purple)
+
+plot(p_h1, p_h2, p_h3, p_p1, p_p2, p_p3,
+     layout=(2, 3), size=(1000, 500), link=:y)
+```
+
+**Key advantage of DALTON over Fenrir (RodeoSolver)**: The DALTON likelihood directly incorporates observations into the Kalman state, giving a tighter data-adaptive estimate of p(Y|θ). On oscillatory systems with moderate noise, this can lead to different smoothing of the recovered functional response.
 
 ## Summary
 

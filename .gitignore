@@ -2,7 +2,6 @@ docs/build/
 docs/Manifest.toml
 vignettes/Manifest.toml
 vignettes/*/*.html
-vignettes/*/*.md
 vignettes/*/*.pdf
 vignettes/*/figure/
 vignettes/*_files/
@@ -10,3 +9,4 @@ vignettes/*_files/
 *.jl.*.cov
 *.jl.mem
 Manifest.toml
+proofs/

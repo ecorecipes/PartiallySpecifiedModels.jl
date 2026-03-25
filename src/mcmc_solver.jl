@@ -114,18 +114,9 @@ function _build_penalty_info(prob::PSMProblem)
     offset = 0
     for approx in prob.approximators
         np = nparams(approx)
-        if approx isa BSplineApproximator
-            push!(penalties, spline_penalty_matrix(
-                collect(range(approx.domain[1], approx.domain[2], length=approx.nknots))))
-            push!(offsets, offset)
-        elseif approx isa GPApproximator
-            push!(penalties, penalty_matrix(approx))
-            push!(offsets, offset)
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            push!(penalties, penalty_matrix(approx))
-            push!(offsets, offset)
-        elseif approx isa COMONetApproximator
-            push!(penalties, penalty_matrix(approx))
+        S = penalty_matrix(approx)
+        if S !== nothing
+            push!(penalties, S)
             push!(offsets, offset)
         end
         offset += np
@@ -224,10 +215,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     nuts = NUTS(alg.target_accept)
 
     # Run sampler using AbstractMCMC interface (handles adaptation internally)
-    chain_raw = AbstractMCMC.sample(
-        ld_ad, nuts, alg.n_warmup + alg.n_samples;
-        initial_params=theta0,
-        progress=verbose, verbose=false)
+    # Suppress AdvancedHMC "Verbosity toggle: max_iters" warnings
+    chain_raw = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        AbstractMCMC.sample(
+            ld_ad, nuts, alg.n_warmup + alg.n_samples;
+            initial_params=theta0,
+            progress=verbose, verbose=false)
+    end
 
     # Extract samples as matrix (drop warmup)
     n_total = length(chain_raw)
@@ -296,6 +290,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
             uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
         elseif approx isa COMONetApproximator
             uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
+        elseif approx isa SPDEApproximator
+            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
+        elseif approx isa ShapeConstrainedSPDEApproximator
+            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
         elseif approx isa NeuralApproximator
             spec = mlp_spec_from_lux(approx.model)
             lo = approx.domain === nothing ? nothing : approx.domain[1]
