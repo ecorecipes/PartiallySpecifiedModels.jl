@@ -664,6 +664,27 @@ end
 NegativeBinomial() = NegativeBinomial(1.0)
 
 """
+    TruncatedNormal(lower=0.0, sigma=1.0)
+
+Truncated Normal likelihood for non-negative continuous data.  The distribution
+is a Normal(μ, σ²) truncated to `[lower, ∞)`.  Scale parameter σ is fixed
+(not profiled like the Gaussian σ²).
+
+Useful for continuous measurements that are bounded below (e.g., population
+densities, concentrations).
+
+# Fields
+- `lower::Float64`: lower truncation point (default 0.0)
+- `sigma::Float64`: standard deviation (default 1.0)
+"""
+struct TruncatedNormal <: AbstractLikelihood
+    lower::Float64
+    sigma::Float64
+end
+TruncatedNormal(; lower::Float64=0.0, sigma::Float64=1.0) =
+    TruncatedNormal(lower, sigma)
+
+"""
     CustomLikelihood(loglik_scalar)
 
 User-defined likelihood. `loglik_scalar(y, μ)` returns scalar log-likelihood

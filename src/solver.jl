@@ -517,8 +517,77 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     f_vec, _ = eval_model(beta)
     compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
 
+    # ─── Gaussian warm-start for non-Gaussian likelihoods ─────────
+    # For Poisson/NegBin with identity link, the IRLS weights (1/V(μ))
+    # can create local minima when the initial fit is poor.  We first
+    # run Gaussian PCLS iterations to stabilize the coefficients, then
+    # do one final Gaussian LAML pass to set good smoothing parameters.
+    if !(prob.likelihood isa Gaussian) && m > 0
+        prev_gw_ss = Inf
+        for gw_iter in 1:50
+            f_vec_new, _ = try; eval_model(beta); catch; break; end
+            f_vec .= f_vec_new
+            compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+
+            z_pseudo = y_vec .- f_vec .+ J * beta
+            w_gauss = copy(w_vec)  # unit IRLS weights (Gaussian)
+            a_pcls, _ = pcls_step(J, z_pseudo, theta, w_gauss)
+            beta_new, _ = step_contract(beta, a_pcls, build_B(theta))
+            beta .= beta_new
+
+            gw_ss = sum((y_vec[i] - f_vec[i])^2 * w_vec[i] for i in 1:n_data)
+            if verbose && (gw_iter <= 3 || gw_iter % 10 == 0)
+                println("Gauss-warmup $gw_iter: SS=$(round(gw_ss, sigdigits=6))")
+            end
+
+            # Stop when SS stabilizes
+            if gw_iter > 5 && abs(gw_ss - prev_gw_ss) < 1e-4 * max(prev_gw_ss, 1.0)
+                if verbose; println("Gauss-warmup converged at iter $gw_iter"); end
+                break
+            end
+            prev_gw_ss = gw_ss
+        end
+
+        # Now run a full Gaussian LAML solve from the warm-started coefficients
+        # to get proper smoothing parameter estimation. Run a few PCLS+LAML
+        # cycles exactly like the main loop does, but with Gaussian weights.
+        for gw_laml in 1:20
+            f_vec_new, _ = try; eval_model(beta); catch; break; end
+            f_vec .= f_vec_new
+            compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+
+            w_gauss = copy(w_vec)
+            theta_new, _ = try
+                rho0 = log.(max.(theta, 1e-20))
+                estimate_smoothing_params(J, w_gauss, w_vec,
+                    y_vec, f_vec, beta, S_list, uf_offsets, uf_nk, n_p;
+                    family=Gaussian(), rho_init=rho0, verbose=(verbose && gw_laml <= 2))
+            catch; (copy(theta), NaN); end
+            theta .= theta_new
+
+            z_pseudo = y_vec .- f_vec .+ J * beta
+            a_pcls, _ = pcls_step(J, z_pseudo, theta, w_gauss)
+            beta_new, _ = step_contract(beta, a_pcls, build_B(theta))
+
+            gw_ss_new = sum((y_vec[i] - f_vec[i])^2 * w_vec[i] for i in 1:n_data)
+            beta .= beta_new
+
+            if verbose && (gw_laml <= 2 || gw_laml % 5 == 0)
+                println("Gauss-LAML $gw_laml: SS=$(round(gw_ss_new, sigdigits=6)), " *
+                        "θ=$(round.(theta, sigdigits=3))")
+            end
+
+            if gw_laml > 2 && abs(gw_ss_new - prev_gw_ss) < 1e-5 * max(prev_gw_ss, 1.0)
+                if verbose; println("Gauss-LAML converged at iter $gw_laml"); end
+                break
+            end
+            prev_gw_ss = gw_ss_new
+        end
+    end
+
     otheta = copy(theta)
     prev_obj = Inf  # Track penalized objective for convergence
+    prev_data_loss = Inf  # Track data loss for non-Gaussian convergence
 
     for iter in 0:(maxiters-1)
         # Re-evaluate model + Jacobian
@@ -608,15 +677,24 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                     "θ=$(round.(theta, sigdigits=3))")
         end
 
-        # Check convergence: relative change in penalized objective.
+        # Check convergence: relative change in penalized objective AND data fit.
+        # For non-Gaussian likelihoods, the penalized objective can appear stable
+        # (large |obj| makes relative tolerance easy to meet) while the data fit
+        # is still poor.  Require both objective stability AND small relative
+        # change in data loss.
         # Don't converge before warmup is complete — the smoothing parameters
         # haven't been optimised yet and the objective may improve further.
         min_conv_iter = max(3, alg.warmup + 3)
-        if iter >= min_conv_iter && abs(curr_obj - prev_obj) < 1e-6 * max(abs(prev_obj), 1.0)
+        curr_data_loss = sum((y_vec[i] - f_vec[i])^2 * w_vec[i] for i in 1:n_data)
+        obj_stable = abs(curr_obj - prev_obj) < 1e-6 * max(abs(prev_obj), 1.0)
+        dl_stable = prev_data_loss < Inf &&
+                    abs(curr_data_loss - prev_data_loss) < 1e-4 * max(prev_data_loss, 1.0)
+        if iter >= min_conv_iter && obj_stable && dl_stable
             if verbose; println("Converged at iter $iter (objective stable)"); end
             break
         end
         prev_obj = curr_obj
+        prev_data_loss = curr_data_loss
 
         if stop && iter >= min_conv_iter
             if verbose; println("Converged at iter $iter (no improvement)"); end

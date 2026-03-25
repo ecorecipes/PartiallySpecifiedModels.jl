@@ -19,13 +19,14 @@ julia:
 
 Real-world ecological data are rarely Gaussian. Count data (e.g., population surveys) are better modeled with **Poisson** or **Negative Binomial** likelihoods, which properly account for the discrete, non-negative nature of the observations.
 
-`PartiallySpecifiedModels.jl` supports four likelihood families:
+`PartiallySpecifiedModels.jl` supports five likelihood families:
 
 | Family | Typical use | Variance function |
 |--------|-------------|-------------------|
 | `Gaussian()` | Continuous measurements | $\sigma^2$ (profiled) |
 | `Poisson()` | Count data, no overdispersion | $\mu$ |
 | `NegativeBinomial(θ)` | Overdispersed count data | $\mu + \mu^2/\theta$ |
+| `TruncatedNormal(sigma=σ)` | Non-negative continuous data | $\sigma^2(1 - \delta(\mu))$ |
 | `CustomLikelihood(f)` | Any distribution | Via ForwardDiff |
 
 This vignette demonstrates each family on an SIR epidemic model with a
@@ -179,14 +180,14 @@ $$
 V(\boldsymbol{\rho}) = \ell(\hat\beta) - \tfrac{1}{2}\hat\beta' S^\lambda \hat\beta + \tfrac{1}{2}\log|S^\lambda|_+ - \tfrac{1}{2}\log|H| + \tfrac{M_p}{2}\log 2\pi
 $$
 
-For count data we use fewer basis functions (6 instead of 8) because the
-LAML smoothing parameter estimation for non-Gaussian likelihoods lacks the
-profiled $\sigma^2$ scale factor that Gaussian REML enjoys.
+For count data, the LAML solver uses Pearson-scaled Fellner-Schall updates and
+a Gaussian warm-start phase to ensure reliable convergence with identity-link
+IRLS weights.
 
 ```{julia}
 #| echo: false
 prob_poisson = PSMProblem(sir_psm!, u0, tspan,
-    [make_approx(6)];
+    [make_approx(8)];
     data_times = data_times,
     data_values = reshape(y_poisson, :, 1),
     obs_to_state = [2],
@@ -209,7 +210,7 @@ more overdispersion.
 ```{julia}
 #| echo: false
 prob_nb = PSMProblem(sir_psm!, u0, tspan,
-    [make_approx(6)];
+    [make_approx(8)];
     data_times = data_times,
     data_values = reshape(y_negbin, :, 1),
     obs_to_state = [2],
@@ -221,6 +222,43 @@ sol_nb = solve(prob_nb, LAML(maxiters=80, verbose=false))
 println("NegBin — Loss: ", round(sol_nb.data_loss, sigdigits=4),
         ", EDF: ", round(sol_nb.edf, digits=2),
         ", λ: ", round.(sol_nb.smoothing_params, sigdigits=3))
+```
+
+## Fitting with Truncated Normal Likelihood
+
+For non-negative continuous measurements (e.g., population densities,
+concentrations), `TruncatedNormal(sigma=σ)` models data as drawn from
+a Normal($\mu$, $\sigma^2$) truncated below at 0.  Unlike Gaussian, the
+truncation ensures the likelihood properly handles observations near zero
+without assigning probability to negative values.
+
+The log-likelihood for a single observation is:
+
+$$
+\ell(y_i \mid \mu_i, \sigma) = -\frac{(y_i - \mu_i)^2}{2\sigma^2} - \log\sigma - \frac{1}{2}\log 2\pi - \log\Phi\!\left(\frac{\mu_i}{\sigma}\right)
+$$
+
+where $\Phi$ is the standard normal CDF.  The IRLS weights use the
+Fisher information, which accounts for the truncation adjustment.
+
+```{julia}
+#| echo: false
+# Truncated normal observations: Gaussian noise clipped at 0
+y_trnorm = max.(y_gauss, 0.0)
+
+prob_trnorm = PSMProblem(sir_psm!, u0, tspan,
+    [make_approx(8)];
+    data_times = data_times,
+    data_values = reshape(y_trnorm, :, 1),
+    obs_to_state = [2],
+    known_params = (γ = γ, N = N),
+    likelihood = TruncatedNormal(sigma=5.0),
+    solver = Tsit5())
+
+sol_trnorm = solve(prob_trnorm, LAML(maxiters=80, verbose=false))
+println("TruncNormal — Loss: ", round(sol_trnorm.data_loss, sigdigits=4),
+        ", EDF: ", round(sol_trnorm.edf, digits=2),
+        ", λ: ", round.(sol_trnorm.smoothing_params, sigdigits=3))
 ```
 
 ## Custom Likelihoods
@@ -271,7 +309,7 @@ parameter (here $b=10$) appropriately for your data.
 ## Comparing Recovered $\lambda(I)$
 
 The key output of a PSM is the recovered unknown function. Here we compare
-the estimated force of infection $\hat\lambda(I/N)$ across all four
+the estimated force of infection $\hat\lambda(I/N)$ across all five
 likelihood families against the true power-law $\lambda(I) = 0.5 \cdot I^{0.9}$:
 
 ```{julia}
@@ -287,6 +325,7 @@ for (sol, name, col) in [
     (sol_gauss,   "Gaussian",    1),
     (sol_poisson, "Poisson",     2),
     (sol_nb,      "Neg. Binomial", 3),
+    (sol_trnorm,  "Trunc. Normal", 5),
     (sol_laplace, "Laplace (custom)", 4)]
     if haskey(sol.unknown_functions, :λ)
         λ_est = [sol.unknown_functions[:λ](I) for I in I_grid]
@@ -312,13 +351,52 @@ p2 = scatter(data_times, I_true, ms=3, color=:black, alpha=0.5,
 for (sol, name, col) in [
     (sol_gauss,   "Gaussian", 1),
     (sol_poisson, "Poisson",  2),
-    (sol_nb,      "Neg. Bin.", 3)]
+    (sol_nb,      "Neg. Bin.", 3),
+    (sol_trnorm,  "Trunc. Normal", 5)]
     pred = sol.fitted_values[:, 1]
     plot!(p2, data_times, pred, label="$(name) (EDF=$(round(sol.edf, digits=1)))",
           lw=2, color=col)
 end
 
 p2
+```
+
+## Diagnostic Plots
+
+A standard 4-panel diagnostic display assesses residual behaviour for the Gaussian fit, which serves as the baseline likelihood.
+
+```{julia}
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol_gauss)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+```{julia}
+#| echo: false
+println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_watson], ", "))
 ```
 
 ## Summary
@@ -328,10 +406,13 @@ p2
 | `Gaussian()` | Continuous, symmetric errors | Profiled REML ($\sigma^2$ estimated) |
 | `Poisson()` | Counts, variance ≈ mean | Full marginal likelihood, IRLS weights $w/\mu$ |
 | `NegativeBinomial(θ)` | Overdispersed counts | Full ML, IRLS weights $w/(\mu + \mu^2/\theta)$ |
+| `TruncatedNormal(sigma=σ)` | Non-negative continuous | Full ML, Fisher-information weights |
 | `CustomLikelihood(f)` | Any distribution | Autodiff for IRLS weights |
 
 For Gaussian data, LAML is exactly equivalent to REML. For non-Gaussian data,
-the solver uses Fisher scoring with identity-link working weights
-$\tilde{w}_i = w_i / V(\mu_i)$ at each P-IRLS iteration, following
-Wood, Pya & Säfken (2016). The LAML objective uses the actual log-likelihood
-(Poisson, NegBin, etc.) rather than a profiled scale parameter.
+the solver uses a Gaussian warm-start phase followed by Fisher scoring with
+identity-link working weights $\tilde{w}_i = w_i / V(\mu_i)$ at each P-IRLS
+iteration, following Wood, Pya & Säfken (2016). Smoothing parameters are
+estimated via Fellner-Schall updates with Pearson dispersion scaling. The LAML
+objective uses the actual log-likelihood (Poisson, NegBin, TruncatedNormal,
+etc.) rather than a profiled scale parameter.

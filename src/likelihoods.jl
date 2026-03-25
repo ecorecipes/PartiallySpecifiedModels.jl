@@ -6,6 +6,36 @@
 #
 # Reference: Wood, Pya & Säfken (2016), Section 2.
 
+# ─── Standard normal helpers (avoid Distributions.jl dependency) ────
+
+const _INV_SQRT_2PI = 1.0 / sqrt(2π)
+
+"""Standard normal PDF φ(x)."""
+_normpdf(x::Real) = _INV_SQRT_2PI * exp(-0.5 * x^2)
+
+"""Standard normal CDF Φ(x) via rational approximation (Abramowitz & Stegun 26.2.17)."""
+function _normcdf(x::Real)
+    # Accuracy: |ε| < 7.5e-8
+    if x >= 0
+        t = 1.0 / (1.0 + 0.2316419 * x)
+        poly = t * (0.319381530 + t * (-0.356563782 +
+               t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+        1.0 - _normpdf(x) * poly
+    else
+        1.0 - _normcdf(-x)
+    end
+end
+
+"""Standard normal log-CDF log Φ(x), stable for large negative x."""
+function _normlogcdf(x::Real)
+    if x > -6.0
+        log(_normcdf(x))
+    else
+        # Asymptotic expansion: log Φ(x) ≈ -½x² - log(-x√(2π))
+        -0.5 * x^2 - log(-x) - 0.5 * log(2π)
+    end
+end
+
 # ─── Log-likelihood functions ───────────────────────────────────────
 
 """
@@ -39,6 +69,20 @@ function log_likelihood(fam::NegativeBinomial, y::AbstractVector,
     for i in eachindex(y)
         mu_i = max(mu[i], 1e-10)
         ll += w[i] * (y[i] * log(mu_i / (mu_i + θ)) + θ * log(θ / (mu_i + θ)))
+    end
+    ll
+end
+
+function log_likelihood(fam::TruncatedNormal, y::AbstractVector,
+                        mu::AbstractVector, w::AbstractVector)
+    σ = fam.sigma
+    a = fam.lower
+    ll = 0.0
+    for i in eachindex(y)
+        z = (y[i] - mu[i]) / σ
+        # log f(y|μ,σ,a) = -½z² - log(σ) - ½log(2π) - log Φ((μ-a)/σ)
+        ll += w[i] * (-0.5 * z^2 - log(σ) - 0.5 * log(2π) -
+                       _normlogcdf((mu[i] - a) / σ))
     end
     ll
 end
@@ -90,6 +134,25 @@ function irls_weights(fam::NegativeBinomial, y::AbstractVector,
     wt
 end
 
+function irls_weights(fam::TruncatedNormal, y::AbstractVector,
+                      mu::AbstractVector, w::AbstractVector)
+    # For TruncatedNormal(a, σ), the Fisher information is:
+    #   I(μ) = (1/σ²)(1 + ξ·λ(ξ) - λ(ξ)²)
+    # where ξ = (μ-a)/σ, λ(ξ) = φ(ξ)/Φ(ξ) (inverse Mills ratio).
+    # Working weight: W̃ = w × I(μ) = w × (-∂²ℓ/∂μ²)
+    σ = fam.sigma
+    a = fam.lower
+    wt = similar(w)
+    for i in eachindex(w)
+        ξ = (mu[i] - a) / σ
+        Φξ = max(_normcdf(ξ), 1e-15)
+        λξ = _normpdf(ξ) / Φξ          # inverse Mills ratio
+        info = (1.0 + ξ * λξ - λξ^2) / σ^2
+        wt[i] = w[i] * max(info, 1e-10)
+    end
+    wt
+end
+
 function irls_weights(fam::CustomLikelihood, y::AbstractVector,
                       mu::AbstractVector, w::AbstractVector)
     # Derive via ForwardDiff: w̃_i = w_i × (-∂²ℓ/∂μ²)
@@ -137,6 +200,12 @@ function irls_pseudodata(fam::NegativeBinomial, y::AbstractVector,
         z[i] = log(mu_i) + (y[i] - mu_i) / mu_i
     end
     z
+end
+
+function irls_pseudodata(fam::TruncatedNormal, y::AbstractVector,
+                         mu::AbstractVector, w::AbstractVector)
+    # Identity link: z = y (same as Gaussian)
+    copy(y)
 end
 
 function irls_pseudodata(fam::CustomLikelihood, y::AbstractVector,

@@ -2,10 +2,164 @@
 Residual diagnostics for PSM solutions.
 
 Provides tools to assess fit quality and detect oversmoothing:
-- Durbin-Watson statistic for residual autocorrelation
-- Empirical autocorrelation function (ACF)
-- Empirical semivariogram
+- `appraise` — 4-panel diagnostic data (QQ, residuals vs fitted, histogram, obs vs fitted)
+- `deviance_residuals` — per-observation deviance residuals for each likelihood family
+- `durbin_watson` — Durbin-Watson statistic for residual autocorrelation
+- `residual_acf` — empirical autocorrelation function (ACF)
+- `semivariogram` — empirical semivariogram
 """
+
+using Statistics: mean, std
+
+# ─── Inverse standard normal CDF ─────────────────────────────────────
+
+"""
+    _qnorm(p)
+
+Inverse standard normal CDF (quantile function) via Acklam's rational
+approximation.  Accuracy: |ε| < 1.15×10⁻⁹ for 0 < p < 1.
+"""
+function _qnorm(p::Real)
+    # Peter Acklam's rational approximation
+    a = (-3.969683028665376e+01,  2.209460984245205e+02, -2.759285104469687e+02,
+          1.383577518672690e+02, -3.066479806614716e+01,  2.506628277459239e+00)
+    b = (-5.447609879822406e+01,  1.615858368580409e+02, -1.556989798598866e+02,
+          6.680131188771972e+01, -1.328068155288572e+01)
+    c = (-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00,  4.374664141464968e+00,  2.938163982698783e+00)
+    d = (7.784695709041462e-03,  3.224671290700398e-01,  2.445134137142996e+00,
+         3.754408661907416e+00)
+
+    p_low = 0.02425
+    p_high = 1.0 - p_low
+
+    if p < p_low
+        q = sqrt(-2.0 * log(p))
+        (((((c[1]*q + c[2])*q + c[3])*q + c[4])*q + c[5])*q + c[6]) /
+         ((((d[1]*q + d[2])*q + d[3])*q + d[4])*q + 1.0)
+    elseif p <= p_high
+        q = p - 0.5
+        r = q * q
+        (((((a[1]*r + a[2])*r + a[3])*r + a[4])*r + a[5])*r + a[6]) * q /
+         (((((b[1]*r + b[2])*r + b[3])*r + b[4])*r + b[5])*r + 1.0)
+    else
+        q = sqrt(-2.0 * log(1.0 - p))
+        -(((((c[1]*q + c[2])*q + c[3])*q + c[4])*q + c[5])*q + c[6]) /
+          ((((d[1]*q + d[2])*q + d[3])*q + d[4])*q + 1.0)
+    end
+end
+
+# ─── Deviance residuals ──────────────────────────────────────────────
+
+"""
+    deviance_residuals(family, y, mu)
+
+Compute per-observation deviance residuals: ``r_i^D = \\text{sign}(y_i - \\mu_i) \\sqrt{d_i}``
+where ``d_i`` is the unit deviance contribution.
+
+For a well-specified model, deviance residuals are approximately standard normal.
+"""
+function deviance_residuals(::Gaussian, y::AbstractVector, mu::AbstractVector)
+    y .- mu
+end
+
+function deviance_residuals(::Poisson, y::AbstractVector, mu::AbstractVector)
+    [begin
+        yi, mi = y[i], max(mu[i], 1e-10)
+        d = yi > 0 ? 2.0 * (yi * log(yi / mi) - (yi - mi)) : 2.0 * mi
+        sign(yi - mi) * sqrt(max(d, 0.0))
+    end for i in eachindex(y)]
+end
+
+function deviance_residuals(fam::NegativeBinomial, y::AbstractVector, mu::AbstractVector)
+    k = fam.theta
+    [begin
+        yi, mi = y[i], max(mu[i], 1e-10)
+        d_y = yi > 0 ? yi * log(yi / mi) : 0.0
+        d_k = (yi + k) * log((yi + k) / (mi + k))
+        sign(yi - mi) * sqrt(max(2.0 * (d_y - d_k), 0.0))
+    end for i in eachindex(y)]
+end
+
+function deviance_residuals(::TruncatedNormal, y::AbstractVector, mu::AbstractVector)
+    y .- mu  # same as Gaussian for response-scale residuals
+end
+
+# Fallback for unknown families — use raw residuals
+function deviance_residuals(::AbstractLikelihood, y::AbstractVector, mu::AbstractVector)
+    y .- mu
+end
+
+# ─── Appraise (4-panel diagnostic data) ──────────────────────────────
+
+"""
+    appraise(sol::PSMSolution; family=nothing)
+
+Compute diagnostic data for a standard 4-panel goodness-of-fit display,
+following the pattern of R's `gratia::appraise()` for GAMs.
+
+Returns a named tuple with fields:
+- `residuals`: standardized residuals (deviance if `family` given, else response/σ̂)
+- `fitted`: fitted values (vectorized across all observed states)
+- `observed`: observed values (vectorized)
+- `qq_theoretical`: theoretical normal quantiles
+- `qq_sample`: sorted standardized residuals
+- `durbin_watson`: DW statistic per observed state
+
+## Example
+
+```julia
+diag = appraise(sol)
+
+# 4-panel plot with Plots.jl:
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample, title="QQ Plot")
+p_rf = scatter(diag.fitted, diag.residuals, title="Residuals vs Fitted")
+p_hist = histogram(diag.residuals, title="Histogram of Residuals")
+p_of = scatter(diag.observed, diag.fitted, title="Observed vs Fitted")
+plot(p_qq, p_rf, p_hist, p_of, layout=(2,2))
+```
+"""
+function appraise(sol::PSMSolution; family::Union{Nothing, AbstractLikelihood}=nothing)
+    y = vec(sol.data_values)
+    mu = vec(sol.fitted_values)
+
+    if family !== nothing && !(family isa Gaussian)
+        r = deviance_residuals(family, y, mu)
+        # Standardize by estimated scale (median absolute deviance residual)
+        sc = median_abs(r)
+        if sc > 1e-10
+            r_std = r ./ sc
+        else
+            r_std = copy(r)
+        end
+    else
+        r = y .- mu
+        σ = std(r; corrected=true)
+        r_std = σ > 1e-10 ? r ./ σ : copy(r)
+    end
+
+    # QQ data: sorted standardized residuals vs normal quantiles
+    n = length(r_std)
+    sorted = sort(r_std)
+    theoretical = [_qnorm((i - 0.5) / n) for i in 1:n]
+
+    # DW per observed state
+    resid_mat = sol.data_values .- sol.fitted_values
+    dw = durbin_watson(resid_mat)
+
+    (residuals=r_std, fitted=mu, observed=y,
+     qq_theoretical=theoretical, qq_sample=sorted,
+     durbin_watson=dw)
+end
+
+"""Median of absolute values (robust scale estimator, avoids StatsBase dependency)."""
+function median_abs(x::AbstractVector)
+    ax = abs.(x)
+    sort!(ax)
+    n = length(ax)
+    n == 0 && return 0.0
+    isodd(n) ? ax[(n+1)÷2] : 0.5 * (ax[n÷2] + ax[n÷2+1])
+end
 
 """
     durbin_watson(residuals)

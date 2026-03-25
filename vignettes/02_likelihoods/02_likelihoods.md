@@ -1,6 +1,6 @@
 # Likelihood Families
 Simon Frost
-2026-03-22
+2026-03-25
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -12,6 +12,8 @@ Simon Frost
 - [Fitting with Poisson Likelihood](#fitting-with-poisson-likelihood)
 - [Fitting with Negative Binomial
   Likelihood](#fitting-with-negative-binomial-likelihood)
+- [Fitting with Truncated Normal
+  Likelihood](#fitting-with-truncated-normal-likelihood)
 - [Custom Likelihoods](#custom-likelihoods)
 - [Comparing Recovered $\lambda(I)$](#comparing-recovered-lambdai)
 - [Comparing Time Series Fits](#comparing-time-series-fits)
@@ -24,14 +26,15 @@ population surveys) are better modeled with **Poisson** or **Negative
 Binomial** likelihoods, which properly account for the discrete,
 non-negative nature of the observations.
 
-`PartiallySpecifiedModels.jl` supports four likelihood families:
+`PartiallySpecifiedModels.jl` supports five likelihood families:
 
-| Family                | Typical use                   | Variance function     |
-|-----------------------|-------------------------------|-----------------------|
-| `Gaussian()`          | Continuous measurements       | $\sigma^2$ (profiled) |
-| `Poisson()`           | Count data, no overdispersion | $\mu$                 |
-| `NegativeBinomial(θ)` | Overdispersed count data      | $\mu + \mu^2/\theta$  |
-| `CustomLikelihood(f)` | Any distribution              | Via ForwardDiff       |
+| Family | Typical use | Variance function |
+|----|----|----|
+| `Gaussian()` | Continuous measurements | $\sigma^2$ (profiled) |
+| `Poisson()` | Count data, no overdispersion | $\mu$ |
+| `NegativeBinomial(θ)` | Overdispersed count data | $\mu + \mu^2/\theta$ |
+| `TruncatedNormal(sigma=σ)` | Non-negative continuous data | $\sigma^2(1 - \delta(\mu))$ |
+| `CustomLikelihood(f)` | Any distribution | Via ForwardDiff |
 
 This vignette demonstrates each family on an SIR epidemic model with a
 nonlinear force of infection, following the partially specified model
@@ -192,11 +195,11 @@ Poisson log-likelihood rather than a profiled scale:
 
 $$V(\boldsymbol{\rho}) = \ell(\hat\beta) - \tfrac{1}{2}\hat\beta' S^\lambda \hat\beta + \tfrac{1}{2}\log|S^\lambda|_+ - \tfrac{1}{2}\log|H| + \tfrac{M_p}{2}\log 2\pi$$
 
-For count data we use fewer basis functions (6 instead of 8) because the
-LAML smoothing parameter estimation for non-Gaussian likelihoods lacks
-the profiled $\sigma^2$ scale factor that Gaussian REML enjoys.
+For count data, the LAML solver uses Pearson-scaled Fellner-Schall
+updates and a Gaussian warm-start phase to ensure reliable convergence
+with identity-link IRLS weights.
 
-    Poisson — Loss: 512700.0, EDF: 3.94, λ: [0.000157]
+    Poisson — Loss: 207600.0, EDF: 4.13, λ: [3.66e-5]
 
 ## Fitting with Negative Binomial Likelihood
 
@@ -204,7 +207,24 @@ the profiled $\sigma^2$ scale factor that Gaussian REML enjoys.
 controlling the variance: $\text{Var}(Y) = \mu + \mu^2/\theta$. Smaller
 $\theta$ means more overdispersion.
 
-    NegBin — Loss: 110400.0, EDF: 3.15, λ: [29.8]
+    NegBin — Loss: 163900.0, EDF: 7.83, λ: [3.66e-5]
+
+## Fitting with Truncated Normal Likelihood
+
+For non-negative continuous measurements (e.g., population densities,
+concentrations), `TruncatedNormal(sigma=σ)` models data as drawn from a
+Normal($\mu$, $\sigma^2$) truncated below at 0. Unlike Gaussian, the
+truncation ensures the likelihood properly handles observations near
+zero without assigning probability to negative values.
+
+The log-likelihood for a single observation is:
+
+$$\ell(y_i \mid \mu_i, \sigma) = -\frac{(y_i - \mu_i)^2}{2\sigma^2} - \log\sigma - \frac{1}{2}\log 2\pi - \log\Phi\!\left(\frac{\mu_i}{\sigma}\right)$$
+
+where $\Phi$ is the standard normal CDF. The IRLS weights use the Fisher
+information, which accounts for the truncation adjustment.
+
+    TruncNormal — Loss: 926.7, EDF: 3.63, λ: [349.0]
 
 ## Custom Likelihoods
 
@@ -218,7 +238,7 @@ Here we demonstrate with a **Laplace (double-exponential) likelihood**,
 which is more robust to outliers than the Gaussian. We create data with
 a few outlier observations:
 
-    Laplace — Loss: 9587.0, EDF: 2.7
+    Laplace — Loss: 9562.0, EDF: 2.71
 
 > [!NOTE]
 >
@@ -231,7 +251,7 @@ a few outlier observations:
 
 The key output of a PSM is the recovered unknown function. Here we
 compare the estimated force of infection $\hat\lambda(I/N)$ across all
-four likelihood families against the true power-law
+five likelihood families against the true power-law
 $\lambda(I) = 0.5 \cdot I^{0.9}$:
 
 ``` julia
@@ -247,6 +267,7 @@ for (sol, name, col) in [
     (sol_gauss,   "Gaussian",    1),
     (sol_poisson, "Poisson",     2),
     (sol_nb,      "Neg. Binomial", 3),
+    (sol_trnorm,  "Trunc. Normal", 5),
     (sol_laplace, "Laplace (custom)", 4)]
     if haskey(sol.unknown_functions, :λ)
         λ_est = [sol.unknown_functions[:λ](I) for I in I_grid]
@@ -262,7 +283,7 @@ vspan!([Imin_obs, Imax_obs], color=:grey, alpha=0.1, label="Observed range")
 p1
 ```
 
-![](02_likelihoods_files/figure-commonmark/cell-11-output-1.svg)
+![](02_likelihoods_files/figure-commonmark/cell-12-output-1.svg)
 
 ## Comparing Time Series Fits
 
@@ -274,7 +295,8 @@ p2 = scatter(data_times, I_true, ms=3, color=:black, alpha=0.5,
 for (sol, name, col) in [
     (sol_gauss,   "Gaussian", 1),
     (sol_poisson, "Poisson",  2),
-    (sol_nb,      "Neg. Bin.", 3)]
+    (sol_nb,      "Neg. Bin.", 3),
+    (sol_trnorm,  "Trunc. Normal", 5)]
     pred = sol.fitted_values[:, 1]
     plot!(p2, data_times, pred, label="$(name) (EDF=$(round(sol.edf, digits=1)))",
           lw=2, color=col)
@@ -283,7 +305,7 @@ end
 p2
 ```
 
-![](02_likelihoods_files/figure-commonmark/cell-12-output-1.svg)
+![](02_likelihoods_files/figure-commonmark/cell-13-output-1.svg)
 
 ## Summary
 
@@ -292,10 +314,14 @@ p2
 | `Gaussian()` | Continuous, symmetric errors | Profiled REML ($\sigma^2$ estimated) |
 | `Poisson()` | Counts, variance ≈ mean | Full marginal likelihood, IRLS weights $w/\mu$ |
 | `NegativeBinomial(θ)` | Overdispersed counts | Full ML, IRLS weights $w/(\mu + \mu^2/\theta)$ |
+| `TruncatedNormal(sigma=σ)` | Non-negative continuous | Full ML, Fisher-information weights |
 | `CustomLikelihood(f)` | Any distribution | Autodiff for IRLS weights |
 
 For Gaussian data, LAML is exactly equivalent to REML. For non-Gaussian
-data, the solver uses Fisher scoring with identity-link working weights
+data, the solver uses a Gaussian warm-start phase followed by Fisher
+scoring with identity-link working weights
 $\tilde{w}_i = w_i / V(\mu_i)$ at each P-IRLS iteration, following Wood,
-Pya & Säfken (2016). The LAML objective uses the actual log-likelihood
-(Poisson, NegBin, etc.) rather than a profiled scale parameter.
+Pya & Säfken (2016). Smoothing parameters are estimated via
+Fellner-Schall updates with Pearson dispersion scaling. The LAML
+objective uses the actual log-likelihood (Poisson, NegBin,
+TruncatedNormal, etc.) rather than a profiled scale parameter.
