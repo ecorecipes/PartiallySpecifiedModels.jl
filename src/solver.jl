@@ -34,9 +34,12 @@ function _validate_problem(prob::PSMProblem, solver_name::String;
               "but data_values has $n_obs columns")
     isempty(prob.approximators) &&
         error("$solver_name: no approximators specified")
-    any(s -> s < 1 || s > length(prob.u0), prob.obs_to_state) &&
-        error("$solver_name: obs_to_state contains indices outside " *
-              "range 1:$(length(prob.u0))")
+    # Resolve u0 — may be a function of parameters (e.g., copepod model)
+    if !(prob.u0 isa Function)
+        any(s -> s < 1 || s > length(prob.u0), prob.obs_to_state) &&
+            error("$solver_name: obs_to_state contains indices outside " *
+                  "range 1:$(length(prob.u0))")
+    end
     if require_continuous && prob.discrete
         error("$solver_name does not support discrete-time models. " *
               "The probabilistic ODE solver is designed for continuous ODEs. " *
