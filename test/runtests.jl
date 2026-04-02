@@ -1714,4 +1714,61 @@ using OrdinaryDiffEq
         @test sol.edf < 8.0
     end
 
+    # ─── Bootstrap confidence intervals ───────────────────────────
+
+    @testset "Bootstrap" begin
+        Random.seed!(42)
+        function logistic_bs!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+        end
+        prob_ode = ODEProblem((du,u,p,t) -> (du[1] = 0.5*(1-u[1]/10)*u[1]),
+            [1.0], (0.0, 15.0))
+        sol_true = OrdinaryDiffEq.solve(prob_ode, Tsit5(); saveat=0.5)
+        t_obs = sol_true.t
+        data = reshape([sol_true.u[i][1] + 0.3*randn() for i in 1:length(t_obs)], :, 1)
+
+        uf = BSplineApproximator(:r, (0.1, 10.0), 6; initial=x -> 0.3)
+        prob = PSMProblem(logistic_bs!, [1.0], (0.0, 15.0), [uf];
+            data_times=t_obs, data_values=data, obs_to_state=[1],
+            known_params=NamedTuple(), solver=Tsit5())
+        sol = solve(prob, LAML(maxiters=50, verbose=false))
+
+        @testset "parametric bootstrap" begin
+            bs = bootstrap(sol, prob, LAML(maxiters=50, verbose=false);
+                nboot=10, method=:parametric, rng=Random.Xoshiro(1))
+            @test bs isa BootstrapResult
+            @test bs.n_success >= 5
+            @test size(bs.coefs, 1) == bs.n_success
+            @test size(bs.coefs, 2) == length(sol.parameters)
+            @test size(bs.fitted_values, 3) == bs.n_success
+            @test size(bs.ci_fitted.lower) == size(sol.fitted_values)
+            @test size(bs.ci_fitted.upper) == size(sol.fitted_values)
+            @test all(bs.ci_fitted.lower .<= bs.ci_fitted.upper)
+            @test haskey(bs.ci_uf, :r)
+            @test length(bs.ci_uf[:r].lower) == 100  # default uf_ngrid
+            @test all(bs.ci_uf[:r].lower .<= bs.ci_uf[:r].upper)
+            @test bs.level == 0.95
+        end
+
+        @testset "nonparametric bootstrap" begin
+            bs = bootstrap(sol, prob, LAML(maxiters=50, verbose=false);
+                nboot=10, method=:nonparametric, rng=Random.Xoshiro(2))
+            @test bs.n_success >= 5
+            @test all(bs.ci_fitted.lower .<= bs.ci_fitted.upper)
+        end
+
+        @testset "case bootstrap" begin
+            bs = bootstrap(sol, prob, LAML(maxiters=50, verbose=false);
+                nboot=10, method=:case, rng=Random.Xoshiro(3))
+            @test bs.n_success >= 5
+            @test all(bs.ci_fitted.lower .<= bs.ci_fitted.upper)
+        end
+
+        @testset "custom level" begin
+            bs = bootstrap(sol, prob, LAML(maxiters=50, verbose=false);
+                nboot=10, level=0.90, rng=Random.Xoshiro(4))
+            @test bs.level == 0.90
+        end
+    end
+
 end

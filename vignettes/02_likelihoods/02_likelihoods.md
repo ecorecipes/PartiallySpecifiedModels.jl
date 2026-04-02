@@ -1,6 +1,6 @@
 # Likelihood Families
 Simon Frost
-2026-03-25
+2026-04-02
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -200,7 +200,7 @@ For count data, the LAML solver uses Pearson-scaled Fellner-Schall
 updates and a Gaussian warm-start phase to ensure reliable convergence
 with identity-link IRLS weights.
 
-    Poisson — Loss: 4671.0, EDF: 2.18, λ: [5160.0]
+    Poisson — Loss: 4259.0, EDF: 3.54, λ: [134.0]
 
 ## Fitting with Negative Binomial Likelihood
 
@@ -208,7 +208,7 @@ with identity-link IRLS weights.
 controlling the variance: $\text{Var}(Y) = \mu + \mu^2/\theta$. Smaller
 $\theta$ means more overdispersion.
 
-    NegBin — Loss: 114500.0, EDF: 2.01, λ: [63200.0]
+    NegBin — Loss: 270500.0, EDF: 4.94, λ: [3.66e-5]
 
 ## Fitting with Truncated Normal Likelihood
 
@@ -225,7 +225,7 @@ $$\ell(y_i \mid \mu_i, \sigma) = -\frac{(y_i - \mu_i)^2}{2\sigma^2} - \log\sigma
 where $\Phi$ is the standard normal CDF. The IRLS weights use the Fisher
 information, which accounts for the truncation adjustment.
 
-    TruncNormal — Loss: 1337.0, EDF: 8.0, λ: [0.0142]
+    TruncNormal — Loss: 2156.0, EDF: 7.67, λ: [0.014]
 
 ## Custom Likelihoods
 
@@ -239,7 +239,7 @@ Here we demonstrate with a **Laplace (double-exponential) likelihood**,
 which is more robust to outliers than the Gaussian. We create data with
 a few outlier observations:
 
-    Laplace — Loss: 9445.0, EDF: 0.89
+    Laplace — Loss: 9421.0, EDF: 1.98
 
 > [!NOTE]
 >
