@@ -1,6 +1,6 @@
 # Probabilistic ODE Solving with DaltonSolver
 Simon Frost
-2026-03-23
+2026-04-02
 
 - [Overview](#overview)
 - [Logistic Growth with Unknown Per-Capita
@@ -23,6 +23,7 @@ Simon Frost
     (Oscillatory)](#functional-response-recovery-oscillatory)
   - [Fitted Trajectories
     (Oscillatory)](#fitted-trajectories-oscillatory)
+- [Diagnostic Plots](#diagnostic-plots)
 - [Summary](#summary)
 
 ## Overview
@@ -262,6 +263,47 @@ likelihood directly incorporates observations into the Kalman state,
 giving a tighter data-adaptive estimate of p(Y\|θ). On oscillatory
 systems with moderate noise, this can lead to different smoothing of the
 recovered functional response.
+
+## Diagnostic Plots
+
+A standard 4-panel diagnostic display assesses residual behaviour. The
+QQ plot checks normality of standardized residuals, “Residuals vs
+Fitted” detects systematic patterns, the histogram visualises the
+residual distribution, and “Observed vs Fitted” checks overall
+calibration.
+
+``` julia
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol_dalton)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+![](18_dalton_files/figure-commonmark/cell-14-output-1.svg)
+
+    Durbin-Watson: 2.325
 
 ## Summary
 

@@ -536,6 +536,19 @@ A Durbin-Watson statistic near 2 indicates no strong autocorrelation in
 the residuals, supporting the validity of the bootstrap CIs (which
 assume approximately independent errors).
 
+> [!TIP]
+>
+> ### See Also
+>
+> - [Vignette 14: MCMC](../14_mcmc/14_mcmc.qmd) — Bayesian credible
+>   intervals via NUTS sampling
+> - [Vignette 24: Variational](../24_variational/24_variational.qmd) —
+>   approximate Bayesian posterior intervals
+> - [Vignette 27: Blowfly DDE](../27_blowfly_dde/27_blowfly_dde.qmd) —
+>   bootstrap CIs on a DDE model
+> - [Vignette 28: Fisheries](../28_fisheries/28_fisheries.qmd) — Poisson
+>   parametric bootstrap on count data
+
 ## Practical Guidance
 
 ### Choosing a bootstrap method

@@ -1,6 +1,6 @@
 # Bayesian Inference with MCMCSolver
 Simon Frost
-2026-03-23
+2026-04-02
 
 - [Overview](#overview)
 - [Example: Logistic Growth with Unknown Carrying
@@ -23,6 +23,7 @@ Simon Frost
   - [Posterior Diagnostics](#posterior-diagnostics)
   - [Comparison with LAML](#comparison-with-laml)
   - [Discussion](#discussion)
+- [Diagnostic Plots](#diagnostic-plots)
 - [Summary](#summary)
 
 ## Overview
@@ -538,6 +539,59 @@ complexity the data supports. Values close to the number of knots
 indicate overfitting risk, while low values suggest the function is
 well-constrained. The posterior spread in EDF reflects **uncertainty
 about model complexity** — a feature unique to Bayesian approaches.
+
+## Diagnostic Plots
+
+A standard 4-panel diagnostic display assesses residual behaviour for
+the MCMC fit. The QQ plot checks normality of standardized residuals,
+“Residuals vs Fitted” detects systematic patterns, the histogram
+visualises the residual distribution, and “Observed vs Fitted” checks
+overall calibration.
+
+``` julia
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+![](14_mcmc_files/figure-commonmark/cell-21-output-1.svg)
+
+    Durbin-Watson: 1.486
+
+> [!TIP]
+>
+> ### See Also
+>
+> - [Vignette 19:
+>   Pseudo-Marginal](../19_pseudo_marginal/19_pseudo_marginal.qmd) —
+>   Bayesian inference with probabilistic ODE likelihood
+> - [Vignette 24: Variational](../24_variational/24_variational.qmd) —
+>   fast approximate Bayesian inference
+> - [Vignette 29: Bootstrap](../29_bootstrap/29_bootstrap.qmd) —
+>   frequentist uncertainty via resampling
 
 ## Summary
 

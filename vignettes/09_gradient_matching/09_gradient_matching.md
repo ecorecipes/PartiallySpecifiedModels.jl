@@ -1,6 +1,6 @@
 # Integration-Free Inference with Gradient Matching
 Simon Frost
-2026-03-22
+2026-04-02
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -20,6 +20,10 @@ Simon Frost
   - [Inspecting AGM diagnostics](#inspecting-agm-diagnostics)
 - [Example 2: Logistic Growth — A Clean
   Demonstration](#example-2-logistic-growth--a-clean-demonstration)
+- [Diagnostic Plots](#diagnostic-plots)
+- [Two-Stage
+  Smooth-Then-Differentiate](#two-stage-smooth-then-differentiate)
+  - [Exponential decay comparison](#exponential-decay-comparison)
 - [When to Use Gradient Matching](#when-to-use-gradient-matching)
   - [Advantages](#advantages)
   - [Limitations](#limitations)
@@ -36,12 +40,16 @@ ODE integration entirely by:
 2.  Computing derivatives of that curve
 3.  Matching those derivatives to the ODE right-hand side
 
-`PartiallySpecifiedModels.jl` provides two gradient matching solvers:
+`PartiallySpecifiedModels.jl` provides several integration-free solvers:
 
 - **`GradientMatching`** — basic smoothing spline approach with
   derivative matching
 - **`AdaptiveGradientMatching` (AGM)** — Gaussian process-based with
   adaptive mismatch parameters and smoothing penalties
+- **`TwoStageSolver`** — smooth-then-differentiate baseline (penalized
+  least squares)
+- **`BNGSolver`** — Bayesian Numerical Gradient matching (Bayesian
+  interpretation of the two-stage idea)
 
 This vignette compares these integration-free methods against standard
 integration-based solvers, highlighting the speed advantage and
@@ -92,18 +100,18 @@ prob = PSMProblem(sir!, u0, tspan, [approx_β];
     obs_to_state=[1, 2], known_params=(γ=0.25,), solver=Tsit5())
 ```
 
-    PSMProblem{typeof(sir!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(sir!, [990.0, 10.0, 0.0], (0.0, 60.0), BSplineApproximator[BSplineApproximator(:β, (0.0, 0.15), 8, PartiallySpecifiedModels.var"#6#7"{Float64}(0.4))], [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0  …  51.0, 52.0, 53.0, 54.0, 55.0, 56.0, 57.0, 58.0, 59.0, 60.0], [988.1832125927411 9.896037666331825; 985.8975437423887 13.461390776142522; … ; 329.35354655287034 3.2084058156376694; 323.05533131939933 5.286766967095861], [1.0 1.0; 1.0 1.0; … ; 1.0 1.0; 1.0 1.0], [1, 2], (γ = 0.25,), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false)
+    PSMProblem{typeof(sir!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(sir!, [990.0, 10.0, 0.0], (0.0, 60.0), BSplineApproximator[BSplineApproximator(:β, (0.0, 0.15), 8, PartiallySpecifiedModels.var"#6#7"{Float64}(0.4))], [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0  …  51.0, 52.0, 53.0, 54.0, 55.0, 56.0, 57.0, 58.0, 59.0, 60.0], [988.1832125927411 9.896037666331825; 985.8975437423887 13.461390776142522; … ; 329.35354655287034 3.2084058156376694; 323.05533131939933 5.286766967095861], [1.0 1.0; 1.0 1.0; … ; 1.0 1.0; 1.0 1.0], [1, 2], (γ = 0.25,), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false, Float64[], nothing)
 
 ### Fit with all approaches
 
     Method               | Time (s) | Data Loss
     -------------------------------------------------------
-    GradientMatching     | 3.66     | 0.0
-    AGM                  | 5.1      | 1184.4
-    LAML                 | 5.87     | 1754.0
-    CollocationLAML      | 1.67     | 1210.1
-    AdamSolver           | 4.18     | 1365.0
-    RodeoSolver          | 4.33     | 1342.4
+    GradientMatching     | 4.14     | 0.0
+    AGM                  | 5.68     | 1184.4
+    LAML                 | 6.2      | 1754.0
+    CollocationLAML      | 1.62     | 1210.1
+    AdamSolver           | 4.31     | 1365.0
+    RodeoSolver          | 4.49     | 1342.4
 
 ### Compare recovered β(prevalence)
 
@@ -167,7 +175,7 @@ for fitted trajectories.
 ### Inspecting AGM diagnostics
 
     AGM convergence info:
-      GP hyperparams: [(52268.25281995996, 18.0, 52.26825281995996), (864.7704326939464, 12.0, 8.647704326939465), (0.0, 0.0, 0.0)]
+      GP hyperparams: [(52268.25281995996, 18.0, 52.26825281995996), (864.7704326939464, 12.0, 8.647704326939465), (3.078267445e-314, 3.14e-321, NaN)]
       Gamma (mismatch): [5.3415, 6.4351, 5.3671]
       Derivative loss: 11416.7432
 
@@ -192,7 +200,7 @@ prob_g = PSMProblem(growth!, u0_g, tspan_g, [approx_r];
     data_times=sol_g.t, data_values=data_g, obs_to_state=[1], solver=Tsit5())
 ```
 
-    PSMProblem{typeof(growth!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(growth!, [0.5], (0.0, 15.0), BSplineApproximator[BSplineApproximator(:r, (0.0, 12.0), 8, PartiallySpecifiedModels.var"#6#7"{Float64}(0.3))], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  10.5, 11.0, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0], [0.01; 1.1164659276520987; … ; 9.561007913522136; 10.063834705188276;;], [1.0; 1.0; … ; 1.0; 1.0;;], [1], NamedTuple(), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false)
+    PSMProblem{typeof(growth!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(growth!, [0.5], (0.0, 15.0), BSplineApproximator[BSplineApproximator(:r, (0.0, 12.0), 8, PartiallySpecifiedModels.var"#6#7"{Float64}(0.3))], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  10.5, 11.0, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0], [0.01; 1.1164659276520987; … ; 9.561007913522136; 10.063834705188276;;], [1.0; 1.0; … ; 1.0; 1.0;;], [1], NamedTuple(), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false, Float64[], nothing)
 
 ``` julia
 # Compare methods
@@ -217,6 +225,103 @@ hline!([0.0], color=:gray, ls=:dot, label=nothing)
 
 ![](09_gradient_matching_files/figure-commonmark/cell-8-output-1.svg)
 
+## Diagnostic Plots
+
+A standard 4-panel diagnostic display assesses residual behaviour for
+the Adaptive Gradient Matching fit.
+
+``` julia
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol_agm)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+![](09_gradient_matching_files/figure-commonmark/cell-9-output-1.svg)
+
+    Durbin-Watson: 1.588, 1.903
+
+## Two-Stage Smooth-Then-Differentiate
+
+The `TwoStageSolver` provides the simplest integration-free baseline: it
+first smooths the observed data with a spline, then numerically
+differentiates the smooth to estimate derivatives, and finally fits the
+unknown function to match those derivatives. This is fast but less
+accurate than the adaptive gradient matching approach above.
+
+### Exponential decay comparison
+
+Using a density-dependent decay model $du/dt = -r(u) \cdot u$ with true
+rate $r(u) = 0.5u$, we compare the three derivative-matching solvers
+against the integration-based LAML baseline.
+
+``` julia
+r_true_decay(u) = 0.5 * u
+
+function decay!(du, u, p, t)
+    du[1] = -p.r(u[1]) * u[1]
+end
+
+u0_d = [5.0]; tspan_d = (0.0, 10.0)
+sol_d = OrdinaryDiffEq.solve(ODEProblem(decay!, u0_d, tspan_d, (; r=r_true_decay)), Tsit5(); saveat=0.25)
+data_d = reshape(max.(sol_d[1,:] .+ 0.1 .* randn(length(sol_d.t)), 0.01), :, 1)
+
+uf_d = BSplineApproximator(:r, (0.01, 5.5), 10)
+prob_d = PSMProblem(decay!, u0_d, tspan_d, [uf_d];
+    data_times=collect(sol_d.t), data_values=Float64.(data_d),
+    obs_to_state=[1], known_params=NamedTuple())
+```
+
+    PSMProblem{typeof(decay!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(decay!, [5.0], (0.0, 10.0), BSplineApproximator[BSplineApproximator(:r, (0.01, 5.5), 10, PartiallySpecifiedModels.var"#4#5"())], [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25  …  7.75, 8.0, 8.25, 8.5, 8.75, 9.0, 9.25, 9.5, 9.75, 10.0], [4.999369988114051; 3.2974435780566793; … ; 0.18161410174188075; 0.2814068342217305;;], [1.0; 1.0; … ; 1.0; 1.0;;], [1], NamedTuple(), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false, Float64[], nothing)
+
+``` julia
+sol_ts  = solve(prob_d, TwoStageSolver(maxiters=2000, lr=0.01, verbose=false))
+sol_bng = solve(prob_d, BNGSolver(maxiters=2000, lr=0.01, verbose=false))
+sol_laml_d = solve(prob_d, LAML(maxiters=100, verbose=false))
+
+u_grid_d = range(0.01, 5.5, length=100)
+plot(u_grid_d, r_true_decay.(u_grid_d), label="True r(u)", lw=3, color=:black, ls=:dash,
+     xlabel="Population u", ylabel="r(u)", title="Rate Recovery: TwoStage vs BNG vs LAML")
+plot!(u_grid_d, [sol_ts.unknown_functions[:r](x) for x in u_grid_d], label="TwoStage", lw=2)
+plot!(u_grid_d, [sol_bng.unknown_functions[:r](x) for x in u_grid_d], label="BNG", lw=2, ls=:dash)
+plot!(u_grid_d, [sol_laml_d.unknown_functions[:r](x) for x in u_grid_d], label="LAML", lw=2, ls=:dot)
+```
+
+![](09_gradient_matching_files/figure-commonmark/cell-12-output-1.svg)
+
+    TwoStage    loss=0.0  r(2)=0.9528
+    BNG         loss=1.4316  r(2)=0.9528
+    LAML        loss=0.3408  r(2)=1.0301
+    True        r(2)=1.0
+
+TwoStage and BNG use the same derivative-matching objective, so their
+point estimates typically coincide; BNG adds a Bayesian interpretation.
+LAML integrates the ODE and selects smoothing via marginal likelihood,
+generally recovering the functional response more accurately when data
+are sparse or noisy.
+
 ## When to Use Gradient Matching
 
 ### Advantages
@@ -237,10 +342,11 @@ hline!([0.0], color=:gray, ls=:dot, label=nothing)
 
 ### Recommendations
 
-| Scenario                           | Recommended method          |
-|------------------------------------|-----------------------------|
-| Fast exploratory fit               | `GradientMatching`          |
-| Stiff/unstable ODE                 | `AdaptiveGradientMatching`  |
-| Well-behaved system, best accuracy | `LAML` or `CollocationLAML` |
-| Need uncertainty quantification    | `RodeoSolver`               |
-| Neural network approximators       | `AdamSolver`                |
+| Scenario                           | Recommended method              |
+|------------------------------------|---------------------------------|
+| Fastest possible baseline          | `TwoStageSolver` or `BNGSolver` |
+| Fast exploratory fit               | `GradientMatching`              |
+| Stiff/unstable ODE                 | `AdaptiveGradientMatching`      |
+| Well-behaved system, best accuracy | `LAML` or `CollocationLAML`     |
+| Need uncertainty quantification    | `RodeoSolver`                   |
+| Neural network approximators       | `AdamSolver`                    |

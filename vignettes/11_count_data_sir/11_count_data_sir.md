@@ -1,6 +1,6 @@
 # Epidemiological Count Data: Non-Gaussian Likelihoods
 Simon Frost
-2026-03-22
+2026-04-02
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -28,6 +28,7 @@ Simon Frost
   - [When to use each likelihood](#when-to-use-each-likelihood)
   - [Log-link for positive-constrained
     rates](#log-link-for-positive-constrained-rates)
+- [Diagnostic Plots](#diagnostic-plots)
 - [Key Takeaways](#key-takeaways)
 
 ## Overview
@@ -63,6 +64,11 @@ using Random
 import Distributions
 Random.seed!(42)
 ```
+
+    Precompiling packages...
+        PartiallySpecifiedModels Being precompiled by another process (pid: 36853, pidfile: /Users/username/.julia/compiled/v1.12/PartiallySpecifiedModels/tWtwA_lLwID.ji.pidfile)
+      18184.3 ms  ✓ PartiallySpecifiedModels
+      1 dependency successfully precompiled in 42 seconds. 387 already precompiled.
 
     TaskLocalRNG()
 
@@ -171,11 +177,11 @@ Each likelihood gets a fresh approximator:
 
 ### Poisson (correct variance structure for counts)
 
-    Poisson: data_loss = 1.5792116e6, edf = 8.0
+    Poisson: data_loss = 1.5755791e6, edf = 2.0
 
 ### Negative Binomial (accounts for overdispersion)
 
-    NegBin: data_loss = 1.5876563e6, edf = 2.1
+    NegBin: data_loss = 1.5872837e6, edf = 2.0
 
 ## Compare Results
 
@@ -228,8 +234,8 @@ plot!(prev_grid, [sol_nb.unknown_functions[:β](p) for p in prev_grid],
     Likelihood | β(0.01) est | β(0.06) est | EDF  | Cor(β̂, β_true)
     ----------------------------------------------------------------------
     Gaussian   | 0.483 (0.490) | 0.459 (0.443) | 2.1  | 0.979
-    Poisson    | 0.474 (0.490) | 0.432 (0.443) | 8.0  | 0.506
-    NegBin     | 0.497 (0.490) | 0.457 (0.443) | 2.1  | 0.986
+    Poisson    | 0.508 (0.490) | 0.459 (0.443) | 2.0  | 1.0
+    NegBin     | 0.506 (0.490) | 0.451 (0.443) | 2.0  | 1.0
 
 ## Using RodeoSolver with Count Data
 
@@ -283,6 +289,47 @@ plot!(prev_grid, β_log_est, label="Log-link NegBin", lw=2, color=:darkgreen)
 ```
 
 ![](11_count_data_sir_files/figure-commonmark/cell-14-output-1.svg)
+
+## Diagnostic Plots
+
+A standard 4-panel diagnostic display assesses residual behaviour for
+the primary Gaussian fit. The QQ plot checks normality of standardized
+residuals, “Residuals vs Fitted” detects systematic patterns, the
+histogram visualises the residual distribution, and “Observed vs Fitted”
+checks overall calibration.
+
+``` julia
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol_gauss)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+![](11_count_data_sir_files/figure-commonmark/cell-15-output-1.svg)
+
+    Durbin-Watson: 2.52, 1.773
 
 ## Key Takeaways
 

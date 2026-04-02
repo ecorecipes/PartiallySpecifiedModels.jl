@@ -1,6 +1,6 @@
 # Lotka–Volterra Predator–Prey with Real Data
 Simon Frost
-2026-03-22
+2026-04-02
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -141,7 +141,7 @@ prob = PSMProblem(lotka_volterra!, u0, tspan,
     abstol = 1e-6, reltol = 1e-6, maxiters = 10000)
 ```
 
-    PSMProblem{typeof(lotka_volterra!), Vector{Float64}, Gaussian, BS3{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(lotka_volterra!, [19.58, 30.09], (1845.0, 1935.0), BSplineApproximator[BSplineApproximator(:r, (0.0, 180.0), 10, var"#2#3"()), BSplineApproximator(:δ, (0.0, 80.0), 10, var"#5#6"())], [1845.0, 1846.0, 1847.0, 1848.0, 1849.0, 1850.0, 1851.0, 1852.0, 1853.0, 1854.0  …  1926.0, 1927.0, 1928.0, 1929.0, 1930.0, 1931.0, 1932.0, 1933.0, 1934.0, 1935.0], [19.58 30.09; 19.6 45.15; … ; 81.66 29.7; 15.76 35.4], [1.0 1.0; 1.0 1.0; … ; 1.0 1.0; 1.0 1.0], [1, 2], (α = 0.01,), Gaussian(), BS3{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(:maxiters => 10000, :reltol => 1.0e-6, :abstol => 1.0e-6), false)
+    PSMProblem{typeof(lotka_volterra!), Vector{Float64}, Gaussian, BS3{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(lotka_volterra!, [19.58, 30.09], (1845.0, 1935.0), BSplineApproximator[BSplineApproximator(:r, (0.0, 180.0), 10, var"#2#3"()), BSplineApproximator(:δ, (0.0, 80.0), 10, var"#5#6"())], [1845.0, 1846.0, 1847.0, 1848.0, 1849.0, 1850.0, 1851.0, 1852.0, 1853.0, 1854.0  …  1926.0, 1927.0, 1928.0, 1929.0, 1930.0, 1931.0, 1932.0, 1933.0, 1934.0, 1935.0], [19.58 30.09; 19.6 45.15; … ; 81.66 29.7; 15.76 35.4], [1.0 1.0; 1.0 1.0; … ; 1.0 1.0; 1.0 1.0], [1, 2], (α = 0.01,), Gaussian(), BS3{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(:maxiters => 10000, :reltol => 1.0e-6, :abstol => 1.0e-6), false, Float64[], nothing)
 
 Note that `obs_to_state = [1, 2]` means column 1 of the data corresponds
 to state variable 1 (hares) and column 2 to state 2 (lynx). The
@@ -220,10 +220,45 @@ The total EDF of the model is the sum across all unknown functions.
 
 ## Residual Diagnostics
 
-Residual diagnostics help detect over- or under-smoothing. Key tools are
-the **Durbin–Watson statistic** (DW ≈ 2 for independent residuals, DW \<
-2 for positive autocorrelation indicating oversmoothing) and the
-**empirical autocorrelation function (ACF)**:
+A standard 4-panel diagnostic display assesses residual behaviour:
+
+``` julia
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+![](03_lotka_volterra_files/figure-commonmark/cell-10-output-1.svg)
+
+    Durbin-Watson: 0.706, 0.469
+
+Additional time-series diagnostics — the **Durbin–Watson statistic** (DW
+≈ 2 for independent residuals, DW \< 2 for positive autocorrelation
+indicating oversmoothing) and the **empirical autocorrelation function
+(ACF)**:
 
     Durbin–Watson: hare = 0.706  lynx = 0.469
 
@@ -245,7 +280,7 @@ hline!([1.96/sqrt(91), -1.96/sqrt(91)], color=:gray, ls=:dash, label="95% CI")
 plot(p5, p6, layout=(2, 1), size=(700, 500))
 ```
 
-![](03_lotka_volterra_files/figure-commonmark/cell-11-output-1.svg)
+![](03_lotka_volterra_files/figure-commonmark/cell-13-output-1.svg)
 
 The DW values well below 2 and strong positive ACF at lag 1, with a
 clear ~10-year oscillatory pattern, indicate that the model is not
@@ -310,7 +345,7 @@ plot!(p2c, years, pred_coll[:, 2], label="Collocation", lw=2, color=:darkred)
 plot(p1c, p2c, layout=(2, 1), size=(700, 500))
 ```
 
-![](03_lotka_volterra_files/figure-commonmark/cell-14-output-1.svg)
+![](03_lotka_volterra_files/figure-commonmark/cell-16-output-1.svg)
 
 ### Residual Diagnostics (Collocation)
 
@@ -335,7 +370,7 @@ hline!([1.96/sqrt(91), -1.96/sqrt(91)], color=:gray, ls=:dash, label="95% CI")
 plot(p5c, p6c, layout=(2, 1), size=(700, 500))
 ```
 
-![](03_lotka_volterra_files/figure-commonmark/cell-16-output-1.svg)
+![](03_lotka_volterra_files/figure-commonmark/cell-18-output-1.svg)
 
 ### Estimated Unknown Functions (Comparison)
 
@@ -359,7 +394,7 @@ plot!(p4c, L_grid, [δ_coll(L) for L in L_grid],
 plot(p3c, p4c, layout=(1, 2), size=(800, 350))
 ```
 
-![](03_lotka_volterra_files/figure-commonmark/cell-17-output-1.svg)
+![](03_lotka_volterra_files/figure-commonmark/cell-19-output-1.svg)
 
 ## Discussion
 

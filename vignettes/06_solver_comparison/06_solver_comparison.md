@@ -1,6 +1,6 @@
 # Solver Comparison: Seven Methods on One Problem
 Simon Frost
-2026-03-22
+2026-04-02
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -21,6 +21,7 @@ Simon Frost
   - [Recovered transmission rate
     β(prevalence)](#recovered-transmission-rate-βprevalence)
   - [Summary table](#summary-table)
+- [Diagnostic Plots](#diagnostic-plots)
 - [Discussion](#discussion)
 
 ## Overview
@@ -52,6 +53,11 @@ using Plots
 using Random
 Random.seed!(42)
 ```
+
+    Precompiling packages...
+        PartiallySpecifiedModels Being precompiled by another process (pid: 36853, pidfile: /Users/username/.julia/compiled/v1.12/PartiallySpecifiedModels/tWtwA_lLwID.ji.pidfile)
+      16825.4 ms  ✓ PartiallySpecifiedModels
+      1 dependency successfully precompiled in 40 seconds. 387 already precompiled.
 
     TaskLocalRNG()
 
@@ -124,7 +130,7 @@ prob = PSMProblem(sir!, u0, tspan, [approx_β];
     obs_to_state=[1, 2], known_params=(γ=0.25,), solver=Tsit5())
 ```
 
-    PSMProblem{typeof(sir!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(sir!, [990.0, 10.0, 0.0], (0.0, 60.0), BSplineApproximator[BSplineApproximator(:β, (0.0, 0.15), 8, PartiallySpecifiedModels.var"#6#7"{Float64}(0.4))], [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0  …  51.0, 52.0, 53.0, 54.0, 55.0, 56.0, 57.0, 58.0, 59.0, 60.0], [988.1832125927411 9.896037666331825; 985.8975437423887 13.461390776142522; … ; 329.35354655287034 3.2084058156376694; 323.05533131939933 5.286766967095861], [1.0 1.0; 1.0 1.0; … ; 1.0 1.0; 1.0 1.0], [1, 2], (γ = 0.25,), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false)
+    PSMProblem{typeof(sir!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(sir!, [990.0, 10.0, 0.0], (0.0, 60.0), BSplineApproximator[BSplineApproximator(:β, (0.0, 0.15), 8, PartiallySpecifiedModels.var"#6#7"{Float64}(0.4))], [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0  …  51.0, 52.0, 53.0, 54.0, 55.0, 56.0, 57.0, 58.0, 59.0, 60.0], [988.1832125927411 9.896037666331825; 985.8975437423887 13.461390776142522; … ; 329.35354655287034 3.2084058156376694; 323.05533131939933 5.286766967095861], [1.0 1.0; 1.0 1.0; … ; 1.0 1.0; 1.0 1.0], [1, 2], (γ = 0.25,), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false, Float64[], nothing)
 
 ## Fit with Each Solver
 
@@ -136,7 +142,7 @@ mixed models. For strongly nonlinear models like prevalence-dependent
 transmission, `initial_lambda` and `warmup` keep the early IRLS steps
 well-conditioned:
 
-    LAML: data_loss=1364.5, edf=6.1, time=7.0s
+    LAML: data_loss=1364.5, edf=6.1, time=8.3s
 
 ### 2. CollocationLAML
 
@@ -145,7 +151,7 @@ collocation. A continuation schedule gradually increases the ODE
 penalty, starting from a pure data-fit and converging toward
 ODE-consistent solutions.
 
-    CollocationLAML: data_loss=1210.1, edf=8.0, time=1.8s
+    CollocationLAML: data_loss=1210.1, edf=8.0, time=2.2s
 
 ### 3. GradientMatching
 
@@ -153,7 +159,7 @@ Estimates derivatives directly from a smooth interpolant of the data,
 then fits the ODE right-hand side to those derivatives. No ODE
 integration required — fast but relies on good derivative estimates.
 
-    GradientMatching: data_loss=0.0, edf=8.0, time=2.4s
+    GradientMatching: data_loss=0.0, edf=8.0, time=2.7s
 
 > [!NOTE]
 >
@@ -167,7 +173,7 @@ Direct optimisation of the B-spline coefficients using the Adam gradient
 descent algorithm. Integrates the ODE at each step and minimises the
 mean squared error to data.
 
-    AdamSolver: data_loss=1365.0, time=4.0s
+    AdamSolver: data_loss=1365.0, time=4.6s
 
 ### 5. AdaptiveGradientMatching (AGM)
 
@@ -176,7 +182,7 @@ parameters $\gamma_k$ that control how tightly the GP derivatives must
 satisfy the ODE. Uses pre-computed eigendecomposition for efficiency and
 a B-spline smoothing penalty.
 
-    AGM: data_loss=1184.4, time=4.8s
+    AGM: data_loss=1184.4, time=5.5s
 
 ### 6. RodeoSolver
 
@@ -185,7 +191,7 @@ Kalman filter/smoother. The ODE is enforced as pseudo-observations in a
 state-space model; the marginal likelihood is maximised over B-spline
 coefficients.
 
-    RodeoSolver: data_loss=1342.4, time=3.9s
+    RodeoSolver: data_loss=1342.4, time=4.2s
 
 ## Comparison
 
@@ -239,12 +245,61 @@ p_β
 
     Solver              | Data Loss | Time (s)
     --------------------------------------------------
-    LAML                | 1364.5    | 7.0
-    CollocationLAML     | 1210.1    | 1.8
-    GradientMatching    | 0.0       | 2.4
-    Adam                | 1365.0    | 4.0
-    AGM                 | 1184.4    | 4.8
-    Rodeo               | 1342.4    | 3.9
+    LAML                | 1364.5    | 8.3
+    CollocationLAML     | 1210.1    | 2.2
+    GradientMatching    | 0.0       | 2.7
+    Adam                | 1365.0    | 4.6
+    AGM                 | 1184.4    | 5.5
+    Rodeo               | 1342.4    | 4.2
+
+## Diagnostic Plots
+
+A standard 4-panel diagnostic display assesses residual behaviour for
+the recommended LAML solver.
+
+``` julia
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol_laml)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+![](06_solver_comparison_files/figure-commonmark/cell-14-output-1.svg)
+
+    Durbin-Watson: 1.366, 1.844
+
+> [!TIP]
+>
+> ### See Also
+>
+> - [Vignette 05: Neural
+>   Networks](../05_neural_networks/05_neural_networks.qmd) — compares
+>   approximator types (B-spline, GP, neural)
+> - [Vignette 09: Gradient
+>   Matching](../09_gradient_matching/09_gradient_matching.qmd) —
+>   detailed integration-free solver comparison
 
 ## Discussion
 
