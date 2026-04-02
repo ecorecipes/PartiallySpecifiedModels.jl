@@ -201,7 +201,7 @@ plot!(prev_grid, λ_est, label="Estimated λ(I/N)", lw=2, color=:red)
 
 ```{julia}
 #| echo: false
-println("Parametric bootstrap: $(bs_param.n_success) / 100 replicates succeeded")
+println("Parametric bootstrap: $(bs_param.n_success) / 50 replicates succeeded")
 ```
 
 ## Section 3: Nonparametric Bootstrap
@@ -246,49 +246,18 @@ plot!(prev_grid, λ_est, label="Estimated λ(I/N)", lw=2, color=:red)
 
 ```{julia}
 #| echo: false
-println("Nonparametric bootstrap: $(bs_nonparam.n_success) / 100 replicates succeeded")
+println("Nonparametric bootstrap: $(bs_nonparam.n_success) / 50 replicates succeeded")
 ```
 
 ## Section 4: Case Bootstrap
 
-The **case bootstrap** resamples entire observation rows $(t_i, I_i)$ with replacement. This is the most conservative method: it makes no assumptions about the error structure or the design, and naturally accounts for heteroscedasticity and dependence.
+::: {.callout-warning}
+## Case bootstrap is not recommended for ODE models
 
-However, because time points can be duplicated or missing, the refit can be less stable.
+The **case bootstrap** resamples entire observation rows with replacement. For time series data from ODE models, this scrambles the temporal structure — a resampled dataset might place the peak observation at an early time point. This produces unreliable CIs and high failure rates. Case resampling is designed for cross-sectional (i.i.d.) data, not time-ordered dynamical systems.
 
-```{julia}
-bs_case = bootstrap(sol, prob, LAML(maxiters=80, verbose=false);
-    nboot=50, method=:case, rng=Random.Xoshiro(42), verbose=true)
-```
-
-### Trajectory confidence intervals
-
-```{julia}
-plot(data_times, I_true, label="True I(t)", lw=2, color=:black, ls=:dash,
-     xlabel="Time (days)", ylabel="Infected",
-     title="Case bootstrap: trajectory CI")
-scatter!(data_times, I_obs, label="Observed", ms=3, alpha=0.4, color=:steelblue)
-plot!(data_times, sol.fitted_values[:, 1], label="PSM fit", lw=2, color=:red)
-plot!(data_times, bs_case.ci_fitted.lower[:, 1],
-      fillrange=bs_case.ci_fitted.upper[:, 1],
-      fillalpha=0.2, color=:green, label="95% CI", ls=:dot, lw=0)
-```
-
-### Unknown function confidence intervals
-
-```{julia}
-plot(prev_grid, λ_true, label="True λ(I/N)", lw=2, color=:black, ls=:dash,
-     xlabel="Prevalence (I/N)", ylabel="Force of infection λ",
-     title="Case bootstrap: unknown function CI")
-plot!(bs_case.uf_grid[:λ], bs_case.ci_uf[:λ].lower,
-      fillrange=bs_case.ci_uf[:λ].upper,
-      fillalpha=0.2, color=:green, label="95% CI", ls=:dot, lw=0)
-plot!(prev_grid, λ_est, label="Estimated λ(I/N)", lw=2, color=:red)
-```
-
-```{julia}
-#| echo: false
-println("Case bootstrap: $(bs_case.n_success) / 100 replicates succeeded")
-```
+For ODE-based PSMs, use **parametric** or **nonparametric** bootstrap instead.
+:::
 
 ## Section 5: Comparison of Bootstrap Methods
 
@@ -302,13 +271,10 @@ scatter!(p_traj, data_times, I_obs, label="Data", ms=2, alpha=0.3, color=:gray)
 
 plot!(p_traj, data_times, bs_param.ci_fitted.lower[:, 1],
       fillrange=bs_param.ci_fitted.upper[:, 1],
-      fillalpha=0.15, color=:red, label="Parametric", ls=:dot, lw=0)
+      fillalpha=0.2, color=:red, label="Parametric", ls=:dot, lw=0)
 plot!(p_traj, data_times, bs_nonparam.ci_fitted.lower[:, 1],
       fillrange=bs_nonparam.ci_fitted.upper[:, 1],
-      fillalpha=0.15, color=:blue, label="Nonparametric", ls=:dot, lw=0)
-plot!(p_traj, data_times, bs_case.ci_fitted.lower[:, 1],
-      fillrange=bs_case.ci_fitted.upper[:, 1],
-      fillalpha=0.15, color=:green, label="Case", ls=:dot, lw=0)
+      fillalpha=0.2, color=:blue, label="Nonparametric", ls=:dot, lw=0)
 plot!(p_traj, data_times, sol.fitted_values[:, 1], label="Fit", lw=2, color=:red)
 ```
 
@@ -321,13 +287,10 @@ p_uf = plot(prev_grid, λ_true, label="True λ", lw=2, color=:black, ls=:dash,
 
 plot!(p_uf, bs_param.uf_grid[:λ], bs_param.ci_uf[:λ].lower,
       fillrange=bs_param.ci_uf[:λ].upper,
-      fillalpha=0.15, color=:red, label="Parametric", ls=:dot, lw=0)
+      fillalpha=0.2, color=:red, label="Parametric", ls=:dot, lw=0)
 plot!(p_uf, bs_nonparam.uf_grid[:λ], bs_nonparam.ci_uf[:λ].lower,
       fillrange=bs_nonparam.ci_uf[:λ].upper,
-      fillalpha=0.15, color=:blue, label="Nonparametric", ls=:dot, lw=0)
-plot!(p_uf, bs_case.uf_grid[:λ], bs_case.ci_uf[:λ].lower,
-      fillrange=bs_case.ci_uf[:λ].upper,
-      fillalpha=0.15, color=:green, label="Case", ls=:dot, lw=0)
+      fillalpha=0.2, color=:blue, label="Nonparametric", ls=:dot, lw=0)
 plot!(p_uf, prev_grid, λ_est, label="Fit", lw=2, color=:red)
 ```
 
@@ -361,12 +324,11 @@ end
 println("Method          | n_success | CI width at peak | Mean UF CI width | UF coverage")
 println("-"^85)
 for (name, bs) in [("Parametric", bs_param),
-                    ("Nonparametric", bs_nonparam),
-                    ("Case", bs_case)]
+                    ("Nonparametric", bs_nonparam)]
     w_peak = round(ci_width_at_peak(bs), digits=1)
     w_uf = round(mean_uf_ci_width(bs), sigdigits=3)
     cov = round(uf_coverage(bs) * 100, digits=1)
-    println(rpad(name, 16), "| ", rpad("$(bs.n_success)/100", 10),
+    println(rpad(name, 16), "| ", rpad("$(bs.n_success)/50", 10),
             "| ", rpad("$w_peak", 17),
             "| ", rpad("$w_uf", 17),
             "| ", cov, "%")
@@ -512,8 +474,11 @@ A Durbin-Watson statistic near 2 indicates no strong autocorrelation in the resi
 | Gaussian noise, well-specified model | `:parametric` — narrowest CIs |
 | Count data (Poisson, NegBin) | `:parametric` — respects variance–mean relationship |
 | Suspect non-Gaussian errors | `:nonparametric` — no distributional assumption |
-| Irregular sampling, heteroscedasticity | `:case` — most robust |
 | Quick exploratory analysis | `:parametric` with `nboot=50` |
+
+::: {.callout-note}
+The `:case` bootstrap (resampling entire rows) is available but **not recommended** for ODE/DDE models because it scrambles the temporal structure of the data.
+:::
 
 ### Tips
 
