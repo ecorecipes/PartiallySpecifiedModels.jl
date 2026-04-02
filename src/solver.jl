@@ -522,70 +522,69 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
 
     # ─── Gaussian warm-start for non-Gaussian likelihoods ─────────
     # For Poisson/NegBin with identity link, the IRLS weights (1/V(μ))
-    # can create local minima when the initial fit is poor.  We first
-    # run Gaussian PCLS iterations to stabilize the coefficients, then
-    # do one final Gaussian LAML pass to set good smoothing parameters.
+    # can create local minima when the initial fit is poor.  We run a
+    # full Gaussian IRLS+LAML solve (unit weights, profiled σ²) to find
+    # good starting coefficients AND smoothing parameters, then switch
+    # to the actual likelihood.  This mimics mgcv's initialization.
     if !(prob.likelihood isa Gaussian) && m > 0
-        prev_gw_ss = Inf
+        gw_otheta = copy(theta)
+        prev_gw_obj = Inf
+
         for gw_iter in 1:50
             f_vec_new, _ = try; eval_model(beta); catch; break; end
             f_vec .= f_vec_new
             compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
 
+            w_gauss = copy(w_vec)
             z_pseudo = y_vec .- f_vec .+ J * beta
-            w_gauss = copy(w_vec)  # unit IRLS weights (Gaussian)
-            a_pcls, _ = pcls_step(J, z_pseudo, theta, w_gauss)
-            beta_new, _ = step_contract(beta, a_pcls, build_B(theta))
-            beta .= beta_new
 
-            gw_ss = sum((y_vec[i] - f_vec[i])^2 * w_vec[i] for i in 1:n_data)
-            if verbose && (gw_iter <= 3 || gw_iter % 10 == 0)
-                println("Gauss-warmup $gw_iter: SS=$(round(gw_ss, sigdigits=6))")
+            # Try step with current θ
+            a0_pcls, _ = pcls_step(J, z_pseudo, gw_otheta, w_gauss)
+            a0, f01 = step_contract(beta, a0_pcls, build_B(gw_otheta))
+
+            # After warmup iters, also estimate θ via Gaussian LAML
+            if gw_iter > 3
+                theta_new, _ = try
+                    rho0 = log.(max.(gw_otheta, 1e-20))
+                    estimate_smoothing_params(J, w_gauss, w_vec,
+                        y_vec, f_vec, beta, S_list, uf_offsets, uf_nk, n_p;
+                        family=Gaussian(), rho_init=rho0, verbose=false)
+                catch; (copy(gw_otheta), NaN); end
+
+                # Try step with new θ
+                a1_pcls, B1 = pcls_step(J, z_pseudo, theta_new, w_gauss)
+                a1, f11 = step_contract(beta, a1_pcls, B1)
+
+                # Accept new θ only if it improves the Gaussian data fit
+                ss_a0 = sum((y_vec[i] - (try; first(eval_model(a0)); catch; f_vec; end)[i])^2 * w_vec[i] for i in 1:n_data)
+                ss_a1 = sum((y_vec[i] - (try; first(eval_model(a1)); catch; f_vec; end)[i])^2 * w_vec[i] for i in 1:n_data)
+
+                if ss_a1 <= ss_a0
+                    beta .= a1
+                    gw_otheta .= theta_new
+                else
+                    beta .= a0
+                end
+            else
+                beta .= a0
             end
 
-            # Stop when SS stabilizes
-            if gw_iter > 5 && abs(gw_ss - prev_gw_ss) < 1e-4 * max(prev_gw_ss, 1.0)
+            gw_ss = sum((y_vec[i] - f_vec[i])^2 * w_vec[i] for i in 1:n_data)
+            gw_obj = 0.5 * (gw_ss + dot(beta, build_B(gw_otheta) * beta))
+
+            if verbose && (gw_iter <= 3 || gw_iter % 10 == 0)
+                println("Gauss-warmup $gw_iter: SS=$(round(gw_ss, sigdigits=6)), " *
+                        "θ=$(round.(gw_otheta, sigdigits=3))")
+            end
+
+            if gw_iter > 5 && abs(gw_obj - prev_gw_obj) < 1e-6 * max(abs(prev_gw_obj), 1.0)
                 if verbose; println("Gauss-warmup converged at iter $gw_iter"); end
                 break
             end
-            prev_gw_ss = gw_ss
+            prev_gw_obj = gw_obj
         end
 
-        # Now run a full Gaussian LAML solve from the warm-started coefficients
-        # to get proper smoothing parameter estimation. Run a few PCLS+LAML
-        # cycles exactly like the main loop does, but with Gaussian weights.
-        for gw_laml in 1:20
-            f_vec_new, _ = try; eval_model(beta); catch; break; end
-            f_vec .= f_vec_new
-            compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
-
-            w_gauss = copy(w_vec)
-            theta_new, _ = try
-                rho0 = log.(max.(theta, 1e-20))
-                estimate_smoothing_params(J, w_gauss, w_vec,
-                    y_vec, f_vec, beta, S_list, uf_offsets, uf_nk, n_p;
-                    family=Gaussian(), rho_init=rho0, verbose=(verbose && gw_laml <= 2))
-            catch; (copy(theta), NaN); end
-            theta .= theta_new
-
-            z_pseudo = y_vec .- f_vec .+ J * beta
-            a_pcls, _ = pcls_step(J, z_pseudo, theta, w_gauss)
-            beta_new, _ = step_contract(beta, a_pcls, build_B(theta))
-
-            gw_ss_new = sum((y_vec[i] - f_vec[i])^2 * w_vec[i] for i in 1:n_data)
-            beta .= beta_new
-
-            if verbose && (gw_laml <= 2 || gw_laml % 5 == 0)
-                println("Gauss-LAML $gw_laml: SS=$(round(gw_ss_new, sigdigits=6)), " *
-                        "θ=$(round.(theta, sigdigits=3))")
-            end
-
-            if gw_laml > 2 && abs(gw_ss_new - prev_gw_ss) < 1e-5 * max(prev_gw_ss, 1.0)
-                if verbose; println("Gauss-LAML converged at iter $gw_laml"); end
-                break
-            end
-            prev_gw_ss = gw_ss_new
-        end
+        theta .= gw_otheta
     end
 
     otheta = copy(theta)
