@@ -1440,4 +1440,278 @@ using OrdinaryDiffEq
         @test result.solution.data_loss < 5.0
     end
 
+    # ─── Diagnostics tests ────────────────────────────────────────
+
+    @testset "Diagnostic functions" begin
+        # Use a simple solved problem for diagnostics
+        Random.seed!(42)
+        function logistic_diag!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+        end
+        r_true(N) = 0.5 * (1 - N / 10.0)
+        prob_ode = ODEProblem((du,u,p,t) -> (du[1] = r_true(u[1])*u[1]), [1.0], (0.0, 15.0))
+        sol_true = OrdinaryDiffEq.solve(prob_ode, Tsit5(); saveat=0.5)
+        t_obs = sol_true.t
+        data = reshape([sol_true.u[i][1] + 0.2*randn() for i in 1:length(t_obs)], :, 1)
+
+        uf = BSplineApproximator(:r, (0.1, 10.0), 6; initial=x -> 0.3)
+        prob = PSMProblem(logistic_diag!, [1.0], (0.0, 15.0), [uf];
+            data_times=t_obs, data_values=data, obs_to_state=[1],
+            known_params=NamedTuple(), solver=Tsit5())
+        sol = solve(prob, LAML(maxiters=50, verbose=false))
+
+        @testset "durbin_watson" begin
+            using PartiallySpecifiedModels: durbin_watson
+            resid = sol.data_values .- sol.fitted_values
+            dw = durbin_watson(resid)
+            @test length(dw) == 1
+            @test 0.0 < dw[1] < 4.0  # DW always in [0, 4]
+
+            # Single vector
+            dw_v = durbin_watson(resid[:, 1])
+            @test dw_v ≈ dw[1]
+        end
+
+        @testset "residual_acf" begin
+            using PartiallySpecifiedModels: residual_acf
+            resid = sol.data_values .- sol.fitted_values
+            acf = residual_acf(resid[:, 1]; maxlag=5)
+            @test length(acf) == 5
+            @test all(isfinite, acf)
+            @test all(a -> -1.0 <= a <= 1.0, acf)  # ACF bounded
+
+            # Matrix version
+            acf_m = residual_acf(resid; maxlag=5)
+            @test size(acf_m) == (5, 1)
+            @test acf_m[:, 1] ≈ acf
+        end
+
+        @testset "semivariogram" begin
+            using PartiallySpecifiedModels: semivariogram
+            resid = sol.data_values .- sol.fitted_values
+            lags, gamma = semivariogram(t_obs, resid[:, 1])
+            @test length(lags) == length(gamma)
+            @test length(lags) > 0
+            @test all(g -> g >= 0.0, gamma)  # γ(h) ≥ 0
+            @test all(isfinite, gamma)
+        end
+
+        @testset "residual_diagnostics" begin
+            using PartiallySpecifiedModels: residual_diagnostics
+            diag = residual_diagnostics(sol)
+            @test size(diag.residuals) == size(sol.data_values)
+            @test length(diag.durbin_watson) == 1
+            @test size(diag.acf, 1) == 10  # default maxlag
+            @test length(diag.semivariogram) == 1
+            @test length(diag.semivariogram[1].lags) > 0
+        end
+
+        @testset "appraise" begin
+            using PartiallySpecifiedModels: appraise
+            diag = appraise(sol)
+            n = length(sol.data_times) * size(sol.data_values, 2)
+            @test length(diag.residuals) == n
+            @test length(diag.fitted) == n
+            @test length(diag.observed) == n
+            @test length(diag.qq_theoretical) == n
+            @test length(diag.qq_sample) == n
+            @test issorted(diag.qq_sample)  # sorted
+            @test length(diag.durbin_watson) == 1
+        end
+
+        @testset "deviance_residuals" begin
+            using PartiallySpecifiedModels: deviance_residuals
+            y = [5.0, 10.0, 20.0, 50.0]
+            mu = [4.5, 11.0, 18.0, 55.0]
+
+            # Gaussian: just y - mu
+            dr_g = deviance_residuals(Gaussian(), y, mu)
+            @test dr_g ≈ y .- mu
+
+            # Poisson: sign(y-mu) * sqrt(2(y*log(y/mu) - (y-mu)))
+            dr_p = deviance_residuals(Poisson(), y, mu)
+            @test length(dr_p) == 4
+            @test all(isfinite, dr_p)
+            @test sign(dr_p[1]) == sign(y[1] - mu[1])
+            @test sign(dr_p[2]) == sign(y[2] - mu[2])
+
+            # NegativeBinomial
+            dr_nb = deviance_residuals(NegativeBinomial(10.0), y, mu)
+            @test length(dr_nb) == 4
+            @test all(isfinite, dr_nb)
+
+            # TruncatedNormal: same as Gaussian
+            dr_tn = deviance_residuals(TruncatedNormal(), y, mu)
+            @test dr_tn ≈ y .- mu
+
+            # appraise with Poisson family
+            diag_p = appraise(sol; family=Poisson())
+            @test length(diag_p.residuals) == length(sol.data_times)
+            @test all(isfinite, diag_p.residuals)
+        end
+    end
+
+    # ─── TruncatedNormal likelihood tests ─────────────────────────
+
+    @testset "TruncatedNormal likelihood" begin
+        @testset "construction" begin
+            tn = TruncatedNormal()
+            @test tn.lower == 0.0
+            @test tn.sigma == 1.0
+
+            tn2 = TruncatedNormal(sigma=5.0, lower=-1.0)
+            @test tn2.lower == -1.0
+            @test tn2.sigma == 5.0
+        end
+
+        @testset "log_likelihood" begin
+            using PartiallySpecifiedModels: log_likelihood
+            y = [1.0, 2.0, 5.0]
+            mu = [1.5, 2.5, 4.0]
+            w = ones(3)
+            ll = log_likelihood(TruncatedNormal(sigma=1.0), y, mu, w)
+            @test isfinite(ll)
+            @test ll < 0.0  # log-likelihood is negative
+
+            # Higher sigma → less peaked → lower (more negative) log-lik per point
+            # but broader coverage — just check finite
+            ll2 = log_likelihood(TruncatedNormal(sigma=5.0), y, mu, w)
+            @test isfinite(ll2)
+        end
+
+        @testset "irls_weights" begin
+            using PartiallySpecifiedModels: irls_weights
+            y = [1.0, 3.0, 10.0]
+            mu = [1.5, 2.5, 9.0]
+            w = ones(3)
+            wi = irls_weights(TruncatedNormal(sigma=2.0), y, mu, w)
+            @test length(wi) == 3
+            @test all(wi .> 0)
+            @test all(isfinite, wi)
+        end
+
+        @testset "LAML solver with TruncatedNormal" begin
+            Random.seed!(99)
+            function sir_tn!(du, u, p, t)
+                S, I, R = u
+                λ = max(p.λ(I / 1000.0), 0.0)
+                du[1] = -λ * S
+                du[2] =  λ * S - 0.25 * I
+                du[3] =  0.25 * I
+            end
+            prob_true = ODEProblem((du,u,p,t) -> begin
+                S,I,R=u; λ=0.5*(I/1000)^0.9
+                du[1]=-λ*S; du[2]=λ*S-0.25*I; du[3]=0.25*I
+            end,
+                [990.0, 10.0, 0.0], (0.0, 40.0))
+            sol_true = OrdinaryDiffEq.solve(prob_true, Tsit5(); saveat=1.0)
+            I_data = [max(sol_true(t)[2] + 5*randn(), 0.01) for t in sol_true.t]
+
+            uf = BSplineApproximator(:λ, (0.0, 0.25), 6; initial=x->0.4x)
+            prob = PSMProblem(sir_tn!, [990.0, 10.0, 0.0], (0.0, 40.0), [uf];
+                data_times=sol_true.t, data_values=reshape(I_data, :, 1),
+                obs_to_state=[2], known_params=NamedTuple(),
+                likelihood=TruncatedNormal(sigma=5.0), solver=Tsit5())
+            sol = solve(prob, LAML(maxiters=80, verbose=false))
+            @test sol.data_loss < 20000  # reasonable fit
+            @test sol.edf > 1.0
+            @test haskey(sol.unknown_functions, :λ)
+        end
+    end
+
+    # ─── NeuralApproximator tests ─────────────────────────────────
+
+    @testset "NeuralApproximator" begin
+        import Lux
+
+        @testset "construction" begin
+            model = Lux.Chain(Lux.Dense(1, 8, tanh), Lux.Dense(8, 1))
+            na = NeuralApproximator(:f, model; domain=(0.0, 1.0), rng_seed=42)
+            @test na.name == :f
+            @test na.domain == (0.0, 1.0)
+            @test na.penalty_weight == 0.0
+            @test na.rng_seed == 42
+            @test nparams(na) > 0
+        end
+
+        @testset "initial_params" begin
+            model = Lux.Chain(Lux.Dense(1, 4, tanh), Lux.Dense(4, 1))
+            na = NeuralApproximator(:f, model; rng_seed=42)
+            p = initial_params(na)
+            @test length(p) == nparams(na)
+            @test all(isfinite, p)
+
+            # Deterministic with same seed
+            p2 = initial_params(NeuralApproximator(:f, model; rng_seed=42))
+            @test p ≈ p2
+        end
+
+        @testset "AdamSolver with NeuralApproximator" begin
+            Random.seed!(42)
+            function decay_nn!(du, u, p, t)
+                du[1] = -p.f(u[1]) * u[1]
+            end
+
+            prob_true = ODEProblem((du,u,p,t) -> (du[1] = -0.5*u[1]^1.0*u[1]),
+                [5.0], (0.0, 10.0))
+            sol_true = OrdinaryDiffEq.solve(prob_true, Tsit5(); saveat=0.5)
+            t_obs = sol_true.t
+            data = reshape([sol_true.u[i][1] + 0.1*randn() for i in 1:length(t_obs)], :, 1)
+
+            model = Lux.Chain(Lux.Dense(1, 8, tanh), Lux.Dense(8, 1))
+            uf = NeuralApproximator(:f, model; domain=(0.0, 5.0), rng_seed=42)
+
+            prob = PSMProblem(decay_nn!, [5.0], (0.0, 10.0), [uf];
+                data_times=t_obs, data_values=data, obs_to_state=[1],
+                known_params=NamedTuple(), solver=Tsit5())
+
+            sol = solve(prob, AdamSolver(lr=0.01, maxiters=500, verbose=false))
+            @test sol.data_loss < 5.0
+            @test haskey(sol.unknown_functions, :f)
+            # Check the function is callable
+            @test isfinite(sol.unknown_functions[:f](1.0))
+        end
+    end
+
+    # ─── Poisson warm-start test ──────────────────────────────────
+
+    @testset "Poisson LAML warm-start" begin
+        Random.seed!(11)
+        function sir_pois!(du, u, p, t)
+            S, I, R = u
+            λ = max(p.λ(I / 1000.0), 0.0)
+            du[1] = -λ * S
+            du[2] =  λ * S - 0.25 * I
+            du[3] =  0.25 * I
+        end
+
+        prob_true = ODEProblem((du,u,p,t) -> begin
+            S,I,R = u; λ = 0.5*(I/1000)^0.9
+            du[1]=-λ*S; du[2]=λ*S-0.25*I; du[3]=0.25*I
+        end, [990.0, 10.0, 0.0], (0.0, 40.0))
+        sol_true = OrdinaryDiffEq.solve(prob_true, Tsit5(); saveat=1.0)
+        I_true = [sol_true(t)[2] for t in sol_true.t]
+
+        # Generate Poisson data (simple inversion method)
+        function sample_poisson(μ)
+            μ = max(μ, 0.01); c = 0; s = 0.0
+            while true; s -= log(rand()); s > μ && break; c += 1; end
+            Float64(c)
+        end
+        y_pois = sample_poisson.(I_true)
+
+        uf = BSplineApproximator(:λ, (0.0, 0.25), 8; initial=x -> 0.4x)
+        prob = PSMProblem(sir_pois!, [990.0, 10.0, 0.0], (0.0, 40.0), [uf];
+            data_times=sol_true.t, data_values=reshape(y_pois, :, 1),
+            obs_to_state=[2], known_params=NamedTuple(),
+            likelihood=Poisson(), solver=Tsit5())
+        sol = solve(prob, LAML(maxiters=80, verbose=false))
+
+        # Warm-start should achieve reasonable fit (SS < 20000)
+        # Without warm-start this seed gives SS > 200000
+        @test sol.data_loss < 20000
+        @test sol.edf > 1.5
+        @test sol.edf < 8.0
+    end
+
 end
