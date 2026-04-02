@@ -416,6 +416,13 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_watson], ", "))
 ```
 
+::: {.callout-tip}
+## See Also
+- [Vignette 19: Pseudo-Marginal](../19_pseudo_marginal/19_pseudo_marginal.qmd) — Bayesian inference with probabilistic ODE likelihood
+- [Vignette 24: Variational](../24_variational/24_variational.qmd) — fast approximate Bayesian inference
+- [Vignette 29: Bootstrap](../29_bootstrap/29_bootstrap.qmd) — frequentist uncertainty via resampling
+:::
+
 ## Summary
 
 | Feature | MCMCSolver |

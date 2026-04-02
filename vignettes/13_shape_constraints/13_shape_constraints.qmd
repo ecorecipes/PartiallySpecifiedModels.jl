@@ -797,6 +797,12 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_watson], ", "))
 ```
 
+::: {.callout-tip}
+## See Also
+- [Vignette 16: COMONet](../16_comonet/16_comonet.qmd) — neural network approximators with formally verified shape constraints
+- [Vignette 26: SPDE](../26_spde/26_spde.qmd) — SPDE approximators with shape constraints
+:::
+
 ## Summary
 
 ```{julia}
