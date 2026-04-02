@@ -143,7 +143,8 @@ function _magi_kalman_loglik(ld::MAGILogDensity, theta::AbstractVector{T}) where
                 μ_pred_obs = (D * μ_filt[state_idx])[1]
                 S_pred_obs = (D * Σ_filt[state_idx] * D')[1, 1] + T(ld.obs_var)
                 res = y_obs - μ_pred_obs
-                loglik += T(-0.5) * (log(max(S_pred_obs, T(1e-300))) + res^2 / S_pred_obs)
+                S_clamped = max(S_pred_obs, T(1e-300))
+                loglik += T(-0.5) * (log(S_clamped) + res^2 / S_clamped)
 
                 z_data = T[y_obs]
                 d_zero = zeros(T, 1)
@@ -228,7 +229,8 @@ function _magi_kalman_loglik(ld::MAGILogDensity, theta::AbstractVector{T}) where
                     μ_pred_obs = (D * μ_filt[state_idx])[1]
                     S_pred_obs = (D * Σ_filt[state_idx] * D')[1, 1] + T(ld.obs_var)
                     res = y_obs - μ_pred_obs
-                    loglik += T(-0.5) * (log(max(S_pred_obs, T(1e-300))) + res^2 / S_pred_obs)
+                    S_clamped = max(S_pred_obs, T(1e-300))
+                    loglik += T(-0.5) * (log(S_clamped) + res^2 / S_clamped)
 
                     # Kalman update (condition on observation)
                     z_data = T[y_obs]
