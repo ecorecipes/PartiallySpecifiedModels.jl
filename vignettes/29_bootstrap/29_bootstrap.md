@@ -21,10 +21,6 @@ Simon Frost
   - [Unknown function confidence
     intervals](#unknown-function-confidence-intervals-1)
 - [Section 4: Case Bootstrap](#section-4-case-bootstrap)
-  - [Trajectory confidence
-    intervals](#trajectory-confidence-intervals-2)
-  - [Unknown function confidence
-    intervals](#unknown-function-confidence-intervals-2)
 - [Section 5: Comparison of Bootstrap
   Methods](#section-5-comparison-of-bootstrap-methods)
   - [Side-by-side trajectory CIs](#side-by-side-trajectory-cis)
@@ -239,7 +235,7 @@ plot!(prev_grid, λ_est, label="Estimated λ(I/N)", lw=2, color=:red)
 
 ![](29_bootstrap_files/figure-commonmark/cell-13-output-1.svg)
 
-    Parametric bootstrap: 50 / 100 replicates succeeded
+    Parametric bootstrap: 50 / 50 replicates succeeded
 
 ## Section 3: Nonparametric Bootstrap
 
@@ -295,61 +291,23 @@ plot!(prev_grid, λ_est, label="Estimated λ(I/N)", lw=2, color=:red)
 
 ![](29_bootstrap_files/figure-commonmark/cell-17-output-1.svg)
 
-    Nonparametric bootstrap: 50 / 100 replicates succeeded
+    Nonparametric bootstrap: 50 / 50 replicates succeeded
 
 ## Section 4: Case Bootstrap
 
-The **case bootstrap** resamples entire observation rows $(t_i, I_i)$
-with replacement. This is the most conservative method: it makes no
-assumptions about the error structure or the design, and naturally
-accounts for heteroscedasticity and dependence.
-
-However, because time points can be duplicated or missing, the refit can
-be less stable.
-
-``` julia
-bs_case = bootstrap(sol, prob, LAML(maxiters=80, verbose=false);
-    nboot=50, method=:case, rng=Random.Xoshiro(42), verbose=true)
-```
-
-    Bootstrap replicate 1 / 50
-    Bootstrap replicate 2 / 50
-    Bootstrap replicate 3 / 50
-    Bootstrap replicate 50 / 50
-    Bootstrap complete: 50 / 50 successful
-
-    BootstrapResult([-3.0987371914949406 -12.352925347837964 … -16.020537537417344 -16.020537581583376; -3.1318488049717086 -6.597998352720369 … -9.553492939872191 -9.553492939872255; … ; -4.447109971354661 -3.9177224322438753 … -8.657637450482541 -8.657637450482603; -3.413390152721921 -9.789872793227659 … -12.40172295948317 -12.40172295948327], [10.0; 45.121339262054114; … ; 37.97250368240128; 36.33540551046981;;; 10.0; 44.709735821597334; … ; 37.769792574237755; 36.123786993698296;;; 10.0; 37.87550754384671; … ; 41.04260205212224; 39.61167328149367;;; … ;;; 10.0; 37.17330582333548; … ; 33.32761111023745; 31.645786381529135;;; 10.0; 25.653996162726838; … ; 40.14747259671781; 38.590061306489254;;; 10.0; 35.25083491061527; … ; 41.66079057704344; 40.330860137542736], Dict(:λ => [0.036766083723570465 0.03582017105942142 … 0.012985454508558042 0.027008351809775705; 0.03821830384234423 0.037277341528117895 … 0.01411178727511397 0.028076798959498328; … ; 0.044123667393909424 0.0445731519891054 … 0.032727496424979 0.03248544332056711; 0.04412367518919021 0.04457816868957968 … 0.0327397838516193 0.032485734031995644]), Dict(:λ => [0.0, 0.0027474747474747476, 0.005494949494949495, 0.008242424242424242, 0.01098989898989899, 0.013737373737373737, 0.016484848484848484, 0.019232323232323233, 0.02197979797979798, 0.024727272727272726  …  0.24727272727272728, 0.25002020202020203, 0.25276767676767675, 0.25551515151515153, 0.25826262626262625, 0.261010101010101, 0.26375757575757575, 0.2665050505050505, 0.26925252525252524, 0.272]), (lower = [10.0; 19.056533485399726; … ; 26.266920797571256; 24.699960816003852;;], upper = [10.0; 44.688680415425374; … ; 41.80805229929996; 40.69178063875687;;]), Dict(:λ => (lower = [0.00937635335860821, 0.010041056551321533, 0.010706139235024519, 0.011371650950229625, 0.012037641237449322, 0.012704159637196073, 0.013371255689982337, 0.01403897893632059, 0.014707378916723291, 0.015376505171702902  …  0.024957956940619426, 0.024958029102997378, 0.024958101265375322, 0.024958173427753277, 0.024958245590131233, 0.024958317752509184, 0.02495838991488714, 0.02495846207726509, 0.024958534239643042, 0.024958606402020994], upper = [0.03584901501761481, 0.03729917631025202, 0.03855527439924273, 0.03963171539484672, 0.04054819337522894, 0.041316900577428234, 0.04194962639672714, 0.0424606211144071, 0.0428641350117495, 0.04317441837003575  …  0.08918083677051006, 0.0900365466061974, 0.09089225644188471, 0.09174796627757206, 0.0926036761132594, 0.09345938594894676, 0.0943150957846341, 0.09517080562032143, 0.09602651545600877, 0.09688222529169609])), 0.95, 50)
-
-### Trajectory confidence intervals
-
-``` julia
-plot(data_times, I_true, label="True I(t)", lw=2, color=:black, ls=:dash,
-     xlabel="Time (days)", ylabel="Infected",
-     title="Case bootstrap: trajectory CI")
-scatter!(data_times, I_obs, label="Observed", ms=3, alpha=0.4, color=:steelblue)
-plot!(data_times, sol.fitted_values[:, 1], label="PSM fit", lw=2, color=:red)
-plot!(data_times, bs_case.ci_fitted.lower[:, 1],
-      fillrange=bs_case.ci_fitted.upper[:, 1],
-      fillalpha=0.2, color=:green, label="95% CI", ls=:dot, lw=0)
-```
-
-![](29_bootstrap_files/figure-commonmark/cell-20-output-1.svg)
-
-### Unknown function confidence intervals
-
-``` julia
-plot(prev_grid, λ_true, label="True λ(I/N)", lw=2, color=:black, ls=:dash,
-     xlabel="Prevalence (I/N)", ylabel="Force of infection λ",
-     title="Case bootstrap: unknown function CI")
-plot!(bs_case.uf_grid[:λ], bs_case.ci_uf[:λ].lower,
-      fillrange=bs_case.ci_uf[:λ].upper,
-      fillalpha=0.2, color=:green, label="95% CI", ls=:dot, lw=0)
-plot!(prev_grid, λ_est, label="Estimated λ(I/N)", lw=2, color=:red)
-```
-
-![](29_bootstrap_files/figure-commonmark/cell-21-output-1.svg)
-
-    Case bootstrap: 50 / 100 replicates succeeded
+> [!WARNING]
+>
+> ### Case bootstrap is not recommended for ODE models
+>
+> The **case bootstrap** resamples entire observation rows with
+> replacement. For time series data from ODE models, this scrambles the
+> temporal structure — a resampled dataset might place the peak
+> observation at an early time point. This produces unreliable CIs and
+> high failure rates. Case resampling is designed for cross-sectional
+> (i.i.d.) data, not time-ordered dynamical systems.
+>
+> For ODE-based PSMs, use **parametric** or **nonparametric** bootstrap
+> instead.
 
 ## Section 5: Comparison of Bootstrap Methods
 
@@ -363,17 +321,14 @@ scatter!(p_traj, data_times, I_obs, label="Data", ms=2, alpha=0.3, color=:gray)
 
 plot!(p_traj, data_times, bs_param.ci_fitted.lower[:, 1],
       fillrange=bs_param.ci_fitted.upper[:, 1],
-      fillalpha=0.15, color=:red, label="Parametric", ls=:dot, lw=0)
+      fillalpha=0.2, color=:red, label="Parametric", ls=:dot, lw=0)
 plot!(p_traj, data_times, bs_nonparam.ci_fitted.lower[:, 1],
       fillrange=bs_nonparam.ci_fitted.upper[:, 1],
-      fillalpha=0.15, color=:blue, label="Nonparametric", ls=:dot, lw=0)
-plot!(p_traj, data_times, bs_case.ci_fitted.lower[:, 1],
-      fillrange=bs_case.ci_fitted.upper[:, 1],
-      fillalpha=0.15, color=:green, label="Case", ls=:dot, lw=0)
+      fillalpha=0.2, color=:blue, label="Nonparametric", ls=:dot, lw=0)
 plot!(p_traj, data_times, sol.fitted_values[:, 1], label="Fit", lw=2, color=:red)
 ```
 
-![](29_bootstrap_files/figure-commonmark/cell-23-output-1.svg)
+![](29_bootstrap_files/figure-commonmark/cell-19-output-1.svg)
 
 ### Side-by-side unknown function CIs
 
@@ -384,25 +339,21 @@ p_uf = plot(prev_grid, λ_true, label="True λ", lw=2, color=:black, ls=:dash,
 
 plot!(p_uf, bs_param.uf_grid[:λ], bs_param.ci_uf[:λ].lower,
       fillrange=bs_param.ci_uf[:λ].upper,
-      fillalpha=0.15, color=:red, label="Parametric", ls=:dot, lw=0)
+      fillalpha=0.2, color=:red, label="Parametric", ls=:dot, lw=0)
 plot!(p_uf, bs_nonparam.uf_grid[:λ], bs_nonparam.ci_uf[:λ].lower,
       fillrange=bs_nonparam.ci_uf[:λ].upper,
-      fillalpha=0.15, color=:blue, label="Nonparametric", ls=:dot, lw=0)
-plot!(p_uf, bs_case.uf_grid[:λ], bs_case.ci_uf[:λ].lower,
-      fillrange=bs_case.ci_uf[:λ].upper,
-      fillalpha=0.15, color=:green, label="Case", ls=:dot, lw=0)
+      fillalpha=0.2, color=:blue, label="Nonparametric", ls=:dot, lw=0)
 plot!(p_uf, prev_grid, λ_est, label="Fit", lw=2, color=:red)
 ```
 
-![](29_bootstrap_files/figure-commonmark/cell-24-output-1.svg)
+![](29_bootstrap_files/figure-commonmark/cell-20-output-1.svg)
 
 ### Quantitative comparison
 
     Method          | n_success | CI width at peak | Mean UF CI width | UF coverage
     -------------------------------------------------------------------------------------
-    Parametric      | 50/100    | 11.5             | 0.00695          | 70.0%
-    Nonparametric   | 50/100    | 9.9              | 0.00728          | 67.0%
-    Case            | 50/100    | 44.7             | 0.0372           | 18.0%
+    Parametric      | 50/50     | 11.5             | 0.00695          | 70.0%
+    Nonparametric   | 50/50     | 9.9              | 0.00728          | 67.0%
 
 **Interpretation:**
 
@@ -425,7 +376,7 @@ pseudo-data with variance proportional to the mean.
 
 ### Generate Poisson data
 
-![](29_bootstrap_files/figure-commonmark/cell-26-output-1.svg)
+![](29_bootstrap_files/figure-commonmark/cell-22-output-1.svg)
 
 ### Fit with Poisson likelihood
 
@@ -487,7 +438,7 @@ plot!(p2, prev_grid, λ_pois_est, label="Estimated λ", lw=2, color=:purple)
 plot(p1, p2, layout=(1, 2), size=(900, 400))
 ```
 
-![](29_bootstrap_files/figure-commonmark/cell-30-output-1.svg)
+![](29_bootstrap_files/figure-commonmark/cell-26-output-1.svg)
 
 Note how the Poisson CIs are **narrower near zero** (where counts are
 small and Poisson variance is low) and **wider at the peak** (where
@@ -527,7 +478,7 @@ plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
 plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 ```
 
-![](29_bootstrap_files/figure-commonmark/cell-31-output-1.svg)
+![](29_bootstrap_files/figure-commonmark/cell-27-output-1.svg)
 
     Durbin-Watson: 1.938
 
@@ -557,8 +508,13 @@ assume approximately independent errors).
 | Gaussian noise, well-specified model | `:parametric` — narrowest CIs |
 | Count data (Poisson, NegBin) | `:parametric` — respects variance–mean relationship |
 | Suspect non-Gaussian errors | `:nonparametric` — no distributional assumption |
-| Irregular sampling, heteroscedasticity | `:case` — most robust |
 | Quick exploratory analysis | `:parametric` with `nboot=50` |
+
+> [!NOTE]
+>
+> The `:case` bootstrap (resampling entire rows) is available but **not
+> recommended** for ODE/DDE models because it scrambles the temporal
+> structure of the data.
 
 ### Tips
 
