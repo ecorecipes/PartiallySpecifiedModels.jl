@@ -395,6 +395,11 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_watson], ", "))
 ```
 
+::: {.callout-tip}
+## See Also
+- [Vignette 06: Solver Comparison](../06_solver_comparison/06_solver_comparison.qmd) — compares solvers (this vignette compares approximators)
+:::
+
 ## Summary Table
 
 We compare methods using the **Pearson correlation** between true and recovered $\beta(I)$

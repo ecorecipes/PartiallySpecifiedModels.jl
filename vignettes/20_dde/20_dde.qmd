@@ -275,6 +275,11 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_watson], ", "))
 ```
 
+::: {.callout-tip}
+## See Also
+- [Vignette 27: Blowfly DDE](../27_blowfly_dde/27_blowfly_dde.qmd) — ecological DDE application with bootstrap confidence intervals
+:::
+
 ## Summary
 
 PartiallySpecifiedModels.jl supports delay differential equations through the `delays` and `history` keyword arguments to `PSMProblem`. The DDE dynamics function takes an extra history argument `h` that provides delayed state values. All standard solvers (LAML, Adam) work with DDEs via automatic wrapping with `MethodOfSteps`.

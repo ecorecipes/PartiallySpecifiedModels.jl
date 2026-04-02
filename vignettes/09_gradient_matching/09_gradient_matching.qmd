@@ -23,10 +23,12 @@ Fitting ODE models typically requires **solving the ODE** at each iteration of t
 2. Computing derivatives of that curve
 3. Matching those derivatives to the ODE right-hand side
 
-`PartiallySpecifiedModels.jl` provides two gradient matching solvers:
+`PartiallySpecifiedModels.jl` provides several integration-free solvers:
 
 - **`GradientMatching`** — basic smoothing spline approach with derivative matching
 - **`AdaptiveGradientMatching` (AGM)** — Gaussian process-based with adaptive mismatch parameters and smoothing penalties
+- **`TwoStageSolver`** — smooth-then-differentiate baseline (penalized least squares)
+- **`BNGSolver`** — Bayesian Numerical Gradient matching (Bayesian interpretation of the two-stage idea)
 
 This vignette compares these integration-free methods against standard integration-based solvers, highlighting the speed advantage and scenarios where gradient matching excels.
 
@@ -248,6 +250,55 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_watson], ", "))
 ```
 
+## Two-Stage Smooth-Then-Differentiate
+
+The `TwoStageSolver` provides the simplest integration-free baseline: it first smooths the observed data with a spline, then numerically differentiates the smooth to estimate derivatives, and finally fits the unknown function to match those derivatives. This is fast but less accurate than the adaptive gradient matching approach above.
+
+### Exponential decay comparison
+
+Using a density-dependent decay model $du/dt = -r(u) \cdot u$ with true rate $r(u) = 0.5u$, we compare the three derivative-matching solvers against the integration-based LAML baseline.
+
+```{julia}
+r_true_decay(u) = 0.5 * u
+
+function decay!(du, u, p, t)
+    du[1] = -p.r(u[1]) * u[1]
+end
+
+u0_d = [5.0]; tspan_d = (0.0, 10.0)
+sol_d = OrdinaryDiffEq.solve(ODEProblem(decay!, u0_d, tspan_d, (; r=r_true_decay)), Tsit5(); saveat=0.25)
+data_d = reshape(max.(sol_d[1,:] .+ 0.1 .* randn(length(sol_d.t)), 0.01), :, 1)
+
+uf_d = BSplineApproximator(:r, (0.01, 5.5), 10)
+prob_d = PSMProblem(decay!, u0_d, tspan_d, [uf_d];
+    data_times=collect(sol_d.t), data_values=Float64.(data_d),
+    obs_to_state=[1], known_params=NamedTuple())
+```
+
+```{julia}
+sol_ts  = solve(prob_d, TwoStageSolver(maxiters=2000, lr=0.01, verbose=false))
+sol_bng = solve(prob_d, BNGSolver(maxiters=2000, lr=0.01, verbose=false))
+sol_laml_d = solve(prob_d, LAML(maxiters=100, verbose=false))
+
+u_grid_d = range(0.01, 5.5, length=100)
+plot(u_grid_d, r_true_decay.(u_grid_d), label="True r(u)", lw=3, color=:black, ls=:dash,
+     xlabel="Population u", ylabel="r(u)", title="Rate Recovery: TwoStage vs BNG vs LAML")
+plot!(u_grid_d, [sol_ts.unknown_functions[:r](x) for x in u_grid_d], label="TwoStage", lw=2)
+plot!(u_grid_d, [sol_bng.unknown_functions[:r](x) for x in u_grid_d], label="BNG", lw=2, ls=:dash)
+plot!(u_grid_d, [sol_laml_d.unknown_functions[:r](x) for x in u_grid_d], label="LAML", lw=2, ls=:dot)
+```
+
+```{julia}
+#| echo: false
+for (nm, s) in [("TwoStage", sol_ts), ("BNG", sol_bng), ("LAML", sol_laml_d)]
+    println(rpad(nm, 12), "loss=", round(s.data_loss, digits=4),
+            "  r(2)=", round(s.unknown_functions[:r](2.0), digits=4))
+end
+println("True        r(2)=", round(r_true_decay(2.0), digits=4))
+```
+
+TwoStage and BNG use the same derivative-matching objective, so their point estimates typically coincide; BNG adds a Bayesian interpretation. LAML integrates the ODE and selects smoothing via marginal likelihood, generally recovering the functional response more accurately when data are sparse or noisy.
+
 ## When to Use Gradient Matching
 
 ### Advantages
@@ -266,6 +317,7 @@ println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_wa
 
 | Scenario | Recommended method |
 |----------|-------------------|
+| Fastest possible baseline | `TwoStageSolver` or `BNGSolver` |
 | Fast exploratory fit | `GradientMatching` |
 | Stiff/unstable ODE | `AdaptiveGradientMatching` |
 | Well-behaved system, best accuracy | `LAML` or `CollocationLAML` |

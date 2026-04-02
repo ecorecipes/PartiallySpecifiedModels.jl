@@ -279,6 +279,12 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_watson], ", "))
 ```
 
+::: {.callout-tip}
+## See Also
+- [Vignette 05: Neural Networks](../05_neural_networks/05_neural_networks.qmd) — compares approximator types (B-spline, GP, neural)
+- [Vignette 09: Gradient Matching](../09_gradient_matching/09_gradient_matching.qmd) — detailed integration-free solver comparison
+:::
+
 ## Discussion
 
 **Key observations:**
