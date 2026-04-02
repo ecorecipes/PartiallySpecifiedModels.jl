@@ -1,13 +1,13 @@
 # Vignettes
 
-The `vignettes/` directory contains 26 worked examples covering every solver, approximator, and likelihood type. Each vignette is a self-contained [Quarto](https://quarto.org/) document with rendered markdown available on GitHub.
+The `vignettes/` directory contains 30 worked examples covering every solver, approximator, and likelihood type. Each vignette is a self-contained [Quarto](https://quarto.org/) document with rendered markdown available on GitHub.
 
 ## Getting Started
 
 | # | Vignette | Description |
 |:--|:---------|:------------|
 | 01 | [Getting Started](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/01_getting_started/01_getting_started.md) | Basic PSM workflow with exponential and logistic growth |
-| 02 | [Likelihoods](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/02_likelihoods/02_likelihoods.md) | Gaussian, Poisson, Negative Binomial, and custom likelihoods |
+| 02 | [Likelihoods](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/02_likelihoods/02_likelihoods.md) | Gaussian, Poisson, Negative Binomial, Truncated Normal, and custom likelihoods |
 
 ## Ecological Models
 
@@ -20,6 +20,8 @@ The `vignettes/` directory contains 26 worked examples covering every solver, ap
 | 11 | [Count Data SIR](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/11_count_data_sir/11_count_data_sir.md) | SIR model with Poisson and Negative Binomial likelihoods |
 | 12 | [Discrete Time](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/12_discrete_time/12_discrete_time.md) | Ricker, Beverton–Holt, and discrete competition models |
 | 20 | [DDE](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/20_dde/20_dde.md) | Delay differential equations with unknown functions |
+| 27 | [Blowfly DDE](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/27_blowfly_dde/27_blowfly_dde.md) | Nicholson blowfly DDE with shape constraints and bootstrap CIs |
+| 28 | [Fisheries](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/28_fisheries/28_fisheries.md) | Discrete stock-recruitment with Poisson counts and shape constraints |
 
 ## Approximators
 
@@ -43,10 +45,17 @@ The `vignettes/` directory contains 26 worked examples covering every solver, ap
 | 18 | [Dalton](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/18_dalton/18_dalton.md) | Data-adaptive Kalman likelihood fitting |
 | 19 | [Pseudo-Marginal](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/19_pseudo_marginal/19_pseudo_marginal.md) | Probabilistic ODE + Bayesian MCMC |
 | 21 | [GCV](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/21_gcv/21_gcv.md) | Generalized Cross-Validation vs LAML smoothing |
-| 22 | [Two-Stage](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/22_two_stage/22_two_stage.md) | Smooth-then-differentiate baseline approach |
+| 22 | [Two-Stage](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/22_two_stage/22_two_stage.md) | Redirect — see Vignette 09 |
 | 23 | [Derivative-Free](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/23_derivative_free/23_derivative_free.md) | Nelder-Mead and Particle Swarm optimization |
 | 24 | [Variational](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/24_variational/24_variational.md) | Fast approximate Bayesian inference via variational methods |
 | 25 | [ABC](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/25_abc/25_abc.md) | Likelihood-free inference with ABC-SMC |
+
+## Uncertainty Quantification
+
+| # | Vignette | Description |
+|:--|:---------|:------------|
+| 29 | [Bootstrap](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/29_bootstrap/29_bootstrap.md) | Parametric, nonparametric, and case bootstrap CIs (Gaussian and Poisson) |
+| 30 | [Model Selection](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/30_model_selection/30_model_selection.md) | LAML marginal likelihood for knot, approximator, and structural selection |
 
 ## Running Vignettes Locally
 
