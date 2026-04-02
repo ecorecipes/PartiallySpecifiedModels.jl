@@ -357,14 +357,35 @@ plot!(p_uf, prev_grid, λ_est, label="Fit", lw=2, color=:red)
 
 **Interpretation:**
 
-- **Parametric** CIs tend to be the narrowest because they assume the
-  correct error model (Gaussian with estimated $\sigma$).
-- **Nonparametric** CIs are slightly wider because they make fewer
-  distributional assumptions — the resampled residuals capture any
-  non-Gaussian features.
-- **Case** CIs are typically the widest and can have lower success
-  rates, since resampling rows may create degenerate pseudo-datasets.
-  However, they are the most robust to model misspecification.
+- **Parametric** CIs tend to be narrower because they assume the correct
+  error model.
+- **Nonparametric** CIs are slightly wider because resampled residuals
+  capture any non-Gaussian features.
+
+> [!IMPORTANT]
+>
+> ### Bootstrap coverage and smoothing bias
+>
+> The bootstrap CIs may show **less than nominal coverage** (e.g., 70%
+> instead of 95%) for the unknown function $\lambda(I/N)$. This is a
+> well-known limitation: the smoothing penalty introduces **bias** in
+> the estimated function (pulling it towards linearity), and the
+> bootstrap only captures **sampling variability** around the biased
+> estimate — not the bias itself.
+>
+> This is analogous to the bias–variance tradeoff in kernel smoothing
+> and GAMs (Nychka 1988, Wood 2006 §6.10). Two approaches give better
+> coverage:
+>
+> 1.  **Bayesian credible intervals** from the LAML posterior covariance
+>     (see [Vignette 14: MCMC](../14_mcmc/14_mcmc.qmd)) — these account
+>     for smoothing uncertainty by design.
+> 2.  **Undersmoothing** — using more knots or smaller λ reduces bias at
+>     the cost of wider CIs.
+>
+> For **trajectory** CIs (fitted values at observed times), bootstrap
+> coverage is typically much closer to nominal because the ODE
+> integration integrates out local bias in the unknown function.
 
 ## Section 6: Bootstrap with Non-Gaussian Likelihoods
 
