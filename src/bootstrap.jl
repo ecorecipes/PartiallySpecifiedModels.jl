@@ -54,7 +54,8 @@ Compute bootstrap confidence intervals for a PSM solution.
 - `alg`: the solver algorithm (e.g., `LAML(...)`)
 - `nboot::Int=200`: number of bootstrap replicates
 - `method::Symbol=:parametric`: bootstrap method
-  - `:parametric` — resample from N(0, σ̂) per observed state
+  - `:parametric` — sample from the fitted distribution (Gaussian, Poisson,
+    NegBin, TruncatedNormal — uses the problem's likelihood family)
   - `:nonparametric` — resample residuals with replacement per state
   - `:case` — resample entire observations (rows) with replacement
 - `level::Float64=0.95`: confidence level for CIs
@@ -123,7 +124,8 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
         end
 
         # Generate pseudo-data
-        y_boot = _resample_data(method, fitted, resid, σ_hat, n_times, n_obs, rng)
+        y_boot = _resample_data(method, prob.likelihood, fitted, resid, σ_hat,
+                                n_times, n_obs, rng)
 
         # Build new problem with pseudo-data
         prob_boot = PSMProblem(prob.dynamics!, prob.u0, prob.tspan,
@@ -214,20 +216,30 @@ end
 
 # ─── Resampling methods ──────────────────────────────────────────
 
-function _resample_data(method::Symbol, fitted::Matrix{Float64},
+"""
+    _resample_data(method, family, fitted, resid, σ_hat, n_times, n_obs, rng)
+
+Generate bootstrap pseudo-data.
+
+For `:parametric`, the sampling distribution depends on the likelihood family:
+- `Gaussian()`:  y* ~ N(μ̂, σ̂)
+- `Poisson()`:   y* ~ Poisson(μ̂)
+- `NegativeBinomial(θ)`: y* ~ NegBin(μ̂, θ)  (Gamma-Poisson mixture)
+- `TruncatedNormal(lower, σ)`: y* ~ TruncNorm(μ̂, σ, lower)
+- Other: falls back to Gaussian residuals
+
+For `:nonparametric`, residuals are resampled with replacement per state.
+For `:case`, entire observation rows are resampled.
+"""
+function _resample_data(method::Symbol, family::AbstractLikelihood,
+                        fitted::Matrix{Float64},
                         resid::Matrix{Float64}, σ_hat::Vector{Float64},
                         n_times::Int, n_obs::Int, rng)
     y_boot = similar(fitted)
 
     if method == :parametric
-        # Parametric: fitted + N(0, σ̂_j) per state j
-        for j in 1:n_obs
-            for i in 1:n_times
-                y_boot[i, j] = fitted[i, j] + σ_hat[j] * randn(rng)
-            end
-        end
+        _parametric_resample!(y_boot, family, fitted, σ_hat, n_times, n_obs, rng)
     elseif method == :nonparametric
-        # Nonparametric: fitted + resampled residuals (per state)
         for j in 1:n_obs
             idx = rand(rng, 1:n_times, n_times)
             for i in 1:n_times
@@ -235,14 +247,103 @@ function _resample_data(method::Symbol, fitted::Matrix{Float64},
             end
         end
     elseif method == :case
-        # Case resampling: resample entire rows
         idx = rand(rng, 1:n_times, n_times)
-        for j in 1:n_obs
-            for i in 1:n_times
-                y_boot[i, j] = (fitted .+ resid)[idx[i], j]
-            end
+        for j in 1:n_obs, i in 1:n_times
+            y_boot[i, j] = resid[idx[i], j] + fitted[idx[i], j]
         end
     end
 
     y_boot
+end
+
+# ─── Parametric samplers per likelihood family ────────────────────
+
+function _parametric_resample!(y::Matrix, ::Gaussian, fitted::Matrix,
+                               σ_hat::Vector, n_t::Int, n_obs::Int, rng)
+    for j in 1:n_obs, i in 1:n_t
+        y[i, j] = fitted[i, j] + σ_hat[j] * randn(rng)
+    end
+end
+
+function _parametric_resample!(y::Matrix, ::Poisson, fitted::Matrix,
+                               σ_hat::Vector, n_t::Int, n_obs::Int, rng)
+    for j in 1:n_obs, i in 1:n_t
+        μ = max(fitted[i, j], 1e-10)
+        y[i, j] = Float64(_sample_poisson(μ, rng))
+    end
+end
+
+function _parametric_resample!(y::Matrix, fam::NegativeBinomial, fitted::Matrix,
+                               σ_hat::Vector, n_t::Int, n_obs::Int, rng)
+    θ = fam.theta
+    for j in 1:n_obs, i in 1:n_t
+        μ = max(fitted[i, j], 1e-10)
+        # Gamma-Poisson mixture: G ~ Gamma(θ, μ/θ), then Y ~ Poisson(G)
+        g = _sample_gamma(θ, μ / θ, rng)
+        y[i, j] = Float64(_sample_poisson(g, rng))
+    end
+end
+
+function _parametric_resample!(y::Matrix, fam::TruncatedNormal, fitted::Matrix,
+                               σ_hat::Vector, n_t::Int, n_obs::Int, rng)
+    σ = fam.sigma
+    lo = fam.lower
+    for j in 1:n_obs, i in 1:n_t
+        # Rejection sampling from N(μ, σ²) truncated to [lower, ∞)
+        μ = fitted[i, j]
+        for _ in 1:1000
+            z = μ + σ * randn(rng)
+            if z >= lo
+                y[i, j] = z
+                @goto next_tn
+            end
+        end
+        y[i, j] = max(μ, lo)  # fallback
+        @label next_tn
+    end
+end
+
+# Fallback: use Gaussian residuals for unknown likelihood families
+function _parametric_resample!(y::Matrix, ::AbstractLikelihood, fitted::Matrix,
+                               σ_hat::Vector, n_t::Int, n_obs::Int, rng)
+    for j in 1:n_obs, i in 1:n_t
+        y[i, j] = fitted[i, j] + σ_hat[j] * randn(rng)
+    end
+end
+
+# ─── Distribution samplers (no Distributions.jl dependency) ───────
+
+"""Sample from Poisson(μ) using inverse CDF (Knuth) for μ ≤ 30, normal approx for μ > 30."""
+function _sample_poisson(μ::Real, rng)
+    if μ <= 30.0
+        L = exp(-μ)
+        k = 0; p = 1.0
+        while true
+            k += 1
+            p *= rand(rng)
+            p <= L && return k - 1
+        end
+    else
+        # Normal approximation for large μ
+        max(0, round(Int, μ + sqrt(μ) * randn(rng)))
+    end
+end
+
+"""Sample from Gamma(shape, scale) using Marsaglia & Tsang (2000)."""
+function _sample_gamma(shape::Real, scale::Real, rng)
+    if shape < 1.0
+        # Boost: Gamma(a) = Gamma(a+1) * U^(1/a)
+        return _sample_gamma(shape + 1.0, scale, rng) * rand(rng)^(1.0 / shape)
+    end
+    d = shape - 1.0 / 3.0
+    c = 1.0 / sqrt(9.0 * d)
+    while true
+        x = randn(rng)
+        v = (1.0 + c * x)^3
+        v <= 0.0 && continue
+        u = rand(rng)
+        if u < 1.0 - 0.0331 * x^4 || log(u) < 0.5 * x^2 + d * (1.0 - v + log(v))
+            return d * v * scale
+        end
+    end
 end
