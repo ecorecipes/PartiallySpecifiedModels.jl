@@ -52,6 +52,7 @@ AbstractLikelihood
 Gaussian
 Poisson
 NegativeBinomial
+TruncatedNormal
 CustomLikelihood
 ```
 
@@ -74,9 +75,18 @@ optimize_spde_range
 with_range_param
 ```
 
+## Bootstrap Confidence Intervals
+
+```@docs
+bootstrap
+BootstrapResult
+```
+
 ## Diagnostics
 
 ```@docs
+appraise
+deviance_residuals
 residual_diagnostics
 durbin_watson
 residual_acf
