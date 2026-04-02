@@ -1,0 +1,513 @@
+---
+title: "Bootstrap Confidence Intervals"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+When fitting a partially specified model, point estimates of the unknown function and fitted trajectories are rarely sufficient — we also need **uncertainty quantification**. Bootstrap confidence intervals provide a distribution-free (or distribution-aware) approach to estimating the variability of both the fitted trajectories and the recovered unknown functions.
+
+`PartiallySpecifiedModels.jl` implements three bootstrap methods:
+
+| Method | Description | Assumptions |
+|--------|-------------|-------------|
+| `:parametric` | Simulate new data from the fitted likelihood (e.g., $N(\hat\mu, \hat\sigma)$ or $\text{Pois}(\hat\mu)$) | Correct likelihood family |
+| `:nonparametric` | Resample residuals with replacement per state | Exchangeable residuals |
+| `:case` | Resample entire observation rows with replacement | Weakest assumptions |
+
+This vignette demonstrates all three methods on an SIR epidemic model with a nonparametric force of infection, compares the resulting confidence intervals, and shows how the parametric bootstrap adapts to non-Gaussian likelihoods.
+
+## Setup
+
+```{julia}
+using PartiallySpecifiedModels
+using PartiallySpecifiedModels: solve, appraise
+using OrdinaryDiffEq
+using Plots
+using Statistics
+using Random
+Random.seed!(42)
+```
+
+## The Model: SIR with Unknown Force of Infection
+
+We consider an SIR epidemic model where the force of infection $\lambda(I/N)$ is unknown. The true transmission follows a **power-law** form:
+
+$$
+\lambda(I/N) = \beta \left(\frac{I}{N}\right)^\alpha, \quad \beta = 0.5, \; \alpha = 0.9
+$$
+
+This departs slightly from the standard mass-action $\lambda = \beta \cdot I/N$ ($\alpha = 1$), which makes the nonparametric recovery more interesting.
+
+```{julia}
+function sir_true!(du, u, p, t)
+    S, I, R = u
+    N = 1000.0
+    prev = I / N
+    λ = 0.5 * prev^0.9
+    du[1] = -λ * S
+    du[2] =  λ * S - 0.25 * I
+    du[3] =  0.25 * I
+end
+```
+
+### Generate synthetic data
+
+We simulate the true model and observe $I(t)$ daily with Gaussian noise ($\sigma = 5$):
+
+```{julia}
+#| echo: false
+N_pop = 1000.0
+u0 = [990.0, 10.0, 0.0]
+tspan = (0.0, 40.0)
+data_times = collect(0.0:1.0:40.0)
+
+true_prob = ODEProblem(sir_true!, u0, tspan)
+true_sol = OrdinaryDiffEq.solve(true_prob, Tsit5(); saveat=data_times)
+
+I_true = [true_sol(t)[2] for t in data_times]
+σ_noise = 5.0
+I_obs = I_true .+ σ_noise .* randn(length(data_times))
+I_obs = max.(I_obs, 0.0)
+
+scatter(data_times, I_obs, label="Observed I(t)", xlabel="Time (days)", ylabel="Infected",
+        title="SIR epidemic: synthetic data", ms=4, alpha=0.6, color=:steelblue)
+plot!(data_times, I_true, label="True I(t)", lw=2, color=:black, ls=:dash)
+```
+
+The prevalence range determines the B-spline domain:
+
+```{julia}
+#| echo: false
+prev_range = I_true ./ N_pop
+println("Prevalence range: $(round(minimum(prev_range), digits=4)) – $(round(maximum(prev_range), digits=4))")
+```
+
+## Section 1: Fit the PSM
+
+We model $\lambda(I/N)$ with a penalized cubic B-spline with 8 knots. The PSM dynamics access the unknown function via `p.λ`:
+
+```{julia}
+function sir_psm!(du, u, p, t)
+    S, I, R = u
+    λ = max(p.λ(I / p.N), 0.0)
+    du[1] = -λ * S
+    du[2] =  λ * S - p.γ * I
+    du[3] =  p.γ * I
+end
+```
+
+```{julia}
+approx_λ = BSplineApproximator(:λ, (0.005, 0.15), 8;
+                                initial = x -> 0.4 * x)
+
+prob = PSMProblem(
+    sir_psm!, u0, tspan, [approx_λ];
+    data_times = data_times,
+    data_values = reshape(I_obs, :, 1),
+    obs_to_state = [2],
+    known_params = (γ = 0.25, N = N_pop),
+    likelihood = Gaussian(),
+    solver = Tsit5()
+)
+
+sol = solve(prob, LAML(maxiters=100, verbose=false))
+```
+
+```{julia}
+#| echo: false
+println("Data loss (SS): ", round(sol.data_loss, digits=1))
+println("EDF:            ", round(sol.edf, digits=2))
+println("Smoothing λ:    ", round.(sol.smoothing_params, sigdigits=4))
+```
+
+### Fitted trajectory
+
+```{julia}
+plot(data_times, I_true, label="True I(t)", lw=2, color=:black, ls=:dash,
+     xlabel="Time (days)", ylabel="Infected",
+     title="PSM fit: SIR with unknown λ(I/N)")
+scatter!(data_times, I_obs, label="Observed", ms=4, alpha=0.5, color=:steelblue)
+plot!(data_times, sol.fitted_values[:, 1], label="PSM fit", lw=2, color=:red)
+```
+
+### Recovered unknown function
+
+```{julia}
+prev_grid = range(0.005, 0.14, length=100)
+λ_true = [0.5 * p^0.9 for p in prev_grid]
+λ_est = [sol.unknown_functions[:λ](p) for p in prev_grid]
+
+plot(prev_grid, λ_true, label="True λ(I/N)", lw=2, color=:black, ls=:dash,
+     xlabel="Prevalence (I/N)", ylabel="Force of infection λ",
+     title="Recovered unknown function")
+plot!(prev_grid, λ_est, label="Estimated λ(I/N)", lw=2, color=:red)
+```
+
+## Section 2: Parametric Bootstrap
+
+The **parametric bootstrap** generates pseudo-data by sampling from the fitted likelihood:
+
+$$
+I^*_t \sim N\bigl(\hat{I}(t),\; \hat\sigma^2\bigr)
+$$
+
+Each replicate is refit with LAML, producing a distribution of fitted trajectories and unknown function curves. Pointwise quantiles give the confidence intervals.
+
+```{julia}
+bs_param = bootstrap(sol, prob, LAML(maxiters=80, verbose=false);
+    nboot=100, method=:parametric, rng=Random.Xoshiro(42), verbose=true)
+```
+
+### Trajectory confidence intervals
+
+```{julia}
+plot(data_times, I_true, label="True I(t)", lw=2, color=:black, ls=:dash,
+     xlabel="Time (days)", ylabel="Infected",
+     title="Parametric bootstrap: trajectory CI")
+scatter!(data_times, I_obs, label="Observed", ms=3, alpha=0.4, color=:steelblue)
+plot!(data_times, sol.fitted_values[:, 1], label="PSM fit", lw=2, color=:red)
+plot!(data_times, bs_param.ci_fitted.lower[:, 1],
+      fillrange=bs_param.ci_fitted.upper[:, 1],
+      fillalpha=0.2, color=:red, label="95% CI", ls=:dot, lw=0)
+```
+
+### Unknown function confidence intervals
+
+```{julia}
+uf_grid = bs_param.uf_grid[:λ]
+plot(prev_grid, λ_true, label="True λ(I/N)", lw=2, color=:black, ls=:dash,
+     xlabel="Prevalence (I/N)", ylabel="Force of infection λ",
+     title="Parametric bootstrap: unknown function CI")
+plot!(uf_grid, bs_param.ci_uf[:λ].lower,
+      fillrange=bs_param.ci_uf[:λ].upper,
+      fillalpha=0.2, color=:red, label="95% CI", ls=:dot, lw=0)
+plot!(prev_grid, λ_est, label="Estimated λ(I/N)", lw=2, color=:red)
+```
+
+```{julia}
+#| echo: false
+println("Parametric bootstrap: $(bs_param.n_success) / 100 replicates succeeded")
+```
+
+## Section 3: Nonparametric Bootstrap
+
+The **nonparametric bootstrap** resamples the residuals $\hat{e}_t = I_t - \hat{I}(t)$ with replacement and adds them to the fitted values to create pseudo-data:
+
+$$
+I^*_t = \hat{I}(t) + \hat{e}_{\pi(t)}
+$$
+
+where $\pi$ is a random permutation with replacement. This makes no assumption about the error distribution — only that residuals are exchangeable.
+
+```{julia}
+bs_nonparam = bootstrap(sol, prob, LAML(maxiters=80, verbose=false);
+    nboot=100, method=:nonparametric, rng=Random.Xoshiro(42), verbose=true)
+```
+
+### Trajectory confidence intervals
+
+```{julia}
+plot(data_times, I_true, label="True I(t)", lw=2, color=:black, ls=:dash,
+     xlabel="Time (days)", ylabel="Infected",
+     title="Nonparametric bootstrap: trajectory CI")
+scatter!(data_times, I_obs, label="Observed", ms=3, alpha=0.4, color=:steelblue)
+plot!(data_times, sol.fitted_values[:, 1], label="PSM fit", lw=2, color=:red)
+plot!(data_times, bs_nonparam.ci_fitted.lower[:, 1],
+      fillrange=bs_nonparam.ci_fitted.upper[:, 1],
+      fillalpha=0.2, color=:blue, label="95% CI", ls=:dot, lw=0)
+```
+
+### Unknown function confidence intervals
+
+```{julia}
+plot(prev_grid, λ_true, label="True λ(I/N)", lw=2, color=:black, ls=:dash,
+     xlabel="Prevalence (I/N)", ylabel="Force of infection λ",
+     title="Nonparametric bootstrap: unknown function CI")
+plot!(bs_nonparam.uf_grid[:λ], bs_nonparam.ci_uf[:λ].lower,
+      fillrange=bs_nonparam.ci_uf[:λ].upper,
+      fillalpha=0.2, color=:blue, label="95% CI", ls=:dot, lw=0)
+plot!(prev_grid, λ_est, label="Estimated λ(I/N)", lw=2, color=:red)
+```
+
+```{julia}
+#| echo: false
+println("Nonparametric bootstrap: $(bs_nonparam.n_success) / 100 replicates succeeded")
+```
+
+## Section 4: Case Bootstrap
+
+The **case bootstrap** resamples entire observation rows $(t_i, I_i)$ with replacement. This is the most conservative method: it makes no assumptions about the error structure or the design, and naturally accounts for heteroscedasticity and dependence.
+
+However, because time points can be duplicated or missing, the refit can be less stable.
+
+```{julia}
+bs_case = bootstrap(sol, prob, LAML(maxiters=80, verbose=false);
+    nboot=100, method=:case, rng=Random.Xoshiro(42), verbose=true)
+```
+
+### Trajectory confidence intervals
+
+```{julia}
+plot(data_times, I_true, label="True I(t)", lw=2, color=:black, ls=:dash,
+     xlabel="Time (days)", ylabel="Infected",
+     title="Case bootstrap: trajectory CI")
+scatter!(data_times, I_obs, label="Observed", ms=3, alpha=0.4, color=:steelblue)
+plot!(data_times, sol.fitted_values[:, 1], label="PSM fit", lw=2, color=:red)
+plot!(data_times, bs_case.ci_fitted.lower[:, 1],
+      fillrange=bs_case.ci_fitted.upper[:, 1],
+      fillalpha=0.2, color=:green, label="95% CI", ls=:dot, lw=0)
+```
+
+### Unknown function confidence intervals
+
+```{julia}
+plot(prev_grid, λ_true, label="True λ(I/N)", lw=2, color=:black, ls=:dash,
+     xlabel="Prevalence (I/N)", ylabel="Force of infection λ",
+     title="Case bootstrap: unknown function CI")
+plot!(bs_case.uf_grid[:λ], bs_case.ci_uf[:λ].lower,
+      fillrange=bs_case.ci_uf[:λ].upper,
+      fillalpha=0.2, color=:green, label="95% CI", ls=:dot, lw=0)
+plot!(prev_grid, λ_est, label="Estimated λ(I/N)", lw=2, color=:red)
+```
+
+```{julia}
+#| echo: false
+println("Case bootstrap: $(bs_case.n_success) / 100 replicates succeeded")
+```
+
+## Section 5: Comparison of Bootstrap Methods
+
+### Side-by-side trajectory CIs
+
+```{julia}
+p_traj = plot(data_times, I_true, label="True", lw=2, color=:black, ls=:dash,
+     xlabel="Time (days)", ylabel="Infected",
+     title="Trajectory CI comparison", legend=:topright)
+scatter!(p_traj, data_times, I_obs, label="Data", ms=2, alpha=0.3, color=:gray)
+
+plot!(p_traj, data_times, bs_param.ci_fitted.lower[:, 1],
+      fillrange=bs_param.ci_fitted.upper[:, 1],
+      fillalpha=0.15, color=:red, label="Parametric", ls=:dot, lw=0)
+plot!(p_traj, data_times, bs_nonparam.ci_fitted.lower[:, 1],
+      fillrange=bs_nonparam.ci_fitted.upper[:, 1],
+      fillalpha=0.15, color=:blue, label="Nonparametric", ls=:dot, lw=0)
+plot!(p_traj, data_times, bs_case.ci_fitted.lower[:, 1],
+      fillrange=bs_case.ci_fitted.upper[:, 1],
+      fillalpha=0.15, color=:green, label="Case", ls=:dot, lw=0)
+plot!(p_traj, data_times, sol.fitted_values[:, 1], label="Fit", lw=2, color=:red)
+```
+
+### Side-by-side unknown function CIs
+
+```{julia}
+p_uf = plot(prev_grid, λ_true, label="True λ", lw=2, color=:black, ls=:dash,
+     xlabel="Prevalence (I/N)", ylabel="λ(I/N)",
+     title="Unknown function CI comparison", legend=:topleft)
+
+plot!(p_uf, bs_param.uf_grid[:λ], bs_param.ci_uf[:λ].lower,
+      fillrange=bs_param.ci_uf[:λ].upper,
+      fillalpha=0.15, color=:red, label="Parametric", ls=:dot, lw=0)
+plot!(p_uf, bs_nonparam.uf_grid[:λ], bs_nonparam.ci_uf[:λ].lower,
+      fillrange=bs_nonparam.ci_uf[:λ].upper,
+      fillalpha=0.15, color=:blue, label="Nonparametric", ls=:dot, lw=0)
+plot!(p_uf, bs_case.uf_grid[:λ], bs_case.ci_uf[:λ].lower,
+      fillrange=bs_case.ci_uf[:λ].upper,
+      fillalpha=0.15, color=:green, label="Case", ls=:dot, lw=0)
+plot!(p_uf, prev_grid, λ_est, label="Fit", lw=2, color=:red)
+```
+
+### Quantitative comparison
+
+```{julia}
+#| echo: false
+function ci_width_at_peak(bs)
+    peak_idx = argmax(sol.fitted_values[:, 1])
+    bs.ci_fitted.upper[peak_idx, 1] - bs.ci_fitted.lower[peak_idx, 1]
+end
+
+function uf_coverage(bs)
+    grid = bs.uf_grid[:λ]
+    lo = bs.ci_uf[:λ].lower
+    hi = bs.ci_uf[:λ].upper
+    n_covered = 0
+    for (k, x) in enumerate(grid)
+        λ_true_k = 0.5 * x^0.9
+        if lo[k] <= λ_true_k <= hi[k]
+            n_covered += 1
+        end
+    end
+    n_covered / length(grid)
+end
+
+function mean_uf_ci_width(bs)
+    mean(bs.ci_uf[:λ].upper .- bs.ci_uf[:λ].lower)
+end
+
+println("Method          | n_success | CI width at peak | Mean UF CI width | UF coverage")
+println("-"^85)
+for (name, bs) in [("Parametric", bs_param),
+                    ("Nonparametric", bs_nonparam),
+                    ("Case", bs_case)]
+    w_peak = round(ci_width_at_peak(bs), digits=1)
+    w_uf = round(mean_uf_ci_width(bs), sigdigits=3)
+    cov = round(uf_coverage(bs) * 100, digits=1)
+    println(rpad(name, 16), "| ", rpad("$(bs.n_success)/100", 10),
+            "| ", rpad("$w_peak", 17),
+            "| ", rpad("$w_uf", 17),
+            "| ", cov, "%")
+end
+```
+
+**Interpretation:**
+
+- **Parametric** CIs tend to be the narrowest because they assume the correct error model (Gaussian with estimated $\sigma$).
+- **Nonparametric** CIs are slightly wider because they make fewer distributional assumptions — the resampled residuals capture any non-Gaussian features.
+- **Case** CIs are typically the widest and can have lower success rates, since resampling rows may create degenerate pseudo-datasets. However, they are the most robust to model misspecification.
+
+## Section 6: Bootstrap with Non-Gaussian Likelihoods
+
+A key advantage of the parametric bootstrap is that it **respects the likelihood family**. When fitting count data with `Poisson()`, the parametric bootstrap samples $I^*_t \sim \text{Pois}(\hat{I}(t))$ instead of adding Gaussian noise. This naturally produces integer pseudo-data with variance proportional to the mean.
+
+### Generate Poisson data
+
+```{julia}
+#| echo: false
+function sample_poisson(μ)
+    μ = max(μ, 0.01); c = 0; s = 0.0
+    while true; s -= log(rand()); s > μ && break; c += 1; end
+    Float64(c)
+end
+
+I_pois = [sample_poisson(v) for v in I_true]
+
+scatter(data_times, I_pois, label="Poisson observations", xlabel="Time (days)",
+        ylabel="Infected (count)", title="SIR epidemic: Poisson data",
+        ms=4, alpha=0.6, color=:purple)
+plot!(data_times, I_true, label="True I(t)", lw=2, color=:black, ls=:dash)
+```
+
+### Fit with Poisson likelihood
+
+```{julia}
+prob_pois = PSMProblem(
+    sir_psm!, u0, tspan,
+    [BSplineApproximator(:λ, (0.005, 0.15), 8; initial = x -> 0.4 * x)];
+    data_times = data_times,
+    data_values = reshape(I_pois, :, 1),
+    obs_to_state = [2],
+    known_params = (γ = 0.25, N = N_pop),
+    likelihood = Poisson(),
+    solver = Tsit5()
+)
+
+sol_pois = solve(prob_pois, LAML(maxiters=100, verbose=false))
+```
+
+```{julia}
+#| echo: false
+println("Poisson fit — data_loss: ", round(sol_pois.data_loss, digits=1),
+        ", EDF: ", round(sol_pois.edf, digits=2))
+```
+
+### Parametric bootstrap with Poisson likelihood
+
+The parametric bootstrap now samples from $\text{Pois}(\hat\mu_t)$:
+
+```{julia}
+bs_pois = bootstrap(sol_pois, prob_pois, LAML(maxiters=80, verbose=false);
+    nboot=100, method=:parametric, rng=Random.Xoshiro(42), verbose=true)
+```
+
+```{julia}
+p1 = plot(data_times, I_true, label="True I(t)", lw=2, color=:black, ls=:dash,
+     xlabel="Time (days)", ylabel="Infected (count)",
+     title="Poisson bootstrap: trajectory CI")
+scatter!(p1, data_times, I_pois, label="Data", ms=3, alpha=0.4, color=:purple)
+plot!(p1, data_times, sol_pois.fitted_values[:, 1], label="PSM fit", lw=2, color=:purple)
+plot!(p1, data_times, bs_pois.ci_fitted.lower[:, 1],
+      fillrange=bs_pois.ci_fitted.upper[:, 1],
+      fillalpha=0.2, color=:purple, label="95% CI", ls=:dot, lw=0)
+
+p2 = plot(prev_grid, λ_true, label="True λ", lw=2, color=:black, ls=:dash,
+     xlabel="Prevalence (I/N)", ylabel="λ(I/N)",
+     title="Poisson bootstrap: unknown function CI")
+plot!(p2, bs_pois.uf_grid[:λ], bs_pois.ci_uf[:λ].lower,
+      fillrange=bs_pois.ci_uf[:λ].upper,
+      fillalpha=0.2, color=:purple, label="95% CI", ls=:dot, lw=0)
+λ_pois_est = [sol_pois.unknown_functions[:λ](p) for p in prev_grid]
+plot!(p2, prev_grid, λ_pois_est, label="Estimated λ", lw=2, color=:purple)
+
+plot(p1, p2, layout=(1, 2), size=(900, 400))
+```
+
+Note how the Poisson CIs are **narrower near zero** (where counts are small and Poisson variance is low) and **wider at the peak** (where counts — and hence Poisson variance — are large). This heteroscedasticity is automatically captured by the parametric bootstrap.
+
+## Section 7: Diagnostic Plots
+
+Standard 4-panel diagnostics for the primary Gaussian fit help verify that the residuals are well-behaved:
+
+```{julia}
+diag = appraise(sol)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+```{julia}
+#| echo: false
+println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_watson], ", "))
+```
+
+A Durbin-Watson statistic near 2 indicates no strong autocorrelation in the residuals, supporting the validity of the bootstrap CIs (which assume approximately independent errors).
+
+## Practical Guidance
+
+### Choosing a bootstrap method
+
+| Scenario | Recommended method |
+|----------|-------------------|
+| Gaussian noise, well-specified model | `:parametric` — narrowest CIs |
+| Count data (Poisson, NegBin) | `:parametric` — respects variance–mean relationship |
+| Suspect non-Gaussian errors | `:nonparametric` — no distributional assumption |
+| Irregular sampling, heteroscedasticity | `:case` — most robust |
+| Quick exploratory analysis | `:parametric` with `nboot=50` |
+
+### Tips
+
+- **Start with `nboot=50–100`** to check the method works, then increase to 200+ for publication-quality CIs.
+- **Check `bs.n_success`**: if many replicates fail (< 80% success), the model may be unstable. Try increasing `maxiters` or simplifying the approximator (fewer knots).
+- **Set `rng=Random.Xoshiro(seed)`** for reproducibility.
+- The parametric bootstrap is the default for good reason: it is fast, well-calibrated, and adapts to the likelihood family. Use nonparametric or case bootstrap when you have reason to doubt the error model.
