@@ -38,7 +38,7 @@ using OrdinaryDiffEq
 using Plots
 using Statistics
 using Random
-Random.seed!(42)
+Random.seed!(7)
 ```
 
 ## The Model: SIR with Unknown Force of Infection
@@ -92,17 +92,19 @@ The prevalence range determines the B-spline domain:
 ```{julia}
 #| echo: false
 prev_range = I_true ./ N_pop
+foi_domain = (0.0, round(maximum(prev_range) * 1.2, digits=3))
 println("Prevalence range: $(round(minimum(prev_range), digits=4)) – $(round(maximum(prev_range), digits=4))")
+println("B-spline domain: $foi_domain")
 ```
 
 ## Section 1: Fit the PSM
 
-We model $\lambda(I/N)$ with a penalized cubic B-spline with 8 knots. The PSM dynamics access the unknown function via `p.λ`:
+We model $\lambda(I/N)$ with a shape-constrained B-spline (8 knots, increasing with $\lambda(0) = 0$). The `inc_zero_left` constraint is biologically motivated: the force of infection must be zero when there are no infected individuals, and should increase with prevalence.
 
 ```{julia}
 function sir_psm!(du, u, p, t)
     S, I, R = u
-    λ = max(p.λ(I / p.N), 0.0)
+    λ = p.λ(I / p.N)
     du[1] = -λ * S
     du[2] =  λ * S - p.γ * I
     du[3] =  p.γ * I
@@ -110,8 +112,8 @@ end
 ```
 
 ```{julia}
-approx_λ = BSplineApproximator(:λ, (0.005, 0.15), 8;
-                                initial = x -> 0.4 * x)
+approx_λ = ShapeConstrainedBSplineApproximator(:λ, foi_domain, 10,
+    :inc_zero_left; initial = 0.4)
 
 prob = PSMProblem(
     sir_psm!, u0, tspan, [approx_λ];
@@ -168,7 +170,7 @@ Each replicate is refit with LAML, producing a distribution of fitted trajectori
 
 ```{julia}
 bs_param = bootstrap(sol, prob, LAML(maxiters=80, verbose=false);
-    nboot=100, method=:parametric, rng=Random.Xoshiro(42), verbose=true)
+    nboot=50, method=:parametric, rng=Random.Xoshiro(42), verbose=true)
 ```
 
 ### Trajectory confidence intervals
@@ -214,7 +216,7 @@ where $\pi$ is a random permutation with replacement. This makes no assumption a
 
 ```{julia}
 bs_nonparam = bootstrap(sol, prob, LAML(maxiters=80, verbose=false);
-    nboot=100, method=:nonparametric, rng=Random.Xoshiro(42), verbose=true)
+    nboot=50, method=:nonparametric, rng=Random.Xoshiro(42), verbose=true)
 ```
 
 ### Trajectory confidence intervals
@@ -255,7 +257,7 @@ However, because time points can be duplicated or missing, the refit can be less
 
 ```{julia}
 bs_case = bootstrap(sol, prob, LAML(maxiters=80, verbose=false);
-    nboot=100, method=:case, rng=Random.Xoshiro(42), verbose=true)
+    nboot=50, method=:case, rng=Random.Xoshiro(42), verbose=true)
 ```
 
 ### Trajectory confidence intervals
@@ -404,7 +406,7 @@ plot!(data_times, I_true, label="True I(t)", lw=2, color=:black, ls=:dash)
 ```{julia}
 prob_pois = PSMProblem(
     sir_psm!, u0, tspan,
-    [BSplineApproximator(:λ, (0.005, 0.15), 8; initial = x -> 0.4 * x)];
+    [ShapeConstrainedBSplineApproximator(:λ, foi_domain, 10, :inc_zero_left; initial = 0.4)];
     data_times = data_times,
     data_values = reshape(I_pois, :, 1),
     obs_to_state = [2],
@@ -428,7 +430,7 @@ The parametric bootstrap now samples from $\text{Pois}(\hat\mu_t)$:
 
 ```{julia}
 bs_pois = bootstrap(sol_pois, prob_pois, LAML(maxiters=80, verbose=false);
-    nboot=100, method=:parametric, rng=Random.Xoshiro(42), verbose=true)
+    nboot=50, method=:parametric, rng=Random.Xoshiro(42), verbose=true)
 ```
 
 ```{julia}
