@@ -1769,6 +1769,81 @@ using OrdinaryDiffEq
                 nboot=10, level=0.90, rng=Random.Xoshiro(4))
             @test bs.level == 0.90
         end
+
+        @testset "Poisson parametric bootstrap" begin
+            # Fit with Poisson likelihood, then bootstrap should sample from Poisson(μ̂)
+            Random.seed!(42)
+            function sir_bs_pois!(du, u, p, t)
+                S, I, R = u
+                λ = max(p.λ(I / 1000.0), 0.0)
+                du[1] = -λ * S; du[2] = λ * S - 0.25 * I; du[3] = 0.25 * I
+            end
+            prob_ode = ODEProblem((du,u,p,t) -> begin
+                S,I,R=u; λ=0.5*(I/1000)^0.9
+                du[1]=-λ*S; du[2]=λ*S-0.25*I; du[3]=0.25*I
+            end, [990.0, 10.0, 0.0], (0.0, 40.0))
+            sol_ode = OrdinaryDiffEq.solve(prob_ode, Tsit5(); saveat=2.0)
+            I_true = [sol_ode(t)[2] for t in sol_ode.t]
+            # Simple Poisson sampling
+            function _sp(μ)
+                μ = max(μ, 0.01); c = 0; s = 0.0
+                while true; s -= log(rand()); s > μ && break; c += 1; end
+                Float64(c)
+            end
+            y_pois = _sp.(I_true)
+
+            uf = BSplineApproximator(:λ, (0.0, 0.25), 6; initial=x->0.4x)
+            prob_p = PSMProblem(sir_bs_pois!, [990.0,10.0,0.0], (0.0,40.0), [uf];
+                data_times=sol_ode.t, data_values=reshape(y_pois,:,1),
+                obs_to_state=[2], known_params=NamedTuple(),
+                likelihood=Poisson(), solver=Tsit5())
+            sol_p = solve(prob_p, LAML(maxiters=80, verbose=false))
+
+            bs = bootstrap(sol_p, prob_p, LAML(maxiters=80, verbose=false);
+                nboot=10, method=:parametric, rng=Random.Xoshiro(5))
+            @test bs.n_success >= 3
+            @test all(bs.ci_fitted.lower .<= bs.ci_fitted.upper)
+            # Poisson bootstrap data should be non-negative integers
+        end
+
+        @testset "NegBin parametric bootstrap" begin
+            # Reuse the logistic problem but with NegBin likelihood
+            Random.seed!(42)
+            data_pos = abs.(data) .+ 0.1  # ensure positive for NegBin
+            uf_nb = BSplineApproximator(:r, (0.1, 10.0), 6; initial=x -> 0.3)
+            prob_nb = PSMProblem(logistic_bs!, [1.0], (0.0, 15.0), [uf_nb];
+                data_times=t_obs, data_values=data_pos,
+                obs_to_state=[1], known_params=NamedTuple(),
+                likelihood=NegativeBinomial(10.0), solver=Tsit5())
+            sol_nb = solve(prob_nb, LAML(maxiters=50, verbose=false))
+            bs_nb = bootstrap(sol_nb, prob_nb, LAML(maxiters=50, verbose=false);
+                nboot=10, method=:parametric, rng=Random.Xoshiro(7))
+            @test bs_nb.n_success >= 3
+            @test all(bs_nb.ci_fitted.lower .<= bs_nb.ci_fitted.upper)
+        end
+
+        @testset "internal samplers" begin
+            using PartiallySpecifiedModels: _sample_poisson, _sample_gamma
+            rng = Random.Xoshiro(42)
+            # Poisson: small μ (Knuth) and large μ (normal approx)
+            samples_small = [_sample_poisson(5.0, rng) for _ in 1:1000]
+            @test all(s -> s >= 0, samples_small)
+            @test 4.0 < mean(samples_small) < 6.0  # E[X] = μ
+
+            samples_large = [_sample_poisson(100.0, rng) for _ in 1:1000]
+            @test all(s -> s >= 0, samples_large)
+            @test 90.0 < mean(samples_large) < 110.0
+
+            # Gamma: shape=2, scale=3 → mean=6
+            samples_g = [_sample_gamma(2.0, 3.0, rng) for _ in 1:1000]
+            @test all(s -> s > 0, samples_g)
+            @test 5.0 < mean(samples_g) < 7.0
+
+            # Gamma with shape < 1 (boost method)
+            samples_g2 = [_sample_gamma(0.5, 2.0, rng) for _ in 1:1000]
+            @test all(s -> s > 0, samples_g2)
+            @test 0.5 < mean(samples_g2) < 1.5  # E = 0.5*2 = 1.0
+        end
     end
 
 end
