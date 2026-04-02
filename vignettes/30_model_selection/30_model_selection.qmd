@@ -1,0 +1,503 @@
+---
+title: "Model Selection with Marginal Likelihood"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+When fitting a partially specified model, several modelling choices must be made:
+
+1. **How many knots** (or basis functions) should we use for a B-spline approximator?
+2. **Which approximator type** best captures the unknown function — B-splines, SPDE, or GP?
+3. **Which functions** in the model should be treated as unknown?
+
+The **Laplace Approximate Marginal Likelihood (LAML)** provides a principled criterion for answering all three questions. LAML integrates out the unknown function coefficients via a Laplace approximation to the marginal likelihood:
+
+$$
+\text{LAML}(\lambda) = -\frac{n}{2}\log(2\pi\hat\sigma^2) + \frac{1}{2}\log|\mathbf{S}_\lambda| - \frac{1}{2}\log|\mathbf{H}| - \frac{1}{2\hat\sigma^2}\|\mathbf{y} - \hat{\mathbf{y}}\|^2
+$$
+
+where $\mathbf{S}_\lambda$ is the penalty matrix scaled by the smoothing parameter $\lambda$, $\mathbf{H}$ is the Hessian of the penalized log-likelihood, and $\hat\sigma^2$ is the estimated dispersion. Lower (more negative) LAML values indicate a better model — analogous to AIC or BIC, but with proper accounting for the smoothing penalty.
+
+This vignette demonstrates LAML-based model selection on two example systems: logistic growth and Lotka–Volterra predator–prey.
+
+## Setup
+
+```{julia}
+using PartiallySpecifiedModels
+using PartiallySpecifiedModels: solve
+using OrdinaryDiffEq
+using Plots
+using Random
+using DataFrames
+using Printf
+Random.seed!(42)
+```
+
+## Logistic Growth with Unknown Per-Capita Rate
+
+### Data generation
+
+We consider logistic growth where the per-capita growth rate $r(N)$ is treated as unknown:
+
+$$
+\frac{dN}{dt} = r(N) \cdot N
+$$
+
+The true per-capita rate is linear: $r(N) = 0.5\,(1 - N/10)$, giving a carrying capacity of $K = 10$.
+
+```{julia}
+#| echo: false
+function logistic_true!(du, u, p, t)
+    N = u[1]
+    du[1] = 0.5 * (1.0 - N / 10.0) * N
+end
+
+u0_true = [1.0]
+tspan = (0.0, 15.0)
+prob_true = ODEProblem(logistic_true!, u0_true, tspan)
+sol_true = OrdinaryDiffEq.solve(prob_true, Tsit5(); saveat=0.01)
+
+data_t = collect(0.5:0.5:15.0)
+σ_obs = 0.3
+data_N = [max(0.1, sol_true(t)[1] + σ_obs * randn()) for t in data_t]
+data_vals = reshape(data_N, :, 1)
+```
+
+```{julia}
+plot(sol_true, label="True trajectory", lw=2, xlabel="Time", ylabel="N(t)")
+scatter!(data_t, data_N, label="Observations (σ=$σ_obs)", ms=4, alpha=0.7)
+```
+
+### PSM dynamics
+
+The partially specified model replaces the known $r(N)$ with an unknown function to be estimated from data:
+
+```{julia}
+function logistic!(du, u, p, t)
+    N = u[1]
+    du[1] = p.r(N) * N
+end
+```
+
+## Section 1: Knot Selection for B-Spline Approximators
+
+A key modelling choice for B-spline approximators is the number of knots. Too few knots restrict the function space and lead to underfitting; too many create an overly flexible basis that can overfit despite the smoothing penalty. LAML provides a principled way to choose.
+
+We fit the logistic growth model with B-spline approximators using 4 to 20 knots, recording the LAML objective, effective degrees of freedom (EDF), and data-space sum of squares for each.
+
+```{julia}
+N_domain = (0.1, 10.5)
+knot_counts = [4, 6, 8, 10, 12, 15, 20]
+knot_results = []
+
+for nk in knot_counts
+    uf = BSplineApproximator(:r, N_domain, nk; initial=x -> 0.3)
+    prob = PSMProblem(logistic!, [1.0], tspan, [uf];
+        data_times=data_t, data_values=data_vals,
+        obs_to_state=[1], known_params=(;),
+        solver=Tsit5())
+    sol = solve(prob, LAML(maxiters=80, verbose=false))
+    push!(knot_results, (nk=nk, laml=sol.objective, edf=sol.edf, ss=sol.data_loss))
+end
+```
+
+### LAML vs number of knots
+
+The LAML curve is characteristically U-shaped: underfitting (too few knots) yields poor data fit, while overfitting (too many knots) incurs a complexity penalty.
+
+```{julia}
+laml_vals = [r.laml for r in knot_results]
+best_idx = argmin(laml_vals)
+best_nk = knot_results[best_idx].nk
+
+plot(knot_counts, laml_vals,
+    marker=:circle, ms=6, lw=2,
+    xlabel="Number of knots", ylabel="LAML",
+    title="Knot selection via LAML",
+    label="LAML", legend=:topright)
+vline!([best_nk], ls=:dash, color=:red, label="Best ($best_nk knots)")
+```
+
+### Summary table
+
+```{julia}
+#| output: asis
+println("| Knots | LAML | EDF | Data SS |")
+println("|------:|-----:|----:|--------:|")
+for r in knot_results
+    marker = r.nk == best_nk ? " ✓" : ""
+    @printf("| %d | %.2f | %.1f | %.3f |%s\n", r.nk, r.laml, r.edf, r.ss, marker)
+end
+```
+
+### Recovered unknown functions
+
+We plot the estimated $r(N)$ for a few representative knot counts against the truth.
+
+```{julia}
+N_grid = range(N_domain[1], N_domain[2], length=200)
+r_true = [0.5 * (1.0 - N / 10.0) for N in N_grid]
+
+selected_knots = [4, best_nk, 20]
+p_uf = plot(N_grid, r_true, lw=3, ls=:dash, color=:black, label="True r(N)",
+    xlabel="N", ylabel="r(N)", title="Estimated per-capita rate")
+
+for nk in selected_knots
+    uf = BSplineApproximator(:r, N_domain, nk; initial=x -> 0.3)
+    prob = PSMProblem(logistic!, [1.0], tspan, [uf];
+        data_times=data_t, data_values=data_vals,
+        obs_to_state=[1], known_params=(;),
+        solver=Tsit5())
+    sol = solve(prob, LAML(maxiters=80, verbose=false))
+    r_hat = [sol.unknown_functions[:r](N) for N in N_grid]
+    lbl = nk == best_nk ? "$nk knots (best)" : "$nk knots"
+    plot!(p_uf, N_grid, r_hat, lw=2, label=lbl)
+end
+display(p_uf)
+```
+
+::: {.callout-note}
+The LAML-selected model typically recovers the linear truth well, while the 4-knot model is too rigid and the 20-knot model may show slight edge wiggles — though the smoothing penalty limits the damage.
+:::
+
+## Section 2: Approximator Type Comparison
+
+Different approximator types encode different prior assumptions about the unknown function. We compare three types on the same logistic growth problem, each with 8 basis functions:
+
+- **B-spline**: Local polynomial basis with a second-derivative roughness penalty.
+- **SPDE**: Matérn covariance via a stochastic PDE discretization ($\nu = 1.5$), giving a stationary GP-like prior.
+- **GP**: Gaussian process with a squared-exponential kernel and inducing-point approximation.
+
+```{julia}
+uf_bspline = BSplineApproximator(:r, N_domain, 8; initial=x -> 0.3)
+uf_spde = SPDEApproximator(:r, N_domain, 8; nu=1.5, initial=x -> 0.3)
+uf_gp = GPApproximator(:r, N_domain, 8; kernel=:sqexp, initial=x -> 0.3)
+
+approx_specs = [
+    ("B-spline (8 knots)", uf_bspline),
+    ("SPDE (Matérn ν=1.5, 8 mesh)", uf_spde),
+    ("GP (SE, 8 inducing)", uf_gp),
+]
+
+approx_results = []
+approx_solutions = Dict{String, Any}()
+
+for (name, uf) in approx_specs
+    prob = PSMProblem(logistic!, [1.0], tspan, [uf];
+        data_times=data_t, data_values=data_vals,
+        obs_to_state=[1], known_params=(;),
+        solver=Tsit5())
+    sol = solve(prob, LAML(maxiters=80, verbose=false))
+    push!(approx_results, (name=name, laml=sol.objective, edf=sol.edf, ss=sol.data_loss))
+    approx_solutions[name] = sol
+end
+```
+
+### Comparison table
+
+```{julia}
+#| output: asis
+best_approx_idx = argmin([r.laml for r in approx_results])
+println("| Approximator | LAML | EDF | Data SS |")
+println("|:-------------|-----:|----:|--------:|")
+for (i, r) in enumerate(approx_results)
+    marker = i == best_approx_idx ? " ✓" : ""
+    @printf("| %s | %.2f | %.1f | %.3f |%s\n", r.name, r.laml, r.edf, r.ss, marker)
+end
+```
+
+### Recovered unknown functions by approximator type
+
+```{julia}
+p_approx = plot(N_grid, r_true, lw=3, ls=:dash, color=:black, label="True r(N)",
+    xlabel="N", ylabel="r(N)", title="Approximator comparison")
+
+colors = [:blue, :red, :green]
+for (i, (name, _)) in enumerate(approx_specs)
+    sol = approx_solutions[name]
+    r_hat = [sol.unknown_functions[:r](N) for N in N_grid]
+    plot!(p_approx, N_grid, r_hat, lw=2, color=colors[i], label=name)
+end
+display(p_approx)
+```
+
+::: {.callout-note}
+For a smooth, nearly linear unknown function, B-splines and SPDE typically perform similarly. GP approximators may show slightly different behaviour near domain boundaries due to the squared-exponential kernel's stationarity. LAML provides a fair comparison across types by penalising complexity through the marginal likelihood.
+:::
+
+## Section 3: Structural Model Selection
+
+Beyond choosing approximator details, LAML can guide **structural** model selection — deciding which functions in a multi-species model should be estimated nonparametrically and which should remain parametric.
+
+### Lotka–Volterra predator–prey
+
+Consider a predator–prey system with unknown prey growth rate $r(H)$ and predator death rate $\delta(L)$:
+
+$$
+\begin{aligned}
+\frac{dH}{dt} &= r(H) \cdot H - \alpha \, H \, L \\
+\frac{dL}{dt} &= \alpha \, H \, L - \delta(L) \cdot L
+\end{aligned}
+$$
+
+The true functions are $r(H) = 0.5\,(1 - H/10)$ (logistic prey growth) and $\delta(L) = 0.3$ (constant predator mortality).
+
+### Data generation
+
+```{julia}
+#| echo: false
+function lv_true!(du, u, p, t)
+    H, L = u
+    du[1] = 0.5 * (1.0 - H / 10.0) * H - 0.01 * H * L
+    du[2] = 0.01 * H * L - 0.3 * L
+end
+
+u0_lv = [4.0, 2.0]
+tspan_lv = (0.0, 40.0)
+prob_lv_true = ODEProblem(lv_true!, u0_lv, tspan_lv)
+sol_lv_true = OrdinaryDiffEq.solve(prob_lv_true, Tsit5(); saveat=0.01)
+
+data_t_lv = collect(1.0:1.0:40.0)
+σ_lv = 0.3
+data_H = [max(0.1, sol_lv_true(t)[1] + σ_lv * randn()) for t in data_t_lv]
+data_L = [max(0.1, sol_lv_true(t)[2] + σ_lv * randn()) for t in data_t_lv]
+data_vals_lv = hcat(data_H, data_L)
+```
+
+```{julia}
+plot(sol_lv_true, label=["True H(t)" "True L(t)"], lw=2,
+    xlabel="Time", ylabel="Population")
+scatter!(data_t_lv, data_H, label="H obs", ms=3, alpha=0.6)
+scatter!(data_t_lv, data_L, label="L obs", ms=3, alpha=0.6)
+```
+
+### Three candidate model structures
+
+We compare three structural models that differ in which functions are treated as unknown:
+
+**Model A** — Both $r(H)$ and $\delta(L)$ unknown (2 UFs):
+
+```{julia}
+function lv_both!(du, u, p, t)
+    H, L = u
+    du[1] = p.r(H) * H - 0.01 * H * L
+    du[2] = 0.01 * H * L - p.δ(L) * L
+end
+```
+
+**Model B** — Only $r(H)$ unknown; $\delta$ is a fitted constant (1 UF):
+
+```{julia}
+function lv_r_only!(du, u, p, t)
+    H, L = u
+    du[1] = p.r(H) * H - 0.01 * H * L
+    du[2] = 0.01 * H * L - p.δ * L
+end
+```
+
+**Model C** — Only $\delta(L)$ unknown; $r$ is a fitted constant (1 UF):
+
+```{julia}
+function lv_delta_only!(du, u, p, t)
+    H, L = u
+    du[1] = p.r * H - 0.01 * H * L
+    du[2] = 0.01 * H * L - p.δ(L) * L
+end
+```
+
+### Fitting all three structures
+
+```{julia}
+H_domain = (0.1, 11.0)
+L_domain = (0.1, 6.0)
+nk_lv = 8
+lv_solver = LAML(maxiters=100, verbose=false)
+
+# Model A: both r(H) and δ(L) unknown
+uf_r_A = BSplineApproximator(:r, H_domain, nk_lv; initial=x -> 0.3)
+uf_δ_A = BSplineApproximator(:δ, L_domain, nk_lv; initial=x -> 0.3)
+prob_A = PSMProblem(lv_both!, u0_lv, tspan_lv, [uf_r_A, uf_δ_A];
+    data_times=data_t_lv, data_values=data_vals_lv,
+    obs_to_state=[1, 2], known_params=(;),
+    solver=Tsit5())
+sol_A = solve(prob_A, lv_solver)
+
+# Model B: only r(H) unknown, δ constant
+uf_r_B = BSplineApproximator(:r, H_domain, nk_lv; initial=x -> 0.3)
+prob_B = PSMProblem(lv_r_only!, u0_lv, tspan_lv, [uf_r_B];
+    data_times=data_t_lv, data_values=data_vals_lv,
+    obs_to_state=[1, 2], known_params=(δ=0.3,),
+    solver=Tsit5())
+sol_B = solve(prob_B, lv_solver)
+
+# Model C: only δ(L) unknown, r constant
+uf_δ_C = BSplineApproximator(:δ, L_domain, nk_lv; initial=x -> 0.3)
+prob_C = PSMProblem(lv_delta_only!, u0_lv, tspan_lv, [uf_δ_C];
+    data_times=data_t_lv, data_values=data_vals_lv,
+    obs_to_state=[1, 2], known_params=(r=0.5,),
+    solver=Tsit5())
+sol_C = solve(prob_C, lv_solver)
+```
+
+### Structural comparison
+
+```{julia}
+#| output: asis
+struct_results = [
+    ("A: r(H) + δ(L) unknown", sol_A.objective, sol_A.edf, sol_A.data_loss),
+    ("B: r(H) unknown, δ const", sol_B.objective, sol_B.edf, sol_B.data_loss),
+    ("C: δ(L) unknown, r const", sol_C.objective, sol_C.edf, sol_C.data_loss),
+]
+
+best_struct = argmin([r[2] for r in struct_results])
+println("| Model structure | LAML | EDF | Data SS |")
+println("|:----------------|-----:|----:|--------:|")
+for (i, (name, laml, edf, ss)) in enumerate(struct_results)
+    marker = i == best_struct ? " ✓" : ""
+    @printf("| %s | %.2f | %.1f | %.3f |%s\n", name, laml, edf, ss, marker)
+end
+```
+
+### Recovered unknown functions
+
+```{julia}
+H_grid = range(H_domain[1], H_domain[2], length=200)
+L_grid = range(L_domain[1], L_domain[2], length=200)
+r_true_lv = [0.5 * (1.0 - H / 10.0) for H in H_grid]
+δ_true_lv = fill(0.3, length(L_grid))
+
+p1 = plot(H_grid, r_true_lv, lw=3, ls=:dash, color=:black, label="True r(H)",
+    xlabel="H", ylabel="r(H)", title="Prey growth rate")
+if haskey(sol_A.unknown_functions, :r)
+    plot!(p1, H_grid, [sol_A.unknown_functions[:r](H) for H in H_grid],
+        lw=2, color=:blue, label="Model A")
+end
+plot!(p1, H_grid, [sol_B.unknown_functions[:r](H) for H in H_grid],
+    lw=2, color=:red, label="Model B")
+
+p2 = plot(L_grid, δ_true_lv, lw=3, ls=:dash, color=:black, label="True δ(L)",
+    xlabel="L", ylabel="δ(L)", title="Predator death rate")
+if haskey(sol_A.unknown_functions, :δ)
+    plot!(p2, L_grid, [sol_A.unknown_functions[:δ](L) for L in L_grid],
+        lw=2, color=:blue, label="Model A")
+end
+plot!(p2, L_grid, [sol_C.unknown_functions[:δ](L) for L in L_grid],
+    lw=2, color=:green, label="Model C")
+
+plot(p1, p2, layout=(1, 2), size=(900, 400))
+```
+
+::: {.callout-note}
+Since the true predator death rate $\delta$ is constant, LAML should favour Model B (only $r(H)$ unknown) or Model A with a near-constant estimate for $\delta(L)$. Model C — which fixes $r$ as constant — should score worst because the true prey growth is nonlinear.
+:::
+
+## Section 4: Diagnostics for the Best Knot Model
+
+We refit the best model from Section 1 and examine its diagnostic plots.
+
+```{julia}
+uf_best = BSplineApproximator(:r, N_domain, best_nk; initial=x -> 0.3)
+prob_best = PSMProblem(logistic!, [1.0], tspan, [uf_best];
+    data_times=data_t, data_values=data_vals,
+    obs_to_state=[1], known_params=(;),
+    solver=Tsit5())
+sol_best = solve(prob_best, LAML(maxiters=80, verbose=false))
+```
+
+### Fitted trajectory
+
+```{julia}
+p_traj = plot(sol_best.data_times, sol_best.fitted_values[:, 1], lw=2,
+    label="Fitted N(t)",
+    xlabel="Time", ylabel="N(t)", title="Best model ($best_nk knots)")
+scatter!(p_traj, data_t, data_N, label="Observations", ms=4, alpha=0.7)
+plot!(p_traj, sol_true.t, [sol_true.u[i][1] for i in eachindex(sol_true.u)],
+    lw=2, ls=:dash, color=:black, label="True trajectory")
+p_traj
+```
+
+### Residual diagnostics
+
+```{julia}
+diag = appraise(sol_best)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+### Durbin–Watson and residual autocorrelation
+
+```{julia}
+#| echo: false
+println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_watson], ", "))
+
+resid_mat = sol_best.data_values .- sol_best.fitted_values
+acf_vals = residual_acf(resid_mat[:, 1]; maxlag=5)
+println("Residual ACF (lags 1–5): ", round.(acf_vals; digits=3))
+```
+
+## Discussion
+
+### Guidelines for LAML-based model selection
+
+1. **Knot selection**: Start with a moderate number (6–10) and sweep upwards. LAML typically produces a clear minimum or plateau. Unlike cross-validation, LAML does not require held-out data or repeated fitting.
+
+2. **Approximator comparison**: LAML enables fair comparison across approximator types because it accounts for effective complexity (EDF), not just the number of parameters. A GP with 8 inducing points may have a very different EDF from a B-spline with 8 knots.
+
+3. **Structural selection**: LAML naturally penalises unnecessary complexity. If a function is truly constant, a nonparametric estimate will have low EDF and the LAML penalty for the extra smoothing parameters will make the simpler parametric model preferable.
+
+4. **Caveats**: LAML is based on a Laplace approximation and assumes a Gaussian error model (or a well-specified likelihood). For highly non-Gaussian data or multi-modal posteriors, consider the MCMC or ABC approaches in other vignettes.
+
+### Relationship to other criteria
+
+| Criterion | Accounts for smoothing? | Requires refitting? | Bayesian? |
+|:----------|:-----------------------:|:-------------------:|:---------:|
+| AIC       | No                      | No                  | No        |
+| BIC       | No                      | No                  | No        |
+| GCV       | Yes                     | No                  | No        |
+| LAML      | Yes                     | No                  | Yes (approx.) |
+| WAIC/LOO  | Yes                     | Yes (MCMC)          | Yes       |
+
+LAML and GCV are closely related — both optimise a criterion that balances fit against complexity. LAML has a more natural Bayesian interpretation as an approximate marginal likelihood, while GCV minimises an estimate of prediction error. In practice they often agree; when they differ, LAML tends to be more conservative (fewer EDF).
+
+::: {.callout-tip}
+## See Also
+- [Vignette 05: Neural Networks](../05_neural_networks/05_neural_networks.qmd) — approximator type comparison with neural networks
+- [Vignette 06: Solver Comparison](../06_solver_comparison/06_solver_comparison.qmd) — solver method comparison
+- [Vignette 21: GCV](../21_gcv/21_gcv.qmd) — GCV-based smoothing parameter selection
+- [Vignette 26: SPDE](../26_spde/26_spde.qmd) — SPDE approximator details
+- [Vignette 29: Bootstrap](../29_bootstrap/29_bootstrap.qmd) — uncertainty quantification for selected models
+:::
