@@ -25,6 +25,9 @@ one-sided differences at boundaries.
 """
 function build_diff_matrix(times::AbstractVector{Float64})
     T = length(times)
+    for i in 1:T-1
+        times[i+1] <= times[i] && error("build_diff_matrix: times must be strictly increasing (duplicate at index $i)")
+    end
     D = zeros(T, T)
 
     # Forward difference at t_1 (second-order)

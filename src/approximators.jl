@@ -46,6 +46,7 @@ function spline_penalty_matrix(knots_x::AbstractVector)
     end
 
     h = diff(knots_x)
+    any(h .<= 0) && error("spline_penalty_matrix: knots must be strictly increasing")
     m = n - 2  # number of interior knots
 
     # H: m × n matrix of second divided differences
@@ -185,6 +186,7 @@ For piecewise linear hat functions on a mesh with spacings `h`.
 function spde_fem_matrices(mesh::AbstractVector)
     n = length(mesh)
     h = diff(mesh)
+    any(h .<= 0) && error("spde_fem_matrices: mesh must be strictly increasing")
 
     # Lumped mass matrix (diagonal)
     C = zeros(n, n)
