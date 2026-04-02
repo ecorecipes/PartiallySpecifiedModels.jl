@@ -61,6 +61,8 @@ Compute bootstrap confidence intervals for a PSM solution.
 - `level::Float64=0.95`: confidence level for CIs
 - `uf_ngrid::Int=100`: number of grid points for unknown function CIs
 - `rng`: random number generator
+- `parallel::Bool=false`: use multi-threading (`Threads.@threads`) for replicates.
+  Requires Julia started with `JULIA_NUM_THREADS > 1`.
 - `verbose::Bool=false`: print progress
 
 # Returns
@@ -88,6 +90,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                    level::Float64=0.95,
                    uf_ngrid::Int=100,
                    rng=default_rng(),
+                   parallel::Bool=false,
                    verbose::Bool=false)
 
     method in (:parametric, :nonparametric, :case) ||
@@ -108,84 +111,162 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
         lo, hi = approx.domain
         uf_grids[approx.name] = collect(range(lo, hi, length=uf_ngrid))
     end
+    uf_names = collect(keys(uf_grids))
 
-    # Storage for bootstrap samples
     n_p = length(sol.parameters)
-    coef_samples = zeros(nboot, n_p)
-    fitted_samples = zeros(n_times, n_obs, nboot)
-    uf_samples = Dict{Symbol, Matrix{Float64}}(
-        name => zeros(uf_ngrid, nboot) for name in keys(uf_grids))
 
-    n_success = 0
+    if parallel && Threads.nthreads() > 1
+        # ─── Threaded bootstrap ───────────────────────────────────
+        # Pre-generate all pseudo-data with independent RNGs per replicate
+        # to ensure reproducibility regardless of thread scheduling.
+        rngs = [Random.Xoshiro(rand(rng, UInt64)) for _ in 1:nboot]
+        boot_data = [_resample_data(method, prob.likelihood, fitted, resid,
+                                    σ_hat, n_times, n_obs, rngs[b])
+                     for b in 1:nboot]
 
-    for b in 1:nboot
-        if verbose && (b <= 3 || b % 50 == 0 || b == nboot)
-            println("Bootstrap replicate $b / $nboot")
+        # Per-replicate result storage (avoid races)
+        results = Vector{Union{Nothing, NamedTuple}}(nothing, nboot)
+
+        if verbose
+            println("Bootstrap: $nboot replicates on $(Threads.nthreads()) threads")
         end
 
-        # Generate pseudo-data
-        y_boot = _resample_data(method, prob.likelihood, fitted, resid, σ_hat,
-                                n_times, n_obs, rng)
+        Threads.@threads for b in 1:nboot
+            prob_boot = PSMProblem(prob.dynamics!, prob.u0, prob.tspan,
+                prob.approximators;
+                data_times=prob.data_times,
+                data_values=boot_data[b],
+                data_weights=prob.data_weights,
+                obs_to_state=prob.obs_to_state,
+                known_params=prob.known_params,
+                likelihood=prob.likelihood,
+                solver=prob.ode_solver,
+                discrete=prob.discrete,
+                delays=prob.delays,
+                history=prob.history,
+                prob.ode_kwargs...)
 
-        # Build new problem with pseudo-data
-        prob_boot = PSMProblem(prob.dynamics!, prob.u0, prob.tspan,
-            prob.approximators;
-            data_times=prob.data_times,
-            data_values=y_boot,
-            data_weights=prob.data_weights,
-            obs_to_state=prob.obs_to_state,
-            known_params=prob.known_params,
-            likelihood=prob.likelihood,
-            solver=prob.ode_solver,
-            discrete=prob.discrete,
-            delays=prob.delays,
-            history=prob.history,
-            prob.ode_kwargs...)
+            sol_boot = try
+                solve(prob_boot, alg)
+            catch
+                nothing
+            end
 
-        # Refit
-        sol_boot = try
-            solve(prob_boot, alg)
-        catch e
-            if verbose; println("  Replicate $b failed: $e"); end
-            continue
+            if sol_boot !== nothing && all(isfinite, sol_boot.fitted_values)
+                # Evaluate UFs on grid
+                uf_vals = Dict{Symbol, Vector{Float64}}()
+                for name in uf_names
+                    grid = uf_grids[name]
+                    if haskey(sol_boot.unknown_functions, name)
+                        f = sol_boot.unknown_functions[name]
+                        uf_vals[name] = Float64[(try; f(x); catch; NaN; end) for x in grid]
+                    end
+                end
+                results[b] = (coefs=collect(sol_boot.parameters),
+                              fitted=copy(sol_boot.fitted_values),
+                              uf_vals=uf_vals)
+            end
         end
 
-        # Check for valid solution
-        if !all(isfinite, sol_boot.fitted_values)
-            if verbose; println("  Replicate $b: non-finite fitted values"); end
-            continue
+        # Collect successful results
+        successful = filter(!isnothing, results)
+        n_success = length(successful)
+
+        if n_success < 3
+            error("bootstrap: only $n_success / $nboot replicates succeeded. " *
+                  "Check model stability or increase nboot.")
         end
 
-        n_success += 1
-        coef_samples[n_success, :] .= sol_boot.parameters
-        fitted_samples[:, :, n_success] .= sol_boot.fitted_values
+        coef_samples = zeros(n_success, n_p)
+        fitted_samples = zeros(n_times, n_obs, n_success)
+        uf_samples = Dict{Symbol, Matrix{Float64}}(
+            name => zeros(uf_ngrid, n_success) for name in uf_names)
 
-        # Evaluate unknown functions on grids
-        for (name, grid) in uf_grids
-            if haskey(sol_boot.unknown_functions, name)
-                f = sol_boot.unknown_functions[name]
-                for (k, x) in enumerate(grid)
-                    val = try; f(x); catch; NaN; end
-                    uf_samples[name][k, n_success] = val
+        for (k, r) in enumerate(successful)
+            coef_samples[k, :] .= r.coefs
+            fitted_samples[:, :, k] .= r.fitted
+            for name in uf_names
+                if haskey(r.uf_vals, name)
+                    uf_samples[name][:, k] .= r.uf_vals[name]
                 end
             end
         end
-    end
 
-    if n_success < 3
-        error("bootstrap: only $n_success / $nboot replicates succeeded. " *
-              "Check model stability or increase nboot.")
-    end
+        if verbose
+            println("Bootstrap complete: $n_success / $nboot successful")
+        end
+    else
+        # ─── Sequential bootstrap ─────────────────────────────────
+        coef_samples = zeros(nboot, n_p)
+        fitted_samples = zeros(n_times, n_obs, nboot)
+        uf_samples = Dict{Symbol, Matrix{Float64}}(
+            name => zeros(uf_ngrid, nboot) for name in uf_names)
+        n_success = 0
 
-    if verbose
-        println("Bootstrap complete: $n_success / $nboot successful")
-    end
+        for b in 1:nboot
+            if verbose && (b <= 3 || b % 50 == 0 || b == nboot)
+                println("Bootstrap replicate $b / $nboot")
+            end
 
-    # Trim to successful replicates
-    coef_samples = coef_samples[1:n_success, :]
-    fitted_samples = fitted_samples[:, :, 1:n_success]
-    for name in keys(uf_samples)
-        uf_samples[name] = uf_samples[name][:, 1:n_success]
+            y_boot = _resample_data(method, prob.likelihood, fitted, resid,
+                                    σ_hat, n_times, n_obs, rng)
+
+            prob_boot = PSMProblem(prob.dynamics!, prob.u0, prob.tspan,
+                prob.approximators;
+                data_times=prob.data_times,
+                data_values=y_boot,
+                data_weights=prob.data_weights,
+                obs_to_state=prob.obs_to_state,
+                known_params=prob.known_params,
+                likelihood=prob.likelihood,
+                solver=prob.ode_solver,
+                discrete=prob.discrete,
+                delays=prob.delays,
+                history=prob.history,
+                prob.ode_kwargs...)
+
+            sol_boot = try
+                solve(prob_boot, alg)
+            catch e
+                if verbose; println("  Replicate $b failed: $e"); end
+                continue
+            end
+
+            if !all(isfinite, sol_boot.fitted_values)
+                if verbose; println("  Replicate $b: non-finite fitted values"); end
+                continue
+            end
+
+            n_success += 1
+            coef_samples[n_success, :] .= sol_boot.parameters
+            fitted_samples[:, :, n_success] .= sol_boot.fitted_values
+
+            for (name, grid) in uf_grids
+                if haskey(sol_boot.unknown_functions, name)
+                    f = sol_boot.unknown_functions[name]
+                    for (k, x) in enumerate(grid)
+                        val = try; f(x); catch; NaN; end
+                        uf_samples[name][k, n_success] = val
+                    end
+                end
+            end
+        end
+
+        if n_success < 3
+            error("bootstrap: only $n_success / $nboot replicates succeeded. " *
+                  "Check model stability or increase nboot.")
+        end
+
+        if verbose
+            println("Bootstrap complete: $n_success / $nboot successful")
+        end
+
+        # Trim to successful replicates
+        coef_samples = coef_samples[1:n_success, :]
+        fitted_samples = fitted_samples[:, :, 1:n_success]
+        for name in uf_names
+            uf_samples[name] = uf_samples[name][:, 1:n_success]
+        end
     end
 
     # Compute quantiles
