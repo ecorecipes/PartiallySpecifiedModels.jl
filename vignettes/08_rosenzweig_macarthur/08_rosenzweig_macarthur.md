@@ -1,6 +1,6 @@
 # Recovering Functional Responses: The Rosenzweig-MacArthur Model
 Simon Frost
-2026-03-22
+2026-04-02
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -14,6 +14,7 @@ Simon Frost
   - [Recovered functional response](#recovered-functional-response)
 - [Comparison Across Solvers](#comparison-across-solvers)
 - [Ecological Interpretation](#ecological-interpretation)
+- [Diagnostic Plots](#diagnostic-plots)
 - [Phase Portrait](#phase-portrait)
 
 ## Overview
@@ -140,7 +141,7 @@ prob = PSMProblem(consumer_resource!, u0, tspan, [approx_f];
     solver=Tsit5())
 ```
 
-    PSMProblem{typeof(consumer_resource!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(consumer_resource!, [20.0, 2.0], (0.0, 30.0), BSplineApproximator[BSplineApproximator(:f, (0.0, 22.0), 8, PartiallySpecifiedModels.var"#6#7"{Float64}(1.0))], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  25.5, 26.0, 26.5, 27.0, 27.5, 28.0, 28.5, 29.0, 29.5, 30.0], [19.81832125927411 1.9844056499497738; 18.59217322955963 2.5007756990768337; … ; 3.0544691681141445 10.889505761680244; 2.5190470640325087 11.279979969880175], [1.0 1.0; 1.0 1.0; … ; 1.0 1.0; 1.0 1.0], [1, 2], (a = 0.5, R0 = 20.0, ε = 0.4, d = 0.3), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false)
+    PSMProblem{typeof(consumer_resource!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(consumer_resource!, [20.0, 2.0], (0.0, 30.0), BSplineApproximator[BSplineApproximator(:f, (0.0, 22.0), 8, PartiallySpecifiedModels.var"#6#7"{Float64}(1.0))], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  25.5, 26.0, 26.5, 27.0, 27.5, 28.0, 28.5, 29.0, 29.5, 30.0], [19.81832125927411 1.9844056499497738; 18.59217322955963 2.5007756990768337; … ; 3.0544691681141445 10.889505761680244; 2.5190470640325087 11.279979969880175], [1.0 1.0; 1.0 1.0; … ; 1.0 1.0; 1.0 1.0], [1, 2], (a = 0.5, R0 = 20.0, ε = 0.4, d = 0.3), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false, Float64[], nothing)
 
 ## Fit with LAML
 
@@ -292,6 +293,44 @@ assuming Holling Type II and estimating $a$ and $h$), because the PSM
 approach makes no assumption about the functional form and lets the data
 speak.
 
+## Diagnostic Plots
+
+A standard 4-panel diagnostic display assesses residual behaviour for
+the consumer–resource fit.
+
+``` julia
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+![](08_rosenzweig_macarthur_files/figure-commonmark/cell-10-output-1.svg)
+
+    Durbin-Watson: 1.295, 1.835
+
 ## Phase Portrait
 
 ``` julia
@@ -302,4 +341,4 @@ plot!(sol.fitted_values[:, 1], sol.fitted_values[:, 2], label="PSM fit", lw=2, c
 scatter!([u0[1]], [u0[2]], label="Start", ms=8, color=:red, marker=:star5)
 ```
 
-![](08_rosenzweig_macarthur_files/figure-commonmark/cell-10-output-1.svg)
+![](08_rosenzweig_macarthur_files/figure-commonmark/cell-12-output-1.svg)

@@ -1,6 +1,6 @@
 # COMONet: Shape-Constrained Neural Network Approximators
 Simon Frost
-2026-03-23
+2026-04-02
 
 - [Overview](#overview)
 - [Logistic Growth with Unknown Per-Capita
@@ -22,6 +22,7 @@ Simon Frost
   - [Residuals](#residuals)
   - [Numerical Summary](#numerical-summary)
 - [Method Comparison](#method-comparison)
+- [Diagnostic Plots](#diagnostic-plots)
 - [Summary](#summary)
 
 ## Overview
@@ -52,6 +53,11 @@ using Plots
 using Random
 Random.seed!(123)
 ```
+
+    Precompiling packages...
+        PartiallySpecifiedModels Being precompiled by another process (pid: 36853, pidfile: /Users/sdwfrost/.julia/compiled/v1.12/PartiallySpecifiedModels/tWtwA_lLwID.ji.pidfile)
+      15554.7 ms  ✓ PartiallySpecifiedModels
+      1 dependency successfully precompiled in 34 seconds. 387 already precompiled.
 
     TaskLocalRNG()
 
@@ -453,6 +459,47 @@ Figure 5: Residuals (observed − fitted) for each method
 - **Caveat**: COMONet saturates at domain edges and cannot represent
   functions that cross zero — use SCBS instead if the function may
   change sign
+
+## Diagnostic Plots
+
+A standard 4-panel diagnostic display assesses residual behaviour for
+the COMONet fit. The QQ plot checks normality of standardized residuals,
+“Residuals vs Fitted” detects systematic patterns, the histogram
+visualises the residual distribution, and “Observed vs Fitted” checks
+overall calibration.
+
+``` julia
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol_como)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+![](16_comonet_files/figure-commonmark/cell-16-output-1.svg)
+
+    Durbin-Watson: 2.095
 
 ## Summary
 

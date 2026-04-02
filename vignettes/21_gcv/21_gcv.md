@@ -1,6 +1,6 @@
 # GCV Smoothing Parameter Selection
 Simon Frost
-2026-03-25
+2026-04-02
 
 - [Overview](#overview)
 - [Logistic Growth with Unknown Per-Capita
@@ -34,6 +34,11 @@ using Plots
 using Random
 Random.seed!(123)
 ```
+
+    Precompiling packages...
+        PartiallySpecifiedModels Being precompiled by another process (pid: 36853, pidfile: /Users/sdwfrost/.julia/compiled/v1.12/PartiallySpecifiedModels/tWtwA_lLwID.ji.pidfile)
+      19702.6 ms  ✓ PartiallySpecifiedModels
+      1 dependency successfully precompiled in 32 seconds. 387 already precompiled.
 
     TaskLocalRNG()
 

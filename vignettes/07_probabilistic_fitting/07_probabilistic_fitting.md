@@ -1,6 +1,6 @@
 # Probabilistic ODE Fitting with RodeoSolver
 Simon Frost
-2026-03-22
+2026-04-02
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -19,6 +19,7 @@ Simon Frost
 - [Method Variants](#method-variants)
   - [Basic vs Fenrir](#basic-vs-fenrir)
   - [Schober vs Kramer interrogation](#schober-vs-kramer-interrogation)
+- [Diagnostic Plots](#diagnostic-plots)
 - [Key Takeaways](#key-takeaways)
 
 ## Overview
@@ -111,7 +112,7 @@ prob = PSMProblem(sir!, u0, tspan, [approx_β];
     obs_to_state=[1, 2], known_params=(γ=0.25,), solver=Tsit5())
 ```
 
-    PSMProblem{typeof(sir!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(sir!, [990.0, 10.0, 0.0], (0.0, 60.0), BSplineApproximator[BSplineApproximator(:β, (0.0, 0.15), 8, PartiallySpecifiedModels.var"#6#7"{Float64}(0.4))], [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0  …  51.0, 52.0, 53.0, 54.0, 55.0, 56.0, 57.0, 58.0, 59.0, 60.0], [988.1832125927411 9.896037666331825; 985.8975437423887 13.461390776142522; … ; 329.35354655287034 3.2084058156376694; 323.05533131939933 5.286766967095861], [1.0 1.0; 1.0 1.0; … ; 1.0 1.0; 1.0 1.0], [1, 2], (γ = 0.25,), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false)
+    PSMProblem{typeof(sir!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(sir!, [990.0, 10.0, 0.0], (0.0, 60.0), BSplineApproximator[BSplineApproximator(:β, (0.0, 0.15), 8, PartiallySpecifiedModels.var"#6#7"{Float64}(0.4))], [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0  …  51.0, 52.0, 53.0, 54.0, 55.0, 56.0, 57.0, 58.0, 59.0, 60.0], [988.1832125927411 9.896037666331825; 985.8975437423887 13.461390776142522; … ; 329.35354655287034 3.2084058156376694; 323.05533131939933 5.286766967095861], [1.0 1.0; 1.0 1.0; … ; 1.0 1.0; 1.0 1.0], [1, 2], (γ = 0.25,), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false, Float64[], nothing)
 
 ## Fitting with RodeoSolver
 
@@ -144,25 +145,25 @@ sol = solve(prob, RodeoSolver(
     Iter     Function value    √(Σ(yᵢ-ȳ)²)/n 
     ------   --------------    --------------
          0     5.642234e+02     1.582269e+02
-     * time: 0.013247013092041016
+     * time: 0.014133930206298828
         40     4.617256e+02     2.991238e+00
-     * time: 0.5520820617675781
+     * time: 0.2809720039367676
         80     4.555313e+02     7.948408e-02
-     * time: 0.698073148727417
+     * time: 0.4416007995605469
        120     4.552681e+02     6.932960e-03
-     * time: 0.8326411247253418
+     * time: 0.6037588119506836
        160     4.552446e+02     1.359903e-03
-     * time: 0.9491381645202637
+     * time: 0.7388567924499512
        200     4.552378e+02     1.132600e-04
-     * time: 1.0736310482025146
+     * time: 0.8870007991790771
       NM loss: 455.24
 
     Stage 2: L-BFGS refinement...
     Iter     Function value   Gradient norm 
          0     4.552374e+02     1.854564e+00
-     * time: 9.107589721679688e-5
+     * time: 6.318092346191406e-5
         20     4.551680e+02     2.230936e+00
-     * time: 0.9038050174713135
+     * time: 0.9673411846160889
       Converged: true
       Final -loglik: 455.17
 
@@ -305,6 +306,44 @@ The `interrogate` parameter controls how the ODE residual is linearised:
   accurate for nonlinear ODEs.
 - `:schober` — simply evaluates the ODE at the predicted mean. Simpler
   and faster, but less accurate.
+
+## Diagnostic Plots
+
+A standard 4-panel diagnostic display assesses residual behaviour for
+the probabilistic fit.
+
+``` julia
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+![](07_probabilistic_fitting_files/figure-commonmark/cell-11-output-1.svg)
+
+    Durbin-Watson: 1.438, 1.699
 
 ## Key Takeaways
 

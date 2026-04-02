@@ -1,6 +1,6 @@
 # Alternative Approximators: Neural Networks and Gaussian Processes
 Simon Frost
-2026-03-22
+2026-04-02
 
 - [Overview](#overview)
   - [When to use each](#when-to-use-each)
@@ -22,6 +22,7 @@ Simon Frost
   - [B-Splines](#b-splines)
   - [Gaussian Processes](#gaussian-processes)
   - [Neural Networks](#neural-networks)
+- [Diagnostic Plots](#diagnostic-plots)
 - [Summary Table](#summary-table)
 
 ## Overview
@@ -297,6 +298,52 @@ considerations:
   architecture provides implicit regularization
 - Best suited for multi-dimensional inputs where B-splines and GPs
   cannot be applied
+
+## Diagnostic Plots
+
+A standard 4-panel diagnostic display assesses residual behaviour for
+the B-spline baseline fit.
+
+``` julia
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol_spline)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+![](05_neural_networks_files/figure-commonmark/cell-13-output-1.svg)
+
+    Durbin-Watson: 2.146, 1.405
+
+> [!TIP]
+>
+> ### See Also
+>
+> - [Vignette 06: Solver
+>   Comparison](../06_solver_comparison/06_solver_comparison.qmd) —
+>   compares solvers (this vignette compares approximators)
 
 ## Summary Table
 

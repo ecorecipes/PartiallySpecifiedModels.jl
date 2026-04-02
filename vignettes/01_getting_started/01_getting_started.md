@@ -1,8 +1,9 @@
 # Getting Started with PartiallySpecifiedModels.jl
 Simon Frost
-2026-03-25
+2026-04-02
 
 - [Overview](#overview)
+- [Vignette Guide](#vignette-guide)
 - [Setup](#setup)
 - [A Simple Example: Exponential
   Growth](#a-simple-example-exponential-growth)
@@ -39,6 +40,24 @@ This vignette introduces the basic workflow of
 We start with the simplest possible example: exponential growth with an
 unknown per-capita growth rate.
 
+## Vignette Guide
+
+This package includes 29 vignettes organized by topic:
+
+| Topic | Vignettes |
+|----|----|
+| **Getting started** | 01 (this), 02 (likelihoods) |
+| **Ecological models** | 03 (Lotka-Volterra), 04 (copepod), 08 (consumer-resource), 10 (chemostat), 27 (blowfly DDE), 28 (fisheries) |
+| **Approximator types** | 05 (B-spline, GP, neural), 26 (SPDE) |
+| **Solver comparison** | 06 (all solvers), 09 (gradient matching) |
+| **Shape constraints** | 13 (B-spline constraints), 16 (COMONet) |
+| **Bayesian inference** | 14 (MCMC), 15 (MAGI), 19 (pseudo-marginal), 24 (variational), 25 (ABC) |
+| **Uncertainty** | 07 (probabilistic ODE), 29 (bootstrap CIs) |
+| **Count data** | 02 (likelihoods), 11 (epidemiological), 28 (fisheries) |
+| **Discrete time** | 12 (Ricker, Beverton-Holt), 28 (fisheries) |
+| **Delay equations** | 20 (DDE basics), 27 (blowfly) |
+| **Diagnostics** | All vignettes include `appraise()` diagnostic plots |
+
 ## Setup
 
 ``` julia
@@ -49,6 +68,11 @@ using Plots
 using Random
 Random.seed!(42)
 ```
+
+    Precompiling packages...
+        PartiallySpecifiedModels Being precompiled by another process (pid: 36853, pidfile: /Users/sdwfrost/.julia/compiled/v1.12/PartiallySpecifiedModels/tWtwA_lLwID.ji.pidfile)
+      21655.7 ms  ✓ PartiallySpecifiedModels
+      1 dependency successfully precompiled in 50 seconds. 387 already precompiled.
 
     TaskLocalRNG()
 

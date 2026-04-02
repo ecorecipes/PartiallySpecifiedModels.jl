@@ -1,6 +1,6 @@
 # Chemostat Dynamics: Recovering Microbial Growth Kinetics
 Simon Frost
-2026-03-22
+2026-04-02
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -17,6 +17,7 @@ Simon Frost
 - [Residual Diagnostics](#residual-diagnostics)
 - [Substrate Inhibition: What If Monod Is
   Wrong?](#substrate-inhibition-what-if-monod-is-wrong)
+- [Diagnostic Plots](#diagnostic-plots)
 - [Key Takeaways](#key-takeaways)
 
 ## Overview
@@ -141,7 +142,7 @@ prob = PSMProblem(chemostat!, u0, tspan, [approx_μ];
     solver=Tsit5())
 ```
 
-    PSMProblem{typeof(chemostat!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(chemostat!, [10.0, 0.5], (0.0, 30.0), BSplineApproximator[BSplineApproximator(:μ, (0.0, 12.0), 8, PartiallySpecifiedModels.var"#6#7"{Float64}(0.5))], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  25.5, 26.0, 26.5, 27.0, 27.5, 28.0, 28.5, 29.0, 29.5, 30.0], [9.890992755564467 0.49480188331659125; 9.632637153300509 0.6972316752750717; … ; 0.8887669549405476 4.425115965910029; 0.5675476653902087 4.555125423173031], [1.0 1.0; 1.0 1.0; … ; 1.0 1.0; 1.0 1.0], [1, 2], (D = 0.3, Sin = 10.0, Y = 0.5), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false)
+    PSMProblem{typeof(chemostat!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(chemostat!, [10.0, 0.5], (0.0, 30.0), BSplineApproximator[BSplineApproximator(:μ, (0.0, 12.0), 8, PartiallySpecifiedModels.var"#6#7"{Float64}(0.5))], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  25.5, 26.0, 26.5, 27.0, 27.5, 28.0, 28.5, 29.0, 29.5, 30.0], [9.890992755564467 0.49480188331659125; 9.632637153300509 0.6972316752750717; … ; 0.8887669549405476 4.425115965910029; 0.5675476653902087 4.555125423173031], [1.0 1.0; 1.0 1.0; … ; 1.0 1.0; 1.0 1.0], [1, 2], (D = 0.3, Sin = 10.0, Y = 0.5), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false, Float64[], nothing)
 
 ### LAML fit
 
@@ -443,29 +444,29 @@ prob = PSMProblem(chemostat!, u0, tspan, [approx_μ];
     Iter     Function value    √(Σ(yᵢ-ȳ)²)/n 
     ------   --------------    --------------
          0     1.359367e+07     2.057742e+09
-     * time: 0.01338505744934082
+     * time: 0.013787031173706055
         40     1.950419e+01     1.057963e+02
-     * time: 0.18946194648742676
+     * time: 0.22847700119018555
         80    -1.015484e+01     7.910731e-01
-     * time: 0.29083704948425293
+     * time: 0.695120096206665
        120    -1.802579e+01     4.533810e-01
-     * time: 0.38104987144470215
+     * time: 0.7913548946380615
        160    -2.331371e+01     4.381614e-01
-     * time: 0.4572598934173584
+     * time: 0.8817610740661621
        200    -2.627359e+01     1.365776e-01
-     * time: 0.5422399044036865
+     * time: 0.9762799739837646
       NM loss: -26.329
 
     Stage 2: L-BFGS refinement...
     Iter     Function value   Gradient norm 
          0    -2.632876e+01     3.133903e+01
-     * time: 7.510185241699219e-5
+     * time: 6.198883056640625e-5
         20    -2.722711e+01     8.769959e-01
-     * time: 0.6966149806976318
+     * time: 0.7004189491271973
         40    -2.729078e+01     4.130655e+00
-     * time: 1.169321060180664
+     * time: 1.1777889728546143
         60    -2.733287e+01     8.481795e-02
-     * time: 1.647799015045166
+     * time: 1.6621367931365967
       Converged: true
       Final -loglik: -27.333
 
@@ -584,6 +585,47 @@ plot!(S_eval_h, μ_est_h, label="PSM estimate", lw=2, color=:red)
 The PSM successfully detects the **non-monotonic** growth kinetics — the
 specific growth rate increases, peaks, and then declines — without any
 assumption about inhibition.
+
+## Diagnostic Plots
+
+A standard 4-panel diagnostic display assesses residual behaviour. The
+QQ plot checks normality of standardized residuals, “Residuals vs
+Fitted” detects systematic patterns, the histogram visualises the
+residual distribution, and “Observed vs Fitted” checks overall
+calibration.
+
+``` julia
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol_laml)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+![](10_chemostat_files/figure-commonmark/cell-13-output-1.svg)
+
+    Durbin-Watson: 1.336, 1.565
 
 ## Key Takeaways
 

@@ -1,6 +1,6 @@
 # Variational Inference for PSMs
 Simon Frost
-2026-03-24
+2026-04-02
 
 - [Overview](#overview)
 - [Logistic Growth with Unknown
@@ -11,6 +11,7 @@ Simon Frost
   - [Posterior Standard Deviations](#posterior-standard-deviations)
   - [ELBO Convergence](#elbo-convergence)
   - [Summary](#summary)
+- [Diagnostic Plots](#diagnostic-plots)
 - [When to Use Variational
   Inference](#when-to-use-variational-inference)
 
@@ -201,6 +202,47 @@ println("True: r(5)=$(round(r_true(5.0), digits=3))")
     VI:   loss=0.504, edf=8.0, r(5)=0.215
     LAML: loss=0.455, edf=3.8, r(5)=0.25
     True: r(5)=0.25
+
+## Diagnostic Plots
+
+A standard 4-panel diagnostic display assesses residual behaviour. The
+QQ plot checks normality of standardized residuals, “Residuals vs
+Fitted” detects systematic patterns, the histogram visualises the
+residual distribution, and “Observed vs Fitted” checks overall
+calibration.
+
+``` julia
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol_vi)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot of Residuals", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label="")
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel="Residuals", ylabel="Density",
+    title="Histogram of Residuals", legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel="Observed", ylabel="Fitted",
+    title="Observed vs Fitted", ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
+```
+
+![](24_variational_files/figure-commonmark/cell-10-output-1.svg)
+
+    Durbin-Watson: 2.679
 
 ## When to Use Variational Inference
 

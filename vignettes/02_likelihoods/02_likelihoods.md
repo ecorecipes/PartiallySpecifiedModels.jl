@@ -372,6 +372,16 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
     Durbin-Watson: 2.382
 
+> [!TIP]
+>
+> ### See Also
+>
+> - [Vignette 11: Count Data
+>   SIR](../11_count_data_sir/11_count_data_sir.qmd) — applied
+>   epidemiological count data with overdispersion
+> - [Vignette 28: Fisheries](../28_fisheries/28_fisheries.qmd) — Poisson
+>   counts with shape-constrained recruitment
+
 ## Summary
 
 | Likelihood | When to use | LAML behaviour |

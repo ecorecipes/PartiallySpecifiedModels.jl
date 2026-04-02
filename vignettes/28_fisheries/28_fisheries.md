@@ -67,10 +67,6 @@ import Distributions
 Random.seed!(42)
 ```
 
-    Precompiling packages...
-      24942.7 ms  ✓ PartiallySpecifiedModels
-      1 dependency successfully precompiled in 58 seconds. 387 already precompiled.
-
     TaskLocalRNG()
 
 ## Synthetic Data

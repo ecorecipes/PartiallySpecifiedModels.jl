@@ -1,6 +1,6 @@
 # Copepod Stage-Structured Population Model
 Simon Frost
-2026-03-25
+2026-04-02
 
 - [Overview](#overview)
 - [Setup](#setup)
