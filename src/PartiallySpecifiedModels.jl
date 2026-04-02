@@ -112,6 +112,9 @@ include("profile_range.jl")
 # Residual diagnostics
 include("diagnostics.jl")
 
+# Bootstrap confidence intervals
+include("bootstrap.jl")
+
 # Exports — types
 export AbstractApproximator, BSplineApproximator, NeuralApproximator, GPApproximator, SPDEApproximator
 export ShapeConstrainedBSplineApproximator, ShapeConstrainedSPDEApproximator, SHAPE_CONSTRAINTS
@@ -132,6 +135,7 @@ export nparams, initial_params
 export optimize_spde_range, with_range_param
 export residual_diagnostics, durbin_watson, residual_acf, semivariogram
 export appraise, deviance_residuals
+export bootstrap, BootstrapResult
 
 # Re-export common ODE solvers and problem types
 using OrdinaryDiffEq: Tsit5, BS3, Vern7, Vern9, TRBDF2
