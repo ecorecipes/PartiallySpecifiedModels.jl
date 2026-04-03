@@ -1,6 +1,6 @@
 # Probabilistic ODE Solving with DaltonSolver
 Simon Frost
-2026-04-02
+2026-04-03
 
 - [Overview](#overview)
 - [Logistic Growth with Unknown Per-Capita
@@ -108,7 +108,7 @@ Figure 1: Simulated logistic growth data with noise
 ### Fit with DaltonSolver
 
 ``` julia
-uf = BSplineApproximator(:r, (0.5, 10.5), 8)
+uf = BSplineApproximator(:r, (0.0, 11.0), 8; initial=x -> 0.3)
 
 prob = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf];
     data_times=t_data, data_values=Float64.(data_matrix),
@@ -121,9 +121,14 @@ sol_dalton = solve(prob, DaltonSolver(n_steps=200, maxiters=500, verbose=false))
 ### Compare with LAML and RodeoSolver
 
 ``` julia
-sol_laml = solve(prob, LAML(maxiters=50, verbose=false));
+sol_laml = solve(prob, LAML(maxiters=100, verbose=false));
 sol_rodeo = solve(prob, RodeoSolver(n_steps=200, method=:fenrir, maxiters=500, verbose=false));
 ```
+
+    DaltonSolver: SS=0.1548, r(5)=0.233
+    RodeoSolver:  SS=0.1548, r(5)=0.233
+    LAML:         SS=0.1997, EDF=2.0, r(5)=0.25
+    True r(5) = 0.25
 
 ### Recovered Per-Capita Growth Rate
 
@@ -301,9 +306,9 @@ plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
 plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 ```
 
-![](18_dalton_files/figure-commonmark/cell-14-output-1.svg)
+![](18_dalton_files/figure-commonmark/cell-15-output-1.svg)
 
-    Durbin-Watson: 2.325
+    Durbin-Watson: 2.324
 
 ## Summary
 
@@ -312,3 +317,25 @@ fitting partially specified models. By treating the ODE solution as
 uncertain (via an IBM prior and Kalman filtering), it naturally accounts
 for discretization error and provides state uncertainty estimates
 alongside the fitted unknown functions.
+
+> [!TIP]
+>
+> ### When to prefer DALTON
+>
+> For smooth, well-observed ODE systems (like the logistic example
+> above), all three solvers give similar results — LAML is usually the
+> best choice due to its automatic smoothing parameter selection.
+>
+> DALTON and Rodeo are most valuable when:
+>
+> - **Discretisation matters**: stiff or rapidly-changing dynamics where
+>   the ODE solver’s step size affects the likelihood
+> - **Uncertainty propagation**: you want posterior state covariances
+>   (e.g., for downstream decision-making)
+> - **Combining with Bayesian inference**: the probabilistic likelihood
+>   integrates naturally with `PseudoMarginalSolver` for full posterior
+>   sampling (see [Vignette
+>   19](../19_pseudo_marginal/19_pseudo_marginal.qmd))
+> - **Non-smooth dynamics**: the IBM prior regularises naturally,
+>   avoiding the linearisation issues that plague LAML on oscillatory
+>   systems
