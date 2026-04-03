@@ -1,6 +1,6 @@
 # Fast Gradient Matching with BNGSolver
 Simon Frost
-2026-04-02
+2026-04-03
 
 - [Overview](#overview)
 - [Lotka-Volterra with Unknown
@@ -43,52 +43,52 @@ Random.seed!(123)
 
 ## Lotka-Volterra with Unknown Predation
 
-We model a predator-prey system where the functional response g(H) is
-unknown:
+We model a classic Lotka-Volterra predator-prey system where the
+predation rate g(H) is unknown:
 
-$$\frac{dH}{dt} = rH\left(1 - \frac{H}{K}\right) - g(H)P, \qquad \frac{dP}{dt} = \epsilon \, g(H)P - mP$$
+$$\frac{dH}{dt} = \alpha H - g(H) P, \qquad \frac{dP}{dt} = \epsilon \, g(H) P - \delta P$$
 
-The true functional response is a Holling Type II:
-$g(H) = \frac{aH}{1 + ahH}$ with $a = 0.5$, $h = 2$.
+The true predation rate is linear: $g(H) = \beta H$ with $\beta = 0.02$.
+We use standard parameters that produce sustained oscillations.
 
 ``` julia
-g_true(H) = 0.5 * H / (1.0 + 1.0 * H)
+g_true(H) = 0.02 * H
 
 function lv!(du, u, p, t)
     H, P = u
-    du[1] = 0.4 * H * (1.0 - H / 5.0) - p.g(H) * P
-    du[2] = 0.5 * p.g(H) * P - 0.3 * P
+    du[1] = 1.0 * H - p.g(H) * P
+    du[2] = 0.5 * p.g(H) * P - 0.5 * P
 end
 
-sol_true = solve(ODEProblem(lv!, [2.0, 1.0], (0.0, 30.0), (; g=g_true)),
+sol_true = solve(ODEProblem(lv!, [50.0, 10.0], (0.0, 30.0), (; g=g_true)),
                  Tsit5(); saveat=0.5)
 t_data = collect(sol_true.t)
-data_H = [sol_true.u[i][1] + 0.05 * randn() for i in 1:length(t_data)]
-data_P = [sol_true.u[i][2] + 0.05 * randn() for i in 1:length(t_data)]
+data_H = [sol_true.u[i][1] + 2.0 * randn() for i in 1:length(t_data)]
+data_P = [sol_true.u[i][2] + 1.0 * randn() for i in 1:length(t_data)]
 data_matrix = hcat(max.(data_H, 0.01), max.(data_P, 0.01))
 ```
 
     61×2 Matrix{Float64}:
-     1.96771  1.02154
-     2.00603  0.900556
-     2.08833  0.954042
-     2.25903  0.797732
-     2.40387  0.74879
-     2.54524  0.778812
-     2.62325  0.656819
-     2.82429  0.585357
-     2.8102   0.700324
-     3.02951  0.582505
-     ⋮        
-     4.85171  0.0291275
-     4.89029  0.01
-     4.96827  0.0661197
-     4.75869  0.03665
-     4.94916  0.0606831
-     4.8486   0.051129
-     5.07512  0.0561048
-     4.90888  0.209459
-     4.89641  0.01
+      48.7085    10.4309
+      71.5248     9.88018
+     106.077     14.535
+     153.575     18.9921
+     195.445     36.1008
+     188.359     77.3002
+     110.244    126.042
+      48.6654   141.633
+      16.3112   131.089
+      10.3839   107.841
+       ⋮        
+       7.85613  107.228
+       5.53558   85.4056
+       6.97702   69.8794
+       0.01      55.0511
+       5.35017   44.1628
+       1.61545   34.9901
+      11.436     28.0487
+       6.15968   25.6394
+       7.90919   17.1187
 
 ### Observed Data
 
@@ -106,20 +106,20 @@ BNG is particularly useful for multi-variable systems since it avoids
 potential ODE instabilities during early optimization.
 
 ``` julia
-uf = BSplineApproximator(:g, (0.0, 5.0), 10)
+uf = BSplineApproximator(:g, (0.0, 120.0), 10; initial=H -> 0.015 * H)
 
-prob = PSMProblem(lv!, [2.0, 1.0], (0.0, 30.0), [uf];
+prob = PSMProblem(lv!, [50.0, 10.0], (0.0, 30.0), [uf];
     data_times=t_data, data_values=Float64.(data_matrix),
     obs_to_state=[1, 2], known_params=NamedTuple(),
     likelihood=PartiallySpecifiedModels.Gaussian())
 
-sol_bng = solve(prob, BNGSolver(maxiters=2000, lr=0.01, verbose=false));
+sol_bng = solve(prob, BNGSolver(maxiters=3000, lr=0.01, verbose=false));
 ```
 
 ### Compare with AdamSolver
 
 ``` julia
-sol_adam = solve(prob, AdamSolver(lr=0.01, maxiters=2000, verbose=false));
+sol_adam = solve(prob, AdamSolver(lr=0.01, maxiters=3000, verbose=false));
 ```
 
 ### Recovered Functional Response
@@ -128,7 +128,7 @@ sol_adam = solve(prob, AdamSolver(lr=0.01, maxiters=2000, verbose=false));
 
 ![](17_bng_files/figure-commonmark/fig-functional-response-output-1.svg)
 
-Figure 2: Recovered functional response g(H): BNG vs Adam vs truth
+Figure 2: Recovered predation rate g(H): BNG vs Adam vs truth
 
 </div>
 
@@ -191,7 +191,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](17_bng_files/figure-commonmark/cell-10-output-1.svg)
 
-    Durbin-Watson: 0.089, 0.39
+    Durbin-Watson: 0.564, 0.419
 
 ## When to Use BNGSolver
 
