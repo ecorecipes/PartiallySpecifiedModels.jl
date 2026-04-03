@@ -1,6 +1,6 @@
 # Discrete-Time Population Models
 Simon Frost
-2026-04-02
+2026-04-03
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -229,11 +229,11 @@ data_bh = max.(data_bh, 1.0)
 
 ### Fit with AdamSolver
 
-    Adam — Data loss: 4.283e6
+    Adam — Data loss: 56970.0
 
 ### Fit with LAML
 
-    LAML — Data loss: 4.709e6
+    LAML — Data loss: 1113.0
 
 ### Compare stock-recruitment curves
 
