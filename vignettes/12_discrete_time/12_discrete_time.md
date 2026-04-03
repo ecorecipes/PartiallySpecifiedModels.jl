@@ -9,7 +9,6 @@ Simon Frost
   - [Generate data](#generate-data)
   - [Fit with LAML](#fit-with-laml)
   - [Fit with GradientMatching](#fit-with-gradientmatching)
-  - [Fit with CollocationLAML](#fit-with-collocationlaml)
   - [Compare fitted trajectories](#compare-fitted-trajectories)
   - [Recover the density-dependence
     function](#recover-the-density-dependence-function)
@@ -23,8 +22,7 @@ Simon Frost
   Competition](#example-3-two-species-competition)
   - [Fit with unknown competition
     function](#fit-with-unknown-competition-function)
-  - [Compare with GradientMatching and
-    CollocationLAML](#compare-with-gradientmatching-and-collocationlaml)
+  - [Compare with GradientMatching](#compare-with-gradientmatching)
   - [Recovered competition effect](#recovered-competition-effect)
 - [Diagnostic Plots](#diagnostic-plots)
 - [Summary](#summary)
@@ -125,16 +123,6 @@ insufficient:
 
     GradientMatching — Data loss: 284.2, EDF: 10.0
 
-### Fit with CollocationLAML
-
-Collocation estimates both states and function parameters simultaneously
-via continuation on ODE compliance. Note that for models with fast
-transients (like the initial growth phase here), most observations fall
-near equilibrium, giving collocation less information about $f(N)$ at
-low densities:
-
-    CollocationLAML — Data loss: 613.2, EDF: 10.0
-
 ### Compare fitted trajectories
 
 ``` julia
@@ -143,11 +131,10 @@ p1 = plot(times, N_true, label="True", lw=2, color=:black, ls=:dash,
 scatter!(times, data, label="Data", ms=3, color=:gray, alpha=0.5)
 plot!(times, sol_laml.fitted_values[:, 1], label="LAML", lw=2, color=:blue)
 plot!(times, sol_gm.fitted_values[:, 1], label="GM+refine", lw=2, color=:green)
-plot!(times, sol_coll.fitted_values[:, 1], label="Collocation", lw=2, color=:red)
 p1
 ```
 
-![](12_discrete_time_files/figure-commonmark/cell-7-output-1.svg)
+![](12_discrete_time_files/figure-commonmark/cell-6-output-1.svg)
 
 ### Recover the density-dependence function
 
@@ -156,26 +143,23 @@ N_grid = range(0.0, 130.0, length=200)
 f_true = [true_f(N) for N in N_grid]
 f_laml = [sol_laml.unknown_functions[:f](N) for N in N_grid]
 f_gm = [sol_gm.unknown_functions[:f](N) for N in N_grid]
-f_coll = [sol_coll.unknown_functions[:f](N) for N in N_grid]
 
 p2 = plot(N_grid, f_true, label="True f(N)", lw=3, color=:black, ls=:dash,
      xlabel="Population N", ylabel="f(N) = per-capita growth",
      title="Ricker — Recovered Density Dependence")
 plot!(N_grid, f_laml, label="LAML (cor=$(round(cor(f_true, f_laml), digits=2)))", lw=2, color=:blue)
 plot!(N_grid, f_gm, label="GM+refine (cor=$(round(cor(f_true, f_gm), digits=2)))", lw=2, color=:green)
-plot!(N_grid, f_coll, label="Collocation (cor=$(round(cor(f_true, f_coll), digits=2)))", lw=2, color=:red)
 hline!([0.0], color=:gray, ls=:dot, label="", alpha=0.5)
 vline!([true_K], color=:gray, ls=:dot, label="K=$(Int(true_K))", alpha=0.5)
 p2
 ```
 
-![](12_discrete_time_files/figure-commonmark/cell-8-output-1.svg)
+![](12_discrete_time_files/figure-commonmark/cell-7-output-1.svg)
 
 The zero-crossing of $f(N)$ reveals the carrying capacity $K$ — where
 the density-dependent growth rate changes sign. LAML and
 GradientMatching (with shooting refinement) both recover the function
-accurately. Collocation struggles in the low-density transient because
-most data fall near $K$.
+accurately.
 
 ## Example 2: Beverton-Holt Recruitment
 
@@ -251,7 +235,7 @@ plot!(N_grid_bh, f_laml_bh, label="LAML", lw=2, color=:blue)
 plot!(N_grid_bh, collect(N_grid_bh), label="1:1 line", lw=1, color=:gray, ls=:dot)
 ```
 
-![](12_discrete_time_files/figure-commonmark/cell-12-output-1.svg)
+![](12_discrete_time_files/figure-commonmark/cell-11-output-1.svg)
 
 The intersection of the stock-recruitment curve with the 1:1 line gives
 the equilibrium population $K$.
@@ -303,7 +287,7 @@ scatter!(times_comp, data_comp[:, 2], label="Obs N₂", ms=3, color=:red, alpha=
 p_data
 ```
 
-![](12_discrete_time_files/figure-commonmark/cell-13-output-1.svg)
+![](12_discrete_time_files/figure-commonmark/cell-12-output-1.svg)
 
 ### Fit with unknown competition function
 
@@ -313,10 +297,9 @@ artefacts at boundaries.
 
     LAML — Data loss: 583.5, EDF: 2.7
 
-### Compare with GradientMatching and CollocationLAML
+### Compare with GradientMatching
 
     GradientMatching — Data loss: 576.5, EDF: 8.0
-    CollocationLAML — Data loss: 893.2, EDF: 8.0
 
 ### Recovered competition effect
 
@@ -325,21 +308,19 @@ N2_grid = range(N2_lo, N2_hi, length=200)
 g_true = [-r1 * α12 * N2 / K1 for N2 in N2_grid]
 g_laml = [sol_laml.unknown_functions[:g](N2) for N2 in N2_grid]
 g_gm = [sol_gm.unknown_functions[:g](N2) for N2 in N2_grid]
-g_coll = [sol_coll.unknown_functions[:g](N2) for N2 in N2_grid]
 
 p3 = plot(N2_grid, g_true, label="True g(N₂)", lw=3, color=:black, ls=:dash,
      xlabel="N₂ (competitor density)", ylabel="g(N₂)",
      title="Competition Effect — Recovered by PSM")
 plot!(N2_grid, g_laml, label="LAML (cor=$(round(cor(g_true, g_laml), digits=2)))", lw=2, color=:blue)
 plot!(N2_grid, g_gm, label="GM+refine (cor=$(round(cor(g_true, g_gm), digits=2)))", lw=2, color=:green)
-plot!(N2_grid, g_coll, label="Collocation (cor=$(round(cor(g_true, g_coll), digits=2)))", lw=2, color=:red)
 hline!([0.0], color=:gray, ls=:dot, label="", alpha=0.5)
 annotate!(mean(N2_grid), minimum(g_true)*0.3,
           text("Negative slope = competitive suppression", 8, :gray))
 p3
 ```
 
-![](12_discrete_time_files/figure-commonmark/cell-16-output-1.svg)
+![](12_discrete_time_files/figure-commonmark/cell-15-output-1.svg)
 
 All three solvers recover the **linear negative competition effect**
 $g(N_2)$ within the observed data range. Unlike the Ricker model, the
@@ -385,7 +366,7 @@ plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
 plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 ```
 
-![](12_discrete_time_files/figure-commonmark/cell-17-output-1.svg)
+![](12_discrete_time_files/figure-commonmark/cell-16-output-1.svg)
 
     Durbin-Watson: 2.62, 1.847
 
@@ -397,7 +378,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 | Time stepping | Adaptive ODE solver | Explicit iteration |
 | SciML problem type | `ODEProblem(f!, u0, tspan)` | `DiscreteProblem(f!, u0, tspan)` |
 | Default solver | `Tsit5()` | `nothing` |
-| Supported solvers | All 7 solvers | LAML, CollocationLAML, GradientMatching, AGM, Adam, MultipleShootingSolver |
+| Supported solvers | All 7 solvers | LAML, GradientMatching, AGM, Adam, MultipleShootingSolver, CollocationLAML\* |
 
 The only solver **not** supporting discrete-time is `RodeoSolver`, which
 relies on continuous-time Kalman filtering with an integrated Brownian
@@ -411,9 +392,6 @@ motion prior.
 - **GradientMatching** — Fast and effective with `refine_iters > 0`. The
   shooting refinement corrects the function in regions poorly covered by
   derivative matching alone.
-- **CollocationLAML** — Works well when the dynamics explore the full
-  state space (e.g., competition models). Less effective for models with
-  fast transients where most observations cluster near equilibrium.
 
 ### Key ecological applications
 
