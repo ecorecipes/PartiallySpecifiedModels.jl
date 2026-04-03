@@ -34,26 +34,26 @@ Random.seed!(123)
 
 ## Lotka-Volterra with Unknown Predation
 
-We model a predator-prey system where the functional response g(H) is unknown:
+We model a classic Lotka-Volterra predator-prey system where the predation rate g(H) is unknown:
 
-$$\frac{dH}{dt} = rH\left(1 - \frac{H}{K}\right) - g(H)P, \qquad \frac{dP}{dt} = \epsilon \, g(H)P - mP$$
+$$\frac{dH}{dt} = \alpha H - g(H) P, \qquad \frac{dP}{dt} = \epsilon \, g(H) P - \delta P$$
 
-The true functional response is a Holling Type II: $g(H) = \frac{aH}{1 + ahH}$ with $a = 0.5$, $h = 2$.
+The true predation rate is linear: $g(H) = \beta H$ with $\beta = 0.02$. We use standard parameters that produce sustained oscillations.
 
 ```{julia}
-g_true(H) = 0.5 * H / (1.0 + 1.0 * H)
+g_true(H) = 0.02 * H
 
 function lv!(du, u, p, t)
     H, P = u
-    du[1] = 0.4 * H * (1.0 - H / 5.0) - p.g(H) * P
-    du[2] = 0.5 * p.g(H) * P - 0.3 * P
+    du[1] = 1.0 * H - p.g(H) * P
+    du[2] = 0.5 * p.g(H) * P - 0.5 * P
 end
 
-sol_true = solve(ODEProblem(lv!, [2.0, 1.0], (0.0, 30.0), (; g=g_true)),
+sol_true = solve(ODEProblem(lv!, [50.0, 10.0], (0.0, 30.0), (; g=g_true)),
                  Tsit5(); saveat=0.5)
 t_data = collect(sol_true.t)
-data_H = [sol_true.u[i][1] + 0.05 * randn() for i in 1:length(t_data)]
-data_P = [sol_true.u[i][2] + 0.05 * randn() for i in 1:length(t_data)]
+data_H = [sol_true.u[i][1] + 2.0 * randn() for i in 1:length(t_data)]
+data_P = [sol_true.u[i][2] + 1.0 * randn() for i in 1:length(t_data)]
 data_matrix = hcat(max.(data_H, 0.01), max.(data_P, 0.01))
 ```
 
@@ -80,20 +80,20 @@ p1
 BNG is particularly useful for multi-variable systems since it avoids potential ODE instabilities during early optimization.
 
 ```{julia}
-uf = BSplineApproximator(:g, (0.0, 5.0), 10)
+uf = BSplineApproximator(:g, (0.0, 120.0), 10; initial=H -> 0.015 * H)
 
-prob = PSMProblem(lv!, [2.0, 1.0], (0.0, 30.0), [uf];
+prob = PSMProblem(lv!, [50.0, 10.0], (0.0, 30.0), [uf];
     data_times=t_data, data_values=Float64.(data_matrix),
     obs_to_state=[1, 2], known_params=NamedTuple(),
     likelihood=PartiallySpecifiedModels.Gaussian())
 
-sol_bng = solve(prob, BNGSolver(maxiters=2000, lr=0.01, verbose=false));
+sol_bng = solve(prob, BNGSolver(maxiters=3000, lr=0.01, verbose=false));
 ```
 
 ### Compare with AdamSolver
 
 ```{julia}
-sol_adam = solve(prob, AdamSolver(lr=0.01, maxiters=2000, verbose=false));
+sol_adam = solve(prob, AdamSolver(lr=0.01, maxiters=3000, verbose=false));
 ```
 
 ### Recovered Functional Response
@@ -101,15 +101,17 @@ sol_adam = solve(prob, AdamSolver(lr=0.01, maxiters=2000, verbose=false));
 ```{julia}
 #| echo: false
 #| label: fig-functional-response
-#| fig-cap: "Recovered functional response g(H): BNG vs Adam vs truth"
+#| fig-cap: "Recovered predation rate g(H): BNG vs Adam vs truth"
 g_bng = sol_bng.unknown_functions[:g]
 g_adam = sol_adam.unknown_functions[:g]
 
-H_grid = range(0.01, 4.5, length=200)
-plot(H_grid, g_true.(H_grid), lw=3, label="True g(H)", color=:black, ls=:dash,
-    xlabel="Prey density H", ylabel="g(H)", title="Functional Response Recovery")
+H_range = extrema([sol_true.u[i][1] for i in 1:length(sol_true.t)])
+H_grid = range(H_range[1] * 0.5, H_range[2] * 1.1, length=200)
+plot(H_grid, g_true.(H_grid), lw=3, label="True g(H) = 0.02H", color=:black, ls=:dash,
+    xlabel="Prey density H", ylabel="g(H)", title="Predation Rate Recovery")
 plot!(H_grid, [g_bng(H) for H in H_grid], lw=2, label="BNG", color=:teal)
 plot!(H_grid, [g_adam(H) for H in H_grid], lw=2, label="Adam", color=:purple)
+vspan!([H_range...], alpha=0.08, color=:steelblue, label="Data range")
 ```
 
 ### Fitted Trajectories
