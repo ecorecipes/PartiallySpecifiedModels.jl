@@ -18,6 +18,9 @@ struct PSMLogDensity
     n_params::Int
     prior_scale::Float64
     obs_sigma::Union{Nothing, Float64}  # nothing = estimate; Float64 = fixed
+    sample_smoothing::Bool
+    n_smooths::Int  # number of smooth terms (penalty matrices)
+    log_lambda_init::Vector{Float64}  # initial log(λ) for hyperprior center
 end
 
 function LogDensityProblems.capabilities(::Type{PSMLogDensity})
@@ -25,21 +28,33 @@ function LogDensityProblems.capabilities(::Type{PSMLogDensity})
 end
 
 function LogDensityProblems.dimension(ld::PSMLogDensity)
-    ld.obs_sigma === nothing ? ld.n_params + 1 : ld.n_params
+    d = ld.n_params
+    if ld.obs_sigma === nothing; d += 1; end
+    if ld.sample_smoothing; d += ld.n_smooths; end
+    d
 end
 
 function LogDensityProblems.logdensity(ld::PSMLogDensity, theta)
     prob = ld.prob
     T = eltype(theta)
 
-    # Split theta into beta (UF params) and optional log_sigma
+    # Parse theta: [beta..., (log_sigma)?, (log_lambda_1, ..., log_lambda_m)?]
+    idx = ld.n_params
+    beta = theta[1:idx]
+
     if ld.obs_sigma === nothing
-        beta = theta[1:ld.n_params]
-        log_sigma = theta[end]
+        idx += 1
+        log_sigma = theta[idx]
         sigma2 = exp(2 * log_sigma)
     else
-        beta = theta
+        log_sigma = nothing
         sigma2 = T(ld.obs_sigma^2)
+    end
+
+    if ld.sample_smoothing && ld.n_smooths > 0
+        log_lambdas = theta[idx+1:idx+ld.n_smooths]
+    else
+        log_lambdas = nothing
     end
 
     # --- Log-likelihood: simulate and compare to data ---
@@ -92,15 +107,28 @@ function LogDensityProblems.logdensity(ld::PSMLogDensity, theta)
         np = size(S, 1)
         off = ld.param_offsets[k]
         beta_k = beta[off+1:off+np]
-        lp -= T(0.5) / T(ld.prior_scale) * dot(beta_k, S * beta_k)
+        # Use sampled λ if available, otherwise fixed prior_scale
+        lambda_k = if log_lambdas !== nothing
+            exp(log_lambdas[k])
+        else
+            T(1.0) / T(ld.prior_scale)
+        end
+        lp -= T(0.5) * lambda_k * dot(beta_k, S * beta_k)
     end
 
     # Broad Gaussian prior on all params
     lp -= T(0.5) * sum(beta .^ 2) / T(100.0 * ld.prior_scale)
 
     # Jeffrey's prior on sigma via log transform
-    if ld.obs_sigma === nothing
+    if log_sigma !== nothing
         lp += log_sigma
+    end
+
+    # Weakly informative hyperprior on log(λ): N(log(λ_init), 2²)
+    if log_lambdas !== nothing
+        for k in 1:ld.n_smooths
+            lp -= T(0.5) * (log_lambdas[k] - T(ld.log_lambda_init[k]))^2 / T(4.0)
+        end
     end
 
     return ll + lp
@@ -126,7 +154,8 @@ end
 
 # ─── Parameter names for MCMCChains ──────────────────────────────
 
-function _param_names(prob::PSMProblem, estimate_sigma::Bool)
+function _param_names(prob::PSMProblem, estimate_sigma::Bool;
+                     sample_smoothing::Bool=false)
     names = String[]
     for approx in prob.approximators
         np = nparams(approx)
@@ -137,6 +166,14 @@ function _param_names(prob::PSMProblem, estimate_sigma::Bool)
     end
     if estimate_sigma
         push!(names, "log_σ")
+    end
+    if sample_smoothing
+        for (k, approx) in enumerate(prob.approximators)
+            S = penalty_matrix(approx)
+            if S !== nothing
+                push!(names, "log_λ[$(approx.name)]")
+            end
+        end
     end
     return names
 end
@@ -188,23 +225,33 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     penalties, offsets, _ = _build_penalty_info(prob)
 
     # Build log-density problem
-    ld = PSMLogDensity(prob, penalties, offsets, n_beta, alg.prior_scale, alg.obs_sigma)
+    n_smooths = length(penalties)
+    log_lambda_init = if alg.sample_smoothing && n_smooths > 0
+        [log(1.0 / alg.prior_scale) for _ in 1:n_smooths]
+    else
+        Float64[]
+    end
+    ld = PSMLogDensity(prob, penalties, offsets, n_beta, alg.prior_scale,
+                       alg.obs_sigma, alg.sample_smoothing, n_smooths,
+                       log_lambda_init)
 
     estimate_sigma = alg.obs_sigma === nothing
     D = LogDensityProblems.dimension(ld)
 
-    # Initial point: beta0 + optional log_sigma
-    theta0 = if estimate_sigma
-        # Rough sigma estimate from data spread
+    # Initial point: beta0 + optional log_sigma + optional log_lambda
+    theta0 = copy(beta0)
+    if estimate_sigma
         sig_init = std(prob.data_values) * 0.1
-        vcat(beta0, log(max(sig_init, 0.01)))
-    else
-        beta0
+        push!(theta0, log(max(sig_init, 0.01)))
+    end
+    if alg.sample_smoothing && n_smooths > 0
+        append!(theta0, log_lambda_init)
     end
 
     if verbose
         println("MCMCSolver: $n_beta UF params" *
                 (estimate_sigma ? " + 1 noise param" : "") *
+                (alg.sample_smoothing ? " + $n_smooths smoothing params" : "") *
                 ", $(alg.n_warmup) warmup + $(alg.n_samples) samples")
     end
 
@@ -232,7 +279,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     end
 
     # Build MCMCChains.Chains object
-    pnames = _param_names(prob, estimate_sigma)
+    pnames = _param_names(prob, estimate_sigma;
+                          sample_smoothing=alg.sample_smoothing)
     chain = MCMCChains.Chains(sample_matrix, pnames)
 
     if verbose

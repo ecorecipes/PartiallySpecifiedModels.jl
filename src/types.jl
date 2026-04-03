@@ -974,7 +974,7 @@ RodeoSolver(; n_steps::Int=200, n_deriv::Int=3,
 
 """
     MCMCSolver(; n_samples=1000, n_warmup=500, n_chains=1, target_accept=0.8,
-                 prior_scale=1.0, obs_sigma=nothing, verbose=false)
+                 prior_scale=1.0, obs_sigma=nothing, sample_smoothing=false, verbose=false)
 
 Full Bayesian inference via Hamiltonian Monte Carlo (NUTS).
 Uses LogDensityProblems.jl + AdvancedHMC.jl.
@@ -987,6 +987,9 @@ Uses LogDensityProblems.jl + AdvancedHMC.jl.
 - `prior_scale`: scale for Gaussian prior on parameters (larger = weaker prior).
   When penalty matrices exist (B-spline, GP), uses the penalty; otherwise N(0, prior_scale²).
 - `obs_sigma`: observation noise std dev. If `nothing`, estimated as a parameter.
+- `sample_smoothing`: if `true`, jointly sample log(λ) for each smooth term
+  with a weakly informative N(log(λ_init), 2²) hyperprior. This gives wider,
+  more honest credible intervals for the unknown functions. Default: `false`.
 - `verbose`: print progress
 """
 struct MCMCSolver
@@ -996,14 +999,17 @@ struct MCMCSolver
     target_accept::Float64
     prior_scale::Float64
     obs_sigma::Union{Nothing, Float64}
+    sample_smoothing::Bool
     verbose::Bool
 end
 
 MCMCSolver(; n_samples::Int=1000, n_warmup::Int=500, n_chains::Int=1,
              target_accept::Float64=0.8, prior_scale::Float64=1.0,
              obs_sigma::Union{Nothing, Float64}=nothing,
+             sample_smoothing::Bool=false,
              verbose::Bool=false) =
-    MCMCSolver(n_samples, n_warmup, n_chains, target_accept, prior_scale, obs_sigma, verbose)
+    MCMCSolver(n_samples, n_warmup, n_chains, target_accept, prior_scale,
+               obs_sigma, sample_smoothing, verbose)
 
 """
     MagiSolver(; n_samples=1000, n_warmup=500, n_deriv=3, n_gridpoints=200,
