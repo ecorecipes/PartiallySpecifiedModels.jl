@@ -20,7 +20,7 @@ The `vignettes/` directory contains 30 worked examples covering every solver, ap
 | 11 | [Count Data SIR](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/11_count_data_sir/11_count_data_sir.md) | SIR model with Poisson and Negative Binomial likelihoods |
 | 12 | [Discrete Time](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/12_discrete_time/12_discrete_time.md) | Ricker, Beverton–Holt, and discrete competition models |
 | 20 | [DDE](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/20_dde/20_dde.md) | Delay differential equations with unknown functions |
-| 27 | [Blowfly DDE](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/27_blowfly_dde/27_blowfly_dde.md) | Nicholson blowfly DDE with shape constraints and bootstrap CIs |
+| 27 | [Predator-Prey Functional Response](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/27_predator_prey/27_predator_prey.md) | Holling Type II with shape constraints, Bayesian and bootstrap CIs |
 | 28 | [Fisheries](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/28_fisheries/28_fisheries.md) | Discrete stock-recruitment with Poisson counts and shape constraints |
 
 ## Approximators
