@@ -159,7 +159,7 @@ We first fit the model with an unconstrained B-spline approximator (10
 knots) and LAML for automatic smoothing parameter selection.
 
 ``` julia
-uf_free = BSplineApproximator(:f, (0.0, 10.0), 10; initial=0.5)
+uf_free = BSplineApproximator(:f, (0.0, 10.0), 10; initial=R -> 0.5 * R)
 
 prob_free = PSMProblem(rm_psm!, u0, tspan, [uf_free];
     data_times=data_t, data_values=data,
@@ -168,10 +168,10 @@ prob_free = PSMProblem(rm_psm!, u0, tspan, [uf_free];
     likelihood=Gaussian(),
     solver=Tsit5())
 
-sol_free = solve(prob_free, LAML(maxiters=100, verbose=false));
+sol_free = solve(prob_free, LAML(maxiters=200, verbose=false));
 ```
 
-    Unconstrained — data loss: 5.11, EDF: 2.0
+    Unconstrained — data loss: 6.33, EDF: 5.01
 
 ### Fitted trajectories
 
@@ -249,7 +249,7 @@ $f''(R) \leq 0$.
 
 ``` julia
 uf_sc = ShapeConstrainedBSplineApproximator(:f, (0.0, 10.0), 10, :inc_concave;
-    initial=0.5)
+    initial=1.0)
 
 prob_sc = PSMProblem(rm_psm!, u0, tspan, [uf_sc];
     data_times=data_t, data_values=data,
@@ -258,10 +258,10 @@ prob_sc = PSMProblem(rm_psm!, u0, tspan, [uf_sc];
     likelihood=Gaussian(),
     solver=Tsit5())
 
-sol_sc = solve(prob_sc, LAML(maxiters=100, verbose=false));
+sol_sc = solve(prob_sc, LAML(maxiters=200, verbose=false));
 ```
 
-    Shape-constrained — data loss: 5.13, EDF: 1.76
+    Shape-constrained — data loss: 5.13, EDF: 1.79
 
 ### Comparison: unconstrained vs shape-constrained
 
@@ -305,7 +305,7 @@ uncertainty. At each replicate, pseudo-data are sampled from the fitted
 Gaussian likelihood and the constrained model is re-estimated.
 
 ``` julia
-bs = bootstrap(sol_sc, prob_sc, LAML(maxiters=100, verbose=false);
+bs = bootstrap(sol_sc, prob_sc, LAML(maxiters=200, verbose=false);
     nboot=50, method=:parametric, level=0.95,
     rng=Random.Xoshiro(42), verbose=false);
 ```
@@ -421,7 +421,7 @@ Figure 9: Four-panel diagnostic plots for the unconstrained LAML fit
 
 </div>
 
-    Durbin-Watson: 1.571, 1.982
+    Durbin-Watson: 1.196, 1.73
 
 ## Summary
 
