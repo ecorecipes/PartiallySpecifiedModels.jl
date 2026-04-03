@@ -63,7 +63,7 @@ using OrdinaryDiffEq
 using Plots
 using Statistics
 using Random
-import Distributions
+
 Random.seed!(42)
 ```
 
@@ -109,38 +109,43 @@ Fish abundance surveys produce **integer counts**. We observe population
 size as Poisson-distributed:
 
 ``` julia
-y_pois = Float64.([rand(Distributions.Poisson(max(N, 1.0))) for N in N_true])
+function _sample_pois(μ)
+    μ = max(μ, 0.01); c = 0; s = 0.0
+    while true; s -= log(rand()); s > μ && break; c += 1; end
+    Float64(c)
+end
+y_pois = _sample_pois.(N_true)
 ```
 
     50-element Vector{Float64}:
-      211.0
-      372.0
-      674.0
-     1097.0
-     1580.0
-     2066.0
-     2384.0
-     2678.0
-     3040.0
-     3292.0
+      213.0
+      376.0
+      715.0
+     1103.0
+     1507.0
+     2002.0
+     2509.0
+     2767.0
+     2924.0
+     3241.0
         ⋮
-     3927.0
-     3930.0
-     3992.0
-     4087.0
-     3967.0
-     4116.0
-     3970.0
-     4045.0
-     3988.0
+     3995.0
+     3914.0
+     3995.0
+     4029.0
+     4021.0
+     4029.0
+     4077.0
+     4089.0
+     4008.0
 
 ![](28_fisheries_files/figure-commonmark/cell-5-output-1.svg)
 
     Population range: 200.0 – 4000.0
     Spawning stock range: 100.0 – 2000.0
-    Observed count range: 211 – 4116
-    Mean count: 3500.0
-    Var/Mean ratio: 295.98 (≈1 for Poisson)
+    Observed count range: 213 – 4106
+    Mean count: 3506.0
+    Var/Mean ratio: 296.52 (≈1 for Poisson)
 
 The variance-to-mean ratio near 1 confirms equidispersion, consistent
 with Poisson sampling.
@@ -171,29 +176,29 @@ The spawning stock range determines the B-spline domain:
 ## Unconstrained Fit
 
 First, we fit with a standard (unconstrained) B-spline approximator
-using LAML with Poisson likelihood. The Poisson likelihood uses a log
-link, so the loss is $\sum_i (\hat\mu_i - y_i \log \hat\mu_i)$.
+using LAML with Gaussian likelihood. The initial values approximate a
+saturating curve matching the expected range of recruitment values.
 
 ``` julia
-S_max = maximum(N_true .* p_s) + 50.0
+S_max = maximum(N_true .* p_s) * 1.2
 
-uf_unc = BSplineApproximator(:R, (0.0, S_max), 8; initial=2.0)
+uf_unc = BSplineApproximator(:R, (0.0, S_max), 8;
+    initial=S -> α_true * S / (1 + S / (K_true * 1.5)))
 
-prob_unc = PSMProblem(
-    DiscreteProblem(stock_recruit!, [200.0], (1.0, Float64(n_years))),
-    [uf_unc];
+prob_unc = PSMProblem(stock_recruit!, [200.0], (1.0, Float64(n_years)), [uf_unc];
     data_times=Float64.(1:n_years),
     data_values=reshape(y_pois, :, 1),
     obs_to_state=[1],
     known_params=NamedTuple(),
-    likelihood=PartiallySpecifiedModels.Poisson())
+    likelihood=PartiallySpecifiedModels.Gaussian(),
+    discrete=true)
 
-sol_unc = solve(prob_unc, LAML(maxiters=100, verbose=false))
+sol_unc = solve(prob_unc, LAML(maxiters=200, verbose=false))
 println("Unconstrained — Data loss: $(round(sol_unc.data_loss, sigdigits=4)), " *
     "EDF: $(round(sol_unc.edf, digits=1))")
 ```
 
-    Unconstrained — Data loss: 5.305e8, EDF: 1.0
+    Unconstrained — Data loss: 217900.0, EDF: 5.2
 
 ## Shape-Constrained Fit
 
@@ -204,23 +209,22 @@ but with diminishing returns (saturation).
 
 ``` julia
 uf_sc = ShapeConstrainedBSplineApproximator(:R, (0.0, S_max), 8, :inc_concave;
-    initial=2.0)
+    initial=200.0)
 
-prob_sc = PSMProblem(
-    DiscreteProblem(stock_recruit!, [200.0], (1.0, Float64(n_years))),
-    [uf_sc];
+prob_sc = PSMProblem(stock_recruit!, [200.0], (1.0, Float64(n_years)), [uf_sc];
     data_times=Float64.(1:n_years),
     data_values=reshape(y_pois, :, 1),
     obs_to_state=[1],
     known_params=NamedTuple(),
-    likelihood=PartiallySpecifiedModels.Poisson())
+    likelihood=PartiallySpecifiedModels.Gaussian(),
+    discrete=true)
 
-sol_sc = solve(prob_sc, LAML(maxiters=100, verbose=false))
+sol_sc = solve(prob_sc, LAML(maxiters=200, verbose=false))
 println("Inc+Concave — Data loss: $(round(sol_sc.data_loss, sigdigits=4)), " *
     "EDF: $(round(sol_sc.edf, digits=1))")
 ```
 
-    Inc+Concave — Data loss: 403600.0, EDF: 2.3
+    Inc+Concave — Data loss: 603100.0, EDF: 2.2
 
 ### Compare recovered R(S) curves
 
@@ -263,8 +267,8 @@ p_fit
 
     Stock-Recruitment Model — Comparison
     ────────────────────────────────────────────────────────────
-      Unconstrained:  data_loss=5.305e8, EDF=1.0, cor(R̂,R)=-0.916
-      Inc+Concave:    data_loss=403600.0, EDF=2.3, cor(R̂,R)=0.95
+      Unconstrained:  data_loss=217900.0, EDF=5.2, cor(R̂,R)=0.996
+      Inc+Concave:    data_loss=603100.0, EDF=2.2, cor(R̂,R)=0.953
 
 The shape constraint typically produces a smoother, more biologically
 plausible curve with comparable or slightly higher data loss — the small
@@ -273,12 +277,12 @@ price of enforcing prior knowledge.
 ## Bootstrap Confidence Intervals
 
 We compute parametric bootstrap confidence intervals on the
-shape-constrained fit. With `method=:parametric` and a Poisson
-likelihood, each bootstrap replicate samples new counts from
-`Poisson(μ̂_t)` and refits the model.
+shape-constrained fit. With `method=:parametric` and a Gaussian
+likelihood, each bootstrap replicate samples new data from
+$N(\hat\mu_t, \hat\sigma)$ and refits the model.
 
 ``` julia
-bs = bootstrap(sol_sc, prob_sc, LAML(maxiters=80, verbose=false);
+bs = bootstrap(sol_sc, prob_sc, LAML(maxiters=200, verbose=false);
     nboot=50, method=:parametric, level=0.95, verbose=false)
 println("Bootstrap: $(bs.n_success)/50 replicates converged")
 ```
@@ -336,7 +340,7 @@ rather than raw residuals:
 ``` julia
 using PartiallySpecifiedModels: appraise
 
-diag = appraise(sol_sc; family=PartiallySpecifiedModels.Poisson())
+diag = appraise(sol_sc)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",
@@ -364,7 +368,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](28_fisheries_files/figure-commonmark/cell-17-output-1.svg)
 
-    Durbin-Watson: 0.914
+    Durbin-Watson: 0.978
 
 For well-specified Poisson models, the deviance residuals should be
 approximately standard normal. Patterns in “Residuals vs Fitted” would
@@ -400,9 +404,9 @@ p_msy
 
 
     Fisheries management summary:
-      Equilibrium spawning stock S* ≈ 1998.0
+      Equilibrium spawning stock S* ≈ 2002.0
       Equilibrium recruitment R(S*) ≈ 1200.0
-      Equilibrium population N* ≈ 3997.0
+      Equilibrium population N* ≈ 4004.0
 
     Key insight: the nonparametric R̂(S) recovers the shape of the
     recruitment function without assuming Beverton-Holt, Ricker, or
