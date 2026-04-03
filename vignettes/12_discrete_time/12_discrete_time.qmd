@@ -146,7 +146,8 @@ prob_coll = PSMProblem(
     data_times=times,
     data_values=reshape(data, :, 1))
 
-sol_coll = solve(prob_coll, CollocationLAML(maxiters=30, verbose=false))
+sol_coll = solve(prob_coll, CollocationLAML(maxiters=30, verbose=false,
+    lambda_ode_start=1.0, lambda_ode_end=1e4, n_continuation=6))
 println("CollocationLAML — Data loss: $(round(sol_coll.data_loss, sigdigits=4)), EDF: $(round(sol_coll.edf, digits=1))")
 ```
 
@@ -351,7 +352,8 @@ println("LAML — Data loss: $(round(sol_laml.data_loss, sigdigits=4)), EDF: $(r
 sol_gm = solve(make_comp_prob(), GradientMatching(maxiters=200, refine_iters=100, verbose=false))
 println("GradientMatching — Data loss: $(round(sol_gm.data_loss, sigdigits=4)), EDF: $(round(sol_gm.edf, digits=1))")
 
-sol_coll = solve(make_comp_prob(), CollocationLAML(maxiters=30, verbose=false))
+sol_coll = solve(make_comp_prob(), CollocationLAML(maxiters=30, verbose=false,
+    lambda_ode_start=1.0, lambda_ode_end=1e4, n_continuation=6))
 println("CollocationLAML — Data loss: $(round(sol_coll.data_loss, sigdigits=4)), EDF: $(round(sol_coll.edf, digits=1))")
 ```
 
@@ -440,9 +442,11 @@ continuous-time Kalman filtering with an integrated Brownian motion prior.
 - **GradientMatching** — Fast and effective with `refine_iters > 0`. The
   shooting refinement corrects the function in regions poorly covered by
   derivative matching alone.
-- **CollocationLAML** — Works well when the dynamics explore the full state
-  space (e.g., competition models). Less effective for models with fast
-  transients where most observations cluster near equilibrium.
+- **CollocationLAML** — Less effective for discrete maps than for continuous ODEs. The
+  collocation treats each state value as a free parameter, so the map compliance penalty
+  `λ_ode × Σ(u_{t+1} - f(u_t))²` competes with the data fit. For short time series where
+  the number of state parameters equals the number of observations, collocation is effectively
+  unconstrained and tends to overfit (high EDF).
 
 ### Key ecological applications
 
