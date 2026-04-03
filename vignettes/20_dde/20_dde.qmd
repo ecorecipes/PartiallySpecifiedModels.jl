@@ -89,7 +89,7 @@ function dde_psm!(du, u, h, p, t)
     du[1] = -p.f(u_delayed[1])
 end
 
-uf = BSplineApproximator(:f, (0.0, 1.5), 8)
+uf = BSplineApproximator(:f, (0.0, 1.5), 8; initial=x -> 0.3 * x)
 
 prob = PSMProblem(dde_psm!, [1.0], (0.0, 10.0), [uf];
     data_times=t_data, data_values=Float64.(data_matrix),
@@ -102,7 +102,7 @@ prob = PSMProblem(dde_psm!, [1.0], (0.0, 10.0), [uf];
 ### Fit with LAML
 
 ```{julia}
-sol_laml = solve(prob, LAML(maxiters=50, verbose=false));
+sol_laml = solve(prob, LAML(maxiters=100, verbose=false));
 ```
 
 ### Recovered Function
@@ -134,95 +134,21 @@ plot!(sol_true.t, [sol_true.u[i][1] for i in 1:length(sol_true.t)],
 title!("Trajectory — Delayed Feedback")
 ```
 
-## Example 2: Blowfly Model with Delayed Reproduction
+## Limitations and Oscillatory DDEs
 
-A more ecological example: Nicholson's blowfly equation with unknown reproduction function:
+::: {.callout-warning}
+## LAML and oscillatory DDEs
 
-$$\frac{dN}{dt} = g(N(t - \tau)) - \delta N(t)$$
+The IRLS+PCLS linearization used by `LAML` works well for DDEs that approach a stable equilibrium (as in Example 1 above), but struggles with **oscillatory DDEs** such as Nicholson's blowfly equation. The delay creates a complex mapping between spline coefficients and the trajectory, and the linearization cannot capture this nonlinear coupling.
 
-where $g$ is the density-dependent reproduction rate acting on the delayed population, and $\delta$ is the mortality rate.
+For oscillatory DDEs, consider:
 
-```{julia}
-g_true(N) = 5.0 * N * exp(-N / 50.0)
+- **`AdamSolver`** — uses autodiff through the DDE solve (works if the dynamics are differentiable)
+- **`CollocationLAML`** — avoids ODE integration; treats state values as free parameters
+- **`MCMCSolver`** — Bayesian inference that handles nonlinearity via sampling
 
-function blowfly_true!(du, u, h, p, t)
-    N_delayed = h(p, t - 2.0)
-    du[1] = g_true(N_delayed[1]) - 0.1 * u[1]
-end
-
-h_blow(p, t) = [20.0]
-prob_blow = DDEProblem(blowfly_true!, [20.0], h_blow, (0.0, 50.0);
-    constant_lags=[2.0])
-sol_blow = solve(prob_blow, MethodOfSteps(Tsit5()); saveat=0.5)
-
-t_blow = collect(sol_blow.t)
-data_blow = [max(sol_blow.u[i][1] + 1.0 * randn(), 0.1) for i in 1:length(t_blow)]
-data_blow_matrix = reshape(data_blow, :, 1)
-```
-
-### Blowfly Data
-
-```{julia}
-#| echo: false
-#| label: fig-data-blowfly
-#| fig-cap: "Nicholson's blowfly population data"
-plot(t_blow, data_blow, seriestype=:scatter, ms=2, alpha=0.5,
-    label="Observed", color=:steelblue, xlabel="Time", ylabel="Population N")
-plot!(sol_blow.t, [sol_blow.u[i][1] for i in 1:length(sol_blow.t)],
-    label="True", color=:black, lw=2, ls=:dash)
-title!("Blowfly Population Data")
-```
-
-### Fit the Blowfly PSM
-
-```{julia}
-function blowfly!(du, u, h, p, t)
-    N_delayed = h(p, t - 2.0)
-    du[1] = p.g(N_delayed[1]) - 0.1 * u[1]
-end
-
-uf_blow = BSplineApproximator(:g, (0.0, 80.0), 12)
-
-prob_blow_psm = PSMProblem(blowfly!, [20.0], (0.0, 50.0), [uf_blow];
-    data_times=t_blow, data_values=Float64.(data_blow_matrix),
-    obs_to_state=[1], known_params=NamedTuple(),
-    likelihood=PartiallySpecifiedModels.Gaussian(),
-    delays=[2.0], history=h_blow)
-
-sol_blow_fit = solve(prob_blow_psm, LAML(maxiters=50, verbose=false));
-```
-
-### Recovered Reproduction Function
-
-```{julia}
-#| echo: false
-#| label: fig-reproduction
-#| fig-cap: "Recovered reproduction function g(N) — note the characteristic hump shape"
-g_fitted = sol_blow_fit.unknown_functions[:g]
-
-N_grid = range(0.1, 75.0, length=200)
-plot(N_grid, g_true.(N_grid), lw=3, label="True g(N)", color=:black, ls=:dash,
-    xlabel="Delayed population N(t-τ)", ylabel="g(N)",
-    title="Blowfly Reproduction Function")
-plot!(N_grid, [g_fitted(N) for N in N_grid], lw=2, label="LAML fit", color=:teal)
-# Mark data range
-N_range = extrema([sol_blow.u[i][1] for i in 1:length(sol_blow.t)])
-vspan!([N_range...], alpha=0.08, color=:steelblue, label="Data range")
-```
-
-### Fitted Blowfly Trajectory
-
-```{julia}
-#| echo: false
-#| label: fig-trajectory-blowfly
-#| fig-cap: "Fitted blowfly population trajectory vs observed data"
-plot(t_blow, data_blow, seriestype=:scatter, ms=2, alpha=0.4,
-    label="Data", color=:gray60, xlabel="Time", ylabel="Population N")
-plot!(t_blow, sol_blow_fit.fitted_values[:, 1], lw=2, label="LAML fit", color=:teal)
-plot!(sol_blow.t, [sol_blow.u[i][1] for i in 1:length(sol_blow.t)],
-    lw=2, ls=:dash, label="True", color=:black)
-title!("Blowfly Trajectory Fit")
-```
+See [Vignette 03: Lotka–Volterra](../03_lotka_volterra/03_lotka_volterra.qmd) for a similar discussion of linearization limitations in oscillatory ODE systems.
+:::
 
 ## DDE Problem Setup
 

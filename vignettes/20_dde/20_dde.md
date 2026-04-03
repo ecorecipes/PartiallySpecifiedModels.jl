@@ -1,6 +1,6 @@
 # Delay Differential Equations
 Simon Frost
-2026-04-02
+2026-04-03
 
 - [Overview](#overview)
 - [Example 1: Delayed Negative
@@ -11,12 +11,7 @@ Simon Frost
   - [Fit with LAML](#fit-with-laml)
   - [Recovered Function](#recovered-function)
   - [Fitted Trajectory](#fitted-trajectory)
-- [Example 2: Blowfly Model with Delayed
-  Reproduction](#example-2-blowfly-model-with-delayed-reproduction)
-  - [Blowfly Data](#blowfly-data)
-  - [Fit the Blowfly PSM](#fit-the-blowfly-psm)
-  - [Recovered Reproduction Function](#recovered-reproduction-function)
-  - [Fitted Blowfly Trajectory](#fitted-blowfly-trajectory)
+- [Limitations and Oscillatory DDEs](#limitations-and-oscillatory-ddes)
 - [DDE Problem Setup](#dde-problem-setup)
 - [Diagnostic Plots](#diagnostic-plots)
 - [Summary](#summary)
@@ -125,7 +120,7 @@ function dde_psm!(du, u, h, p, t)
     du[1] = -p.f(u_delayed[1])
 end
 
-uf = BSplineApproximator(:f, (0.0, 1.5), 8)
+uf = BSplineApproximator(:f, (0.0, 1.5), 8; initial=x -> 0.3 * x)
 
 prob = PSMProblem(dde_psm!, [1.0], (0.0, 10.0), [uf];
     data_times=t_data, data_values=Float64.(data_matrix),
@@ -135,12 +130,12 @@ prob = PSMProblem(dde_psm!, [1.0], (0.0, 10.0), [uf];
     history=h_func)
 ```
 
-    PSMProblem{typeof(dde_psm!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(dde_psm!, [1.0], (0.0, 10.0), BSplineApproximator[BSplineApproximator(:f, (0.0, 1.5), 8, PartiallySpecifiedModels.var"#4#5"())], [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25  …  7.75, 8.0, 8.25, 8.5, 8.75, 9.0, 9.25, 9.5, 9.75, 10.0], [1.015767112032086; 0.8574028280809121; … ; 0.00846453382610652; 0.024216939814217422;;], [1.0; 1.0; … ; 1.0; 1.0;;], [1], NamedTuple(), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false, [1.0], h_func)
+    PSMProblem{typeof(dde_psm!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(dde_psm!, [1.0], (0.0, 10.0), BSplineApproximator[BSplineApproximator(:f, (0.0, 1.5), 8, var"#8#9"())], [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25  …  7.75, 8.0, 8.25, 8.5, 8.75, 9.0, 9.25, 9.5, 9.75, 10.0], [1.015767112032086; 0.8574028280809121; … ; 0.00846453382610652; 0.024216939814217422;;], [1.0; 1.0; … ; 1.0; 1.0;;], [1], NamedTuple(), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false, [1.0], h_func)
 
 ### Fit with LAML
 
 ``` julia
-sol_laml = solve(prob, LAML(maxiters=50, verbose=false));
+sol_laml = solve(prob, LAML(maxiters=100, verbose=false));
 ```
 
 ### Recovered Function
@@ -164,105 +159,32 @@ model
 
 </div>
 
-## Example 2: Blowfly Model with Delayed Reproduction
+## Limitations and Oscillatory DDEs
 
-A more ecological example: Nicholson’s blowfly equation with unknown
-reproduction function:
-
-$$\frac{dN}{dt} = g(N(t - \tau)) - \delta N(t)$$
-
-where $g$ is the density-dependent reproduction rate acting on the
-delayed population, and $\delta$ is the mortality rate.
-
-``` julia
-g_true(N) = 5.0 * N * exp(-N / 50.0)
-
-function blowfly_true!(du, u, h, p, t)
-    N_delayed = h(p, t - 2.0)
-    du[1] = g_true(N_delayed[1]) - 0.1 * u[1]
-end
-
-h_blow(p, t) = [20.0]
-prob_blow = DDEProblem(blowfly_true!, [20.0], h_blow, (0.0, 50.0);
-    constant_lags=[2.0])
-sol_blow = solve(prob_blow, MethodOfSteps(Tsit5()); saveat=0.5)
-
-t_blow = collect(sol_blow.t)
-data_blow = [max(sol_blow.u[i][1] + 1.0 * randn(), 0.1) for i in 1:length(t_blow)]
-data_blow_matrix = reshape(data_blow, :, 1)
-```
-
-    101×1 Matrix{Float64}:
-      18.770911286918476
-      53.17655939651568
-      81.84873502264048
-     109.86845908645137
-     136.923995938962
-     172.21149609991573
-     206.37145910374434
-     230.71267308742244
-     243.34874078116312
-     250.91991400320958
-       ⋮
-     194.0752571921006
-     195.82505460466686
-     194.0578633502817
-     195.04812718779897
-     195.1738797062636
-     195.73607023133877
-     195.2050947659385
-     196.53835685537558
-     196.049978477689
-
-### Blowfly Data
-
-<div id="fig-data-blowfly">
-
-![](20_dde_files/figure-commonmark/fig-data-blowfly-output-1.svg)
-
-Figure 4: Nicholson’s blowfly population data
-
-</div>
-
-### Fit the Blowfly PSM
-
-``` julia
-function blowfly!(du, u, h, p, t)
-    N_delayed = h(p, t - 2.0)
-    du[1] = p.g(N_delayed[1]) - 0.1 * u[1]
-end
-
-uf_blow = BSplineApproximator(:g, (0.0, 80.0), 12)
-
-prob_blow_psm = PSMProblem(blowfly!, [20.0], (0.0, 50.0), [uf_blow];
-    data_times=t_blow, data_values=Float64.(data_blow_matrix),
-    obs_to_state=[1], known_params=NamedTuple(),
-    likelihood=PartiallySpecifiedModels.Gaussian(),
-    delays=[2.0], history=h_blow)
-
-sol_blow_fit = solve(prob_blow_psm, LAML(maxiters=50, verbose=false));
-```
-
-### Recovered Reproduction Function
-
-<div id="fig-reproduction">
-
-![](20_dde_files/figure-commonmark/fig-reproduction-output-1.svg)
-
-Figure 5: Recovered reproduction function g(N) — note the characteristic
-hump shape
-
-</div>
-
-### Fitted Blowfly Trajectory
-
-<div id="fig-trajectory-blowfly">
-
-![](20_dde_files/figure-commonmark/fig-trajectory-blowfly-output-1.svg)
-
-Figure 6: Fitted blowfly population trajectory vs observed data
-
-</div>
+> [!WARNING]
+>
+> ### LAML and oscillatory DDEs
+>
+> The IRLS+PCLS linearization used by `LAML` works well for DDEs that
+> approach a stable equilibrium (as in Example 1 above), but struggles
+> with **oscillatory DDEs** such as Nicholson’s blowfly equation. The
+> delay creates a complex mapping between spline coefficients and the
+> trajectory, and the linearization cannot capture this nonlinear
+> coupling.
+>
+> For oscillatory DDEs, consider:
+>
+> - **`AdamSolver`** — uses autodiff through the DDE solve (works if the
+>   dynamics are differentiable)
+> - **`CollocationLAML`** — avoids ODE integration; treats state values
+>   as free parameters
+> - **`MCMCSolver`** — Bayesian inference that handles nonlinearity via
+>   sampling
+>
+> See [Vignette 03:
+> Lotka–Volterra](../03_lotka_volterra/03_lotka_volterra.qmd) for a
+> similar discussion of linearization limitations in oscillatory ODE
+> systems.
 
 ## DDE Problem Setup
 
@@ -315,9 +237,9 @@ plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
 plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 ```
 
-![](20_dde_files/figure-commonmark/cell-14-output-1.svg)
+![](20_dde_files/figure-commonmark/cell-9-output-1.svg)
 
-    Durbin-Watson: 0.232
+    Durbin-Watson: 2.163
 
 > [!TIP]
 >
