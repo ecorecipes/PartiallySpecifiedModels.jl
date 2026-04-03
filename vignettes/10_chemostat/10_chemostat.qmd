@@ -112,7 +112,7 @@ function chemostat!(du, u, p, t)
     du[2] = max(μ_val, 0.0) * X - 0.3 * X
 end
 
-approx_μ = BSplineApproximator(:μ, (0.0, 12.0), 8; initial=0.5)
+approx_μ = BSplineApproximator(:μ, (0.0, 12.0), 8; initial=S -> 0.5*S/(2.0+S))
 
 prob = PSMProblem(chemostat!, u0, tspan, [approx_μ];
     data_times=data_t, data_values=data,
@@ -125,7 +125,7 @@ prob = PSMProblem(chemostat!, u0, tspan, [approx_μ];
 
 ```{julia}
 #| echo: false
-sol_laml = solve(prob, LAML(maxiters=100, verbose=true))
+sol_laml = solve(prob, LAML(maxiters=200, verbose=true))
 println("Data loss: ", round(sol_laml.data_loss, digits=2))
 println("EDF: ", round(sol_laml.edf, digits=2))
 ```
@@ -224,11 +224,12 @@ sol_haldane = OrdinaryDiffEq.solve(ODEProblem(chemo_haldane!, u0, tspan), Tsit5(
 data_haldane = max.(hcat(sol_haldane[1,:], sol_haldane[2,:]) .+
                     hcat(0.3 .* randn(length(sol_haldane.t)), 0.1 .* randn(length(sol_haldane.t))), 0.01)
 
-prob_h = PSMProblem(chemostat!, u0, tspan, [BSplineApproximator(:μ, (0.0, 12.0), 10; initial=0.5)];
+prob_h = PSMProblem(chemostat!, u0, tspan,
+    [BSplineApproximator(:μ, (0.0, 12.0), 10; initial=S -> 0.3*S/(2.0+S))];
     data_times=sol_haldane.t, data_values=data_haldane,
     obs_to_state=[1, 2], known_params=(D=0.3, Sin=10.0, Y=0.5), solver=Tsit5())
 
-sol_h = solve(prob_h, LAML(maxiters=100, verbose=false))
+sol_h = solve(prob_h, LAML(maxiters=200, verbose=false))
 
 S_eval_h = range(0.5, 10.0, length=100)
 μ_haldane = [S / (2.0 + S + S^2 / 15.0) for S in S_eval_h]
