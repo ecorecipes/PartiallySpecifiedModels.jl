@@ -320,8 +320,8 @@ prob_cr_unc = PSMProblem(
     obs_to_state=[1, 2], known_params=kp_cr, solver=Tsit5())
 sol_cr_unc = solve(prob_cr_unc, LAML(maxiters=200, verbose=false))
 
-# Increasing + concave
-uf_cr_ic = ShapeConstrainedBSplineApproximator(:f, R_domain, 8, :inc_concave;
+# Increasing + concave (needs more knots to express curvature within the constraint)
+uf_cr_ic = ShapeConstrainedBSplineApproximator(:f, R_domain, 15, :inc_concave;
     initial=0.5)
 prob_cr_ic = PSMProblem(
     ODEProblem(cr_psm!, u0_cr, tspan_cr), [uf_cr_ic];
@@ -377,6 +377,12 @@ The `:inc_concave` constraint prevents the spline from oscillating or
 producing a non-monotone response, while `:inc_zero_left` additionally pins
 f(0) = 0, which is the correct biological boundary condition — no consumption
 when prey are absent.
+
+::: {.callout-note}
+## Knot count for compound constraints
+
+The `:inc_concave` constraint requires **more knots** than `:inc_zero_left` to express curvature. With compound constraints (increasing AND concave), each constraint removes degrees of freedom from the spline, so more knots are needed to retain enough flexibility. Here we use 15 knots for `inc_concave` vs 8 for `inc_zero_left`.
+:::
 
 ## Example 4: Ricker Model (Discrete Time)
 
