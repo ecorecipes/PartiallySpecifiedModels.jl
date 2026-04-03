@@ -211,22 +211,23 @@ Holling Type II
 > systems), we show bootstrap CIs instead. For LAML-based Bayesian CIs,
 > see [Vignette 29: Bootstrap](../29_bootstrap/29_bootstrap.qmd).
 
-The credible band is narrow within the data range and widens outside it,
-reflecting reduced information where the trajectory does not visit.
-Importantly, the true function falls within the 95% band over most of
-the domain — demonstrating near-nominal coverage for LAML-based
-inference on a stable system.
-
 ## Shape-Constrained Fit
 
-Biologically, a Holling Type II functional response is **increasing**
-(more prey → more consumption) and **concave** (consumption saturates at
-high prey density due to handling time). The `:inc_concave` constraint
-enforces both properties simultaneously: $f'(R) \geq 0$ and
-$f''(R) \leq 0$.
+A key biological property of the Holling Type II functional response is
+$f(0) = 0$ — a predator that encounters no prey consumes nothing. The
+unconstrained fit has no such guarantee and can produce a non-zero
+intercept, especially outside the observed data range.
+
+We use the `:inc_zero_left` constraint, which enforces:
+
+1.  **Increasing**: $f'(R) \geq 0$ — more prey means more consumption
+2.  **Zero at origin**: $f(0) = 0$ — no prey means no consumption
+
+This pins the function at the biologically correct anchor point and
+ensures sensible extrapolation below the observed range.
 
 ``` julia
-uf_sc = ShapeConstrainedBSplineApproximator(:f, (0.0, 10.0), 10, :inc_concave;
+uf_sc = ShapeConstrainedBSplineApproximator(:f, (0.0, 10.0), 10, :inc_zero_left;
     initial=1.0)
 
 prob_sc = PSMProblem(rm_psm!, u0, tspan, [uf_sc];
@@ -239,7 +240,7 @@ prob_sc = PSMProblem(rm_psm!, u0, tspan, [uf_sc];
 sol_sc = solve(prob_sc, LAML(maxiters=200, verbose=false));
 ```
 
-    Shape-constrained — data loss: 5.13, EDF: 1.79
+    Shape-constrained — data loss: 5.12, EDF: 2.08
 
 ### Comparison: unconstrained vs shape-constrained
 
@@ -249,8 +250,8 @@ f_sc_vals = [sol_sc.unknown_functions[:f](R) for R in R_grid]
 plot(R_grid, f_true_vals, lw=3, label="True f(R)", color=:black, ls=:dash,
      xlabel="Resource density R", ylabel="f(R)",
      title="Functional Response — Unconstrained vs Constrained", legend=:bottomright)
-plot!(R_grid, f_free_vals, lw=2, label="Unconstrained", color=:teal, alpha=0.7)
-plot!(R_grid, f_sc_vals, lw=2, label="Inc + concave", color=:coral)
+plot!(R_grid, f_free_vals, lw=2, label="Unconstrained (collocation)", color=:teal, alpha=0.7)
+plot!(R_grid, f_sc_vals, lw=2, label="Increasing, f(0)=0", color=:coral)
 vspan!([R_range...], alpha=0.08, color=:steelblue, label="Data range")
 ```
 
@@ -258,10 +259,22 @@ vspan!([R_range...], alpha=0.08, color=:steelblue, label="Data range")
 
 ![](27_predator_prey_files/figure-commonmark/fig-comparison-function-output-1.svg)
 
-Figure 4: Recovered functional response: unconstrained vs
-shape-constrained (increasing + concave)
+Figure 4: Recovered functional response: unconstrained collocation vs
+shape-constrained (increasing, f(0)=0)
 
 </div>
+
+> [!TIP]
+>
+> ### Extrapolation and shape constraints
+>
+> Notice how the unconstrained fit deviates from the true function
+> **outside the observed data range** (the shaded region) — it may
+> predict a non-zero intercept at R=0 or curve in the wrong direction at
+> low R. The shape-constrained fit, by pinning $f(0) = 0$ and enforcing
+> monotonicity, gives physically sensible behaviour everywhere. This is
+> the key advantage of incorporating biological prior knowledge via
+> shape constraints.
 
 The shape constraint regularises the estimate outside the data range:
 the unconstrained fit may develop wiggles or non-monotonicity at extreme
@@ -405,7 +418,7 @@ Figure 8: Four-panel diagnostic plots for the unconstrained LAML fit
 
 | Aspect | Unconstrained | Shape-Constrained |
 |----|----|----|
-| **Approximator** | `BSplineApproximator` (10 knots) | `ShapeConstrainedBSplineApproximator` (10 knots, `:inc_concave`) |
+| **Approximator** | `BSplineApproximator` (10 knots) | `ShapeConstrainedBSplineApproximator` (10 knots, `:inc_zero_left`) |
 | **Biological constraint** | None | $f'(R) \geq 0$ and $f''(R) \leq 0$ |
 | **Bayesian CI** | LAML posterior (near-nominal coverage) | — |
 | **Bootstrap CI** | — | 95% parametric bootstrap (50 replicates) |
@@ -416,9 +429,10 @@ Figure 8: Four-panel diagnostic plots for the unconstrained LAML fit
 - The PSM successfully recovers the Holling Type II functional response
   $f(R) = aR/(1 + ahR)$ from noisy two-species time series data, without
   assuming any parametric form.
-- The `:inc_concave` shape constraint encodes the biological expectation
-  of a saturating functional response, improving extrapolation and
-  regularising the fit outside the data range.
+- The `:inc_zero_left` shape constraint pins $f(0) = 0$ (no prey → no
+  consumption) and enforces monotonicity, dramatically improving
+  extrapolation below the observed data range compared to the
+  unconstrained fit.
 - **LAML Bayesian credible bands** provide fast, analytic uncertainty
   quantification with near-nominal coverage for the unknown function —
   ideal when the model approaches a stable equilibrium.
