@@ -821,7 +821,25 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         println("Final θ: ", [round(t, sigdigits=4) for t in theta])
     end
 
+    # Compute Bayesian posterior covariance V_β = (J'WJ + S^λ)⁻¹
+    # This gives "across-the-function" CIs with near-nominal coverage
+    # (Nychka 1988, Wood 2006 §4.8)
+    V_beta = try
+        inv(cholesky(Symmetric(H_final)))
+    catch
+        try; inv(Symmetric(H_final)); catch; nothing; end
+    end
+
+    # Estimate σ² for Gaussian (needed for CI scaling)
+    sigma2_hat = if prob.likelihood isa Gaussian
+        data_loss / max(n_data - edf, 1.0)
+    else
+        1.0  # non-Gaussian: V_β already on natural scale
+    end
+
+    convergence_info = (V_beta=V_beta, sigma2=sigma2_hat)
+
     PSMSolution(params, obj_val, data_loss, edf, copy(theta),
                 Float64.(pred), Float64.(prob.data_values),
-                Float64.(prob.data_times), uf_evals, nothing)
+                Float64.(prob.data_times), uf_evals, convergence_info)
 end

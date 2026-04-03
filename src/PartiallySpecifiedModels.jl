@@ -136,6 +136,7 @@ export optimize_spde_range, with_range_param
 export residual_diagnostics, durbin_watson, residual_acf, semivariogram
 export appraise, deviance_residuals
 export bootstrap, BootstrapResult
+export confidence_band
 
 # Re-export common ODE solvers and problem types
 using OrdinaryDiffEq: Tsit5, BS3, Vern7, Vern9, TRBDF2
