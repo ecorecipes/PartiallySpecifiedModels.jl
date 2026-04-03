@@ -133,7 +133,7 @@ transients (like the initial growth phase here), most observations fall
 near equilibrium, giving collocation less information about $f(N)$ at
 low densities:
 
-    CollocationLAML — Data loss: 613.4, EDF: 10.0
+    CollocationLAML — Data loss: 613.2, EDF: 10.0
 
 ### Compare fitted trajectories
 
