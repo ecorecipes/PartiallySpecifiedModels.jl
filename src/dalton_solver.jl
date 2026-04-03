@@ -291,7 +291,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
         offset_acc += np
     end
 
-    smooth_lambda = 0.1 / max(obs_var, 1e-6)
+    n_smooth = length(smooth_mats)
+    smooth_lambdas = fill(0.1 / max(obs_var, 1e-6), n_smooth)
 
     # ── Objective: negative DALTON log-likelihood + penalty ──
 
@@ -313,9 +314,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
                 return 1e10
             end
 
-            # Reject numerically extreme DALTON loglik arising from explosive
-            # ODE dynamics — a real conditional loglik cannot exceed about
-            # n_obs * max_per_obs, so any value far above that is numerical noise.
             n_data = size(prob.data_values, 1) * size(prob.data_values, 2)
             if ll > 100.0 * max(n_data, 1)
                 return 1e10
@@ -323,10 +321,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
 
             # Smoothing penalty for B-splines
             penalty = 0.0
-            for (S, off) in zip(smooth_mats, smooth_offsets)
+            for (k, (S, off)) in enumerate(zip(smooth_mats, smooth_offsets))
                 np = size(S, 1)
                 β_k = β_[off+1:off+np]
-                penalty += smooth_lambda * dot(β_k, S * β_k)
+                penalty += smooth_lambdas[k] * dot(β_k, S * β_k)
             end
 
             return -ll + penalty
@@ -399,6 +397,77 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
     if verbose
         @printf("  Converged: %s\n", Optim.converged(result))
         @printf("  Final -loglik: %.5g\n", Optim.minimum(result))
+    end
+
+    # ── Fellner-Schall λ refinement (autodiff Jacobian) ──
+    if n_smooth > 0
+        for fs_cycle in 1:3
+            function pred_vec_d(β_)
+                p_ = build_autodiff_param_struct(prob, β_)
+                u0_ = prob.u0 isa Function ? prob.u0(p_) : prob.u0
+                ode_fn = ODEFunction{true, SciMLBase.FullSpecialize}(
+                    (du, u, params, t) -> prob.dynamics!(du, u, p_, t))
+                sol_ad = OrdinaryDiffEq.solve(
+                    ODEProblem(ode_fn, eltype(β_).(u0_), prob.tspan, nothing),
+                    prob.ode_solver;
+                    saveat=prob.data_times, abstol=1e-7, reltol=1e-7,
+                    maxiters=100000, verbose=false)
+                pred = eltype(β_)[]
+                for j in 1:n_obs
+                    sk = prob.obs_to_state[j]
+                    for i in 1:n_t
+                        push!(pred, i <= length(sol_ad.t) ? sol_ad[sk, i] : eltype(β_)(0))
+                    end
+                end
+                pred
+            end
+
+            J_ad = try
+                ForwardDiff.jacobian(pred_vec_d, beta_opt)
+            catch
+                pred_b = pred_vec_d(beta_opt)
+                nd = length(pred_b)
+                J_fd = zeros(nd, n_beta)
+                for j in 1:n_beta
+                    bp = copy(beta_opt); bp[j] += 1e-6
+                    J_fd[:, j] .= (pred_vec_d(bp) .- pred_b) ./ 1e-6
+                end
+                J_fd
+            end
+
+            y_vec = Float64[prob.data_values[i, j] for j in 1:n_obs for i in 1:n_t]
+            mu_vec = Float64.(pred_vec_d(beta_opt))
+            n_data = length(y_vec)
+            JWJ = J_ad' * J_ad
+            σ²_hat = sum((y_vec .- mu_vec).^2) / max(n_data - sum(s -> size(s,1), smooth_mats), 1.0)
+
+            for (k, (S, off)) in enumerate(zip(smooth_mats, smooth_offsets))
+                np_k = size(S, 1)
+                β_k = beta_opt[off+1:off+np_k]
+                bSb = max(dot(β_k, S * β_k), 1e-20)
+                S_full = zeros(n_beta, n_beta)
+                for (kk, (Sk, offk)) in enumerate(zip(smooth_mats, smooth_offsets))
+                    npk = size(Sk, 1); idx = (offk+1):(offk+npk)
+                    S_full[idx, idx] .+= smooth_lambdas[kk] .* Sk
+                end
+                H_hat = JWJ + S_full
+                maxd = maximum(abs.(diag(H_hat)))
+                for i in 1:n_beta; H_hat[i,i] += 1e-12*maxd; end
+                H_inv = try; inv(cholesky(Symmetric(H_hat))); catch; pinv(H_hat); end
+                idx_k = (off+1):(off+np_k)
+                edf_k = clamp(tr(H_inv[idx_k, idx_k] * JWJ[idx_k, idx_k]), 0.01, np_k - 0.01)
+                smooth_lambdas[k] = clamp(σ²_hat * edf_k / bSb, exp(RHO_MIN), exp(RHO_MAX))
+            end
+
+            if verbose; @printf("  FS cycle %d: λ = %s\n", fs_cycle, round.(smooth_lambdas, sigdigits=3)); end
+
+            result_re = Optim.optimize(neg_loglik, fd_gradient, beta_opt,
+                Optim.LBFGS(linesearch=LineSearches.BackTracking()),
+                Optim.Options(iterations=alg.maxiters ÷ 2, g_tol=1e-6, f_reltol=1e-10, show_trace=false);
+                inplace=false)
+            beta_opt = Optim.minimizer(result_re)
+        end
+        if verbose; @printf("  Final λ: %s\n", round.(smooth_lambdas, sigdigits=3)); end
     end
 
     # ── Build solution ──
@@ -508,7 +577,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
         -Optim.minimum(result),           # objective (loglik)
         data_loss,
         edf,
-        Float64[],                         # smoothing_params (not applicable)
+        Float64.(smooth_lambdas),            # smoothing_params (Fellner-Schall)
         pred,
         Float64.(prob.data_values),
         Float64.(prob.data_times),

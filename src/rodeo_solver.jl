@@ -126,8 +126,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
         offset_acc += np
     end
 
-    # Auto-scale smoothing from data variance
-    smooth_lambda = 0.1 / max(obs_var, 1e-6)
+    # Initialize per-term smoothing parameters
+    n_smooth = length(smooth_mats)
+    smooth_lambdas = fill(0.1 / max(obs_var, 1e-6), n_smooth)
 
     # Optimization: maximize loglikelihood w.r.t. beta
     function neg_loglik(β_)
@@ -146,10 +147,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
 
             # Add smoothing penalty for B-splines
             penalty = 0.0
-            for (S, off) in zip(smooth_mats, smooth_offsets)
+            for (k, (S, off)) in enumerate(zip(smooth_mats, smooth_offsets))
                 np = size(S, 1)
                 β_k = β_[off+1:off+np]
-                penalty += smooth_lambda * dot(β_k, S * β_k)
+                penalty += smooth_lambdas[k] * dot(β_k, S * β_k)
             end
 
             return -ll + penalty
@@ -221,6 +222,105 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
     if verbose
         println("  Converged: $(Optim.converged(result))")
         println("  Final -loglik: $(round(Optim.minimum(result), sigdigits=5))")
+    end
+
+    # ── Fellner-Schall λ refinement ──────────────────────────────
+    # After optimizing β with heuristic λ, estimate λ properly via
+    # the Fellner-Schall update from the LAML machinery, then re-optimize.
+    # This alternating approach typically converges in 2-3 outer cycles.
+    if n_smooth > 0
+        for fs_cycle in 1:3
+            # Compute Jacobian of predictions w.r.t. β via ForwardDiff
+            function pred_vec(β_)
+                p_ = build_autodiff_param_struct(prob, β_)
+                u0_ = prob.u0 isa Function ? prob.u0(p_) : prob.u0
+                ode_fn = ODEFunction{true, SciMLBase.FullSpecialize}(
+                    (du, u, params, t) -> prob.dynamics!(du, u, p_, t))
+                sol_ad = OrdinaryDiffEq.solve(
+                    ODEProblem(ode_fn, eltype(β_).(u0_), prob.tspan, nothing),
+                    prob.ode_solver;
+                    saveat=prob.data_times, abstol=1e-7, reltol=1e-7,
+                    maxiters=100000, verbose=false)
+                pred = eltype(β_)[]
+                for j in 1:n_obs
+                    sk = prob.obs_to_state[j]
+                    for i in 1:n_t
+                        push!(pred, i <= length(sol_ad.t) ? sol_ad[sk, i] : eltype(β_)(0))
+                    end
+                end
+                pred
+            end
+
+            J_ad = try
+                ForwardDiff.jacobian(pred_vec, beta_opt)
+            catch
+                # Fallback to FD if autodiff fails
+                pred_base = pred_vec(beta_opt)
+                n_data = length(pred_base)
+                J_fd = zeros(n_data, n_beta)
+                eps_fd = 1e-6
+                for j in 1:n_beta
+                    bp = copy(beta_opt); bp[j] += eps_fd
+                    J_fd[:, j] .= (pred_vec(bp) .- pred_base) ./ eps_fd
+                end
+                J_fd
+            end
+
+            y_vec = Float64[]
+            for j in 1:n_obs, i in 1:n_t
+                push!(y_vec, prob.data_values[i, j])
+            end
+            mu_vec = Float64.(pred_vec(beta_opt))
+            n_data = length(y_vec)
+
+            # Fellner-Schall update for each smooth term
+            JWJ = J_ad' * J_ad
+            σ²_hat = sum((y_vec .- mu_vec).^2) / max(n_data - sum(s -> size(s,1), smooth_mats), 1.0)
+
+            for (k, (S, off)) in enumerate(zip(smooth_mats, smooth_offsets))
+                np_k = size(S, 1)
+                β_k = beta_opt[off+1:off+np_k]
+                bSb = max(dot(β_k, S * β_k), 1e-20)
+
+                # Build full penalty at current λ
+                S_full = zeros(n_beta, n_beta)
+                for (kk, (Sk, offk)) in enumerate(zip(smooth_mats, smooth_offsets))
+                    npk = size(Sk, 1)
+                    idx = (offk+1):(offk+npk)
+                    S_full[idx, idx] .+= smooth_lambdas[kk] .* Sk
+                end
+                H_hat = JWJ + S_full
+                maxd = maximum(abs.(diag(H_hat)))
+                for i in 1:n_beta; H_hat[i,i] += 1e-12*maxd; end
+                H_inv = try; inv(cholesky(Symmetric(H_hat))); catch; pinv(H_hat); end
+
+                # EDF for this term
+                idx_k = (off+1):(off+np_k)
+                edf_k = tr(H_inv[idx_k, idx_k] * JWJ[idx_k, idx_k])
+                edf_k = clamp(edf_k, 0.01, np_k - 0.01)
+
+                # Fellner-Schall: λ_new = σ̂² * edf / (β'Sβ)
+                λ_new = σ²_hat * edf_k / bSb
+                smooth_lambdas[k] = clamp(λ_new, exp(RHO_MIN), exp(RHO_MAX))
+            end
+
+            if verbose
+                println("  FS cycle $fs_cycle: λ = $(round.(smooth_lambdas, sigdigits=3))")
+            end
+
+            # Re-optimize β with updated λ
+            result_re = Optim.optimize(
+                neg_loglik, fd_gradient, beta_opt,
+                Optim.LBFGS(linesearch=LineSearches.BackTracking()),
+                Optim.Options(iterations=alg.maxiters ÷ 2, g_tol=1e-6,
+                              f_reltol=1e-10, show_trace=false);
+                inplace=false)
+            beta_opt = Optim.minimizer(result_re)
+        end
+
+        if verbose
+            println("  Final λ after FS: $(round.(smooth_lambdas, sigdigits=3))")
+        end
     end
 
     # Build solution
@@ -320,7 +420,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
         -Optim.minimum(result),           # objective (loglik)
         data_loss,                        # data_loss
         edf,                              # edf
-        Float64[],                        # smoothing_params (not applicable)
+        Float64.(smooth_lambdas),           # smoothing_params (Fellner-Schall)
         pred,                             # fitted_values
         Float64.(prob.data_values),       # data_values
         Float64.(prob.data_times),        # data_times
