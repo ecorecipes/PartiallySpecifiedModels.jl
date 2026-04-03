@@ -224,16 +224,16 @@ function bh_psm!(u_next, u, p, t)
     u_next[1] = p.f(N)
 end
 
-uf_bh = BSplineApproximator(:f, (0.0, 600.0), 12;
-                              initial=x -> x)  # identity initial
+uf_bh = BSplineApproximator(:f, (0.0, 600.0), 10;
+                              initial=N -> 2.0 * N / (1.0 + N / 600.0))
 
-prob_bh = PSMProblem(
-    DiscreteProblem(bh_psm!, N0_bh, tspan_bh),
-    [uf_bh];
+prob_bh = PSMProblem(bh_psm!, N0_bh, tspan_bh, [uf_bh];
     data_times=times_bh,
-    data_values=reshape(data_bh, :, 1))
+    data_values=reshape(data_bh, :, 1),
+    obs_to_state=[1], known_params=NamedTuple(),
+    discrete=true)
 
-sol_adam = solve(prob_bh, AdamSolver(maxiters=500, lr=0.005, verbose=false))
+sol_adam = solve(prob_bh, AdamSolver(maxiters=3000, lr=0.01, verbose=false))
 println("Adam — Data loss: $(round(sol_adam.data_loss, sigdigits=4))")
 ```
 
@@ -241,7 +241,7 @@ println("Adam — Data loss: $(round(sol_adam.data_loss, sigdigits=4))")
 
 ```{julia}
 #| echo: false
-sol_bh_laml = solve(prob_bh, LAML(maxiters=80, verbose=false))
+sol_bh_laml = solve(prob_bh, LAML(maxiters=200, verbose=false))
 println("LAML — Data loss: $(round(sol_bh_laml.data_loss, sigdigits=4))")
 ```
 
