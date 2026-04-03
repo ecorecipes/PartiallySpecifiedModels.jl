@@ -54,6 +54,10 @@ using Random
 Random.seed!(42)
 ```
 
+    Precompiling packages...
+      22921.2 ms  ✓ PartiallySpecifiedModels
+      1 dependency successfully precompiled in 54 seconds. 387 already precompiled.
+
     TaskLocalRNG()
 
 ## Logistic Growth with Unknown Per-Capita Rate
@@ -125,8 +129,8 @@ sol_laml = solve(prob, LAML(maxiters=100, verbose=false));
 sol_rodeo = solve(prob, RodeoSolver(n_steps=200, method=:fenrir, maxiters=500, verbose=false));
 ```
 
-    DaltonSolver: SS=0.1548, r(5)=0.233
-    RodeoSolver:  SS=0.1548, r(5)=0.233
+    DaltonSolver: SS=0.1546, r(5)=0.231
+    RodeoSolver:  SS=0.1588, r(5)=0.24
     LAML:         SS=0.1997, EDF=2.0, r(5)=0.25
     True r(5) = 0.25
 
@@ -168,7 +172,22 @@ Figure 4: Residuals by solver
 | **Likelihood** | Gaussian residuals | Fenrir marginal | DALTON data-adaptive |
 | **Uncertainty** | EDF-based | State covariance | State covariance |
 | **Discretization** | Adaptive step | Fixed grid | Fixed grid |
-| **Smoothing** | LAML (Fellner-Schall) | B-spline penalty | B-spline penalty |
+| **Smoothing λ** | LAML (Fellner-Schall) — data-driven | Heuristic (0.1/σ²) | Heuristic (0.1/σ²) |
+
+> [!NOTE]
+>
+> ### Smoothing parameter selection
+>
+> Unlike LAML, which estimates the smoothing parameter λ via marginal
+> likelihood (Fellner-Schall iteration), Rodeo and DALTON currently use
+> a heuristic: `λ = 0.1/σ²_obs`. This is a limitation — the smoothing
+> may be too strong or too weak depending on the problem. For better
+> results, you can:
+>
+> 1.  Run LAML first to estimate λ, then use that value to calibrate the
+>     Rodeo/DALTON penalty
+> 2.  Profile over λ by running multiple fits and selecting the one with
+>     the best probabilistic marginal likelihood
 
 ### Why DALTON and Rodeo look identical here
 
@@ -308,7 +327,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](18_dalton_files/figure-commonmark/cell-15-output-1.svg)
 
-    Durbin-Watson: 2.324
+    Durbin-Watson: 2.326
 
 ## Summary
 
