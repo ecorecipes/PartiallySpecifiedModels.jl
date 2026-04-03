@@ -1,6 +1,6 @@
 # GCV Smoothing Parameter Selection
 Simon Frost
-2026-04-02
+2026-04-03
 
 - [Overview](#overview)
 - [Logistic Growth with Unknown Per-Capita
@@ -32,13 +32,8 @@ using PartiallySpecifiedModels
 using OrdinaryDiffEq
 using Plots
 using Random
-Random.seed!(123)
+Random.seed!(42)
 ```
-
-    Precompiling packages...
-        PartiallySpecifiedModels Being precompiled by another process (pid: 36853, pidfile: /Users/username/.julia/compiled/v1.12/PartiallySpecifiedModels/tWtwA_lLwID.ji.pidfile)
-      19702.6 ms  ✓ PartiallySpecifiedModels
-      1 dependency successfully precompiled in 32 seconds. 387 already precompiled.
 
     TaskLocalRNG()
 
@@ -63,41 +58,41 @@ data_matrix = reshape(max.(data_N, 0.01), :, 1)
 ```
 
     31×1 Matrix{Float64}:
-      0.9354269327896023
-      1.1022379499081711
-      1.3859208539670416
-      1.8825231543204026
-      2.3689191995037016
-      2.892534072992916
-      3.33227680373001
-      4.055139873380624
-      4.374401031201666
-      5.173094818257388
+      1.0788355601604291
+      1.1605772282016233
+      1.4609018803046872
+      1.830964168555268
+      2.2494751109754154
+      2.787177904975914
+      3.232988782145511
+      3.9633895011880202
+      4.652430282861129
+      5.0964616704520465
       ⋮
-      9.517594615011413
-      9.760412380623237
-      9.79268472010831
-      9.856463164828625
-      9.872187590739777
-      9.935785227284114
-      9.903174071008431
-     10.115692712241504
-      9.998761920177897
+      9.674117688772498
+      9.568487749761156
+      9.803623047868273
+      9.768192642939432
+      9.931372584493301
+     10.029457191674403
+      9.852147135390531
+      9.835900079757396
+     10.031178231752104
 
 ## GCV vs LAML Comparison
 
 ``` julia
-uf = BSplineApproximator(:r, (0.0, 12.0), 10)
+uf = BSplineApproximator(:r, (0.0, 12.0), 8; initial=x -> 0.3)
 
 prob = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf];
     data_times=t_data, data_values=Float64.(data_matrix),
     obs_to_state=[1], known_params=NamedTuple())
 
-sol_gcv = solve(prob, GCVSolver(maxiters=50, gamma=1.4, verbose=false))
-sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
+sol_gcv = solve(prob, GCVSolver(maxiters=100, gamma=1.4, verbose=false))
+sol_laml = solve(prob, LAML(maxiters=100, verbose=false))
 ```
 
-    PSMSolution((r = [0.5048302484826799, 0.4362630715311124, 0.367642219459838, 0.2990970498832144, 0.231112276182824, 0.16405318966501814, 0.09823441381242196, 0.03393922690935286, -0.029212667929864967, -0.09235165473684903]), 0.1032156623501261, 0.1992839931941202, 3.0733221362588052, [1.4435541602090602], [1.0; 1.2505546606982674; … ; 9.969999186255793; 9.986515470396709;;], [0.9354269327896023; 1.1022379499081711; … ; 10.115692712241504; 9.998761920177897;;], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  10.5, 11.0, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0], Dict{Symbol, Any}(:r => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([0.5048302484826799, 0.4362630715311124, 0.367642219459838, 0.2990970498832144, 0.231112276182824, 0.16405318966501814, 0.09823441381242196, 0.03393922690935286, -0.029212667929864967, -0.09235165473684903], [0.0, 1.3333333333333333, 2.6666666666666665, 4.0, 5.333333333333333, 6.666666666666667, 8.0, 9.333333333333334, 10.666666666666666, 12.0], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 1.3333333333333333, 1.3333333333333333, 1.3333333333333335, 1.333333333333333, 1.333333333333334, 1.333333333333333, 1.333333333333334, 1.3333333333333321, 1.333333333333334], [0.0, -4.233914458022046e-5, -1.1796950689859511e-5, 0.00034495536678612413, 0.000523311565832395, 0.0006859926111071669, 0.0009187664848214652, 0.0007810541542610611, -0.00018437238636796622, 0.0], DataInterpolations.ExtrapolationType.Extension, DataInterpolations.ExtrapolationType.Extension, FindFirstFunctions.Guesser{Vector{Float64}}([0.0, 1.3333333333333333, 2.6666666666666665, 4.0, 5.333333333333333, 6.666666666666667, 8.0, 9.333333333333334, 10.666666666666666, 12.0], Base.RefValue{Int64}(1), true), false, false)), nothing)
+    PSMSolution((r = [0.4621840384496827, 0.4088882414611515, 0.338454048489719, 0.24096482976446115, 0.15748181699676528, 0.07363313127682564, -0.015449720289842483, -0.10133404759389997]), 0.09812306151973041, 0.1805220119946932, 4.547888497127415, [0.02268020450259421], [1.0; 1.2388649924679702; … ; 9.932825811948119; 9.945145919604657;;], [1.0788355601604291; 1.1605772282016233; … ; 9.835900079757396; 10.031178231752104;;], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  10.5, 11.0, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0], Dict{Symbol, Any}(:r => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([0.4621840384496827, 0.4088882414611515, 0.338454048489719, 0.24096482976446115, 0.15748181699676528, 0.07363313127682564, -0.015449720289842483, -0.10133404759389997], [0.0, 1.7142857142857142, 3.4285714285714284, 5.142857142857143, 6.857142857142857, 8.571428571428571, 10.285714285714286, 12.0], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 1.7142857142857142, 1.7142857142857142, 1.7142857142857149, 1.7142857142857135, 1.7142857142857144, 1.7142857142857153, 1.7142857142857135], [0.0, -0.004872893065798407, -0.015499319535229835, 0.011632826959324407, -0.0024359844720455684, -0.0026354713486397576, 0.0022914479295340737, 0.0], DataInterpolations.ExtrapolationType.Extension, DataInterpolations.ExtrapolationType.Extension, FindFirstFunctions.Guesser{Vector{Float64}}([0.0, 1.7142857142857142, 3.4285714285714284, 5.142857142857143, 6.857142857142857, 8.571428571428571, 10.285714285714286, 12.0], Base.RefValue{Int64}(1), true), false, false)), (V_beta = [0.11117158207297874 0.006524041865815616 … -0.004072049359690557 0.00016360295801524328; 0.006524041865815616 0.004507403626320577 … -0.0007839516384248079 9.643071589837435e-6; … ; -0.004072049359690557 -0.0007839516384248079 … 0.0025912387873264445 0.01690764175971608; 0.00016360295801524328 9.643071589837435e-6 … 0.01690764175971608 0.1363024110029373], sigma2 = 0.006824484010476415))
 
 ### Trajectory Fit
 
@@ -136,8 +131,8 @@ println("LAML: data_loss=$(round(sol_laml.data_loss, digits=3)), edf=$(round(sol
         "r(5)=$(round(r_laml(5.0), digits=3)) (true=$(round(r_true(5.0), digits=3)))")
 ```
 
-    GCV:  data_loss=73.522, edf=9.8, r(5)=35.254 (true=0.25)
-    LAML: data_loss=0.199, edf=3.1, r(5)=0.248 (true=0.25)
+    GCV:  data_loss=0.2, edf=2.0, r(5)=0.25 (true=0.25)
+    LAML: data_loss=0.181, edf=4.5, r(5)=0.249 (true=0.25)
 
 ## Effect of GCV Inflation Factor γ
 
@@ -150,7 +145,7 @@ gammas = [1.0, 1.4, 2.0]
 p3 = plot(N_grid, r_true.(N_grid), label="True", lw=2, color=:black,
           xlabel="N", ylabel="r(N)", title="Effect of γ on Smoothing")
 for γ in gammas
-    sol_g = solve(prob, GCVSolver(maxiters=50, gamma=γ, verbose=false))
+    sol_g = solve(prob, GCVSolver(maxiters=100, gamma=γ, verbose=false))
     r_g = sol_g.unknown_functions[:r]
     plot!(p3, N_grid, [r_g(n) for n in N_grid],
           label="γ=$(γ) (edf=$(round(sol_g.edf, digits=1)))", lw=2)
@@ -199,13 +194,22 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](21_gcv_files/figure-commonmark/cell-9-output-1.svg)
 
-    Durbin-Watson: 0.39
+    Durbin-Watson: 1.963
 
 ## When to Use GCV vs LAML
 
-- **GCV** is simpler, faster (no Hessian needed), and works well with
-  abundant data
-- **LAML** is more principled (approximate marginal likelihood), handles
-  complex penalty structures better
-- GCV with $\gamma = 1.4$ often gives similar results to LAML
-- For non-Gaussian likelihoods, LAML is generally preferred
+| Criterion | GCV | LAML |
+|----|----|----|
+| **Speed** | Faster (no Hessian computation) | Slower (Fellner-Schall + Newton) |
+| **Simplicity** | Simpler (golden-section on one λ) | More complex (per-term λ estimation) |
+| **Abundant data** | Works well | Works well |
+| **Sparse data** | Tends to undersmooth | Better (marginal likelihood is more robust) |
+| **Non-Gaussian** | Not recommended | Supported (Poisson, NegBin, etc.) |
+| **Multiple smooth terms** | Single shared λ only | Independent λ per term |
+| **Model selection** | GCV score is comparable across models | LAML value is an approximate marginal likelihood |
+
+**Recommendation**: Use LAML as the default. GCV is useful as a fast
+initial estimate or when you want to cross-check LAML’s smoothing
+parameter selection. The `gamma` inflation factor (default 1.4) guards
+against GCV’s known tendency to undersmooth — increase it if the fit
+looks too wiggly.

@@ -28,7 +28,7 @@ using PartiallySpecifiedModels
 using OrdinaryDiffEq
 using Plots
 using Random
-Random.seed!(123)
+Random.seed!(42)
 ```
 
 ## Logistic Growth with Unknown Per-Capita Rate
@@ -53,14 +53,14 @@ data_matrix = reshape(max.(data_N, 0.01), :, 1)
 ## GCV vs LAML Comparison
 
 ```{julia}
-uf = BSplineApproximator(:r, (0.0, 12.0), 10)
+uf = BSplineApproximator(:r, (0.0, 12.0), 8; initial=x -> 0.3)
 
 prob = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf];
     data_times=t_data, data_values=Float64.(data_matrix),
     obs_to_state=[1], known_params=NamedTuple())
 
-sol_gcv = solve(prob, GCVSolver(maxiters=50, gamma=1.4, verbose=false))
-sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
+sol_gcv = solve(prob, GCVSolver(maxiters=100, gamma=1.4, verbose=false))
+sol_laml = solve(prob, LAML(maxiters=100, verbose=false))
 ```
 
 ### Trajectory Fit
@@ -105,7 +105,7 @@ gammas = [1.0, 1.4, 2.0]
 p3 = plot(N_grid, r_true.(N_grid), label="True", lw=2, color=:black,
           xlabel="N", ylabel="r(N)", title="Effect of γ on Smoothing")
 for γ in gammas
-    sol_g = solve(prob, GCVSolver(maxiters=50, gamma=γ, verbose=false))
+    sol_g = solve(prob, GCVSolver(maxiters=100, gamma=γ, verbose=false))
     r_g = sol_g.unknown_functions[:r]
     plot!(p3, N_grid, [r_g(n) for n in N_grid],
           label="γ=$(γ) (edf=$(round(sol_g.edf, digits=1)))", lw=2)
@@ -153,7 +153,14 @@ println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_wa
 
 ## When to Use GCV vs LAML
 
-- **GCV** is simpler, faster (no Hessian needed), and works well with abundant data
-- **LAML** is more principled (approximate marginal likelihood), handles complex penalty structures better
-- GCV with $\gamma = 1.4$ often gives similar results to LAML
-- For non-Gaussian likelihoods, LAML is generally preferred
+| Criterion | GCV | LAML |
+|-----------|-----|------|
+| **Speed** | Faster (no Hessian computation) | Slower (Fellner-Schall + Newton) |
+| **Simplicity** | Simpler (golden-section on one λ) | More complex (per-term λ estimation) |
+| **Abundant data** | Works well | Works well |
+| **Sparse data** | Tends to undersmooth | Better (marginal likelihood is more robust) |
+| **Non-Gaussian** | Not recommended | Supported (Poisson, NegBin, etc.) |
+| **Multiple smooth terms** | Single shared λ only | Independent λ per term |
+| **Model selection** | GCV score is comparable across models | LAML value is an approximate marginal likelihood |
+
+**Recommendation**: Use LAML as the default. GCV is useful as a fast initial estimate or when you want to cross-check LAML's smoothing parameter selection. The `gamma` inflation factor (default 1.4) guards against GCV's known tendency to undersmooth — increase it if the fit looks too wiggly.
