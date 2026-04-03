@@ -174,7 +174,16 @@ plot(p1, p2, p3, layout=(1, 3), size=(1000, 300), link=:y)
 | **Likelihood** | Gaussian residuals | Fenrir marginal | DALTON data-adaptive |
 | **Uncertainty** | EDF-based | State covariance | State covariance |
 | **Discretization** | Adaptive step | Fixed grid | Fixed grid |
-| **Smoothing** | LAML (Fellner-Schall) | B-spline penalty | B-spline penalty |
+| **Smoothing λ** | LAML (Fellner-Schall) — data-driven | Heuristic (0.1/σ²) | Heuristic (0.1/σ²) |
+
+::: {.callout-note}
+## Smoothing parameter selection
+
+Unlike LAML, which estimates the smoothing parameter λ via marginal likelihood (Fellner-Schall iteration), Rodeo and DALTON currently use a heuristic: `λ = 0.1/σ²_obs`. This is a limitation — the smoothing may be too strong or too weak depending on the problem. For better results, you can:
+
+1. Run LAML first to estimate λ, then use that value to calibrate the Rodeo/DALTON penalty
+2. Profile over λ by running multiple fits and selecting the one with the best probabilistic marginal likelihood
+:::
 
 ### Why DALTON and Rodeo look identical here
 
