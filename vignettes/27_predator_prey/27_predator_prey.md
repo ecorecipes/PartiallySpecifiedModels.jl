@@ -1,6 +1,6 @@
 # Predator-Prey Functional Response with Confidence Intervals
 Simon Frost
-2026-04-02
+2026-04-03
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -8,11 +8,11 @@ Simon Frost
   - [Parameters](#parameters)
   - [Generate data](#generate-data)
 - [The PSM Model](#the-psm-model)
-- [Unconstrained Fit with LAML](#unconstrained-fit-with-laml)
+- [Unconstrained Fit with
+  Collocation](#unconstrained-fit-with-collocation)
   - [Fitted trajectories](#fitted-trajectories)
   - [Recovered functional response](#recovered-functional-response)
-- [Bayesian Credible Bands from
-  LAML](#bayesian-credible-bands-from-laml)
+- [Bayesian Credible Bands](#bayesian-credible-bands)
 - [Shape-Constrained Fit](#shape-constrained-fit)
   - [Comparison: unconstrained vs
     shape-constrained](#comparison-unconstrained-vs-shape-constrained)
@@ -153,10 +153,14 @@ end
 
     rm_psm! (generic function with 1 method)
 
-## Unconstrained Fit with LAML
+## Unconstrained Fit with Collocation
 
-We first fit the model with an unconstrained B-spline approximator (10
-knots) and LAML for automatic smoothing parameter selection.
+For systems where the ODE is strongly coupled to the unknown function
+(so that small changes in $f$ produce large trajectory changes), the
+**collocation approach** (`CollocationLAML`) is more robust than direct
+integration (`LAML`). It treats state values at observation times as
+free parameters and penalises deviations from the ODE, following Ramsay
+et al. (2007) and Fasiolo, Pya & Wood (2016).
 
 ``` julia
 uf_free = BSplineApproximator(:f, (0.0, 10.0), 10; initial=R -> 0.5 * R)
@@ -168,10 +172,13 @@ prob_free = PSMProblem(rm_psm!, u0, tspan, [uf_free];
     likelihood=Gaussian(),
     solver=Tsit5())
 
-sol_free = solve(prob_free, LAML(maxiters=200, verbose=false));
+sol_free = solve(prob_free, CollocationLAML(
+    maxiters=30, verbose=false,
+    lambda_ode_start=0.1, lambda_ode_end=1e4,
+    n_continuation=6));
 ```
 
-    Unconstrained — data loss: 6.33, EDF: 5.01
+    Unconstrained — data loss: 5.04, EDF: 10.0
 
 ### Fitted trajectories
 
@@ -194,44 +201,15 @@ Holling Type II
 
 </div>
 
-## Bayesian Credible Bands from LAML
+## Bayesian Credible Bands
 
-The LAML fit provides a posterior covariance
-$V_\beta = \hat\sigma^2 (J^\top W J + S^\lambda)^{-1}$ for the spline
-coefficients. The `confidence_band` function uses this to compute
-pointwise credible bands for the unknown function. These
-“across-the-function” intervals (Nychka 1988; Wood 2006 §4.8) account
-for smoothing uncertainty and typically achieve **near-nominal
-coverage**, unlike bootstrap CIs which only capture sampling
-variability.
-
-``` julia
-bands = confidence_band(sol_free, prob_free; level=0.95)
-```
-
-    Dict{Symbol, @NamedTuple{grid::Vector{Float64}, fitted::Vector{Float64}, lower::Vector{Float64}, upper::Vector{Float64}, se::Vector{Float64}}} with 1 entry:
-      :f => (grid = [0.0, 0.10101, 0.20202, 0.30303, 0.40404, 0.505051, 0.606061, 0…
-
-``` julia
-cb = bands[:f]
-
-plot(cb.grid, cb.lower, fillrange=cb.upper,
-     fillalpha=0.2, color=:teal, label="95% credible band", ls=:dot, lw=0)
-plot!(cb.grid, cb.fitted, lw=2, label="LAML estimate", color=:teal)
-plot!(R_grid, f_true_vals, lw=3, label="True f(R)", color=:black, ls=:dash,
-      xlabel="Resource density R", ylabel="f(R)",
-      title="Functional Response — LAML Bayesian CI", legend=:bottomright)
-vspan!([R_range...], alpha=0.08, color=:steelblue, label="Data range")
-```
-
-<div id="fig-laml-ci">
-
-![](27_predator_prey_files/figure-commonmark/fig-laml-ci-output-1.svg)
-
-Figure 4: Bayesian 95% credible band from LAML posterior for the
-functional response
-
-</div>
+> [!NOTE]
+>
+> Bayesian credible bands from the LAML posterior covariance
+> (`confidence_band()`) require a standard `LAML`-fitted solution. Since
+> we use `CollocationLAML` above (which is more robust for coupled
+> systems), we show bootstrap CIs instead. For LAML-based Bayesian CIs,
+> see [Vignette 29: Bootstrap](../29_bootstrap/29_bootstrap.qmd).
 
 The credible band is narrow within the data range and widens outside it,
 reflecting reduced information where the trajectory does not visit.
@@ -280,7 +258,7 @@ vspan!([R_range...], alpha=0.08, color=:steelblue, label="Data range")
 
 ![](27_predator_prey_files/figure-commonmark/fig-comparison-function-output-1.svg)
 
-Figure 5: Recovered functional response: unconstrained vs
+Figure 4: Recovered functional response: unconstrained vs
 shape-constrained (increasing + concave)
 
 </div>
@@ -294,7 +272,7 @@ shape.
 
 ![](27_predator_prey_files/figure-commonmark/fig-comparison-trajectory-output-1.svg)
 
-Figure 6: Fitted trajectories: unconstrained vs shape-constrained
+Figure 5: Fitted trajectories: unconstrained vs shape-constrained
 
 </div>
 
@@ -336,7 +314,7 @@ plot(p1, p2, layout=(1, 2), size=(800, 350))
 
 ![](27_predator_prey_files/figure-commonmark/fig-bootstrap-trajectory-output-1.svg)
 
-Figure 7: Fitted trajectories with 95% bootstrap confidence intervals
+Figure 6: Fitted trajectories with 95% bootstrap confidence intervals
 (shape-constrained)
 
 </div>
@@ -361,7 +339,7 @@ vspan!([R_range...], alpha=0.08, color=:steelblue, label="Data range")
 
 ![](27_predator_prey_files/figure-commonmark/fig-bootstrap-function-output-1.svg)
 
-Figure 8: Recovered functional response with 95% bootstrap confidence
+Figure 7: Recovered functional response with 95% bootstrap confidence
 interval
 
 </div>
@@ -417,11 +395,11 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](27_predator_prey_files/figure-commonmark/fig-diagnostics-output-1.svg)
 
-Figure 9: Four-panel diagnostic plots for the unconstrained LAML fit
+Figure 8: Four-panel diagnostic plots for the unconstrained LAML fit
 
 </div>
 
-    Durbin-Watson: 1.196, 1.73
+    Durbin-Watson: 1.589, 2.0
 
 ## Summary
 
