@@ -312,30 +312,31 @@ R_domain = (0.0, 22.0)
 kp_cr = (a=0.5, R0=20.0, ε=0.4, d=0.3)
 
 # Unconstrained
-uf_cr_unc = BSplineApproximator(:f, R_domain, 8; initial=1.0)
+uf_cr_unc = BSplineApproximator(:f, R_domain, 8;
+    initial=R -> v_max * R / (K_m + R + 1.0))
 prob_cr_unc = PSMProblem(
     ODEProblem(cr_psm!, u0_cr, tspan_cr), [uf_cr_unc];
     data_times=data_times_cr, data_values=data_cr,
     obs_to_state=[1, 2], known_params=kp_cr, solver=Tsit5())
-sol_cr_unc = solve(prob_cr_unc, LAML(maxiters=100, verbose=false))
+sol_cr_unc = solve(prob_cr_unc, LAML(maxiters=200, verbose=false))
 
 # Increasing + concave
 uf_cr_ic = ShapeConstrainedBSplineApproximator(:f, R_domain, 8, :inc_concave;
-    initial=1.0)
+    initial=0.5)
 prob_cr_ic = PSMProblem(
     ODEProblem(cr_psm!, u0_cr, tspan_cr), [uf_cr_ic];
     data_times=data_times_cr, data_values=data_cr,
     obs_to_state=[1, 2], known_params=kp_cr, solver=Tsit5())
-sol_cr_ic = solve(prob_cr_ic, LAML(maxiters=100, verbose=false))
+sol_cr_ic = solve(prob_cr_ic, LAML(maxiters=200, verbose=false))
 
 # Increasing + zero at left
 uf_cr_izl = ShapeConstrainedBSplineApproximator(:f, R_domain, 8, :inc_zero_left;
-    initial=R -> v_max * R / (K_m + R))
+    initial=0.5)
 prob_cr_izl = PSMProblem(
     ODEProblem(cr_psm!, u0_cr, tspan_cr), [uf_cr_izl];
     data_times=data_times_cr, data_values=data_cr,
     obs_to_state=[1, 2], known_params=kp_cr, solver=Tsit5())
-sol_cr_izl = solve(prob_cr_izl, LAML(maxiters=100, verbose=false))
+sol_cr_izl = solve(prob_cr_izl, LAML(maxiters=200, verbose=false))
 ```
 
 ### Results
