@@ -1846,4 +1846,140 @@ using OrdinaryDiffEq
         end
     end
 
+    # ─── New solver tests ─────────────────────────────────────────────
+
+    @testset "IntegralMatchingSolver — logistic growth" begin
+        r_im(N) = 0.5 * (1.0 - N / 10.0)
+        function logistic_im!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+        end
+        rng_im = Random.Xoshiro(42)
+        sol_true_im = OrdinaryDiffEq.solve(
+            ODEProblem(logistic_im!, [1.0], (0.0, 15.0), (; r=r_im)),
+            Tsit5(); saveat=0.5)
+        t_im = collect(sol_true_im.t)
+        data_im = [sol_true_im.u[i][1] + 0.1*randn(rng_im) for i in 1:length(t_im)]
+
+        uf_im = BSplineApproximator(:r, (0.0, 12.0), 8)
+        prob_im = PSMProblem(logistic_im!, [1.0], (0.0, 15.0), [uf_im];
+            data_times=t_im, data_values=reshape(max.(data_im, 0.01), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_im = solve(prob_im, IntegralMatchingSolver(maxiters=500, verbose=false))
+
+        @test sol_im isa PSMSolution
+        @test isfinite(sol_im.data_loss)
+        @test isfinite(sol_im.objective)
+        @test haskey(sol_im.unknown_functions, :r)
+        @test sol_im.convergence.method == :integral_matching
+    end
+
+    @testset "EnsembleKalmanSolver — exponential decay" begin
+        function decay_ek!(du, u, p, t)
+            du[1] = -p.f(u[1])
+        end
+        rng_ek = Random.Xoshiro(42)
+        sol_true_ek = OrdinaryDiffEq.solve(
+            ODEProblem(decay_ek!, [5.0], (0.0, 10.0), (; f=x -> 0.5*x)),
+            Tsit5(); saveat=0.5)
+        t_ek = collect(sol_true_ek.t)
+        data_ek = [sol_true_ek.u[i][1] + 0.05*randn(rng_ek) for i in 1:length(t_ek)]
+
+        uf_ek = BSplineApproximator(:f, (0.0, 6.0), 6)
+        prob_ek = PSMProblem(decay_ek!, [5.0], (0.0, 10.0), [uf_ek];
+            data_times=t_ek, data_values=reshape(max.(data_ek, 0.01), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_ek = solve(prob_ek, EnsembleKalmanSolver(n_ensemble=30, n_iterations=15, verbose=false))
+
+        @test sol_ek isa PSMSolution
+        @test isfinite(sol_ek.data_loss)
+        @test haskey(sol_ek.unknown_functions, :f)
+        @test sol_ek.convergence.method == :ensemble_kalman
+        @test haskey(sol_ek.convergence, :ensemble_std)
+    end
+
+    @testset "ODINSolver — logistic growth" begin
+        r_od(N) = 0.5 * (1.0 - N / 10.0)
+        function logistic_od!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+        end
+        rng_od = Random.Xoshiro(123)
+        sol_true_od = OrdinaryDiffEq.solve(
+            ODEProblem(logistic_od!, [1.0], (0.0, 15.0), (; r=r_od)),
+            Tsit5(); saveat=0.5)
+        t_od = collect(sol_true_od.t)
+        data_od = [sol_true_od.u[i][1] + 0.1*randn(rng_od) for i in 1:length(t_od)]
+
+        uf_od = BSplineApproximator(:r, (0.0, 12.0), 8)
+        prob_od = PSMProblem(logistic_od!, [1.0], (0.0, 15.0), [uf_od];
+            data_times=t_od, data_values=reshape(max.(data_od, 0.01), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_od = solve(prob_od, ODINSolver(maxiters=20, verbose=false))
+
+        @test sol_od isa PSMSolution
+        @test isfinite(sol_od.objective)
+        @test haskey(sol_od.unknown_functions, :r)
+        @test sol_od.convergence.method == :odin
+    end
+
+    @testset "RKHSSolver — exponential decay" begin
+        function decay_rk!(du, u, p, t)
+            du[1] = -p.f(u[1])
+        end
+        rng_rk = Random.Xoshiro(42)
+        sol_true_rk = OrdinaryDiffEq.solve(
+            ODEProblem(decay_rk!, [5.0], (0.0, 10.0), (; f=x -> 0.5*x)),
+            Tsit5(); saveat=0.5)
+        t_rk = collect(sol_true_rk.t)
+        data_rk = [sol_true_rk.u[i][1] + 0.05*randn(rng_rk) for i in 1:length(t_rk)]
+
+        uf_rk = BSplineApproximator(:f, (0.0, 6.0), 6)
+        prob_rk = PSMProblem(decay_rk!, [5.0], (0.0, 10.0), [uf_rk];
+            data_times=t_rk, data_values=reshape(max.(data_rk, 0.01), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_rk = solve(prob_rk, RKHSSolver(maxiters=500, n_repr_points=10,
+                                            kernel=:rbf, verbose=false))
+
+        @test sol_rk isa PSMSolution
+        @test isfinite(sol_rk.objective)
+        @test haskey(sol_rk.unknown_functions, :f)
+        @test sol_rk.convergence.method == :rkhs
+        @test sol_rk.convergence.kernel == :rbf
+    end
+
+    @testset "ProfileLikelihoodSolver — logistic growth" begin
+        r_pl(N) = 0.5 * (1.0 - N / 10.0)
+        function logistic_pl!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+        end
+        rng_pl = Random.Xoshiro(42)
+        sol_true_pl = OrdinaryDiffEq.solve(
+            ODEProblem(logistic_pl!, [1.0], (0.0, 15.0), (; r=r_pl)),
+            Tsit5(); saveat=1.0)
+        t_pl = collect(sol_true_pl.t)
+        data_pl = [sol_true_pl.u[i][1] + 0.1*randn(rng_pl) for i in 1:length(t_pl)]
+
+        uf_pl = BSplineApproximator(:r, (0.0, 12.0), 6)
+        prob_pl = PSMProblem(logistic_pl!, [1.0], (0.0, 15.0), [uf_pl];
+            data_times=t_pl, data_values=reshape(max.(data_pl, 0.01), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        # Profile only first 2 parameters to keep test fast
+        sol_pl = solve(prob_pl, ProfileLikelihoodSolver(
+            n_profile_points=10, param_indices=[1, 2], verbose=false))
+
+        @test sol_pl isa PSMSolution
+        @test isfinite(sol_pl.objective)
+        @test sol_pl.convergence.method == :profile_likelihood
+        @test haskey(sol_pl.convergence, :profiles)
+        profiles = sol_pl.convergence.profiles
+        @test haskey(profiles, 1)
+        @test haskey(profiles, 2)
+        @test length(profiles[1].grid) == 10
+        @test length(profiles[1].ci) == 2
+    end
+
 end

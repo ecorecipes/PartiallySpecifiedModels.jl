@@ -1,0 +1,195 @@
+# Profile Likelihood for Identifiability Analysis
+Simon Frost
+2026-04-04
+
+- [Overview](#overview)
+- [Setup](#setup)
+- [Example: Logistic Growth
+  Identifiability](#example-logistic-growth-identifiability)
+  - [Run Profile Likelihood](#run-profile-likelihood)
+  - [Visualise Profile Likelihood
+    Curves](#visualise-profile-likelihood-curves)
+  - [Interpreting the Profiles](#interpreting-the-profiles)
+- [How It Works](#how-it-works)
+- [Diagnostic Plots](#diagnostic-plots)
+- [References](#references)
+
+## Overview
+
+The **ProfileLikelihoodSolver** implements profile likelihood analysis
+for partially specified models. Rather than fitting the model once, it
+systematically explores how the objective changes as each parameter is
+varied — providing:
+
+1.  **Identifiability diagnostics**: flat profiles indicate
+    non-identifiable parameters
+2.  **Likelihood-ratio confidence intervals**: more reliable than Wald
+    CIs for nonlinear models
+3.  **Sensitivity information**: steep profiles indicate well-determined
+    parameters
+
+**When to use ProfileLikelihoodSolver:**
+
+- After fitting with LAML, to assess parameter identifiability
+- When you need confidence intervals that account for nonlinearity
+- To understand which parts of the unknown function are well-determined
+  by data
+
+## Setup
+
+``` julia
+using PartiallySpecifiedModels
+using PartiallySpecifiedModels: solve
+using OrdinaryDiffEq
+using Plots
+using Random
+Random.seed!(42)
+```
+
+    TaskLocalRNG()
+
+## Example: Logistic Growth Identifiability
+
+We fit a logistic growth model where the per-capita growth rate $r(N)$
+is unknown, then profile each B-spline coefficient to assess
+identifiability.
+
+``` julia
+r_true(N) = 0.5 * (1.0 - N / 10.0)
+function logistic!(du, u, p, t)
+    du[1] = p.r(u[1]) * u[1]
+end
+
+sol_true = OrdinaryDiffEq.solve(
+    ODEProblem(logistic!, [1.0], (0.0, 15.0), (; r=r_true)),
+    Tsit5(); saveat=1.0)
+t_data = collect(sol_true.t)
+rng = Random.Xoshiro(42)
+y_data = max.([sol_true.u[i][1] + 0.2*randn(rng) for i in 1:length(t_data)], 0.01)
+
+uf = BSplineApproximator(:r, (0.0, 12.0), 6)
+prob = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf];
+    data_times=t_data, data_values=reshape(y_data, :, 1),
+    obs_to_state=[1], known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+```
+
+    PSMProblem{typeof(logistic!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(logistic!, [1.0], (0.0, 15.0), BSplineApproximator[BSplineApproximator(:r, (0.0, 12.0), 6, PartiallySpecifiedModels.var"#4#5"())], [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0], [1.1576711203208583; 1.37230950933477; … ; 10.109204882177014; 9.97615689866859;;], [1.0; 1.0; … ; 1.0; 1.0;;], [1], NamedTuple(), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false, Float64[], nothing)
+
+### Run Profile Likelihood
+
+``` julia
+sol_pl = solve(prob, ProfileLikelihoodSolver(
+    n_profile_points=20, ci_level=0.95, verbose=true))
+```
+
+    ProfileLikelihoodSolver: Running initial LAML fit...
+      MLE objective = 0.155983, 6 parameters
+      Profiling 6 parameters...
+      Hessian diagonal: [424.0, 3440.0, 3860.0, 4280.0, 9650.0, 412.0]
+      Profiling parameter 1 (MLE=0.4321)...
+        CI: [0.34, 0.6264]
+      Profiling parameter 2 (MLE=0.3691)...
+        CI: [0.3296, 0.4301]
+      Profiling parameter 3 (MLE=0.2718)...
+        CI: [0.2209, 0.309]
+      Profiling parameter 4 (MLE=0.1567)...
+        CI: [0.1084, 0.1986]
+      Profiling parameter 5 (MLE=0.01889)...
+        CI: [-0.01754, 0.05103]
+      Profiling parameter 6 (MLE=0.004628)...
+        CI: [-0.1925, 0.01501]
+
+    PSMSolution((r = [0.43208125977866896, 0.36905872339766804, 0.27175071460935846, 0.1567305823706012, 0.018890341525674148, 0.004627887579704831]), 0.1559826634669598, 0.26124999312070873, 4.60421534373292, [0.013831553210668857], [1.0; 1.4963663298808632; … ; 9.978645324558283; 10.052354432607505;;], [1.1576711203208583; 1.37230950933477; … ; 10.109204882177014; 9.97615689866859;;], [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0], Dict{Symbol, Any}(:r => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([0.43208125977866896, 0.36905872339766804, 0.27175071460935846, 0.1567305823706012, 0.018890341525674148, 0.004627887579704831], [0.0, 2.4, 4.8, 7.2, 9.6, 12.0], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 2.4, 2.4, 2.4000000000000004, 2.3999999999999995, 2.4000000000000004], [0.0, -0.009316002912560845, 0.001549977892630178, -0.01533403725217618, 0.03601522465131429, 0.0], DataInterpolations.ExtrapolationType.Extension, DataInterpolations.ExtrapolationType.Extension, FindFirstFunctions.Guesser{Vector{Float64}}([0.0, 2.4, 4.8, 7.2, 9.6, 12.0], Base.RefValue{Int64}(1), true), false, false)), (converged = true, method = :profile_likelihood, profiles = Dict{Int64, NamedTuple}(5 => (grid = [-0.021825705724191444, -0.017539806013679275, -0.013253906303167109, -0.008968006592654941, -0.004682106882142774, -0.000396207171630606, 0.0038896925388815615, 0.008175592249393729, 0.012461491959905896, 0.016747391670418065, 0.02103329138093023, 0.0253191910914424, 0.029605090801954566, 0.03389099051246673, 0.038176890222978904, 0.04246278993349107, 0.046748689644003236, 0.0510345893545154, 0.055320489065027574, 0.05960638877553974], objective = [2.6064995964959183, 2.2638138641997902, 1.9377862189418522, 1.630764637870913, 1.3445146805397263, 1.0829270624901168, 0.850670487765335, 0.653399912507958, 0.49805095909294944, 0.39301694586615, 0.3480982563060548, 0.3737970284123631, 0.47976136005639913, 0.6724305975071753, 0.9529564098618465, 1.3167906068090203, 1.7555638895201835, 2.25943540661626, 2.693186516016413, 3.4207168367190843], plr = [4.516802680379727, 3.831431215787471, 3.1793759252715947, 2.5653327631297165, 1.992832848467343, 1.469657612368124, 1.0051444629185604, 0.6106033124038065, 0.2999054055737893, 0.08983737912019041, 0.0, 0.051397544212616664, 0.2633262075006887, 0.648664682402241, 1.2097163071115835, 1.9373847010059309, 2.8149312664282573, 3.8226743006204105, 4.690176519420716, 6.145237160826059], ci = (-0.017539806013679275, 0.0510345893545154), threshold = 3.841), 4 => (grid = [0.09556583191029494, 0.10200422669559034, 0.10844262148088574, 0.11488101626618112, 0.12131941105147652, 0.1277578058367719, 0.1341962006220673, 0.1406345954073627, 0.1470729901926581, 0.1535113849779535, 0.1599497797632489, 0.1663881745485443, 0.1728265693338397, 0.1792649641191351, 0.1857033589044305, 0.19214175368972586, 0.19858014847502126, 0.20501854326031665, 0.21145693804561205, 0.21789533283090745], objective = [3.4200930560092626, 2.5802975104512003, 1.871999292382144, 1.3585059525848049, 0.9533661622744198, 0.6628260473525299, 0.4727404539279219, 0.3712780887439241, 0.3485161125750259, 0.3959666010587852, 0.5064963503586042, 0.6746773302738707, 0.8944812932491891, 1.1614126397785964, 1.471532306189399, 1.8213696477204588, 2.2078383631736047, 2.628216759605375, 3.0801781885171193, 3.561693154051334], plr = [6.143153886868474, 4.463562795752349, 3.0469663596142365, 2.019979680019558, 1.2097000993987879, 0.628619869555008, 0.248448682705792, 0.04552395233779638, 0.0, 0.09490097696751854, 0.31596047556715656, 0.6523224353976895, 1.0919303613483264, 1.625793054407141, 2.2460323872287464, 2.945707070290866, 3.718644501197158, 4.559401294060699, 5.463324151884187, 6.426354082952616], ci = (0.10844262148088574, 0.19858014847502126), threshold = 3.841), 6 => (grid = [-0.19254053847181934, -0.17178596730850101, -0.15103139614518268, -0.13027682498186435, -0.10952225381854601, -0.08876768265522766, -0.06801311149190933, -0.047258540328591, -0.026503969165272666, -0.005749398001954331, 0.015005173161364004, 0.03575974432468234, 0.05651431548800068, 0.07726888665131901, 0.09802345781463734, 0.11877802897795568, 0.13953260014127403, 0.16028717130459236, 0.1810417424679107, 0.20179631363122902], objective = [1.1400653459408145, 0.8299226404687131, 0.5903746737473803, 0.42832969032816737, 0.3520310192514855, 0.3705364750056894, 0.4936281534697465, 0.7317984787053802, 1.0952706454747172, 1.5926637544496698, 2.2290450365534813, 2.728438357249681, 3.6774908608482857, 4.9593717100636745, 6.115418802921585, 7.375929011657819, 8.72974880596532, 10.166922937240162, 11.678908166531349, 13.258759542370122], plr = [1.576068653378658, 0.9557832424344552, 0.47668730899178957, 0.15259734215336374, 0.0, 0.03701091150840785, 0.28319426843652196, 0.7595349189077893, 1.4864792524464634, 2.4812654703963686, 3.7540280346039916, 4.752814675996391, 6.6509196831936, 9.214681381624377, 11.526775567340199, 14.047795984812666, 16.75543557342767, 19.629783835977353, 22.653754294559725, 25.81345704623727], ci = (-0.19254053847181934, 0.015005173161364004), threshold = 3.841), 2 => (grid = [0.30086216760943885, 0.30804075242925244, 0.31521933724906603, 0.3223979220688796, 0.3295765068886932, 0.33675509170850687, 0.34393367652832046, 0.35111226134813406, 0.35829084616794765, 0.36546943098776125, 0.37264801580757484, 0.37982660062738843, 0.387005185447202, 0.3941837702670156, 0.4013623550868292, 0.40854093990664286, 0.41571952472645646, 0.42289810954627005, 0.43007669436608364, 0.43725527918589724], objective = [5.519840800254509, 4.357068456239304, 3.378649994409127, 2.5671558141705275, 1.9062754785477476, 1.3809377013755384, 0.9774265499480843, 0.6434317687273119, 0.48620887753615427, 0.37751795956749423, 0.3474966910931112, 0.38802964345385205, 0.4919083270757092, 0.652742074417428, 0.8648720361831493, 1.1232489157503076, 1.4200116504744067, 1.7617057716630082, 2.1342473212252235, 2.5380533977144455], plr = [10.344688218322796, 8.019143530292386, 6.062306606632031, 4.439318246154833, 3.1175575749092728, 2.0668820205648544, 1.2598597177099462, 0.5918701552684014, 0.2774243728860861, 0.060042536948766045, 0.0, 0.08106590472148167, 0.28882327196519597, 0.6104907666486337, 1.0347506901800763, 1.5515044493143928, 2.145029918762591, 2.828418161139794, 3.5735012602642247, 4.381113413242669], ci = (0.3295765068886932, 0.43007669436608364), threshold = 3.841), 3 => (grid = [0.20734239976108265, 0.21412222237669062, 0.22090204499229862, 0.2276818676079066, 0.23446169022351457, 0.24124151283912254, 0.24802133545473054, 0.2548011580703385, 0.2615809806859465, 0.2683608033015545, 0.27514062591716243, 0.28192044853277043, 0.28870027114837843, 0.2954800937639864, 0.3022599163795944, 0.3090397389952023, 0.3158195616108103, 0.3225993842264183, 0.32937920684202626, 0.33615902945763426], objective = [3.439552626818448, 2.663896372130557, 2.017000897650132, 1.4874645751942717, 1.070664857905618, 0.7479293880654951, 0.5319339297632942, 0.39891350094429184, 0.34810860544752475, 0.3735633912764036, 0.4699162778297822, 0.6321627123529353, 0.8557157077795345, 1.1361747517727017, 1.470157781550443, 1.8531009962862044, 2.281789413266082, 2.7532483958260805, 3.2646409203859164, 3.813411685861814], plr = [6.182888042741847, 4.631575533366064, 3.337784584405214, 2.278711939493494, 1.4451125049161864, 0.7996415652359408, 0.36765064863153896, 0.10160979099353418, 0.0, 0.05090957165775767, 0.24361534476451485, 0.5681082138108211, 1.0152142046640196, 1.5761322926503538, 2.244098352205836, 3.0099847816773595, 3.8673616156371144, 4.810279580757111, 5.833064629876783, 6.930606160828578], ci = (0.22090204499229862, 0.3090397389952023), threshold = 3.841), 1 => (grid = [0.23775420234399988, 0.25820968207396505, 0.2786651618039302, 0.2991206415338954, 0.31957612126386054, 0.3400316009938257, 0.3604870807237909, 0.380942560453756, 0.4013980401837212, 0.42185351991368636, 0.4423089996436515, 0.4627644793736167, 0.48321995910358184, 0.503675438833547, 0.5241309185635122, 0.5445863982934773, 0.5650418780234425, 0.5854973577534077, 0.6059528374833728, 0.626408317213338], objective = [5.879279776279984, 4.893919170492708, 4.020728482431846, 3.254039431381968, 2.5884787636129643, 2.0189401938048284, 1.5405960380865877, 1.148826303443977, 0.8206767416484283, 0.6089169949135447, 0.4526674158358644, 0.3670763664945954, 0.3487714685644546, 0.39447930653472213, 0.5011130875617568, 0.6657516128770042, 0.8856792318940057, 1.1580335633744443, 1.4804868060258805, 1.850726916622665], plr = [11.061016615431058, 9.090295403856507, 7.343914027734782, 5.810535925635027, 4.4794145900970195, 3.3403374504807477, 2.383649139044266, 1.6001096697590447, 0.9438105461679474, 0.5202910526981801, 0.20779189454281954, 0.03660979586028157, 0.0, 0.09141567594053501, 0.3046832379946043, 0.6339602886250992, 1.073815526659102, 1.6185241896199793, 2.2634306749228514, 3.0039108961164205], ci = (0.3400316009938257, 0.626408317213338), threshold = 3.841)), mle_objective = 0.1559826634669598))
+
+### Visualise Profile Likelihood Curves
+
+``` julia
+profiles = sol_pl.convergence.profiles
+n_profiled = length(profiles)
+ncols = min(n_profiled, 3)
+nrows = ceil(Int, n_profiled / ncols)
+
+plts = []
+for idx in sort(collect(keys(profiles)))
+    prof = profiles[idx]
+    p = plot(prof.grid, prof.plr, lw=2, color=:blue,
+        xlabel="β_$idx", ylabel="Profile LR",
+        title="Parameter $idx", legend=false)
+    hline!(p, [prof.threshold], color=:red, ls=:dash, label="95% threshold")
+    vline!(p, [prof.ci[1], prof.ci[2]], color=:green, ls=:dot, label="CI")
+    push!(plts, p)
+end
+plot(plts..., layout=(nrows, ncols), size=(300*ncols, 250*nrows))
+```
+
+![](32_profile_likelihood_files/figure-commonmark/cell-5-output-1.svg)
+
+### Interpreting the Profiles
+
+    Profile Likelihood Summary:
+    ------------------------------------------------------------
+      β_1: CI=[0.34, 0.626], width=0.286, well-identified
+      β_2: CI=[0.33, 0.43], width=0.101, well-identified
+      β_3: CI=[0.221, 0.309], width=0.0881, well-identified
+      β_4: CI=[0.108, 0.199], width=0.0901, well-identified
+      β_5: CI=[-0.0175, 0.051], width=0.0686, well-identified
+      β_6: CI=[-0.193, 0.015], width=0.208, well-identified
+
+> [!NOTE]
+>
+> Parameters with **narrow CIs** and **steep profile curves** are
+> well-identified by the data. Parameters with **wide CIs** or **flat
+> profiles** indicate that the data do not strongly constrain those
+> parts of the unknown function — typically parameters corresponding to
+> B-spline knots in regions where the state variable is rarely observed.
+
+## How It Works
+
+For each parameter $\beta_j$:
+
+1.  Fix $\beta_j$ at a grid of values spanning
+    $\hat{\beta}_j \pm 3\hat{\sigma}_j$
+2.  At each grid point, optimise all other parameters $\beta_{-j}$
+    (warm-started from adjacent grid point)
+3.  Compute the profile likelihood ratio:
+    $\text{PLR}(\beta_j) = 2[L(\hat{\beta}) - L(\hat{\beta}_{-j}, \beta_j)]$
+4.  The 95% CI is the set
+    $\{\beta_j : \text{PLR}(\beta_j) < \chi^2_{1, 0.95} = 3.841\}$
+
+This is more reliable than Wald-based CIs (which assume local quadratic
+curvature) because it captures the actual shape of the likelihood
+surface, including asymmetry and non-convexity.
+
+## Diagnostic Plots
+
+``` julia
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol_pl)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash)
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+plot(p_qq, p_rf, layout=(1, 2), size=(700, 300))
+```
+
+![](32_profile_likelihood_files/figure-commonmark/cell-7-output-1.svg)
+
+## References
+
+- Simpson, M.J. & Maclaren, O.J. (2023). Profile-wise analysis: A
+  profile likelihood-based workflow for identifiability analysis,
+  estimation, and prediction with mechanistic mathematical models. *PLOS
+  Computational Biology*, 19(9).
+- Raue, A. et al. (2009). Structural and practical identifiability
+  analysis of partially observed dynamical models. *Bioinformatics*,
+  25(15), 1923–1929.

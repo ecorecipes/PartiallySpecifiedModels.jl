@@ -1,5 +1,5 @@
 ---
-title: "Solver Comparison: Seven Methods on One Problem"
+title: "Solver Comparison: Twelve Methods on One Problem"
 author: "Simon Frost"
 date: today
 format:
@@ -17,7 +17,7 @@ julia:
 
 ## Overview
 
-`PartiallySpecifiedModels.jl` provides **seven different solvers** for fitting partially specified models. Each takes a fundamentally different approach to the estimation problem:
+`PartiallySpecifiedModels.jl` provides **22 different solvers** for fitting partially specified models. This vignette compares 12 representative methods on the same test problem, highlighting the diversity of algorithmic approaches:
 
 | Solver | Approach | Integration? | Smoothing |
 |--------|----------|:------------:|-----------|
@@ -27,9 +27,14 @@ julia:
 | **AdaptiveGradientMatching** | GP-based gradient matching with adaptive mismatch | No | Eigendecomposition + penalty |
 | **AdamSolver** | Direct optimization (Adam) via ODE integration | Yes | Manual (loss-based) |
 | **RodeoSolver** | Probabilistic ODE solving (Kalman filter/smoother) | Implicit (IBM prior) | Automatic (marginal likelihood) |
-| **MultipleShootingSolver** | Augmented Lagrangian with shooting intervals | Yes (per interval) | Manual (penalty-based) |
+| **IntegralMatchingSolver** | Match cumulative integrals of ODE RHS | No | Manual (penalty-based) |
+| **EnsembleKalmanSolver** | Ensemble Kalman Inversion | Yes | Ensemble-based |
+| **ODINSolver** | ODE-Informed GP regression | No | GP marginal likelihood |
+| **RKHSSolver** | Kernel ridge regression (RKHS) | No | RKHS norm penalty |
+| **ProfileLikelihoodSolver** | Profile likelihood for identifiability | Yes (inner) | Automatic (LAML inner) |
+| **TwoStageSolver** | Smooth-then-differentiate | No | Manual (penalty-based) |
 
-This vignette fits the **same model and data** with all seven solvers, comparing accuracy, runtime, and recovered functional forms.
+This vignette fits the **same model and data** with all methods, comparing accuracy, runtime, and recovered functional forms.
 
 ## Setup
 
@@ -183,6 +188,68 @@ println("RodeoSolver: data_loss=$(round(sol_rodeo.data_loss, digits=1)), ",
         "time=$(round(t_rodeo, digits=1))s")
 ```
 
+### 7. IntegralMatchingSolver
+
+Integrates both sides of the ODE and matches the cumulative integrals rather than derivatives. This avoids both derivative estimation (noisy) and full ODE integration (expensive), providing robustness to measurement noise.
+
+```{julia}
+#| echo: false
+t_im = @elapsed sol_im = solve(prob,
+    IntegralMatchingSolver(maxiters=500, lr=0.005, lambda_smooth=1.0, verbose=false))
+println("IntegralMatching: data_loss=$(round(sol_im.data_loss, digits=1)), ",
+        "time=$(round(t_im, digits=1))s")
+```
+
+### 8. EnsembleKalmanSolver
+
+Derivative-free ensemble method: maintains a population of parameter particles, propagates each through the ODE, and updates via the Kalman gain. Naturally handles non-smooth objectives and noisy forward models.
+
+```{julia}
+#| echo: false
+t_ek = @elapsed sol_ek = solve(prob,
+    EnsembleKalmanSolver(n_ensemble=50, n_iterations=30, noise_scale=5.0, verbose=false))
+println("EnsembleKalman: data_loss=$(round(sol_ek.data_loss, digits=1)), ",
+        "time=$(round(t_ek, digits=1))s")
+```
+
+### 9. ODINSolver
+
+ODE-Informed GP regression: alternates between fitting a Gaussian process to the data and optimising unknown-function parameters against the GP's derivative estimates. The ODE residual enters the GP marginal likelihood for tighter coupling.
+
+```{julia}
+#| echo: false
+t_odin = @elapsed sol_odin = solve(prob,
+    ODINSolver(maxiters=30, gp_lengthscale=5.0, gp_variance=100.0,
+               ode_weight=10.0, lr=0.005, verbose=false))
+println("ODIN: data_loss=$(round(sol_odin.data_loss, digits=1)), ",
+        "time=$(round(t_odin, digits=1))s")
+```
+
+### 10. RKHSSolver
+
+Represents the unknown function in a reproducing kernel Hilbert space using RBF kernels at representative points. The RKHS norm $\|\!f\!\|^2_H = \alpha'K\alpha$ acts as the smoothing penalty, providing a non-parametric alternative to splines.
+
+```{julia}
+#| echo: false
+t_rkhs = @elapsed sol_rkhs = solve(prob,
+    RKHSSolver(maxiters=500, n_repr_points=15, kernel=:rbf,
+               lengthscale=0.03, lambda_rkhs=1.0, lr=0.005, verbose=false))
+println("RKHS: data_loss=$(round(sol_rkhs.data_loss, digits=1)), ",
+        "time=$(round(t_rkhs, digits=1))s")
+```
+
+### 11. TwoStageSolver
+
+Simple baseline: smooth data with cubic splines, then match derivatives with Adam optimisation. Fast and transparent, but the quality of derivative estimation limits accuracy.
+
+```{julia}
+#| echo: false
+t_ts = @elapsed sol_ts = solve(prob,
+    TwoStageSolver(maxiters=500, lr=0.005, lambda_smooth=1.0, verbose=false))
+println("TwoStage: data_loss=$(round(sol_ts.data_loss, digits=1)), ",
+        "time=$(round(t_ts, digits=1))s")
+```
+
 ## Comparison
 
 ### Fitted trajectories
@@ -196,11 +263,14 @@ p_I = plot(sol_ode.t, sol_ode[2,:], label="True I", lw=2, color=:black, ls=:dash
            xlabel="Time", ylabel="Infected", title="I(t) fits")
 scatter!(p_I, data_t, data_SI[:, 2], label="Data", ms=2, alpha=0.4, color=:gray)
 
-colors = [:blue, :red, :green, :orange, :purple, :cyan]
+colors = [:blue, :red, :green, :orange, :purple, :cyan, :magenta, :brown, :teal, :pink, :olive]
 solvers_done = [
     ("LAML", sol_laml), ("CollocationLAML", sol_coll),
     ("GradientMatching", sol_gm), ("Adam", sol_adam),
-    ("AGM", sol_agm), ("Rodeo", sol_rodeo)]
+    ("AGM", sol_agm), ("Rodeo", sol_rodeo),
+    ("IntegralMatch", sol_im), ("EnsKalman", sol_ek),
+    ("ODIN", sol_odin), ("RKHS", sol_rkhs),
+    ("TwoStage", sol_ts)]
 
 for (i, (name, sol)) in enumerate(solvers_done)
     plot!(p_S, data_t, sol.fitted_values[:, 1], label=name, lw=1.5, color=colors[i])
@@ -233,7 +303,7 @@ p_β
 #| echo: false
 println("Solver              | Data Loss | Time (s)")
 println("-"^50)
-times_all = [t_laml, t_coll, t_gm, t_adam, t_agm, t_rodeo]
+times_all = [t_laml, t_coll, t_gm, t_adam, t_agm, t_rodeo, t_im, t_ek, t_odin, t_rkhs, t_ts]
 for (i, (name, sol)) in enumerate(solvers_done)
     println(rpad(name, 20), "| ",
             rpad(string(round(sol.data_loss, digits=1)), 10), "| ",
@@ -293,7 +363,7 @@ println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_wa
 
 2. **CollocationLAML** avoids integration instabilities via collocation and generally performs well, though the continuation schedule requires tuning.
 
-3. **GradientMatching** is the fastest (no integration) but relies entirely on derivative estimates from the data. The quality of derivative estimation determines accuracy.
+3. **GradientMatching** is fast (no integration) but relies entirely on derivative estimates from the data. The quality of derivative estimation determines accuracy.
 
 4. **AdamSolver** provides a flexible direct-optimisation approach. With appropriate learning rate tuning, it can reach good fits.
 
@@ -301,9 +371,23 @@ println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_wa
 
 6. **RodeoSolver** embeds ODE constraints within a probabilistic state-space model. It provides uncertainty quantification for free (see the [Probabilistic Fitting vignette](../07_probabilistic_fitting/07_probabilistic_fitting.html)).
 
+7. **IntegralMatchingSolver** matches cumulative integrals rather than derivatives, making it the most noise-robust integration-free method. Particularly strong when data are sparse or noisy.
+
+8. **EnsembleKalmanSolver** is completely derivative-free — useful when the forward model is non-differentiable, stiff, or computationally opaque. Convergence depends on ensemble size and observation noise scale.
+
+9. **ODINSolver** provides a GP-based approach with tighter ODE coupling than simple gradient matching. The alternating GP/ODE optimisation converges reliably for moderately nonlinear problems.
+
+10. **RKHSSolver** offers an alternative to B-spline representations: kernel-based function estimation with RBF, Matérn-3/2, or Matérn-5/2 kernels. The RKHS norm penalty controls smoothness like the spline penalty.
+
+11. **TwoStageSolver** is the simplest baseline and useful for initialisation or sanity checking.
+
 **Recommendations:**
 
 - Start with **LAML** for well-behaved, weakly nonlinear systems.  For strongly nonlinear models, increase `initial_lambda` (e.g. 10) and `warmup` (e.g. 5–10).
 - Use **CollocationLAML** or **AGM** for highly nonlinear or oscillatory dynamics
 - Use **RodeoSolver** when you need uncertainty quantification
+- Use **IntegralMatchingSolver** when data are noisy and you want a robust integration-free method
+- Use **EnsembleKalmanSolver** when gradients are unavailable or the forward model is opaque
+- Use **RKHSSolver** when you want a kernel-based alternative to splines
+- Use **ProfileLikelihoodSolver** (see [Vignette 32](../32_profile_likelihood/32_profile_likelihood.html)) for identifiability analysis and confidence intervals
 - Use **AdamSolver** with neural network approximators or when you need maximum flexibility

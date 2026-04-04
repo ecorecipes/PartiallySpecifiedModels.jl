@@ -5,9 +5,10 @@ A Julia package for fitting partially specified models (PSMs) — dynamical
 systems where some functional responses are modelled nonparametrically using
 penalized B-splines, Gaussian processes, or neural networks.
 
-Provides 17 solvers (LAML, collocation, gradient matching, Adam, multiple
+Provides 22 solvers (LAML, collocation, gradient matching, Adam, multiple
 shooting, adaptive gradient matching, rodeo, MCMC/HMC, MAGI, BNG, DALTON,
-pseudo-marginal, GCV, two-stage, derivative-free, variational, and ABC-SMC)
+pseudo-marginal, GCV, two-stage, derivative-free, variational, ABC-SMC,
+integral matching, profile likelihood, ensemble Kalman, ODIN, and RKHS)
 and 7 approximator types (B-spline, shape-constrained B-spline, SPDE,
 shape-constrained SPDE, neural network, Gaussian process, and COMONet).
 
@@ -106,6 +107,21 @@ include("variational_solver.jl")
 # ABC-SMC solver (likelihood-free)
 include("abc_solver.jl")
 
+# Integral matching solver (Dattner & Klaassen 2015)
+include("integral_matching_solver.jl")
+
+# Profile likelihood solver (Simpson & Maclaren 2023)
+include("profile_likelihood_solver.jl")
+
+# Ensemble Kalman Inversion solver (Iglesias et al. 2013)
+include("ensemble_kalman_solver.jl")
+
+# ODIN solver (ODE-Informed regression, Wenk & Abbati 2020)
+include("odin_solver.jl")
+
+# RKHS solver (kernel-based unknown function estimation)
+include("rkhs_solver.jl")
+
 # Profile range parameter optimization for SPDE
 include("profile_range.jl")
 
@@ -127,6 +143,8 @@ export RodeoSolver, MCMCSolver, MagiSolver
 export BNGSolver, DaltonSolver, PseudoMarginalSolver
 export GCVSolver, TwoStageSolver, DerivativeFreeSolver
 export VariationalSolver, ABCSolver
+export IntegralMatchingSolver, ProfileLikelihoodSolver
+export EnsembleKalmanSolver, ODINSolver, RKHSSolver
 
 # Exports — functions
 export solve, simulate, predict

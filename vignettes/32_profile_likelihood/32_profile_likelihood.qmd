@@ -1,0 +1,151 @@
+---
+title: "Profile Likelihood for Identifiability Analysis"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+The **ProfileLikelihoodSolver** implements profile likelihood analysis for partially specified models. Rather than fitting the model once, it systematically explores how the objective changes as each parameter is varied — providing:
+
+1. **Identifiability diagnostics**: flat profiles indicate non-identifiable parameters
+2. **Likelihood-ratio confidence intervals**: more reliable than Wald CIs for nonlinear models
+3. **Sensitivity information**: steep profiles indicate well-determined parameters
+
+**When to use ProfileLikelihoodSolver:**
+
+- After fitting with LAML, to assess parameter identifiability
+- When you need confidence intervals that account for nonlinearity
+- To understand which parts of the unknown function are well-determined by data
+
+## Setup
+
+```{julia}
+using PartiallySpecifiedModels
+using PartiallySpecifiedModels: solve
+using OrdinaryDiffEq
+using Plots
+using Random
+Random.seed!(42)
+```
+
+## Example: Logistic Growth Identifiability
+
+We fit a logistic growth model where the per-capita growth rate $r(N)$ is unknown, then profile each B-spline coefficient to assess identifiability.
+
+```{julia}
+r_true(N) = 0.5 * (1.0 - N / 10.0)
+function logistic!(du, u, p, t)
+    du[1] = p.r(u[1]) * u[1]
+end
+
+sol_true = OrdinaryDiffEq.solve(
+    ODEProblem(logistic!, [1.0], (0.0, 15.0), (; r=r_true)),
+    Tsit5(); saveat=1.0)
+t_data = collect(sol_true.t)
+rng = Random.Xoshiro(42)
+y_data = max.([sol_true.u[i][1] + 0.2*randn(rng) for i in 1:length(t_data)], 0.01)
+
+uf = BSplineApproximator(:r, (0.0, 12.0), 6)
+prob = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf];
+    data_times=t_data, data_values=reshape(y_data, :, 1),
+    obs_to_state=[1], known_params=NamedTuple(),
+    likelihood=PartiallySpecifiedModels.Gaussian())
+```
+
+### Run Profile Likelihood
+
+```{julia}
+sol_pl = solve(prob, ProfileLikelihoodSolver(
+    n_profile_points=20, ci_level=0.95, verbose=true))
+```
+
+### Visualise Profile Likelihood Curves
+
+```{julia}
+profiles = sol_pl.convergence.profiles
+n_profiled = length(profiles)
+ncols = min(n_profiled, 3)
+nrows = ceil(Int, n_profiled / ncols)
+
+plts = []
+for idx in sort(collect(keys(profiles)))
+    prof = profiles[idx]
+    p = plot(prof.grid, prof.plr, lw=2, color=:blue,
+        xlabel="β_$idx", ylabel="Profile LR",
+        title="Parameter $idx", legend=false)
+    hline!(p, [prof.threshold], color=:red, ls=:dash, label="95% threshold")
+    vline!(p, [prof.ci[1], prof.ci[2]], color=:green, ls=:dot, label="CI")
+    push!(plts, p)
+end
+plot(plts..., layout=(nrows, ncols), size=(300*ncols, 250*nrows))
+```
+
+### Interpreting the Profiles
+
+```{julia}
+#| echo: false
+println("Profile Likelihood Summary:")
+println("-"^60)
+for idx in sort(collect(keys(profiles)))
+    prof = profiles[idx]
+    ci_width = prof.ci[2] - prof.ci[1]
+    min_plr = minimum(prof.plr)
+    max_plr = maximum(prof.plr)
+    curvature = max_plr > 0.1 ? "well-identified" : "poorly-identified"
+    println("  β_$idx: CI=[$(round(prof.ci[1], sigdigits=3)), $(round(prof.ci[2], sigdigits=3))], " *
+            "width=$(round(ci_width, sigdigits=3)), $curvature")
+end
+```
+
+::: {.callout-note}
+Parameters with **narrow CIs** and **steep profile curves** are well-identified by the data. Parameters with **wide CIs** or **flat profiles** indicate that the data do not strongly constrain those parts of the unknown function — typically parameters corresponding to B-spline knots in regions where the state variable is rarely observed.
+:::
+
+## How It Works
+
+For each parameter $\beta_j$:
+
+1. Fix $\beta_j$ at a grid of values spanning $\hat{\beta}_j \pm 3\hat{\sigma}_j$
+2. At each grid point, optimise all other parameters $\beta_{-j}$ (warm-started from adjacent grid point)
+3. Compute the profile likelihood ratio: $\text{PLR}(\beta_j) = 2[L(\hat{\beta}) - L(\hat{\beta}_{-j}, \beta_j)]$
+4. The 95% CI is the set $\{\beta_j : \text{PLR}(\beta_j) < \chi^2_{1, 0.95} = 3.841\}$
+
+This is more reliable than Wald-based CIs (which assume local quadratic curvature) because it captures the actual shape of the likelihood surface, including asymmetry and non-convexity.
+
+## Diagnostic Plots
+
+```{julia}
+using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol_pl)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel="Theoretical quantiles", ylabel="Sample quantiles",
+    title="QQ Plot", ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash)
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel="Fitted values", ylabel="Residuals",
+    title="Residuals vs Fitted", ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+plot(p_qq, p_rf, layout=(1, 2), size=(700, 300))
+```
+
+## References
+
+- Simpson, M.J. & Maclaren, O.J. (2023). Profile-wise analysis: A profile likelihood-based workflow for identifiability analysis, estimation, and prediction with mechanistic mathematical models. *PLOS Computational Biology*, 19(9).
+- Raue, A. et al. (2009). Structural and practical identifiability analysis of partially observed dynamical models. *Bioinformatics*, 25(15), 1923–1929.
