@@ -1340,6 +1340,186 @@ ABCSolver(; n_particles::Int=500, n_generations::Int=10,
             verbose::Bool=false) =
     ABCSolver(n_particles, n_generations, summary_fn, prior_scale, quantile_eps, verbose)
 
+# ─── Integral matching solver (Dattner & Klaassen 2015) ────────────
+
+"""
+    IntegralMatchingSolver
+
+Integral matching estimator: integrates both sides of the ODE so that
+parameter estimation requires neither derivative estimation nor repeated
+ODE integration.  Compares smoothed trajectory increments ŷ(tᵢ)−ŷ(t₁)
+against the cumulative trapezoidal integral of f(ŷ(s),p,s).
+
+# Fields
+- `lambda_smooth`: smoothing penalty weight (default 1.0)
+- `maxiters`: Adam iterations (default 1000)
+- `lr`: learning rate (default 0.01)
+- `verbose`: print progress
+
+# References
+- Dattner & Klaassen (2015), EJS 9(2), 1939–1973
+- R package `simode` (Yaari & Dattner)
+"""
+struct IntegralMatchingSolver
+    lambda_smooth::Float64
+    maxiters::Int
+    lr::Float64
+    verbose::Bool
+end
+
+IntegralMatchingSolver(; lambda_smooth::Float64=1.0, maxiters::Int=1000,
+                         lr::Float64=0.01, verbose::Bool=false) =
+    IntegralMatchingSolver(lambda_smooth, maxiters, lr, verbose)
+
+# ─── Profile likelihood solver ─────────────────────────────────────
+
+"""
+    ProfileLikelihoodSolver
+
+Profile likelihood for identifiability analysis and confidence intervals.
+
+For each unknown-function parameter βⱼ, sweeps βⱼ over a grid while
+optimising all other parameters (β₋ⱼ) at each grid point.  Returns the
+profile likelihood curve Lₚ(βⱼ) and a likelihood-ratio CI.
+
+Uses the LAML solver as the inner optimiser (warm-started from the
+previous grid point).
+
+# Fields
+- `n_profile_points`: grid points per parameter (default 20)
+- `ci_level`: confidence level for LR-based CI (default 0.95)
+- `param_indices`: which parameter indices to profile (default `nothing` = all)
+- `verbose`: print progress
+
+# References
+- Simpson & Maclaren (2023), PLOS Comp Biol
+"""
+struct ProfileLikelihoodSolver
+    n_profile_points::Int
+    ci_level::Float64
+    param_indices::Union{Nothing, Vector{Int}}
+    verbose::Bool
+end
+
+ProfileLikelihoodSolver(; n_profile_points::Int=20, ci_level::Float64=0.95,
+                           param_indices::Union{Nothing, Vector{Int}}=nothing,
+                           verbose::Bool=false) =
+    ProfileLikelihoodSolver(n_profile_points, ci_level, param_indices, verbose)
+
+# ─── Ensemble Kalman inversion solver ──────────────────────────────
+
+"""
+    EnsembleKalmanSolver
+
+Ensemble Kalman Inversion (EKI) for batch parameter estimation.
+
+Uses an ensemble of parameter particles, propagates each through the
+forward model (ODE simulation), and updates via the Kalman gain
+K = Cov(θ, G(θ)) [Cov(G(θ), G(θ)) + Γ]⁻¹.  Iterates until the
+ensemble collapses around the MAP estimate.
+
+# Fields
+- `n_ensemble`: ensemble size (default 50)
+- `n_iterations`: EKI iterations (default 30)
+- `noise_scale`: observation noise std for regularisation (default 0.1)
+- `verbose`: print progress
+
+# References
+- Iglesias, Law & Stuart (2013), Inverse Problems
+- Schillings & Stuart (2017), SIAM J Numer Anal
+"""
+struct EnsembleKalmanSolver
+    n_ensemble::Int
+    n_iterations::Int
+    noise_scale::Float64
+    verbose::Bool
+end
+
+EnsembleKalmanSolver(; n_ensemble::Int=50, n_iterations::Int=30,
+                       noise_scale::Float64=0.1, verbose::Bool=false) =
+    EnsembleKalmanSolver(n_ensemble, n_iterations, noise_scale, verbose)
+
+# ─── ODIN solver (ODE-Informed regression) ─────────────────────────
+
+"""
+    ODINSolver
+
+ODE-Informed regression (Wenk & Abbati 2020): GP smoothing with an
+ODE-informed mean function.
+
+Fits a Gaussian process to each state, then iterates between:
+1. GP hyper-parameter optimisation (marginal likelihood)
+2. ODE parameter optimisation (penalised ODE mismatch on GP mean)
+
+Tighter ODE coupling than AdaptiveGradientMatching because the ODE
+residual enters the GP's marginal likelihood directly.
+
+# Fields
+- `maxiters`: outer EM iterations (default 50)
+- `gp_lengthscale`: initial RBF lengthscale (default 1.0)
+- `gp_variance`: initial signal variance (default 1.0)
+- `ode_weight`: weight for ODE mismatch penalty (default 10.0)
+- `lr`: learning rate for inner Adam loop (default 0.01)
+- `verbose`: print progress
+
+# References
+- Wenk, Abbati et al. (2020), AAAI — ODIN
+- Wenk et al. (2019), AISTATS — FGPGM
+"""
+struct ODINSolver
+    maxiters::Int
+    gp_lengthscale::Float64
+    gp_variance::Float64
+    ode_weight::Float64
+    lr::Float64
+    verbose::Bool
+end
+
+ODINSolver(; maxiters::Int=50, gp_lengthscale::Float64=1.0,
+             gp_variance::Float64=1.0, ode_weight::Float64=10.0,
+             lr::Float64=0.01, verbose::Bool=false) =
+    ODINSolver(maxiters, gp_lengthscale, gp_variance, ode_weight, lr, verbose)
+
+# ─── RKHS solver ───────────────────────────────────────────────────
+
+"""
+    RKHSSolver
+
+Reproducing kernel Hilbert space (RKHS) estimator for unknown functions.
+
+Represents the unknown function as f(x) = Σᵢ αᵢ K(x, xᵢ) where K is a
+kernel (default: squared-exponential) and xᵢ are representative points.
+Solves a penalised least-squares problem with an RKHS norm penalty
+‖f‖² = α' K α, yielding a kernel ridge regression-like estimator within
+the ODE fitting loop.
+
+# Fields
+- `kernel`: kernel type `:rbf`, `:matern32`, `:matern52` (default `:rbf`)
+- `lengthscale`: kernel lengthscale (default 1.0)
+- `lambda_rkhs`: RKHS norm penalty (default 1.0)
+- `n_repr_points`: number of representative points (default 20)
+- `maxiters`: optimisation iterations (default 1000)
+- `lr`: learning rate (default 0.01)
+- `verbose`: print progress
+
+# References
+- Gonzalez et al. (2014), Pattern Recognition Letters
+"""
+struct RKHSSolver
+    kernel::Symbol
+    lengthscale::Float64      # ≤ 0 means auto-scale from domain
+    lambda_rkhs::Float64
+    n_repr_points::Int
+    maxiters::Int
+    lr::Float64
+    verbose::Bool
+end
+
+RKHSSolver(; kernel::Symbol=:rbf, lengthscale::Float64=-1.0,
+             lambda_rkhs::Float64=1.0, n_repr_points::Int=20,
+             maxiters::Int=1000, lr::Float64=0.01, verbose::Bool=false) =
+    RKHSSolver(kernel, lengthscale, lambda_rkhs, n_repr_points, maxiters, lr, verbose)
+
 # ─── Problem and solution types ────────────────────────────────────
 
 """
