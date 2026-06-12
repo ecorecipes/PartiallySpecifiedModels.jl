@@ -36,12 +36,34 @@ function _normlogcdf(x::Real)
     end
 end
 
+# ─── log Γ (Lanczos; avoids a SpecialFunctions dependency) ──────────
+
+"""Log-gamma via the Lanczos approximation (g=7), accurate to ~1e-13 for x>0."""
+function _loggamma(x::Real)
+    g = 7.0
+    c = (0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+         771.32342877765313, -176.61502916214059, 12.507343278686905,
+         -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7)
+    if x < 0.5
+        return log(π / abs(sin(π * x))) - _loggamma(1 - x)
+    end
+    x -= 1
+    a = c[1]
+    t = x + g + 0.5
+    for i in 2:9
+        a += c[i] / (x + (i - 1))
+    end
+    0.5 * log(2π) + (x + 0.5) * log(t) - t + log(a)
+end
+
 # ─── Log-likelihood functions ───────────────────────────────────────
 
 """
     log_likelihood(fam, y, mu, w)
 
-Total weighted log-likelihood: Σ_i w_i ℓ(y_i, μ_i).
+Total weighted log-likelihood: Σ_i w_i ℓ(y_i, μ_i). Includes the full
+normalizing constants so the value is comparable across models/families
+(e.g. for AIC), not just up to an additive constant.
 """
 function log_likelihood(::Gaussian, y::AbstractVector,
                         mu::AbstractVector, w::AbstractVector)
@@ -57,7 +79,8 @@ function log_likelihood(::Poisson, y::AbstractVector,
     ll = 0.0
     for i in eachindex(y)
         mu_i = max(mu[i], 1e-10)
-        ll += w[i] * (y[i] > 0 ? y[i] * log(mu_i) - mu_i : -mu_i)
+        kern = y[i] > 0 ? y[i] * log(mu_i) - mu_i : -mu_i
+        ll += w[i] * (kern - _loggamma(y[i] + 1))   # − log(y!)
     end
     ll
 end
@@ -65,10 +88,13 @@ end
 function log_likelihood(fam::NegativeBinomial, y::AbstractVector,
                         mu::AbstractVector, w::AbstractVector)
     θ = fam.theta
+    lgθ = _loggamma(θ)
     ll = 0.0
     for i in eachindex(y)
         mu_i = max(mu[i], 1e-10)
-        ll += w[i] * (y[i] * log(mu_i / (mu_i + θ)) + θ * log(θ / (mu_i + θ)))
+        kern = y[i] * log(mu_i / (mu_i + θ)) + θ * log(θ / (mu_i + θ))
+        norm = _loggamma(y[i] + θ) - lgθ - _loggamma(y[i] + 1)
+        ll += w[i] * (kern + norm)
     end
     ll
 end

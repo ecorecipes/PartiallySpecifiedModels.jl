@@ -91,22 +91,39 @@ end
 """
     logpdf_mvn(x, μ, Σ)
 
-Log-density of multivariate normal using eigendecomposition for robustness.
-Handles singular covariance matrices gracefully.
+Log-density of the multivariate normal N(μ, Σ) evaluated at `x`, computed
+over the FULL dimension `n = length(x)` (a fixed reference measure).
+
+A small adaptive jitter is added to `Σ` to keep it positive-definite for the
+Cholesky factorization. Evaluating every call at the same dimension `n` is
+essential when log-densities are subtracted (e.g. the DALTON joint − marginal
+identity): a previous eigen-truncation to a data-dependent rank `k` made the
+`-k/2·log(2π)` and log-determinant terms fail to cancel.
 """
 function logpdf_mvn(x::AbstractVector, μ::AbstractVector, Σ::AbstractMatrix)
     n = length(x)
     r = x - μ
-    w, v = eigen(Symmetric(Σ))
-    z = v' * r
-    # Only use non-negligible eigenvalues
-    active = w .> 1e-300
-    k = sum(active)
-    if k == 0
-        return 0.0
+    Σs = Symmetric(Matrix(Σ))
+    # Adaptive jitter scaled to the matrix magnitude.
+    base = max(maximum(diag(Σs)), 1.0)
+    jit = 0.0
+    C = nothing
+    for _ in 1:8
+        F = cholesky(Σs + jit * I, check=false)
+        if issuccess(F)
+            C = F
+            break
+        end
+        jit = jit == 0.0 ? 1e-12 * base : jit * 10
     end
-    w_a = w[active]
-    z_a = z[active]
-    val = -0.5 * sum(z_a .^ 2 ./ w_a) - 0.5 * sum(log.(w_a)) - 0.5 * k * log(2π)
-    val
+    if C === nothing
+        # Last resort: eigen-based pseudo-density on the full dimension.
+        w, v = eigen(Σs)
+        w = max.(w, 1e-12 * base)
+        z = v' * r
+        return -0.5 * sum(z .^ 2 ./ w) - 0.5 * sum(log.(w)) - 0.5 * n * log(2π)
+    end
+    logdet_Σ = 2 * sum(log, diag(C.U))
+    quad = sum(abs2, C.L \ r)
+    -0.5 * quad - 0.5 * logdet_Σ - 0.5 * n * log(2π)
 end

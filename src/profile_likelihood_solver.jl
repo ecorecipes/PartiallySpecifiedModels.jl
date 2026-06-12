@@ -10,6 +10,49 @@
 using LinearAlgebra: dot, norm
 
 """
+    _normal_quantile(p) → Float64
+
+Standard-normal inverse CDF Φ⁻¹(p) via Acklam's rational approximation
+(relative error < 1.15e-9). Self-contained — avoids a Distributions
+dependency for computing χ² thresholds.
+"""
+function _normal_quantile(p::Float64)
+    (p <= 0.0) && return -Inf
+    (p >= 1.0) && return Inf
+    a = (-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+          1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00)
+    b = (-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+          6.680131188771972e+01, -1.328068155288572e+01)
+    c = (-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00)
+    d = (7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00)
+    plow, phigh = 0.02425, 1 - 0.02425
+    if p < plow
+        q = sqrt(-2 * log(p))
+        return (((((c[1]*q+c[2])*q+c[3])*q+c[4])*q+c[5])*q+c[6]) /
+               ((((d[1]*q+d[2])*q+d[3])*q+d[4])*q+1)
+    elseif p <= phigh
+        q = p - 0.5; r = q*q
+        return (((((a[1]*r+a[2])*r+a[3])*r+a[4])*r+a[5])*r+a[6])*q /
+               (((((b[1]*r+b[2])*r+b[3])*r+b[4])*r+b[5])*r+1)
+    else
+        q = sqrt(-2 * log(1 - p))
+        return -(((((c[1]*q+c[2])*q+c[3])*q+c[4])*q+c[5])*q+c[6]) /
+                ((((d[1]*q+d[2])*q+d[3])*q+d[4])*q+1)
+    end
+end
+
+"""
+    _chisq1_quantile(level) → Float64
+
+Quantile of the χ²₁ distribution at probability `level`, used as the
+likelihood-ratio threshold for a pointwise profile confidence interval.
+Uses the identity χ²₁ = Z²: q = Φ⁻¹((1+level)/2)².
+"""
+_chisq1_quantile(level::Float64) = _normal_quantile((1 + level) / 2)^2
+
+"""
     solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
 
 Compute profile likelihoods for unknown-function parameters.
@@ -51,20 +94,22 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
     if verbose; println("  Profiling $(length(indices)) parameters..."); end
 
     # ── Step 2: Profile each parameter ───────────────────────────
-    chi2_threshold = if alg.ci_level >= 0.99
-        6.635  # χ²(1, 0.99)
-    elseif alg.ci_level >= 0.95
-        3.841  # χ²(1, 0.95)
-    elseif alg.ci_level >= 0.90
-        2.706  # χ²(1, 0.90)
-    else
-        3.841
-    end
+    # Likelihood-ratio threshold = χ²₁ quantile at the requested level
+    # (correct for any 0 < ci_level < 1, not just the three tabulated ones).
+    chi2_threshold = _chisq1_quantile(alg.ci_level)
+
+    # Number of scalar observations (for the Gaussian profile-likelihood ratio).
+    n_obs = length(prob.data_times) * size(prob.data_values, 2)
 
     profiles = Dict{Int, NamedTuple}()
 
     # ── Helper: compute objective for full beta vector ───────────
-    function _profile_objective(prob, β_full)
+    # `with_penalty=true` returns RSS + roughness penalty (used to
+    # regularise the nuisance coefficients during inner optimisation);
+    # `with_penalty=false` returns the pure data RSS (used to form the
+    # likelihood-ratio statistic, which must be a function of the data
+    # fit only, not the penalised objective).
+    function _profile_objective(prob, β_full; with_penalty::Bool=true)
         p = build_param_struct(prob, β_full)
         total_loss = 0.0
         try
@@ -101,15 +146,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
         catch
             return 1e10
         end
-        # Penalty
-        offset = 0
-        for approx in prob.approximators
-            np = nparams(approx)
-            pk = β_full[offset+1:offset+np]
-            offset += np
-            S = penalty_matrix(approx)
-            if S !== nothing
-                total_loss += dot(pk, S * pk)
+        # Penalty (only for the regularised objective used in optimisation)
+        if with_penalty
+            offset = 0
+            for approx in prob.approximators
+                np = nparams(approx)
+                pk = β_full[offset+1:offset+np]
+                offset += np
+                S = penalty_matrix(approx)
+                if S !== nothing
+                    total_loss += dot(pk, S * pk)
+                end
             end
         end
         total_loss
@@ -206,9 +253,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
             beta_warm_left = _eval_grid_point!(gi, grid[gi], beta_warm_left)
         end
 
-        # Compute profile likelihood ratio and CI
-        min_obj = minimum(profile_obj)
-        plr = 2.0 .* (profile_obj .- min_obj)  # profile likelihood ratio
+        # Compute the profile likelihood-ratio statistic from the DATA fit.
+        # For Gaussian data with σ² profiled out, −2(ℓ_profile − ℓ̂) =
+        # n·log(RSS_profile / RSS_min); this is what the χ²₁ threshold
+        # references (the penalised objective difference is not χ²₁).
+        profile_rss = [isfinite(profile_obj[gi]) ?
+                       _profile_objective(prob, profile_beta[gi]; with_penalty=false) :
+                       Inf for gi in 1:alg.n_profile_points]
+        rss_min = minimum(filter(isfinite, profile_rss))
+        rss_min = max(rss_min, eps())
+        plr = [isfinite(r) ? n_obs * log(max(r, eps()) / rss_min) : Inf
+               for r in profile_rss]
 
         # Find CI: largest interval where PLR < threshold
         in_ci = plr .< chi2_threshold

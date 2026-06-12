@@ -14,142 +14,114 @@
 #
 # Reference: Wu & Lysy (2024)
 
-# ─── Core filter pass ─────────────────────────────────────────────
+# ─── Core: frozen-linearization joint filter ──────────────────────
+#
+# Correctness note (the heart of DALTON):
+#   logp(Y|Z) = logp(Y,Z) − logp(Z)
+# holds ONLY if both evidences are computed under the SAME, data-INDEPENDENT
+# linear-Gaussian model.  The ODE pseudo-observation Z is a linearization
+# of W·X − f(X) about a reference trajectory; if that linearization point
+# moves when data are assimilated (as in a naive joint filter), the two
+# passes use different models and the Z-terms do not cancel.  We therefore
+# compute the linearization (Hₙ, bₙ) ONCE from an ODE-only "reference"
+# filter and FREEZE it, then reuse those exact measurement models in the
+# joint pass.  Both passes then share one model and the identity is exact.
 
 """
-    _dalton_filter_loglik(ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma,
-                          obs_data, obs_times, obs_to_state, obs_var,
-                          include_obs; interrogate=:kramer)
+    _dalton_reference(ode_fun!, p, u0, tspan, n_steps, q, sigma; interrogate)
 
-Forward Kalman filter pass with IBM prior and ODE interrogation constraints,
-optionally incorporating observation updates at matching grid points.
-
-Returns the total innovation log-likelihood via the Kalman decomposition:
-    logp = Σ_n log p(z_n | z_{1:n-1})
-
-When `include_obs=true`, observations are assimilated after ODE updates,
-giving logp(Y,Z). When `include_obs=false`, only ODE constraints are
-applied, giving logp(Z).
+ODE-only joint Kalman filter. Returns the frozen interrogation models
+`(Hs, bs)` (one per step) and the marginal ODE log-evidence `logp(Z)`.
 """
-function _dalton_filter_loglik(ode_fun!, p, u0::AbstractVector,
-                               tspan::Tuple{Float64, Float64},
-                               n_steps::Int, n_deriv::Int,
-                               sigma::Vector{Float64},
-                               obs_data::Matrix{Float64},
-                               obs_times::Vector{Float64},
-                               obs_to_state::Vector{Int},
-                               obs_var::Float64,
-                               include_obs::Bool;
-                               interrogate::Symbol=:kramer)
+function _dalton_reference(ode_fun!, p, u0::AbstractVector,
+                           tspan::Tuple{Float64,Float64},
+                           n_steps::Int, q::Int, sigma::Vector{Float64};
+                           interrogate::Symbol=:kramer)
     t_min, t_max = tspan
-    dt = (t_max - t_min) / n_steps
-    n_vars = length(u0)
+    n_vars = length(u0); D = n_vars * q
+    A, Qmat = _joint_ibm((t_max - t_min) / n_steps, q, sigma)
+    E0, E1 = _joint_selectors(n_vars, q)
+    V = Matrix(1e-10 * I, n_vars, n_vars)
 
-    # IBM prior matrices
-    wgt_state, var_state = ibm_init(dt, n_deriv, sigma)
-    W_list = first_order_weight(n_vars, n_deriv)
+    μf = _joint_init(ode_fun!, Float64.(u0), t_min, p, q)
+    Σf = zeros(D, D)
+    Hs = Vector{Matrix{Float64}}(undef, n_steps)
+    bs = Vector{Vector{Float64}}(undef, n_steps)
+    logZ = 0.0
+    ztarget = zeros(n_vars)
 
-    # Small ODE measurement noise for numerical stability of the DALTON
-    # difference.  Without this, V_ode = 0 makes the innovation covariance
-    # depend solely on Σ_pred, which can produce extreme log-densities
-    # that amplify when we subtract marginal from joint.
-    ode_nuggets = [fill(1e-10 * sigma[k]^2, 1, 1) for k in 1:n_vars]
-
-    # Initial state from ODE (known exactly, zero covariance)
-    X0 = first_order_init(ode_fun!, Float64.(u0), t_min, p, n_deriv)
-    μ_filt = [copy(X0[k]) for k in 1:n_vars]
-    Σ_filt = [zeros(n_deriv, n_deriv) for _ in 1:n_vars]
-
-    # Map observation times to solver grid indices
-    grid_times = collect(range(t_min, t_max, length=n_steps + 1))
-    n_t_obs = size(obs_data, 1)
-    n_obs_vars = length(obs_to_state)
-    obs_ind = [searchsortedfirst(grid_times, obs_times[i]) for i in 1:n_t_obs]
-    obs_ind = clamp.(obs_ind, 1, n_steps + 1)
-
-    # Build lookup: grid index → [(time_idx, obs_col), ...]
-    obs_at_grid = Dict{Int, Vector{Tuple{Int,Int}}}()
-    if include_obs
-        for i in 1:n_t_obs, j in 1:n_obs_vars
-            gi = obs_ind[i]
-            if !haskey(obs_at_grid, gi)
-                obs_at_grid[gi] = Tuple{Int,Int}[]
-            end
-            push!(obs_at_grid[gi], (i, j))
-        end
-    end
-
-    # Observation matrix: selects 0th derivative from IBM state [x, x', x'', ...]
-    H_obs = zeros(1, n_deriv)
-    H_obs[1, 1] = 1.0
-    V_obs = fill(obs_var, 1, 1)
-
-    interrogate_fn = interrogate == :kramer ? interrogate_kramer : interrogate_schober
-    z_meas = zeros(1)  # ODE pseudo-observation: residual = 0
-    loglik = 0.0
-
-    # Handle observations at initial time (grid index 1)
-    if include_obs && haskey(obs_at_grid, 1)
-        for (ti, ji) in obs_at_grid[1]
-            k = obs_to_state[ji]
-            y_obs = [obs_data[ti, ji]]
-            μ_fore = H_obs * μ_filt[k]
-            Σ_fore = H_obs * Σ_filt[k] * H_obs' + V_obs
-            loglik += logpdf_mvn(y_obs, μ_fore, Σ_fore)
-            μ_filt[k], Σ_filt[k] = kalman_update(
-                μ_filt[k], Σ_filt[k], y_obs, zeros(1), H_obs, V_obs)
-        end
-    end
-
-    # Forward Kalman filter
     for n in 1:n_steps
-        t_n = t_min + dt * n
+        t_n = t_min + (t_max - t_min) * n / n_steps
+        μp = A * μf; Σp = A * Σf * A' + Qmat; Σp = 0.5 * (Σp + Σp')
+        H, b = _joint_interrogate(ode_fun!, E0, E1, t_n, μp, p, n_vars;
+                                  method=interrogate)
+        Hs[n] = H; bs[n] = b
+        zmean = H * μp + b
+        S = H * Σp * H' + V; S = 0.5 * (S + S')
+        logZ += logpdf_mvn(ztarget, zmean, S)
+        Sf = cholesky(Symmetric(S), check=false)
+        K = (Σp * H') * (issuccess(Sf) ? inv(Sf) : pinv(S))
+        μf = μp - K * zmean; Σf = Σp - K * H * Σp; Σf = 0.5 * (Σf + Σf')
+    end
+    Hs, bs, logZ
+end
 
-        # ── Predict ──
-        μ_pred = Vector{Vector{Float64}}(undef, n_vars)
-        Σ_pred = Vector{Matrix{Float64}}(undef, n_vars)
-        for k in 1:n_vars
-            μ_pred[k], Σ_pred[k] = kalman_predict(
-                μ_filt[k], Σ_filt[k], wgt_state[k], var_state[k])
-        end
+"""
+    _dalton_joint_evidence(ode_fun!, p, u0, tspan, n_steps, q, sigma, Hs, bs,
+                           obs_data, obs_times, obs_to_state, obs_var)
 
-        # ── Interrogate ODE ──
-        wgt_m, mean_m, var_m = interrogate_fn(
-            ode_fun!, W_list, t_n, μ_pred, Σ_pred, p, n_vars)
+Joint Kalman filter using the FROZEN interrogation models `(Hs, bs)`,
+assimilating both the ODE pseudo-observations and the data. Returns the
+joint log-evidence `logp(Y,Z)`.
+"""
+function _dalton_joint_evidence(ode_fun!, p, u0::AbstractVector,
+                                tspan::Tuple{Float64,Float64},
+                                n_steps::Int, q::Int, sigma::Vector{Float64},
+                                Hs::Vector{Matrix{Float64}}, bs::Vector{Vector{Float64}},
+                                obs_data::Matrix{Float64}, obs_times::Vector{Float64},
+                                obs_to_state::Vector{Int}, obs_var::Float64)
+    t_min, t_max = tspan
+    n_vars = length(u0); D = n_vars * q
+    A, Qmat = _joint_ibm((t_max - t_min) / n_steps, q, sigma)
+    V = Matrix(1e-10 * I, n_vars, n_vars)
 
-        # ── ODE constraint update with innovation log-likelihood ──
-        for k in 1:n_vars
-            W_total = W_list[k] + wgt_m[k]
-            V_reg = var_m[k] + ode_nuggets[k]
+    μf = _joint_init(ode_fun!, Float64.(u0), t_min, p, q)
+    Σf = zeros(D, D)
+    times = collect(range(t_min, t_max, length = n_steps + 1))
+    n_t_obs = size(obs_data, 1); n_obs_vars = length(obs_to_state)
+    obs_ind = clamp.([searchsortedfirst(times, obs_times[i]) for i in 1:n_t_obs],
+                     1, n_steps + 1)
+    Dmats = [reshape([(c == (obs_to_state[j]-1)*q + 1) ? 1.0 : 0.0 for c in 1:D], 1, D)
+             for j in 1:n_obs_vars]
+    Vobs = fill(obs_var, 1, 1)
+    ztarget = zeros(n_vars)
+    logEv = 0.0
 
-            # Innovation: log p(z=0 | past)
-            μ_fore = W_total * μ_pred[k] + mean_m[k]
-            Σ_fore = W_total * Σ_pred[k] * W_total' + V_reg
-            loglik += logpdf_mvn(z_meas, μ_fore, Σ_fore)
-
-            μ_filt[k], Σ_filt[k] = kalman_update(
-                μ_pred[k], Σ_pred[k], z_meas, mean_m[k], W_total, V_reg)
-        end
-
-        # ── Observation update (joint pass only) ──
-        grid_idx = n + 1
-        if include_obs && haskey(obs_at_grid, grid_idx)
-            for (ti, ji) in obs_at_grid[grid_idx]
-                k = obs_to_state[ji]
-                y_obs = [obs_data[ti, ji]]
-
-                # Innovation: log p(y | past, z_ode)
-                μ_fore = H_obs * μ_filt[k]
-                Σ_fore = H_obs * Σ_filt[k] * H_obs' + V_obs
-                loglik += logpdf_mvn(y_obs, μ_fore, Σ_fore)
-
-                μ_filt[k], Σ_filt[k] = kalman_update(
-                    μ_filt[k], Σ_filt[k], y_obs, zeros(1), H_obs, V_obs)
+    function assimilate_data!(gi)
+        for i in 1:n_t_obs
+            obs_ind[i] == gi || continue
+            for j in 1:n_obs_vars
+                Dj = Dmats[j]; y = [obs_data[i, j]]
+                μfo, Σfo = kalman_forecast(μf, Σf, zeros(1), Dj, Vobs)
+                logEv += logpdf_mvn(y, μfo, Σfo)
+                μf, Σf = kalman_update(μf, Σf, y, zeros(1), Dj, Vobs)
             end
         end
     end
 
-    loglik
+    assimilate_data!(1)
+    for n in 1:n_steps
+        μp = A * μf; Σp = A * Σf * A' + Qmat; Σp = 0.5 * (Σp + Σp')
+        H = Hs[n]; b = bs[n]
+        zmean = H * μp + b
+        S = H * Σp * H' + V; S = 0.5 * (S + S')
+        logEv += logpdf_mvn(ztarget, zmean, S)
+        Sf = cholesky(Symmetric(S), check=false)
+        K = (Σp * H') * (issuccess(Sf) ? inv(Sf) : pinv(S))
+        μf = μp - K * zmean; Σf = Σp - K * H * Σp; Σf = 0.5 * (Σf + Σf')
+        assimilate_data!(n + 1)
+    end
+    logEv
 end
 
 # ─── DALTON log-likelihood ────────────────────────────────────────
@@ -159,12 +131,9 @@ end
                    obs_data, obs_times, obs_to_state, obs_var;
                    interrogate=:kramer)
 
-Compute the DALTON data-adaptive log-likelihood via Bayes' rule:
-
-    logp(Y|Z) = logp(Y,Z) - logp(Z)
-
-where Z are ODE interrogation pseudo-observations and Y are data.
-Two forward Kalman filter passes compute the joint and marginal terms.
+DALTON data-conditional log-likelihood `logp(Y|Z) = logp(Y,Z) − logp(Z)`
+(Wu & Lysy 2024). Computed with a frozen, data-independent ODE
+linearization so the identity is exact (see note above).
 """
 function _dalton_loglik(ode_fun!, p, u0::AbstractVector,
                         tspan::Tuple{Float64, Float64},
@@ -175,19 +144,12 @@ function _dalton_loglik(ode_fun!, p, u0::AbstractVector,
                         obs_to_state::Vector{Int},
                         obs_var::Float64;
                         interrogate::Symbol=:kramer)
-    loglik_joint = _dalton_filter_loglik(
-        ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma,
-        obs_data, obs_times, obs_to_state, obs_var, true;
-        interrogate=interrogate)
-
-    loglik_marginal = _dalton_filter_loglik(
-        ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma,
-        obs_data, obs_times, obs_to_state, obs_var, false;
-        interrogate=interrogate)
-
-    ll = loglik_joint - loglik_marginal
-    # The difference of two large log-densities can lose precision;
-    # return a sentinel when the result is clearly numerical noise.
+    q = n_deriv
+    Hs, bs, logZ = _dalton_reference(ode_fun!, p, u0, tspan, n_steps, q, sigma;
+                                     interrogate=interrogate)
+    logYZ = _dalton_joint_evidence(ode_fun!, p, u0, tspan, n_steps, q, sigma,
+                                   Hs, bs, obs_data, obs_times, obs_to_state, obs_var)
+    ll = logYZ - logZ
     isfinite(ll) ? ll : -Inf
 end
 
@@ -196,24 +158,24 @@ end
 """
     solve(prob::PSMProblem, alg::DaltonSolver)
 
-Fit a partially specified model using the DALTON (DAta-driven Linearisation
-Turn-ON) probabilistic ODE solver. Combines an IBM prior with iterative
-local linearisation of the ODE to obtain a Gaussian posterior over the
-state trajectory, then optimises the unknown-function parameters.
+Fit a partially specified model using the DALTON (Data-Adaptive Likelihood
+with Transformed ObservatioNs) probabilistic ODE solver of Wu & Lysy
+(2024). The data-conditional likelihood `logp(Y|Z) = logp(Y,Z) − logp(Z)`
+is evaluated with two joint Kalman-filter passes that share a single,
+data-independent ODE linearization, then the unknown-function parameters
+are optimized to maximize it.
 
 # Algorithm
 1. Set up the IBM prior of order `n_deriv` for each state variable.
-2. Forward Kalman filter: propagate the prior and assimilate data and
-   ODE pseudo-observations obtained by linearising the dynamics.
-3. RTS backward smoother to obtain the posterior state.
-4. Iterate linearisation using the current posterior mean until
-   convergence (DALTON iterations).
-5. Optimise unknown-function parameters by maximising the marginal
-   log-likelihood.
+2. Reference pass: ODE-only joint filter giving the marginal evidence
+   `logp(Z)` and the frozen EKF1 linearization models `(Hₙ, bₙ)`.
+3. Joint pass: re-filter with the same frozen models, additionally
+   assimilating the data, giving `logp(Y,Z)`.
+4. `logp(Y|Z) = logp(Y,Z) − logp(Z)`; optimize the parameters.
 
 # References
-- Tronarp et al. (2022), "Fenrir: Physics-Enhanced Regression for Initial
-  Value Problems", ICML.
+- Wu, M. & Lysy, M. (2024), "Data-adaptive probabilistic likelihood
+  approximation for ordinary differential equations", AISTATS.
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
@@ -311,11 +273,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
                                 interrogate=alg.interrogate)
 
             if !isfinite(ll)
-                return 1e10
-            end
-
-            n_data = size(prob.data_values, 1) * size(prob.data_values, 2)
-            if ll > 100.0 * max(n_data, 1)
                 return 1e10
             end
 

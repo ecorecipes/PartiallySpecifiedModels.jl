@@ -1,6 +1,6 @@
 # Alternative Approximators: Neural Networks and Gaussian Processes
 Simon Frost
-2026-04-02
+2026-06-12
 
 - [Overview](#overview)
   - [When to use each](#when-to-use-each)
@@ -100,7 +100,7 @@ end
 The B-spline models $\beta(I)$ as a smooth function of the infected
 count, with automatic smoothing via LAML:
 
-    B-Spline — SS: 1804.0, EDF: 9.86
+    B-Spline — SS: 1784.0, EDF: 3.86
 
 ## Approach 2: Gaussian Process Approximator
 
@@ -109,7 +109,7 @@ at inducing points. Different kernel functions control the smoothness of
 the interpolation, while LAML uses a spline-based penalty for automatic
 smoothing parameter selection:
 
-    GP (SqExp) — SS: 1803.0, EDF: 2.59
+    GP (SqExp) — SS: 1805.0, EDF: 2.0
 
 We can also try different kernel functions. The **Matérn 3/2** kernel
 produces rougher functions (once differentiable) while the **Matérn
@@ -117,8 +117,8 @@ produces rougher functions (once differentiable) while the **Matérn
 between inducing points — a squared exponential gives infinitely smooth
 interpolation while Matérn kernels allow more local variation:
 
-    GP (Matérn 3/2) — SS: 1792.0, EDF: 8.77
-    GP (Matérn 5/2) — SS: 1794.0, EDF: 2.7
+    GP (Matérn 3/2) — SS: 1747.0, EDF: 8.47
+    GP (Matérn 5/2) — SS: 1792.0, EDF: 2.58
 
 ## Approach 3: Neural Network Approximator
 
@@ -163,7 +163,7 @@ ODE shooting refinement after GM, using the GM solution as a warm start:
 
     ┌ Warning: Mixed-Precision `matmul_cpu_fallback!` detected and Octavian.jl cannot be used for this set of inputs (C [Matrix{Float64}]: A [Base.ReshapedArray{Float64, 2, SubArray{Float64, 1, Vector{Float64}, Tuple{UnitRange{Int64}}, true}, Tuple{}}] x B [Matrix{Float32}]). Falling back to generic implementation. This may be slow.
     └ @ LuxLib.Impl ~/.julia/packages/LuxLib/ZJ3gh/src/impl/matmul.jl:194
-    Neural (GM+refine) — deriv_SS: 25100.0, EDF: 25.0
+    Neural (GM+refine) — deriv_SS: 11530.0, EDF: 25.0
 
 ## Comparison
 
@@ -335,7 +335,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](05_neural_networks_files/figure-commonmark/cell-13-output-1.svg)
 
-    Durbin-Watson: 2.146, 1.405
+    Durbin-Watson: 2.103, 1.642
 
 > [!TIP]
 >
@@ -353,14 +353,14 @@ interpretable than raw SS values which depend on data scale.
 
     Method                    SS         EDF    cor(β)   β(1)   β(50)
     ------------------------------------------------------------------------
-    B-Spline (10 knots)       1804.0     9.9    0.879    0.493   0.429
-    GP — SqExp (10 pts)       1803.0     2.6    0.994    0.494   0.391
-    GP — Matérn 3/2           1792.0     8.8    0.949    0.478   0.41
-    GP — Matérn 5/2           1794.0     2.7    0.999    0.495   0.391
+    B-Spline (10 knots)       1784.0     3.9    0.999    0.497   0.39
+    GP — SqExp (10 pts)       1805.0     2.0    0.994    0.494   0.391
+    GP — Matérn 3/2           1747.0     8.5    0.947    0.468   0.403
+    GP — Matérn 5/2           1792.0     2.6    0.999    0.495   0.391
     Neural Adam (25)          1786.0     25.0   1.0      0.498   0.389
     ┌ Warning: Mixed-Precision `matmul_cpu_fallback!` detected and Octavian.jl cannot be used for this set of inputs (C [Matrix{Float64}]: A [Base.ReshapedArray{Float64, 2, SubArray{Float64, 1, Vector{Float64}, Tuple{UnitRange{Int64}}, true}, Tuple{}}] x B [Matrix{Float32}]). Falling back to generic implementation. This may be slow.
     └ @ LuxLib.Impl ~/.julia/packages/LuxLib/ZJ3gh/src/impl/matmul.jl:194
-    Neural GM+refine (25)     5.686e-29  25.0   0.891    0.549   0.369
+    Neural GM+refine (25)     1729.0     25.0   0.901    0.545   0.37
     True                      -          -      1.0      0.498   0.389
 
 | Feature | B-Spline | Gaussian Process | Neural Network |

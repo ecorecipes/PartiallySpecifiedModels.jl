@@ -17,11 +17,11 @@ julia:
 
 ## Overview
 
-**MAGI** (Manifold-constrained Gaussian process Inference) is a Bayesian method that uses Gaussian processes to infer ODE parameters without numerically solving the ODE during sampling. Instead, it models each state component as integrated Brownian motion and uses a Kalman filter to enforce the ODE dynamics as a "manifold constraint."
+**MAGI** (Manifold-constrained Gaussian process Inference) is a Bayesian method that uses Gaussian processes to infer ODE parameters without numerically solving the ODE during sampling. It places a Gaussian-process prior on each state component and constrains the GP-implied derivative to match the ODE vector field — the "manifold constraint" — via the conditional derivative covariance `K* = ''K − 'K C⁻¹ ('K)ᵀ` (Yang, Wong & Kou 2021).
 
 **Key advantages:**
 
-- **States marginalized out**: The Kalman filter analytically integrates over trajectory uncertainty, so only ODE parameters are sampled (lower-dimensional MCMC).
+- **States sampled jointly**: the trajectory values on the discretization grid are sampled together with the unknown-function parameters under the manifold-constrained GP posterior.
 - **No ODE solver in the loop**: Avoids numerical integration at each MCMC step — faster per iteration than `MCMCSolver`.
 - **Handles partially observed systems**: Unobserved state components are naturally inferred through the ODE constraint.
 
@@ -103,8 +103,8 @@ prob_sir = PSMProblem(sir!, [0.99, 0.01, 0.0], (0.0, 40.0), [uf_β];
     likelihood=PartiallySpecifiedModels.Gaussian())
 
 sol_sir = solve(prob_sir, MagiSolver(
-    n_samples=200, n_warmup=200,
-    n_gridpoints=80, n_deriv=3,
+    n_samples=150, n_warmup=150,
+    n_gridpoints=40, n_deriv=3,
     obs_var=noise^2, preoptimize=true, verbose=false))
 ```
 
@@ -275,8 +275,8 @@ prob_lv = PSMProblem(lv!, [2.0, 1.0], (0.0, 30.0), [uf_g];
     likelihood=PartiallySpecifiedModels.Gaussian())
 
 sol_lv = solve(prob_lv, MagiSolver(
-    n_samples=200, n_warmup=200,
-    n_gridpoints=60, n_deriv=3,
+    n_samples=150, n_warmup=150,
+    n_gridpoints=40, n_deriv=3,
     sigma=[1.0, 1.0],      # explicit sigma for both states
     obs_var=0.0025, preoptimize=true, verbose=false))
 ```
@@ -394,11 +394,11 @@ p_tr_lv
 
 | Feature | MagiSolver | MCMCSolver |
 |---------|-----------|-----------|
-| **ODE solver per step** | No (Kalman filter) | Yes (full ODE solve) |
-| **States sampled?** | No (marginalized) | No (marginalized via ODE) |
+| **ODE solver per step** | No (GP manifold constraint) | Yes (full ODE solve) |
+| **States sampled?** | Yes (jointly with parameters) | No (determined by the ODE) |
 | **Partially observed** | Natural support | Requires all states |
-| **Speed per iteration** | Fast (matrix ops) | Slower (ODE integration) |
-| **Accuracy** | Approximate (IBM prior) | Exact (ODE solve) |
+| **Speed per iteration** | Matrix ops (scales with grid size) | Slower (ODE integration) |
+| **Accuracy** | Approximate (GP manifold) | Exact (ODE solve) |
 | **Output** | `MCMCChains.Chains` | `MCMCChains.Chains` |
 
 **When to use MAGI:**
@@ -453,4 +453,4 @@ println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_wa
 
 ## Summary
 
-`MagiSolver` provides a GP-based alternative to traditional ODE-in-the-loop Bayesian inference. By modeling trajectories as integrated Brownian motion and enforcing ODE dynamics through Kalman filtering, it marginalizes out state trajectories and samples only the unknown function parameters — making it efficient and naturally suited to partially observed systems.
+`MagiSolver` provides a GP-based alternative to traditional ODE-in-the-loop Bayesian inference. By placing a Gaussian-process prior on each state and enforcing the ODE dynamics through the manifold constraint, it samples the state trajectories jointly with the unknown-function parameters — avoiding a numerical ODE solve at each step and naturally supporting partially observed systems. (The cost scales with the discretization grid size, since the states on the grid are sampled.)

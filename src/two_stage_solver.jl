@@ -23,7 +23,7 @@ derivatives; in stage 2 the unknown-function parameters are estimated by
 nonlinear least squares against those smoothed derivatives.
 
 # Algorithm
-1. Smooth each observed state with cubic splines and evaluate derivatives
+1. Smooth each observed state with a penalized (GCV) smoothing spline and evaluate derivatives
    at the data time points.
 2. Interpolate unobserved states from observed ones using the model.
 3. Minimise ∑ₜ ‖x′(t) − f(x(t), uf(t; β))‖² with respect to β using
@@ -61,10 +61,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             push!(observed_states, sk)
-            itp = CubicSpline(prob.data_values[:, j], times;
-                              extrapolation=ExtrapolationType.Extension)
+            val, _ = _smoothing_spline(times, prob.data_values[:, j])
             for i in 1:n_times
-                y_smooth[i, sk] = itp(times[i])
+                y_smooth[i, sk] = val(times[i])
             end
         end
         # Target: smoothed next-state y_smooth[i+1, k]
@@ -75,15 +74,14 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
             dydt[n_times, k] = y_smooth[n_times, k]
         end
     else
-        # For continuous models: smooth data and compute analytical derivatives
+        # For continuous models: penalized (GCV) smoothing spline + derivative
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             push!(observed_states, sk)
-            itp = CubicSpline(prob.data_values[:, j], times;
-                              extrapolation=ExtrapolationType.Extension)
+            val, der = _smoothing_spline(times, prob.data_values[:, j])
             for i in 1:n_times
-                y_smooth[i, sk] = itp(times[i])
-                dydt[i, sk] = DataInterpolations.derivative(itp, times[i])
+                y_smooth[i, sk] = val(times[i])
+                dydt[i, sk] = der(times[i])
             end
         end
     end

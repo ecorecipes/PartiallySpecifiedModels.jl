@@ -120,7 +120,7 @@ function _golden_section_gcv(J::AbstractMatrix, W_irls::AbstractVector,
         else
             a = c
             c = d
-            gc = gc
+            gc = gd
             betac = betad
             trAc = trAd
             d = a + (b - a) / gr

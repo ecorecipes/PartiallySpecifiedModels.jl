@@ -1,6 +1,6 @@
 # Epidemiological Count Data: Non-Gaussian Likelihoods
 Simon Frost
-2026-04-02
+2026-06-12
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -64,11 +64,6 @@ using Random
 import Distributions
 Random.seed!(42)
 ```
-
-    Precompiling packages...
-        PartiallySpecifiedModels Being precompiled by another process (pid: 36853, pidfile: /Users/sdwfrost/.julia/compiled/v1.12/PartiallySpecifiedModels/tWtwA_lLwID.ji.pidfile)
-      18184.3 ms  ✓ PartiallySpecifiedModels
-      1 dependency successfully precompiled in 42 seconds. 387 already precompiled.
 
     TaskLocalRNG()
 
@@ -173,15 +168,15 @@ Each likelihood gets a fresh approximator:
 
 ### Gaussian (standard, but wrong for counts)
 
-    Gaussian: data_loss = 1.5765256e6, edf = 2.1
+    Gaussian: data_loss = 1.5744947e6, edf = 2.1
 
 ### Poisson (correct variance structure for counts)
 
-    Poisson: data_loss = 1.5755791e6, edf = 2.0
+    Poisson: data_loss = 1.5756104e6, edf = 2.0
 
 ### Negative Binomial (accounts for overdispersion)
 
-    NegBin: data_loss = 1.5872837e6, edf = 2.0
+    NegBin: data_loss = 1.5873241e6, edf = 2.0
 
 ## Compare Results
 
@@ -233,7 +228,7 @@ plot!(prev_grid, [sol_nb.unknown_functions[:β](p) for p in prev_grid],
 
     Likelihood | β(0.01) est | β(0.06) est | EDF  | Cor(β̂, β_true)
     ----------------------------------------------------------------------
-    Gaussian   | 0.483 (0.490) | 0.459 (0.443) | 2.1  | 0.979
+    Gaussian   | 0.494 (0.490) | 0.462 (0.443) | 2.1  | 0.988
     Poisson    | 0.508 (0.490) | 0.459 (0.443) | 2.0  | 1.0
     NegBin     | 0.506 (0.490) | 0.451 (0.443) | 2.0  | 1.0
 
@@ -243,10 +238,10 @@ The RodeoSolver can also be used with count-like data, treating the
 observations as Gaussian with an appropriate observation variance:
 
     Rodeo β recovery:
-      β(0.01): true=0.49, Rodeo=0.399
-      β(0.03): true=0.471, Rodeo=0.552
-      β(0.06): true=0.443, Rodeo=0.471
-      β(0.09): true=0.418, Rodeo=0.445
+      β(0.01): true=0.49, Rodeo=0.503
+      β(0.03): true=0.471, Rodeo=0.486
+      β(0.06): true=0.443, Rodeo=0.459
+      β(0.09): true=0.418, Rodeo=0.432
 
 ## Practical Considerations
 
@@ -329,7 +324,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](11_count_data_sir_files/figure-commonmark/cell-15-output-1.svg)
 
-    Durbin-Watson: 2.52, 1.773
+    Durbin-Watson: 2.522, 1.788
 
 ## Key Takeaways
 

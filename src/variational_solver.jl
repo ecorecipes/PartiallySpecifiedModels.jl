@@ -69,37 +69,38 @@ function _gaussian_loglik(pred, data, weights, obs_noise_var)
 end
 
 """
-    _kl_gaussian(mu, log_sigma, prior_scale)
+    _kl_gaussian_penalized(mu, log_sigma, Λ, logdetΛ)
 
-Analytical KL divergence: KL(q || p) where q = N(μ, σ²), p = N(0, τ²).
-`log_sigma` contains log(σ_i), `prior_scale` = τ.
+Analytical KL(q ‖ p) where q = N(μ, diag(σ²)) and the prior p = N(0, Λ⁻¹)
+has precision Λ. The prior precision is the roughness-penalty GMRF prior
+`λS` (plus a broad ridge on the null space), so — unlike an isotropic
+N(0, τ²) prior — the ELBO actually contains the smoothing penalty `μᵀΛμ`
+that defines a partially specified model.
 
-    KL = Σ_i [log(τ/σ_i) + (σ_i² + μ_i²)/(2τ²) - 1/2]
+    KL = ½[ tr(Λ Σ_q) + μᵀΛμ − k − log|Λ| − log|Σ_q| ]
 """
-function _kl_gaussian(mu, log_sigma, prior_scale)
+function _kl_gaussian_penalized(mu, log_sigma, Λ, logdetΛ)
     T = promote_type(eltype(mu), eltype(log_sigma))
-    τ = T(prior_scale)
-    τ² = τ * τ
-    log_τ = log(τ)
-    kl = zero(T)
-    for i in eachindex(mu)
-        σ_i = exp(log_sigma[i])
-        kl += log_τ - log_sigma[i] + (σ_i^2 + mu[i]^2) / (2 * τ²) - T(0.5)
+    k = length(mu)
+    dΛ = diag(Λ)
+    tr_term = zero(T); quad_part = Λ * mu
+    for i in 1:k
+        tr_term += dΛ[i] * exp(2 * log_sigma[i])
     end
-    kl
+    quad = dot(mu, quad_part)
+    logdetΣq = 2 * sum(log_sigma)
+    T(0.5) * (tr_term + quad - k - T(logdetΛ) - logdetΣq)
 end
 
 """
-    _compute_elbo(prob, mu, log_sigma, prior_scale, epsilons, obs_noise_var)
+    _compute_elbo(prob, mu, log_sigma, Λ, logdetΛ, epsilons, obs_noise_var)
 
-Compute the ELBO using the reparameterization trick.
+Compute the ELBO using the reparameterization trick, with the
+penalty-induced Gaussian prior (precision `Λ`).
 
-    ELBO = (1/S) Σ_s log p(Y|θ_s) - KL(q||p)
-    θ_s = μ + exp(log_σ) ⊙ ε_s
-
-`epsilons` is a matrix of size (n_params, n_samples).
+    ELBO = (1/S) Σ_s log p(Y|θ_s) - KL(q||p),   θ_s = μ + exp(log_σ) ⊙ ε_s
 """
-function _compute_elbo(prob::PSMProblem, mu, log_sigma, prior_scale,
+function _compute_elbo(prob::PSMProblem, mu, log_sigma, Λ, logdetΛ,
                        epsilons, obs_noise_var)
     T = promote_type(eltype(mu), eltype(log_sigma))
     n_samples = size(epsilons, 2)
@@ -131,7 +132,7 @@ function _compute_elbo(prob::PSMProblem, mu, log_sigma, prior_scale,
     end
     avg_ll /= n_valid
 
-    kl = _kl_gaussian(mu, log_sigma, prior_scale)
+    kl = _kl_gaussian_penalized(mu, log_sigma, Λ, logdetΛ)
 
     avg_ll - kl
 end
@@ -205,6 +206,20 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
         println("  prior_scale=$(alg.prior_scale), obs_noise_var=$(round(obs_noise_var, sigdigits=3))")
     end
 
+    # Prior precision Λ = roughness penalty (λS per smooth term) + broad
+    # ridge on the null space.  This is what carries the smoothing penalty
+    # into the ELBO (an isotropic prior would drop it entirely).
+    Λ = zeros(n_p, n_p)
+    ridge = 1.0 / (100.0 * alg.prior_scale)
+    for i in 1:n_p; Λ[i, i] += ridge; end
+    let (pens, offs, _) = _build_penalty_info(prob)
+        for (k, S) in enumerate(pens)
+            npk = size(S, 1); idx = (offs[k]+1):(offs[k]+npk)
+            Λ[idx, idx] .+= (1.0 / alg.prior_scale) .* S
+        end
+    end
+    logdetΛ = logdet(cholesky(Symmetric(Λ)))
+
     # Concatenated variational parameters: φ = [μ; log_σ]
     n_phi = 2 * n_p
     phi = vcat(mu, log_sigma)
@@ -229,7 +244,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
         function neg_elbo(phi_vec)
             mu_v = phi_vec[1:n_p]
             ls_v = phi_vec[n_p+1:end]
-            -_compute_elbo(prob, mu_v, ls_v, alg.prior_scale, epsilons,
+            -_compute_elbo(prob, mu_v, ls_v, Λ, logdetΛ, epsilons,
                            obs_noise_var)
         end
 

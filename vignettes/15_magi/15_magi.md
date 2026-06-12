@@ -1,6 +1,6 @@
 # MAGI: Manifold-Constrained Gaussian Process Inference
 Simon Frost
-2026-04-02
+2026-06-12
 
 - [Overview](#overview)
 - [Example 1: SIR Model (Fully
@@ -29,15 +29,17 @@ Simon Frost
 
 **MAGI** (Manifold-constrained Gaussian process Inference) is a Bayesian
 method that uses Gaussian processes to infer ODE parameters without
-numerically solving the ODE during sampling. Instead, it models each
-state component as integrated Brownian motion and uses a Kalman filter
-to enforce the ODE dynamics as a “manifold constraint.”
+numerically solving the ODE during sampling. It places a
+Gaussian-process prior on each state component and constrains the
+GP-implied derivative to match the ODE vector field — the “manifold
+constraint” — via the conditional derivative covariance
+`K* = ''K − 'K C⁻¹ ('K)ᵀ` (Yang, Wong & Kou 2021).
 
 **Key advantages:**
 
-- **States marginalized out**: The Kalman filter analytically integrates
-  over trajectory uncertainty, so only ODE parameters are sampled
-  (lower-dimensional MCMC).
+- **States sampled jointly**: the trajectory values on the
+  discretization grid are sampled together with the unknown-function
+  parameters under the manifold-constrained GP posterior.
 - **No ODE solver in the loop**: Avoids numerical integration at each
   MCMC step — faster per iteration than `MCMCSolver`.
 - **Handles partially observed systems**: Unobserved state components
@@ -157,14 +159,14 @@ prob_sir = PSMProblem(sir!, [0.99, 0.01, 0.0], (0.0, 40.0), [uf_β];
     likelihood=PartiallySpecifiedModels.Gaussian())
 
 sol_sir = solve(prob_sir, MagiSolver(
-    n_samples=200, n_warmup=200,
-    n_gridpoints=80, n_deriv=3,
+    n_samples=150, n_warmup=150,
+    n_gridpoints=40, n_deriv=3,
     obs_var=noise^2, preoptimize=true, verbose=false))
 ```
 
-    [ Info: Found initial step size 0.01171875
+    [ Info: Found initial step size 0.00037841796875
 
-    PSMSolution((β = [0.27327491942619825, 0.2934848290452108, 0.3206340997639245, 0.30187841175662217, 0.2617178634993693, 0.2219884914310222]), 0.0, 0.0, 6.0, Float64[], [0.0 0.0; 0.0 0.0; … ; 0.0 0.0; 0.0 0.0], [0.9867713466394801 0.002683743105555393; 0.9746336282649085 0.013710526549528696; … ; 0.13646451526712325 0.19328337605363644; 0.12652759050099308 0.18421483813613687], [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0  …  22.0, 24.0, 26.0, 28.0, 30.0, 32.0, 34.0, 36.0, 38.0, 40.0], Dict{Symbol, Any}(:β => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([0.27327491942619825, 0.2934848290452108, 0.3206340997639245, 0.30187841175662217, 0.2617178634993693, 0.2219884914310222], [0.0, 0.1, 0.2, 0.3, 0.4, 0.5], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 0.1, 0.1, 0.09999999999999998, 0.10000000000000003, 0.09999999999999998], [0.0, 2.8453434984252577, -7.217757333880329, -1.5172893985135567, 0.44399877796424625, 0.0], DataInterpolations.ExtrapolationType.Extension, DataInterpolations.ExtrapolationType.Extension, FindFirstFunctions.Guesser{Vector{Float64}}([0.0, 0.1, 0.2, 0.3, 0.4, 0.5], Base.RefValue{Int64}(1), true), false, false)), (method = :magi, chains = MCMC chain (200×6×1 Array{Float64, 3})))
+    PSMSolution((β = [0.27044929319313626, 0.29999180121597996, 0.3380271935699672, 0.2921089157132471, 0.2091887725030719, 0.12146637156991766]), 0.0, 0.0, 6.0, Float64[], [0.9864384640872137 0.010394250657457723; 0.9794044811152912 0.015630298140546416; … ; 0.13325684966928691 0.20288778336627866; 0.11779890441572327 0.18041747267108632], [0.9867713466394801 0.002683743105555393; 0.9746336282649085 0.013710526549528696; … ; 0.13646451526712325 0.19328337605363644; 0.12652759050099308 0.18421483813613687], [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0  …  22.0, 24.0, 26.0, 28.0, 30.0, 32.0, 34.0, 36.0, 38.0, 40.0], Dict{Symbol, Any}(:β => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([0.27044929319313626, 0.29999180121597996, 0.3380271935699672, 0.2921089157132471, 0.2091887725030719, 0.12146637156991766], [0.0, 0.1, 0.2, 0.3, 0.4, 0.5], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 0.1, 0.1, 0.09999999999999998, 0.10000000000000003, 0.09999999999999998], [0.0, 4.5694776230061445, -13.182179893338457, -2.212960176076723, -0.16709861442768753, 0.0], DataInterpolations.ExtrapolationType.Extension, DataInterpolations.ExtrapolationType.Extension, FindFirstFunctions.Guesser{Vector{Float64}}([0.0, 0.1, 0.2, 0.3, 0.4, 0.5], Base.RefValue{Int64}(1), true), false, false)), (method = :magi, chains = MCMC chain (150×6×1 Array{Float64, 3}), state_mean = [0.9864384640872137 0.010394250657457723 -0.7616235320643001; 0.9832169370267603 0.012971747819790136 -0.7599733792916241; … ; 0.1250452933673989 0.19158938301708103 -0.2154599649580183; 0.11779890441572327 0.18041747267108632 -0.19670927483861905]))
 
 ### Posterior Trajectories
 
@@ -248,26 +250,26 @@ end
 ```
 
     60-element Vector{Float64}:
-     0.3998939806467205
-     0.38662434613193297
-     0.3753071167258108
-     0.36975202543430913
-     0.3618958324156978
-     0.3500502393673738
-     0.341872178664738
-     0.3362991045956683
-     0.33353496447484615
-     0.3285341904868064
+     0.3305476229128791
+     0.3258561836592464
+     0.3218191637125972
+     0.31976054860752245
+     0.31631548620649996
+     0.31457906039447014
+     0.3129037381341587
+     0.31001485441302445
+     0.3075451801020065
+     0.3108354559982926
      ⋮
-     0.47059896825930325
-     0.4850028237536813
-     0.49969723197627447
-     0.5146942591353737
-     0.5299434687415613
-     0.5453944243054197
-     0.5597994768193397
-     0.5736197043580726
-     0.5874596862055337
+     0.3837420795340445
+     0.3969677689987883
+     0.4107258908944978
+     0.423151867168049
+     0.4342973763941348
+     0.4474618674831279
+     0.4682426671307166
+     0.4893519371349637
+     0.5106254423175396
 
 ``` julia
 I_data_max = maximum(data_SI[:, 2])
@@ -348,26 +350,26 @@ prey_matrix = reshape(prey_data, :, 1)
 ```
 
     21×1 Matrix{Float64}:
-     1.9547244961190091
-     3.434392520204258
-     4.238965745043219
-     4.554822301037396
-     4.674852427155286
-     4.808157138923292
-     4.751580260467379
-     4.888910277479439
-     4.729172310886974
-     4.871656709344678
+     2.014286270520064
+     3.3194088252774345
+     4.190029987003989
+     4.529280671607581
+     4.6592022479804
+     4.764201472171127
+     4.821896468697043
+     4.936352735655549
+     4.911854228513686
+     4.8558020810897755
      ⋮
-     4.946841015239459
-     4.929431155660668
-     5.011214378261437
-     4.8963469095454615
-     4.889620902467444
-     4.924077246448777
-     4.9098438073611685
-     4.925491007235875
-     4.944687100556234
+     4.933539837385822
+     4.96367089743079
+     4.910474054459323
+     4.956392787883544
+     4.966014301033693
+     4.974547699530589
+     4.962631520358594
+     5.05928043499759
+     5.0117630329479335
 
 ### Plot the Data
 
@@ -408,15 +410,15 @@ prob_lv = PSMProblem(lv!, [2.0, 1.0], (0.0, 30.0), [uf_g];
     likelihood=PartiallySpecifiedModels.Gaussian())
 
 sol_lv = solve(prob_lv, MagiSolver(
-    n_samples=200, n_warmup=200,
-    n_gridpoints=60, n_deriv=3,
+    n_samples=150, n_warmup=150,
+    n_gridpoints=40, n_deriv=3,
     sigma=[1.0, 1.0],      # explicit sigma for both states
     obs_var=0.0025, preoptimize=true, verbose=false))
 ```
 
-    [ Info: Found initial step size 0.0029296875
+    [ Info: Found initial step size 0.00625
 
-    PSMSolution((g = [0.01528597603102903, 0.10709876808927637, 0.19489616608095123, 0.2770522932060643, 0.34302891617325104, 0.3956080028415034, 0.4270735942783363, 0.4333345190937093]), 0.0, 0.0, 8.0, Float64[], [0.0; 0.0; … ; 0.0; 0.0;;], [1.9547244961190091; 3.434392520204258; … ; 4.925491007235875; 4.944687100556234;;], [0.0, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0, 10.5, 12.0, 13.5  …  16.5, 18.0, 19.5, 21.0, 22.5, 24.0, 25.5, 27.0, 28.5, 30.0], Dict{Symbol, Any}(:g => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([0.01528597603102903, 0.10709876808927637, 0.19489616608095123, 0.2770522932060643, 0.34302891617325104, 0.3956080028415034, 0.4270735942783363, 0.4333345190937093], [0.0, 0.7142857142857143, 1.4285714285714286, 2.142857142857143, 2.857142857142857, 3.5714285714285716, 4.285714285714286, 5.0], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 0.7142857142857143, 0.7142857142857143, 0.7142857142857142, 0.7142857142857144, 0.7142857142857144, 0.714285714285714, 0.7142857142857144], [0.0, -0.010977563139304501, -0.0033107816656744267, -0.04212065558876439, -0.01847756487648153, -0.041524111780778236, -0.06372069192189768, 0.0], DataInterpolations.ExtrapolationType.Extension, DataInterpolations.ExtrapolationType.Extension, FindFirstFunctions.Guesser{Vector{Float64}}([0.0, 0.7142857142857143, 1.4285714285714286, 2.142857142857143, 2.857142857142857, 3.5714285714285716, 4.285714285714286, 5.0], Base.RefValue{Int64}(1), true), false, false)), (method = :magi, chains = MCMC chain (200×8×1 Array{Float64, 3})))
+    PSMSolution((g = [1.5723131121678229, 1.4170687700268365, 1.262636902575336, 1.099755225393116, 0.928578489489499, 0.7442191178336711, 0.5511412016516087, 0.3413195597830228]), 0.0, 0.0, 8.0, Float64[], [2.042089646915277; 3.3066361080414173; … ; 5.004818772105896; 4.999279779278145;;], [2.014286270520064; 3.3194088252774345; … ; 5.05928043499759; 5.0117630329479335;;], [0.0, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0, 10.5, 12.0, 13.5  …  16.5, 18.0, 19.5, 21.0, 22.5, 24.0, 25.5, 27.0, 28.5, 30.0], Dict{Symbol, Any}(:g => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([1.5723131121678229, 1.4170687700268365, 1.262636902575336, 1.099755225393116, 0.928578489489499, 0.7442191178336711, 0.5511412016516087, 0.3413195597830228], [0.0, 0.7142857142857143, 1.4285714285714286, 2.142857142857143, 2.857142857142857, 3.5714285714285716, 4.285714285714286, 5.0], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 0.7142857142857143, 0.7142857142857143, 0.7142857142857142, 0.7142857142857144, 0.7142857142857144, 0.714285714285714, 0.7142857142857144], [0.0, 0.008543578541721811, -0.024619611818534906, -0.009434893700841529, -0.03519070394172854, -0.004830086978243201, -0.048019031773818166, 0.0], DataInterpolations.ExtrapolationType.Extension, DataInterpolations.ExtrapolationType.Extension, FindFirstFunctions.Guesser{Vector{Float64}}([0.0, 0.7142857142857143, 1.4285714285714286, 2.142857142857143, 2.857142857142857, 3.5714285714285716, 4.285714285714286, 5.0], Base.RefValue{Int64}(1), true), false, false)), (method = :magi, chains = MCMC chain (150×8×1 Array{Float64, 3}), state_mean = [2.042089646915277 0.593834275377178; 2.69406701161133 0.6043535978896; … ; 5.001857619222012 0.010890443370688249; 4.999279779278145 0.012642609253946762]))
 
 ### Posterior Trajectories
 
@@ -446,6 +448,73 @@ for i in 1:n_traj_lv
     end
 end
 ```
+
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
 
 ``` julia
 H_med = [nanmed(traj_H[:, j]) for j in 1:length(t_pred_lv)]
@@ -536,11 +605,11 @@ Figure 7: Posterior credible interval for functional response g(H)
 </div>
 
     Posterior mean g(H) vs. true Holling Type II:
-      g(0.5) = 0.0723  [-0.2172, 0.4674] (true: 0.1667)
-      g(1.0) = 0.1477  [-0.0541, 0.3696] (true: 0.25)
-      g(2.0) = 0.2663  [0.2168, 0.291] (true: 0.3333)
-      g(3.0) = 0.3516  [0.296, 0.4004] (true: 0.375)
-      g(4.0) = 0.4127  [0.3768, 0.4748] (true: 0.4)
+      g(0.5) = 1.0599  [0.0127, 4.3016] (true: 0.1667)
+      g(1.0) = 0.9828  [0.1369, 3.8402] (true: 0.25)
+      g(2.0) = 0.8822  [0.2397, 2.9823] (true: 0.3333)
+      g(3.0) = 0.7582  [0.2843, 2.1398] (true: 0.375)
+      g(4.0) = 0.577  [0.3154, 1.2054] (true: 0.4)
 
 ### Trace Plots
 
@@ -566,14 +635,14 @@ Figure 8: Trace plots for Lotka-Volterra g(H) spline coefficients
 
 ## Comparison: MagiSolver vs MCMCSolver
 
-| Feature                 | MagiSolver              | MCMCSolver                |
-|-------------------------|-------------------------|---------------------------|
-| **ODE solver per step** | No (Kalman filter)      | Yes (full ODE solve)      |
-| **States sampled?**     | No (marginalized)       | No (marginalized via ODE) |
-| **Partially observed**  | Natural support         | Requires all states       |
-| **Speed per iteration** | Fast (matrix ops)       | Slower (ODE integration)  |
-| **Accuracy**            | Approximate (IBM prior) | Exact (ODE solve)         |
-| **Output**              | `MCMCChains.Chains`     | `MCMCChains.Chains`       |
+| Feature | MagiSolver | MCMCSolver |
+|----|----|----|
+| **ODE solver per step** | No (GP manifold constraint) | Yes (full ODE solve) |
+| **States sampled?** | Yes (jointly with parameters) | No (determined by the ODE) |
+| **Partially observed** | Natural support | Requires all states |
+| **Speed per iteration** | Matrix ops (scales with grid size) | Slower (ODE integration) |
+| **Accuracy** | Approximate (GP manifold) | Exact (ODE solve) |
+| **Output** | `MCMCChains.Chains` | `MCMCChains.Chains` |
 
 **When to use MAGI:**
 
@@ -626,13 +695,15 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](15_magi_files/figure-commonmark/cell-22-output-1.svg)
 
-    Durbin-Watson: 0.006, 0.014
+    Durbin-Watson: 1.88, 1.732
 
 ## Summary
 
 `MagiSolver` provides a GP-based alternative to traditional
-ODE-in-the-loop Bayesian inference. By modeling trajectories as
-integrated Brownian motion and enforcing ODE dynamics through Kalman
-filtering, it marginalizes out state trajectories and samples only the
-unknown function parameters — making it efficient and naturally suited
-to partially observed systems.
+ODE-in-the-loop Bayesian inference. By placing a Gaussian-process prior
+on each state and enforcing the ODE dynamics through the manifold
+constraint, it samples the state trajectories jointly with the
+unknown-function parameters — avoiding a numerical ODE solve at each
+step and naturally supporting partially observed systems. (The cost
+scales with the discretization grid size, since the states on the grid
+are sampled.)

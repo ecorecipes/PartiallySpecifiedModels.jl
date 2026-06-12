@@ -361,22 +361,32 @@ function _build_sigma_matrix(constraint::Symbol, q::Int)
             end
         end
     elseif constraint == :convex
-        # Second differences increasing: β_j = j*ν₁ + Σ_{k=2}^{j} (j-k+1)*νₖ
+        # Convex (NOT necessarily monotone): free intercept β₁ and free
+        # initial slope, with NONNEGATIVE second differences Δ²β_j ≥ 0.
+        # β_i = d₁ + (i-1)·d₂ + Σ_{k=3}^{i} (i-k+1)·d_k, where d₁=γ₁ and
+        # d₂=γ₂ are unconstrained (see `_linear_param_indices`) and
+        # d_k=softplus(γ_k) ≥ 0 for k≥3 are the second differences.
+        # This admits U-shaped (decreasing-then-increasing) functions, which
+        # the previous parameterization (identical to :inc_convex) could not.
         Sig = zeros(q, q)
         for i in 1:q
-            Sig[i, 1] = Float64(i)
+            Sig[i, 1] = 1.0          # intercept (free)
+            Sig[i, 2] = Float64(i - 1)  # linear ramp (free slope)
         end
-        for j in 2:q, i in j:q
-            Sig[i, j] = Float64(i - j + 1)
+        for k in 3:q, i in k:q
+            Sig[i, k] = Float64(i - k + 1)
         end
     elseif constraint == :concave
-        # Second differences decreasing: negate off-diagonal of convex
+        # Concave (NOT necessarily monotone): free intercept and slope with
+        # NONPOSITIVE second differences. Same construction as :convex with
+        # the curvature columns negated; admits ∩-shaped functions.
         Sig = zeros(q, q)
         for i in 1:q
-            Sig[i, 1] = Float64(i)
+            Sig[i, 1] = 1.0
+            Sig[i, 2] = Float64(i - 1)
         end
-        for j in 2:q, i in j:q
-            Sig[i, j] = -Float64(i - j + 1)
+        for k in 3:q, i in k:q
+            Sig[i, k] = -Float64(i - k + 1)
         end
     elseif constraint == :inc_convex
         # Monotone increasing + convex: cumsum of cumsums
@@ -452,15 +462,39 @@ function _build_sigma_matrix(constraint::Symbol, q::Int)
 end
 
 """
+    _linear_param_indices(constraint) -> Tuple
+
+Indices of the γ components that enter the reparameterization *linearly*
+(unconstrained), as opposed to through `softplus` (nonnegative). For most
+constraints this is empty (every component is nonnegative). For `:convex`
+and `:concave` the first two components are the free intercept and slope,
+so only the remaining components (the second differences) are nonnegative.
+"""
+_linear_param_indices(constraint::Symbol) =
+    constraint in (:convex, :concave) ? (1, 2) : ()
+
+"""
+    _apply_constraint_transform(constraint, gamma) -> Vector
+
+Map γ to the nonnegative/linear coefficient vector `d` that `Σ` multiplies:
+`d[i] = γ[i]` for the linear indices, `softplus(γ[i])` otherwise.
+"""
+function _apply_constraint_transform(constraint::Symbol, gamma::AbstractVector)
+    lin = _linear_param_indices(constraint)
+    [i in lin ? gamma[i] : _softplus(gamma[i]) for i in eachindex(gamma)]
+end
+
+"""
     gamma_to_knot_values(a::ShapeConstrainedBSplineApproximator, gamma)
 
-Transform unconstrained parameters γ to B-spline coefficients β = Σ * softplus(γ).
+Transform unconstrained parameters γ to B-spline coefficients β = Σ * d,
+where `d` applies `softplus` to the nonnegative components and the identity
+to the free (linear) components — see [`_apply_constraint_transform`](@ref).
 These are de Boor control point values, not interpolation knot values.
 """
 function gamma_to_knot_values(a::ShapeConstrainedBSplineApproximator,
                               gamma::AbstractVector)
-    ν = [_softplus(g) for g in gamma]
-    a.Sigma * ν
+    a.Sigma * _apply_constraint_transform(a.constraint, gamma)
 end
 
 """

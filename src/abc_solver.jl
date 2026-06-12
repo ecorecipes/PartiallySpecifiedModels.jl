@@ -130,6 +130,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
         end
         kernel_std = 2.0 .* sqrt.(max.(wvar, 1e-12))
 
+        accepted_slots = Int[]
+        failed_slots   = Int[]
         for i in 1:N
             found = false
             for _attempt in 1:1000
@@ -161,12 +163,30 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
                     break
                 end
             end
+            push!(found ? accepted_slots : failed_slots, i)
+        end
 
-            # if no proposal accepted, carry forward old particle
-            if !found
-                new_particles[i] = copy(particles[i])
-                new_distances[i] = distances[i]
+        # Slots that never produced an accepted draw within the attempt
+        # budget must NOT carry forward the previous generation's particle
+        # (it was accepted under the larger previous tolerance, so it is not
+        # a draw from the current ABC posterior and would bias the target).
+        # Instead fill each failed slot by resampling — with multiplicity —
+        # from THIS generation's accepted particles, which are valid draws at
+        # the current tolerance.  If nothing was accepted at all, the
+        # tolerance is too aggressive for the budget: keep the previous
+        # population and tolerance unchanged rather than corrupt it.
+        if isempty(accepted_slots)
+            if alg.verbose
+                @printf("ABC-SMC gen %d: 0 accepted at ε = %.4e; holding population.\n",
+                        gen, epsilon)
             end
+            push!(tolerance_history, epsilon)
+            continue
+        end
+        for i in failed_slots
+            src = accepted_slots[rand(1:length(accepted_slots))]
+            new_particles[i] = copy(new_particles[src])
+            new_distances[i] = new_distances[src]
         end
 
         # ── (f) importance weights ───────────────────────────────────

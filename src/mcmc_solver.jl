@@ -101,19 +101,24 @@ function LogDensityProblems.logdensity(ld::PSMLogDensity, theta)
         end
     end
 
-    # --- Log-prior: penalty matrices + broad prior ---
+    # --- Log-prior: penalty (Gaussian GMRF prior) + broad prior ---
+    # The roughness penalty is the prior precision λS/σ²; the prior is
+    # p(β|λ,σ²) ∝ (λ/σ²)^{rank(S)/2} exp(−(λ/2σ²) βᵀSβ).  The σ² coupling
+    # (data and penalty share the scale) and the (λ/σ²) normalizer are both
+    # required for the hierarchical λ/σ² posterior to be valid.
     lp = zero(T)
     for (k, S) in enumerate(ld.penalty_matrices)
         np = size(S, 1)
         off = ld.param_offsets[k]
         beta_k = beta[off+1:off+np]
-        # Use sampled λ if available, otherwise fixed prior_scale
         lambda_k = if log_lambdas !== nothing
             exp(log_lambdas[k])
         else
             T(1.0) / T(ld.prior_scale)
         end
-        lp -= T(0.5) * lambda_k * dot(beta_k, S * beta_k)
+        rk = _rank_penalty(S)
+        lp += T(0.5) * rk * (log(lambda_k) - log(sigma2)) -
+              T(0.5) * lambda_k / sigma2 * dot(beta_k, S * beta_k)
     end
 
     # Broad Gaussian prior on all params

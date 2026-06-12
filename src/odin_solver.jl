@@ -12,14 +12,20 @@ using LinearAlgebra: dot, norm, Symmetric, cholesky, logdet, I
 """
     solve(prob::PSMProblem, alg::ODINSolver)
 
-Fit a partially specified model using ODE-Informed regression (ODIN).
+Fit a partially specified model using ODE-Informed regression (ODIN;
+Wenk & Abbati et al. 2020).
 
-Alternates between:
-1. **GP step**: Fit a Gaussian process to each observed state using an
-   RBF kernel, with the ODE residual as an additional penalty on the
-   GP marginal likelihood.
-2. **ODE step**: Optimise unknown-function parameters β to minimise the
-   ODE mismatch at the GP mean trajectory.
+A Gaussian process is fit to each observed state, yielding the posterior
+mean state `x`, the posterior-mean derivative `Dx = 'K C⁻¹ y`, and — the
+heart of ODIN — the posterior derivative covariance
+`A = ''K − 'K C⁻¹ ('K)ᵀ (+ γ I)`. The unknown-function parameters are then
+chosen to minimize the Mahalanobis ODE-mismatch *risk functional*
+
+    R(θ) = Σ_d (f_d(x,θ) − D_d x_d)ᵀ A_d⁻¹ (f_d(x,θ) − D_d x_d),
+
+so the gradient match is weighted by how well the GP actually determines the
+derivative (tight where data are dense, loose where sparse). This replaces
+the previous uniform-weight mismatch and ad-hoc noise heuristic.
 
 # Returns
 `PSMSolution` with fitted parameters, GP-smoothed trajectory, and
@@ -50,7 +56,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
         K + noise_var * I
     end
 
-    # Build derivative kernel: ∂K/∂t₂ for gradient matching
+    # Derivative cross-kernel 'K[i,j] = ∂k/∂t_i = Cov(ẋ_i, x_j)
     function build_dKdt(times, ℓ, σ²)
         n = length(times)
         dK = Matrix{Float64}(undef, n, n)
@@ -61,31 +67,47 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
         dK
     end
 
-    # ── GP-smooth each observed state ────────────────────────────
+    # Second-derivative kernel ''K[i,j] = ∂²k/∂t_i∂t_j = Cov(ẋ_i, ẋ_j)
+    function build_d2Kdt2(times, ℓ, σ²)
+        n = length(times)
+        d2K = Matrix{Float64}(undef, n, n)
+        for i in 1:n, j in 1:n
+            r2 = (times[i] - times[j])^2
+            d2K[i, j] = σ² / ℓ^2 * (1 - r2 / ℓ^2) * exp(-0.5 * r2 / ℓ^2)
+        end
+        d2K
+    end
+
+    # ── GP-smooth each observed state and build ODIN weighting ──────
     ℓ = alg.gp_lengthscale
     σ² = alg.gp_variance
     noise_var = 0.01 * σ²  # observation noise
 
     y_smooth = zeros(n_times, n_vars)
-    dydt = zeros(n_times, n_vars)
+    dydt = zeros(n_times, n_vars)                 # GP posterior-mean derivative Dx
+    Ainv = Dict{Int, Matrix{Float64}}()           # A_d⁻¹ per observed state
     observed_states = Set{Int}()
 
-    K_mat = build_K(times, ℓ, σ², noise_var)
-    K_inv = inv(Symmetric(K_mat))
+    K_clean = build_K(times, ℓ, σ², 0.0)
     dK_mat = build_dKdt(times, ℓ, σ²)
+    d2K_mat = build_d2Kdt2(times, ℓ, σ²)
+    Cf = cholesky(Symmetric(build_K(times, ℓ, σ², noise_var)))
+
+    # ODE-mismatch slack (γ): keeps A well-conditioned and represents model
+    # discrepancy tolerance (the γ of Wenk & Abbati's risk functional).
+    γ_slack = 1e-6 * (tr(d2K_mat) / n_times) + 1e-10
 
     for j in 1:n_obs
         sk = prob.obs_to_state[j]
         push!(observed_states, sk)
         y_j = prob.data_values[:, j]
-
-        # GP posterior mean: μ = K * K⁻¹ * y = K_clean * K_noisy⁻¹ * y
-        alpha_gp = K_inv * y_j
-        K_clean = build_K(times, ℓ, σ², 0.0)  # no noise
-        y_smooth[:, sk] = K_clean * alpha_gp
-
-        # GP derivative: dμ/dt = dK/dt * K⁻¹ * y
-        dydt[:, sk] = dK_mat * alpha_gp
+        α = Cf \ y_j
+        y_smooth[:, sk] = K_clean * α
+        dydt[:, sk] = dK_mat * α
+        # Posterior derivative covariance A = ''K − 'K C⁻¹ ('K)ᵀ + γ I
+        A = d2K_mat - dK_mat * (Cf \ dK_mat') + γ_slack * I
+        A = Symmetric(0.5 * (A + A'))
+        Ainv[sk] = Matrix(inv(cholesky(A)))
     end
 
     # Unobserved states: hold at IC
@@ -117,109 +139,66 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
         println("  $n_beta unknown-function parameters, $(alg.maxiters) outer iterations")
     end
 
-    # ── Alternating optimisation ─────────────────────────────────
+    # ── Optimise β against the ODIN Mahalanobis risk functional ─────
+    # R(θ) = Σ_d (f_d − D_d x_d)ᵀ A_d⁻¹ (f_d − D_d x_d), with the GP
+    # posterior (x, Dx, A) fixed from the data. No ad-hoc GP re-noising.
     ode_weight = alg.ode_weight
     lr = alg.lr
     best_beta = copy(beta)
     best_loss = Inf
+    obs_list = sort(collect(observed_states))
 
-    for outer in 1:alg.maxiters
-        # ── ODE step: optimise β to match GP derivatives ─────────
-        # Adam inner loop (20 steps per outer iteration)
-        β1_adam, β2_adam, eps_adam = 0.9, 0.999, 1e-8
-        m_adam = zeros(n_beta)
-        v_adam = zeros(n_beta)
-        n_inner = 20
-
-        function odin_loss(β_eval)
-            T_el = eltype(β_eval)
-            p = build_autodiff_param_struct(prob, β_eval)
-            du = zeros(T_el, n_vars)
-            loss = zero(T_el)
-
-            for i in 1:n_times
-                u = T_el.(y_smooth[i, :])
-                try
-                    prob.dynamics!(du, u, p, times[i])
-                catch
-                    du .= T_el(1e6)
-                end
-                for k in 1:n_vars
-                    loss += ode_weight * (dydt[i, k] - du[k])^2
-                end
+    function odin_risk(β_eval)
+        T_el = eltype(β_eval)
+        p = build_autodiff_param_struct(prob, β_eval)
+        du = zeros(T_el, n_vars)
+        # ODE RHS at the GP-mean trajectory, per state column.
+        F = Matrix{T_el}(undef, n_times, n_vars)
+        for i in 1:n_times
+            u = T_el.(@view y_smooth[i, :])
+            try
+                prob.dynamics!(du, u, p, times[i])
+            catch
+                du .= T_el(1e6)
             end
-
-            # Smoothing penalty
-            offset = 0
-            for approx in prob.approximators
-                np = nparams(approx)
-                pk = β_eval[offset+1:offset+np]
-                offset += np
-                if approx isa BSplineApproximator || approx isa GPApproximator ||
-                   approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator
-                    S = penalty_matrix(approx)
-                    if S !== nothing; loss += dot(pk, S * pk); end
-                elseif approx isa ShapeConstrainedBSplineApproximator
-                    S = penalty_matrix(approx)
-                    if S !== nothing; loss += dot(pk, S * pk); end
-                end
-            end
-            loss
+            F[i, :] .= du
         end
-
-        for inner in 1:n_inner
-            result = DiffResults.MutableDiffResult(0.0, (zeros(n_beta),))
-            ForwardDiff.gradient!(result, odin_loss, beta)
-            loss_val = DiffResults.value(result)
-            grad = DiffResults.gradient(result)
-
-            step = outer * n_inner + inner
-            lr_t = lr * 0.5 * (1 + cos(π * step / (alg.maxiters * n_inner)))
-
-            m_adam .= β1_adam .* m_adam .+ (1 - β1_adam) .* grad
-            v_adam .= β2_adam .* v_adam .+ (1 - β2_adam) .* grad.^2
-            m_hat = m_adam ./ (1 - β1_adam^(inner))
-            v_hat = v_adam ./ (1 - β2_adam^(inner))
-            beta .-= lr_t .* m_hat ./ (sqrt.(v_hat) .+ eps_adam)
-
-            if loss_val < best_loss
-                best_loss = loss_val
-                best_beta .= beta
-            end
+        loss = zero(T_el)
+        for sk in obs_list
+            resid = @view(F[:, sk]) .- T_el.(@view dydt[:, sk])
+            loss += ode_weight * dot(resid, T_el.(Ainv[sk]) * resid)
         end
-
-        # ── GP step: re-smooth with ODE-informed penalty ─────────
-        # Update GP with ODE residual as additional penalty
-        p_cur = build_param_struct(prob, beta)
-        du_tmp = zeros(n_vars)
-
-        for j in 1:n_obs
-            sk = prob.obs_to_state[j]
-            y_j = prob.data_values[:, j]
-
-            # ODE residuals at current β
-            ode_resid = zeros(n_times)
-            for i in 1:n_times
-                u = y_smooth[i, :]
-                prob.dynamics!(du_tmp, u, p_cur, times[i])
-                ode_resid[i] = dydt[i, sk] - du_tmp[sk]
-            end
-
-            # Adjust GP: increase effective noise where ODE residual is small
-            # (trust ODE more) — simple heuristic: tighten noise_var
-            residual_scale = mean(abs2, ode_resid)
-            adjusted_noise = max(noise_var * min(residual_scale / max(σ², 1e-10), 1.0), 1e-8)
-
-            K_adj = build_K(times, ℓ, σ², adjusted_noise)
-            K_adj_inv = inv(Symmetric(K_adj))
-            alpha_gp = K_adj_inv * y_j
-            K_clean = build_K(times, ℓ, σ², 0.0)
-            y_smooth[:, sk] = K_clean * alpha_gp
-            dydt[:, sk] = dK_mat * alpha_gp
+        # Smoothing penalty
+        offset = 0
+        for approx in prob.approximators
+            np = nparams(approx)
+            pk = @view β_eval[offset+1:offset+np]
+            offset += np
+            S = penalty_matrix(approx)
+            S !== nothing && (loss += dot(pk, T_el.(S) * pk))
         end
+        loss
+    end
 
-        if verbose && (outer <= 3 || outer % 10 == 0 || outer == alg.maxiters)
-            println("  outer $outer: loss=$(round(best_loss, sigdigits=5))")
+    β1_adam, β2_adam, eps_adam = 0.9, 0.999, 1e-8
+    m_adam = zeros(n_beta); v_adam = zeros(n_beta)
+    n_total = alg.maxiters * 20
+    for step in 1:n_total
+        result = DiffResults.MutableDiffResult(0.0, (zeros(n_beta),))
+        ForwardDiff.gradient!(result, odin_risk, beta)
+        loss_val = DiffResults.value(result)
+        grad = DiffResults.gradient(result)
+        lr_t = lr * 0.5 * (1 + cos(π * step / n_total))
+        m_adam .= β1_adam .* m_adam .+ (1 - β1_adam) .* grad
+        v_adam .= β2_adam .* v_adam .+ (1 - β2_adam) .* grad .^ 2
+        m_hat = m_adam ./ (1 - β1_adam^step)
+        v_hat = v_adam ./ (1 - β2_adam^step)
+        beta .-= lr_t .* m_hat ./ (sqrt.(v_hat) .+ eps_adam)
+        if loss_val < best_loss
+            best_loss = loss_val; best_beta .= beta
+        end
+        if verbose && (step <= 3 || step % 50 == 0 || step == n_total)
+            println("  step $step: risk=$(round(best_loss, sigdigits=5))")
         end
     end
     beta .= best_beta

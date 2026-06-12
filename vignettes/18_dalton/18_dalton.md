@@ -1,6 +1,6 @@
 # Probabilistic ODE Solving with DaltonSolver
 Simon Frost
-2026-04-03
+2026-06-12
 
 - [Overview](#overview)
 - [Logistic Growth with Unknown Per-Capita
@@ -53,10 +53,6 @@ using Plots; default(fmt=:png)
 using Random
 Random.seed!(42)
 ```
-
-    Precompiling packages...
-      22921.2 ms  ✓ PartiallySpecifiedModels
-      1 dependency successfully precompiled in 54 seconds. 387 already precompiled.
 
     TaskLocalRNG()
 
@@ -131,7 +127,7 @@ sol_rodeo = solve(prob, RodeoSolver(n_steps=200, method=:fenrir, maxiters=500, v
 
     DaltonSolver: SS=0.1546, r(5)=0.231
     RodeoSolver:  SS=0.1588, r(5)=0.24
-    LAML:         SS=0.1997, EDF=2.0, r(5)=0.25
+    LAML:         SS=0.1995, EDF=2.0, r(5)=0.251
     True r(5) = 0.25
 
 ### Recovered Per-Capita Growth Rate

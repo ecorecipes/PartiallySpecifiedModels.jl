@@ -1,6 +1,6 @@
 # RKHS: Reproducing Kernel Hilbert Space Estimation
 Simon Frost
-2026-04-04
+2026-06-12
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -152,7 +152,7 @@ println("\nTime: $(round(t_rbf, digits=1))s")
       iter 1000: loss=186.61 lr=0.0
       Best loss: 186.61
 
-    Time: 4.6s
+    Time: 3.7s
 
 ### Fit with RKHS (Matérn-5/2 kernel)
 
@@ -198,7 +198,7 @@ println("\nTime: $(round(t_mat, digits=1))s")
       Converged at iter 1000
       Best loss: 185.09
 
-    Time: 4.5s
+    Time: 2.6s
 
 ### Compare with TwoStageSolver
 
@@ -212,7 +212,7 @@ t_ts = @elapsed sol_ts = solve(prob,
 println("TwoStage time: $(round(t_ts, digits=1))s")
 ```
 
-    TwoStage time: 3.3s
+    TwoStage time: 3.5s
 
 ### Recovered Functional Response
 
@@ -252,7 +252,7 @@ println("  TwoStage:    $(round(mae_ts, digits=4))")
     Mean absolute error over [1, 40]:
       RKHS-RBF:    0.0546
       RKHS-Matérn: 0.0415
-      TwoStage:    0.0558
+      TwoStage:    0.0701
 
 ## Kernel Comparison
 

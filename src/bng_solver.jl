@@ -21,7 +21,7 @@ Gradient Matching. Avoids solving the ODE by matching smoothed derivatives
 to the model right-hand side.
 
 # Algorithm
-1. Smooth observed data with cubic splines and compute numerical derivatives.
+1. Smooth observed data with a penalized (GCV) smoothing spline and compute derivatives.
 2. Minimize the sum of squared gradient-matching residuals with respect to
    the unknown-function parameters using `Optim.NelderMead`.
 3. Reconstruct trajectories from the fitted spline coefficients.
@@ -57,10 +57,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             push!(observed_states, sk)
-            itp = CubicSpline(prob.data_values[:, j], times;
-                              extrapolation=ExtrapolationType.Extension)
+            val, _ = _smoothing_spline(times, prob.data_values[:, j])
             for i in 1:n_times
-                y_smooth[i, sk] = itp(times[i])
+                y_smooth[i, sk] = val(times[i])
             end
         end
         # Target: smoothed next-state y_smooth[i+1, k]
@@ -71,15 +70,14 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
             dydt[n_times, k] = y_smooth[n_times, k]
         end
     else
-        # For continuous models: smooth data and compute analytical derivatives
+        # For continuous models: penalized (GCV) smoothing spline + derivative
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             push!(observed_states, sk)
-            itp = CubicSpline(prob.data_values[:, j], times;
-                              extrapolation=ExtrapolationType.Extension)
+            val, der = _smoothing_spline(times, prob.data_values[:, j])
             for i in 1:n_times
-                y_smooth[i, sk] = itp(times[i])
-                dydt[i, sk] = DataInterpolations.derivative(itp, times[i])
+                y_smooth[i, sk] = val(times[i])
+                dydt[i, sk] = der(times[i])
             end
         end
     end

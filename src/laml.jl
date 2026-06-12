@@ -97,8 +97,12 @@ function laml_objective(family::AbstractLikelihood,
 
     if family isa Gaussian
         RSS = sum(w_data[i] * (y[i] - mu[i])^2 for i in 1:n)
-        sigma2 = max((RSS + pen) / n, 1e-30)
         n_eff = n - Mp
+        # Profiled REML scale uses the restricted dof (n − Mp), NOT n. Using
+        # /n (the ML scale) leaves the analytic gradient inconsistent with V
+        # by a factor (n−Mp)/n on the penalty term and biases toward
+        # undersmoothing. (Wood 2011, "Fast stable REML".)
+        sigma2 = max((RSS + pen) / max(n_eff, 1), 1e-30)
         V = -0.5 * n_eff * log(sigma2) + 0.5 * log_det_S_plus - 0.5 * log_det_H
     else
         ll = log_likelihood(family, y, mu, w_data)
@@ -280,7 +284,7 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
         sigma2 = if family isa Gaussian
             RSS = sum(w_data[i] * (y[i] - mu[i])^2 for i in 1:n)
             pen = dot(beta, S_lambda * beta)
-            profiled = max((RSS + pen) / n, 1e-30)
+            profiled = max((RSS + pen) / max(n - Mp, 1), 1e-30)   # REML scale
             min(profiled, sigma2_max)
         else
             pearson = sum(w_data[i] * (y[i] - mu[i])^2 /

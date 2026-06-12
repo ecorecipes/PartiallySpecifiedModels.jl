@@ -496,13 +496,15 @@ end
 function initial_params(a::ShapeConstrainedBSplineApproximator)
     xs = range(a.domain[1], a.domain[2], length=a.nknots)
     beta_target = Float64[a.initial_func(x) for x in xs]
-    np = nparams(a)
-    # Solve Σ * ν = β_target for ν = softplus(γ) > 0
-    # For square Σ: direct solve; for rectangular (q × np): least-squares
-    ν = a.Sigma \ beta_target
-    ν = max.(ν, 0.01)
-    # softplus_inv(ν) = log(exp(ν) - 1) for ν > 0
-    return [v > 20.0 ? v : log(exp(v) - 1.0) for v in ν]
+    # Solve Σ * d = β_target for the coefficient vector d.
+    # For square Σ: direct solve; for rectangular (q × np): least-squares.
+    d = a.Sigma \ beta_target
+    lin = _linear_param_indices(a.constraint)
+    # Linear (free) components pass through unchanged; nonnegative components
+    # are clamped positive and inverted through softplus.
+    return [i in lin ? d[i] :
+            (v = max(d[i], 0.01); v > 20.0 ? v : log(exp(v) - 1.0))
+            for i in eachindex(d)]
 end
 
 # ─── COMONet shape-constrained neural network approximator ────────
@@ -1018,10 +1020,11 @@ MCMCSolver(; n_samples::Int=1000, n_warmup::Int=500, n_chains::Int=1,
 
 Manifold-constrained Gaussian process inference (MAGI) for ODE systems.
 
-MAGI models each ODE state as integrated Brownian motion and uses a Kalman
-filter to evaluate the log-likelihood of the ODE constraint. States are
-marginalized out — only ODE parameters θ and unknown function parameters
-are sampled via NUTS/HMC.
+MAGI places a Matérn-3/2 Gaussian-process prior on each state and constrains
+the GP-implied derivative to the ODE vector field through the conditional
+derivative covariance `K* = ''K − 'K C⁻¹ ('K)ᵀ`. The state values on the
+discretization grid are sampled jointly with the unknown-function
+parameters θ via NUTS/HMC (the manifold-constrained posterior).
 
 **Key advantage**: Handles partially observed systems naturally (unobserved
 state components are inferred through the ODE constraint).

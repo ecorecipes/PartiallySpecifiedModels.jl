@@ -1,143 +1,244 @@
-# ─── Probabilistic ODE Solver ────────────────────────────────────────
+# ─── Probabilistic ODE Solver (joint state space) ────────────────────
 #
-# Solves an ODE initial value problem using a Kalman filter/smoother
-# approach with an integrated Brownian motion prior.
+# Solves an ODE initial value problem with a Kalman filter/smoother on an
+# integrated Brownian motion (IBM) prior.
 #
-# Forward pass: Kalman filter with interrogation at each time step
-# Backward pass: RTS smoother for posterior mean and variance
+# Unlike a per-variable block-diagonal filter, this implementation tracks
+# the FULL joint state X = [x₁, x₁′, …, x₁^{(q-1)}, x₂, …] so that the ODE
+# interrogation can use the complete Jacobian ∂f/∂x — including the
+# off-diagonal coupling between state variables — as in the first-order
+# (EKF1) linearization of Krämer et al. (2021)/Tronarp et al. (2019).
+# The global diffusion is calibrated by quasi-maximum-likelihood from the
+# ODE innovations (Bosch, Tronarp & Hennig 2021).
 #
-# The ODE residual W·X - f(X,t) = 0 is treated as a pseudo-observation
-# at each time step, conditioning the Gaussian process prior on the ODE.
+# Forward pass: Kalman filter with ODE interrogation at each step.
+# Backward pass: RTS smoother (and, for Fenrir, data conditioning).
 #
-# Reference: Tronarp et al (2018), Schober et al (2019), Wu & Lysy (2024)
+# Reference: Tronarp et al (2019, 2022), Krämer et al (2021),
+#            Bosch et al (2021), Wu & Lysy (2024)
+
+# ── joint state-space building blocks ────────────────────────────────
+
+"""
+    _joint_ibm(dt, q, sigma) -> (A, Q)
+
+Block-diagonal joint transition `A` (D×D) and process-noise `Q` (D×D) for
+`n_vars = length(sigma)` independent q-times integrated Wiener processes,
+D = n_vars·q. Each block uses the per-variable scale `sigma[k]`.
+"""
+function _joint_ibm(dt::Float64, q::Int, sigma::Vector{Float64})
+    n_vars = length(sigma)
+    D = n_vars * q
+    Q_base, R_base = ibm_state(dt, q, 1.0)
+    A = zeros(D, D)
+    Q = zeros(D, D)
+    for k in 1:n_vars
+        idx = ((k-1)*q+1):(k*q)
+        A[idx, idx] .= Q_base
+        Q[idx, idx] .= sigma[k]^2 .* R_base
+    end
+    A, Q
+end
+
+"""
+    _joint_selectors(n_vars, q) -> (E0, E1)
+
+Selection matrices (each n_vars × D): `E0` picks the value x_k^{(0)} and
+`E1` picks the first derivative x_k^{(1)} of every state variable.
+"""
+function _joint_selectors(n_vars::Int, q::Int)
+    D = n_vars * q
+    E0 = zeros(n_vars, D)
+    E1 = zeros(n_vars, D)
+    for k in 1:n_vars
+        E0[k, (k-1)*q + 1] = 1.0
+        E1[k, (k-1)*q + 2] = 1.0
+    end
+    E0, E1
+end
+
+"""
+    _joint_init(ode_fun!, u0, t0, p, q) -> X0
+
+Initial joint state: value and ODE-derived first derivative per variable,
+higher derivatives zero.
+"""
+function _joint_init(ode_fun!, u0::AbstractVector, t0::Float64, p, q::Int)
+    n_vars = length(u0)
+    du = zeros(n_vars)
+    ode_fun!(du, Float64.(u0), p, t0)
+    X0 = zeros(n_vars * q)
+    for k in 1:n_vars
+        X0[(k-1)*q + 1] = u0[k]
+        X0[(k-1)*q + 2] = du[k]
+    end
+    X0
+end
+
+"""
+    _joint_interrogate(ode_fun!, E0, E1, t, μ_pred, p, n_vars; method)
+
+Linearize the ODE residual r(X) = E1·X − f(E0·X, t) around the predicted
+mean and return the measurement model (H, b) so that the pseudo-observation
+is `0 = H·X + b + noise`.
+
+- `:kramer` (EKF1): full first-order Taylor, H = E1 − J·E0 with the COMPLETE
+  Jacobian J = ∂f/∂u (off-diagonal coupling included), b = J·u − f(u).
+- `:schober` (EKF0): H = E1, b = −f(u) (no Jacobian).
+
+In both cases the innovation under z=0 is f(u) − E1·μ_pred, i.e. the ODE
+defect, but the EKF1 measurement matrix propagates cross-variable
+sensitivity into the covariance update.
+"""
+function _joint_interrogate(ode_fun!, E0::Matrix{Float64}, E1::Matrix{Float64},
+                            t::Float64, μ_pred::Vector{Float64}, p, n_vars::Int;
+                            method::Symbol=:kramer)
+    u = E0 * μ_pred
+    du = zeros(n_vars)
+    ode_fun!(du, u, p, t)
+
+    if method == :schober
+        H = copy(E1)
+        b = -du
+        return H, b
+    end
+
+    # Full Jacobian J = ∂f/∂u via central finite differences.
+    J = zeros(n_vars, n_vars)
+    for j in 1:n_vars
+        h = max(abs(u[j]), 1.0) * 1e-7
+        up = copy(u); up[j] += h
+        um = copy(u); um[j] -= h
+        dup = zeros(n_vars); dum = zeros(n_vars)
+        ode_fun!(dup, up, p, t)
+        ode_fun!(dum, um, p, t)
+        J[:, j] .= (dup .- dum) ./ (2h)
+    end
+
+    H = E1 - J * E0
+    b = J * u - du
+    H, b
+end
 
 """
     probsolve_filter(ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma;
-                     interrogate=:kramer)
+                     interrogate=:kramer, calibrate=true)
 
-Forward (filtering) pass of the probabilistic ODE solver.
-
-Returns a dictionary with:
-- `μ_pred`: predicted means [n_steps+1][n_vars][n_deriv]
-- `Σ_pred`: predicted variances [n_steps+1][n_vars][n_deriv × n_deriv]
-- `μ_filt`: filtered means
-- `Σ_filt`: filtered variances
-- `times`: time grid
+Forward (filtering) pass of the joint probabilistic ODE solver with global
+diffusion calibration. Returns a `Dict` holding the joint filter/predict
+means and covariances, the transition matrix, the calibrated diffusion
+`ssq`, and the time grid.
 """
 function probsolve_filter(ode_fun!, p, u0::AbstractVector,
                           tspan::Tuple{Float64, Float64},
                           n_steps::Int, n_deriv::Int,
                           sigma::Vector{Float64};
-                          interrogate::Symbol=:kramer)
+                          interrogate::Symbol=:kramer,
+                          calibrate::Bool=true)
     t_min, t_max = tspan
     dt = (t_max - t_min) / n_steps
     n_vars = length(u0)
+    q = n_deriv
+    D = n_vars * q
 
-    # IBM prior
-    wgt_state, var_state = ibm_init(dt, n_deriv, sigma)
-    W_list = first_order_weight(n_vars, n_deriv)
+    A, Qmat = _joint_ibm(dt, q, sigma)
+    E0, E1 = _joint_selectors(n_vars, q)
+    X0 = _joint_init(ode_fun!, Float64.(u0), t_min, p, q)
+    V = Matrix(1e-10 * I, n_vars, n_vars)  # tiny ODE-measurement nugget
 
-    # Initial state
-    X0 = first_order_init(ode_fun!, Float64.(u0), t_min, p, n_deriv)
+    μ_pred = Vector{Vector{Float64}}(undef, n_steps + 1)
+    Σ_pred = Vector{Matrix{Float64}}(undef, n_steps + 1)
+    μ_filt = Vector{Vector{Float64}}(undef, n_steps + 1)
+    Σ_filt = Vector{Matrix{Float64}}(undef, n_steps + 1)
 
-    # Allocate storage
-    μ_pred = Vector{Vector{Vector{Float64}}}(undef, n_steps + 1)
-    Σ_pred = Vector{Vector{Matrix{Float64}}}(undef, n_steps + 1)
-    μ_filt = Vector{Vector{Vector{Float64}}}(undef, n_steps + 1)
-    Σ_filt = Vector{Vector{Matrix{Float64}}}(undef, n_steps + 1)
-
-    # Initial: known exactly (zero variance)
     μ_pred[1] = X0
-    Σ_pred[1] = [zeros(n_deriv, n_deriv) for _ in 1:n_vars]
+    Σ_pred[1] = zeros(D, D)
     μ_filt[1] = X0
-    Σ_filt[1] = [zeros(n_deriv, n_deriv) for _ in 1:n_vars]
+    Σ_filt[1] = zeros(D, D)
 
-    # Select interrogation method
-    interrogate_fn = if interrogate == :kramer
-        interrogate_kramer
-    else
-        interrogate_schober
-    end
-
-    # Forward pass
-    z_meas = zeros(1)  # pseudo-observation is always 0 (ODE residual = 0)
+    calib_acc = 0.0  # Σ_n νᵀ S⁻¹ ν  (quasi-MLE diffusion statistic)
 
     for n in 1:n_steps
         t_n = t_min + (t_max - t_min) * n / n_steps
 
-        # Predict (per variable)
-        μ_p = Vector{Vector{Float64}}(undef, n_vars)
-        Σ_p = Vector{Matrix{Float64}}(undef, n_vars)
-        for k in 1:n_vars
-            μ_p[k], Σ_p[k] = kalman_predict(μ_filt[n][k], Σ_filt[n][k],
-                                              wgt_state[k], var_state[k])
+        μp = A * μ_filt[n]
+        Σp = A * Σ_filt[n] * A' + Qmat
+        Σp = 0.5 * (Σp + Σp')
+
+        H, b = _joint_interrogate(ode_fun!, E0, E1, t_n, μp, p, n_vars;
+                                  method=interrogate)
+        ν = -(H * μp + b)                 # innovation at z = 0
+        S = H * Σp * H' + V
+        S = 0.5 * (S + S')
+        Sf = cholesky(Symmetric(S), check=false)
+        Sinv_ν = issuccess(Sf) ? (Sf \ ν) : (pinv(S) * ν)
+        calib_acc += dot(ν, Sinv_ν)
+
+        K = (Σp * H') * (issuccess(Sf) ? inv(Sf) : pinv(S))
+        μf = μp + K * ν
+        Σf = Σp - K * H * Σp
+        Σf = 0.5 * (Σf + Σf')
+
+        μ_pred[n+1] = μp; Σ_pred[n+1] = Σp
+        μ_filt[n+1] = μf; Σ_filt[n+1] = Σf
+    end
+
+    # Global diffusion calibration: scale all covariances by the quasi-MLE
+    # σ̂² = (1/(N·n_vars)) Σ_n νᵀ S⁻¹ ν.  With the tiny nugget the filter
+    # gains (hence the means) are ~scale invariant, so a post-hoc rescale is
+    # equivalent to re-running with the calibrated diffusion.
+    ssq = calibrate ? max(calib_acc / max(n_steps * n_vars, 1), 1e-12) : 1.0
+    if calibrate && ssq != 1.0
+        for n in 1:(n_steps + 1)
+            Σ_pred[n] .*= ssq
+            Σ_filt[n] .*= ssq
         end
-
-        # Interrogate ODE
-        wgt_m, mean_m, var_m = interrogate_fn(ode_fun!, W_list, t_n, μ_p, Σ_p, p, n_vars)
-
-        # Update (per variable)
-        μ_f = Vector{Vector{Float64}}(undef, n_vars)
-        Σ_f = Vector{Matrix{Float64}}(undef, n_vars)
-        for k in 1:n_vars
-            # Total measurement weight: W + wgt_meas
-            W_total = W_list[k] + wgt_m[k]
-            μ_f[k], Σ_f[k] = kalman_update(μ_p[k], Σ_p[k],
-                                             z_meas, mean_m[k],
-                                             W_total, var_m[k])
-        end
-
-        μ_pred[n+1] = μ_p
-        Σ_pred[n+1] = Σ_p
-        μ_filt[n+1] = μ_f
-        Σ_filt[n+1] = Σ_f
     end
 
     times = collect(range(t_min, t_max, length=n_steps + 1))
-
     Dict("μ_pred" => μ_pred, "Σ_pred" => Σ_pred,
          "μ_filt" => μ_filt, "Σ_filt" => Σ_filt,
-         "times" => times, "wgt_state" => wgt_state, "var_state" => var_state)
+         "times" => times, "A" => A, "ssq" => ssq,
+         "n_vars" => n_vars, "q" => q)
 end
 
 """
     probsolve_smooth(filt_out, n_vars)
 
-Backward (smoothing) pass: RTS smoother on the filter output.
-
-Returns `(μ_smooth, Σ_smooth)` — posterior mean and variance at all time points.
+Backward RTS smoother on the joint filter output. Returns posterior
+mean/variance in the per-variable nested format
+`(μ_smooth[n][k]::Vector, Σ_smooth[n][k]::Matrix)` expected by callers
+(the per-variable q×q diagonal block of the joint covariance).
 """
 function probsolve_smooth(filt_out::Dict, n_vars::Int)
-    μ_filt = filt_out["μ_filt"]
-    Σ_filt = filt_out["Σ_filt"]
-    μ_pred = filt_out["μ_pred"]
-    Σ_pred = filt_out["Σ_pred"]
-    wgt_state = filt_out["wgt_state"]
-
+    μ_filt = filt_out["μ_filt"]; Σ_filt = filt_out["Σ_filt"]
+    μ_pred = filt_out["μ_pred"]; Σ_pred = filt_out["Σ_pred"]
+    A = filt_out["A"]; q = filt_out["q"]
     n_steps = length(μ_filt) - 1
+    D = n_vars * q
 
-    # Initialize smooth = filt at terminal time
-    μ_smooth = Vector{Vector{Vector{Float64}}}(undef, n_steps + 1)
-    Σ_smooth = Vector{Vector{Matrix{Float64}}}(undef, n_steps + 1)
-    μ_smooth[n_steps+1] = μ_filt[n_steps+1]
-    Σ_smooth[n_steps+1] = Σ_filt[n_steps+1]
+    μJ = Vector{Vector{Float64}}(undef, n_steps + 1)
+    ΣJ = Vector{Matrix{Float64}}(undef, n_steps + 1)
+    μJ[end] = μ_filt[end]
+    ΣJ[end] = Σ_filt[end]
 
-    # Backward pass
     for n in n_steps:-1:1
-        μ_s = Vector{Vector{Float64}}(undef, n_vars)
-        Σ_s = Vector{Matrix{Float64}}(undef, n_vars)
-        for k in 1:n_vars
-            μ_s[k], Σ_s[k] = kalman_smooth_mv(
-                μ_smooth[n+1][k], Σ_smooth[n+1][k],
-                μ_filt[n][k], Σ_filt[n][k],
-                μ_pred[n+1][k], Σ_pred[n+1][k],
-                wgt_state[k]
-            )
-        end
-        μ_smooth[n] = μ_s
-        Σ_smooth[n] = Σ_s
+        Σpn = Symmetric(Σ_pred[n+1])
+        Σpf = cholesky(Σpn + 1e-12 * I, check=false)
+        G = issuccess(Σpf) ? (Σ_filt[n] * A') / Σpf : (Σ_filt[n] * A') * pinv(Σ_pred[n+1])
+        μs = μ_filt[n] + G * (μJ[n+1] - μ_pred[n+1])
+        Σs = Σ_filt[n] + G * (ΣJ[n+1] - Σ_pred[n+1]) * G'
+        Σs = 0.5 * (Σs + Σs')
+        μJ[n] = μs; ΣJ[n] = Σs
     end
 
+    # Convert joint → per-variable nested format.
+    μ_smooth = Vector{Vector{Vector{Float64}}}(undef, n_steps + 1)
+    Σ_smooth = Vector{Vector{Matrix{Float64}}}(undef, n_steps + 1)
+    for n in 1:(n_steps + 1)
+        μ_smooth[n] = [μJ[n][((k-1)*q+1):(k*q)] for k in 1:n_vars]
+        Σ_smooth[n] = [ΣJ[n][((k-1)*q+1):(k*q), ((k-1)*q+1):(k*q)] for k in 1:n_vars]
+    end
     μ_smooth, Σ_smooth
 end
 
@@ -145,22 +246,8 @@ end
     probsolve(ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma;
               interrogate=:kramer)
 
-Probabilistic ODE solver: returns posterior mean and variance of the solution.
-
-Args:
-- `ode_fun!`: in-place ODE function (du, u, p, t)
-- `p`: parameter struct
-- `u0`: initial values
-- `tspan`: (t_min, t_max)
-- `n_steps`: number of solver steps
-- `n_deriv`: number of derivatives in IBM prior (q)
-- `sigma`: IBM scale parameters (one per variable)
-- `interrogate`: `:kramer` or `:schober`
-
-Returns `(μ_smooth, Σ_smooth, times)` where:
-- `μ_smooth[n][k]`: posterior mean of variable k at time n (vector of length n_deriv)
-- `Σ_smooth[n][k]`: posterior covariance of variable k at time n (n_deriv × n_deriv)
-- `times`: time grid
+Probabilistic ODE solve. Returns `(μ_smooth, Σ_smooth, times)` in the
+per-variable nested format described in [`probsolve_smooth`](@ref).
 """
 function probsolve(ode_fun!, p, u0::AbstractVector,
                    tspan::Tuple{Float64, Float64},
@@ -168,25 +255,18 @@ function probsolve(ode_fun!, p, u0::AbstractVector,
                    sigma::Vector{Float64};
                    interrogate::Symbol=:kramer)
     n_vars = length(u0)
-
     filt_out = probsolve_filter(ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma;
-                                 interrogate=interrogate)
+                                interrogate=interrogate)
     μ_smooth, Σ_smooth = probsolve_smooth(filt_out, n_vars)
-
     μ_smooth, Σ_smooth, filt_out["times"]
 end
 
 """
     basic_loglik(ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma,
-                 obs_data, obs_times, obs_to_state, obs_var;
-                 interrogate=:kramer)
+                 obs_data, obs_times, obs_to_state, obs_var; interrogate=:kramer)
 
-Basic likelihood approximation: solve ODE probabilistically, then
-evaluate data likelihood at posterior mean.
-
-p(Y | θ) ≈ Π_i N(y_i; μ_smooth(t_i), obs_var)
-
-Returns the log-likelihood value.
+Plug-in data likelihood: solve the ODE probabilistically (with full EKF1
+coupling) and evaluate the Gaussian data likelihood at the posterior mean.
 """
 function basic_loglik(ode_fun!, p, u0::AbstractVector,
                       tspan::Tuple{Float64, Float64},
@@ -198,39 +278,28 @@ function basic_loglik(ode_fun!, p, u0::AbstractVector,
                       obs_var::Float64;
                       interrogate::Symbol=:kramer)
     μ_smooth, _, times = probsolve(ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma;
-                                    interrogate=interrogate)
-
-    n_obs = size(obs_data, 2)
-    n_t = size(obs_data, 1)
+                                   interrogate=interrogate)
+    n_obs = size(obs_data, 2); n_t = size(obs_data, 1)
     ll = 0.0
-
     for i in 1:n_t
-        # Find closest solver time point
-        idx = searchsortedfirst(times, obs_times[i])
-        idx = clamp(idx, 1, length(times))
-
+        idx = clamp(searchsortedfirst(times, obs_times[i]), 1, length(times))
         for j in 1:n_obs
             sk = obs_to_state[j]
-            pred = μ_smooth[idx][sk][1]  # zeroth derivative = function value
+            pred = μ_smooth[idx][sk][1]
             ll += -0.5 * log(2π * obs_var) - 0.5 * (obs_data[i, j] - pred)^2 / obs_var
         end
     end
-
     ll
 end
 
 """
     fenrir_loglik(ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma,
-                  obs_data, obs_times, obs_to_state, obs_weight, obs_var_mat;
-                  interrogate=:kramer)
+                  obs_data, obs_times, obs_to_state, obs_var; interrogate=:kramer)
 
-Fenrir likelihood approximation (Tronarp et al 2022):
-Forward pass with ODE interrogation, then backward pass conditioning on data.
-
-The observation model is: Y_m = D_m X_m + Ω^{1/2} η_m
-where D_m picks out the zeroth derivative of observed state variables.
-
-Returns the approximate marginal log-likelihood.
+Fenrir marginal data likelihood (Tronarp et al. 2022) on the joint state
+space: forward filter conditioned on the ODE (with EKF1 coupling and
+calibrated diffusion), then a backward Gauss–Markov pass that conditions on
+the data and accumulates the data evidence `Σ_m log N(y_m; D_m b_m, …)`.
 """
 function fenrir_loglik(ode_fun!, p, u0::AbstractVector,
                        tspan::Tuple{Float64, Float64},
@@ -242,76 +311,51 @@ function fenrir_loglik(ode_fun!, p, u0::AbstractVector,
                        obs_var::Float64;
                        interrogate::Symbol=:kramer)
     n_vars = length(u0)
+    q = n_deriv
+    D = n_vars * q
     n_obs_vars = length(obs_to_state)
 
-    # Forward pass
     filt_out = probsolve_filter(ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma;
-                                 interrogate=interrogate)
-    μ_filt = filt_out["μ_filt"]
-    Σ_filt = filt_out["Σ_filt"]
-    μ_pred = filt_out["μ_pred"]
-    Σ_pred = filt_out["Σ_pred"]
-    wgt_state = filt_out["wgt_state"]
-    var_state = filt_out["var_state"]
-    times = filt_out["times"]
+                                interrogate=interrogate)
+    μ_filt = filt_out["μ_filt"]; Σ_filt = filt_out["Σ_filt"]
+    μ_pred = filt_out["μ_pred"]; Σ_pred = filt_out["Σ_pred"]
+    A = filt_out["A"]; times = filt_out["times"]
 
     n_t_obs = size(obs_data, 1)
+    obs_ind = clamp.([searchsortedfirst(times, obs_times[i]) for i in 1:n_t_obs],
+                     1, n_steps + 1)
 
-    # Map observation times to solver grid indices
-    obs_ind = [searchsortedfirst(times, obs_times[i]) for i in 1:n_t_obs]
-    obs_ind = clamp.(obs_ind, 1, n_steps + 1)
+    # Data observation operators (one scalar per observed variable).
+    Dmats = [reshape([(c == (obs_to_state[j]-1)*q + 1) ? 1.0 : 0.0 for c in 1:D], 1, D)
+             for j in 1:n_obs_vars]
+    Vobs = fill(obs_var, 1, 1)
 
-    # Build observation matrices per observed variable
-    # D picks out the zeroth derivative of each observed state
-    D = zeros(1, n_deriv)
-    D[1, 1] = 1.0
-    obs_var_mat = fill(obs_var, 1, 1)
-
-    # Backward pass with data conditioning
-    # Start from terminal filter state
     logdens = 0.0
-    obs_ptr = n_t_obs  # pointer into observation array (backwards)
+    bμ = copy(μ_filt[end]); bΣ = copy(Σ_filt[end])
+    obs_ptr = n_t_obs
 
-    # Initialize backward state with terminal filter
-    bμ = [copy(μ_filt[n_steps+1][k]) for k in 1:n_vars]
-    bΣ = [copy(Σ_filt[n_steps+1][k]) for k in 1:n_vars]
-
-    # Check terminal observation
-    if obs_ptr >= 1 && obs_ind[obs_ptr] >= n_steps + 1
+    function condition!(ptr)
         for j in 1:n_obs_vars
-            k = obs_to_state[j]
-            μ_f, Σ_f = kalman_forecast(bμ[k], bΣ[k], zeros(1), D, obs_var_mat)
-            logdens += logpdf_mvn([obs_data[obs_ptr, j]], μ_f, Σ_f)
-            bμ[k], bΣ[k] = kalman_update(bμ[k], bΣ[k],
-                                           [obs_data[obs_ptr, j]], zeros(1),
-                                           D, obs_var_mat)
+            Dj = Dmats[j]
+            μf, Σf = kalman_forecast(bμ, bΣ, zeros(1), Dj, Vobs)
+            logdens += logpdf_mvn([obs_data[ptr, j]], μf, Σf)
+            bμ, bΣ = kalman_update(bμ, bΣ, [obs_data[ptr, j]], zeros(1), Dj, Vobs)
         end
-        obs_ptr -= 1
     end
 
-    # Backward sweep
-    for n in n_steps:-1:1
-        # Compute backward Markov parameters (smooth conditional)
-        for k in 1:n_vars
-            G = Σ_filt[n][k] * wgt_state[k]' / Σ_pred[n+1][k]
-            bμ_pred = G * bμ[k] + (μ_filt[n][k] - G * μ_pred[n+1][k])
-            bΣ_pred = G * bΣ[k] * G' + (Σ_filt[n][k] - G * Σ_filt[n][k] * wgt_state[k]' / Σ_pred[n+1][k] * wgt_state[k] * Σ_filt[n][k])
-            bΣ_pred = 0.5 * (bΣ_pred + bΣ_pred')
-            bμ[k] = bμ_pred
-            bΣ[k] = bΣ_pred
-        end
+    if obs_ptr >= 1 && obs_ind[obs_ptr] >= n_steps + 1
+        condition!(obs_ptr); obs_ptr -= 1
+    end
 
-        # Check if this time has an observation
+    for n in n_steps:-1:1
+        Σpn = Symmetric(Σ_pred[n+1])
+        Σpf = cholesky(Σpn + 1e-12 * I, check=false)
+        G = issuccess(Σpf) ? (Σ_filt[n] * A') / Σpf : (Σ_filt[n] * A') * pinv(Σ_pred[n+1])
+        bμ = μ_filt[n] + G * (bμ - μ_pred[n+1])
+        bΣ = Σ_filt[n] + G * (bΣ - Σ_pred[n+1]) * G'
+        bΣ = 0.5 * (bΣ + bΣ')
         if obs_ptr >= 1 && obs_ind[obs_ptr] == n
-            for j in 1:n_obs_vars
-                k = obs_to_state[j]
-                μ_f, Σ_f = kalman_forecast(bμ[k], bΣ[k], zeros(1), D, obs_var_mat)
-                logdens += logpdf_mvn([obs_data[obs_ptr, j]], μ_f, Σ_f)
-                bμ[k], bΣ[k] = kalman_update(bμ[k], bΣ[k],
-                                               [obs_data[obs_ptr, j]], zeros(1),
-                                               D, obs_var_mat)
-            end
-            obs_ptr -= 1
+            condition!(obs_ptr); obs_ptr -= 1
         end
     end
 

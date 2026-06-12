@@ -1,6 +1,6 @@
 # Getting Started with PartiallySpecifiedModels.jl
 Simon Frost
-2026-04-02
+2026-06-12
 
 - [Overview](#overview)
 - [Vignette Guide](#vignette-guide)
@@ -68,11 +68,6 @@ using Plots
 using Random
 Random.seed!(42)
 ```
-
-    Precompiling packages...
-        PartiallySpecifiedModels Being precompiled by another process (pid: 36853, pidfile: /Users/sdwfrost/.julia/compiled/v1.12/PartiallySpecifiedModels/tWtwA_lLwID.ji.pidfile)
-      21655.7 ms  ✓ PartiallySpecifiedModels
-      1 dependency successfully precompiled in 50 seconds. 387 already precompiled.
 
     TaskLocalRNG()
 
@@ -177,9 +172,9 @@ The `LAML()` algorithm estimates the spline coefficients and the
 smoothing parameter $\lambda$ simultaneously. For Gaussian data, LAML is
 equivalent to **Restricted Maximum Likelihood (REML)**.
 
-    Data loss (SS): 2.38
-    EDF:            4.95
-    Smoothing λ:    [0.01933]
+    Data loss (SS): 2.46
+    EDF:            4.02
+    Smoothing λ:    [0.1941]
 
 ### Inspect the solution
 
@@ -307,7 +302,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](01_getting_started_files/figure-commonmark/cell-10-output-1.svg)
 
-    Durbin-Watson: 1.804
+    Durbin-Watson: 1.751
 
 ## Summary
 

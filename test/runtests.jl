@@ -942,6 +942,20 @@ using OrdinaryDiffEq
         d2_cv = diff(diff(beta_cv))
         @test all(d2_cv .< 0)
 
+        # :convex must represent a NON-monotone U-shape (free intercept/slope):
+        # negative initial slope (γ₂<0) + positive curvature ⇒ decreasing then
+        # increasing. The previous parameterization forced monotone increasing.
+        gamma_u = vcat(0.0, -3.0, fill(0.0, 8))  # softplus(0)=0.69 curvature
+        beta_u = gamma_to_knot_values(a_cx, gamma_u)
+        @test all(diff(diff(beta_u)) .> 0)         # still convex
+        @test any(diff(beta_u) .< 0)               # decreasing somewhere
+        @test any(diff(beta_u) .> 0)               # increasing somewhere
+        # :concave likewise represents a non-monotone ∩-shape
+        gamma_n = vcat(0.0, 3.0, fill(0.0, 8))
+        beta_n = gamma_to_knot_values(a_cv, gamma_n)
+        @test all(diff(diff(beta_n)) .< 0)
+        @test any(diff(beta_n) .> 0) && any(diff(beta_n) .< 0)
+
         # Evaluator works and respects domain
         eval_inc = build_constrained_bspline_evaluator(a_inc, gamma)
         @test eval_inc(0.0) < eval_inc(0.5) < eval_inc(1.0)

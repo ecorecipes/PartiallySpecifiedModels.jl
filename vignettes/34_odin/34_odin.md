@@ -1,6 +1,6 @@
 # ODIN: ODE-Informed Gaussian Process Regression
 Simon Frost
-2026-04-04
+2026-06-12
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -50,10 +50,6 @@ using Plots
 using Random
 Random.seed!(42)
 ```
-
-    Precompiling packages...
-      12762.1 ms  ✓ PartiallySpecifiedModels
-      1 dependency successfully precompiled in 38 seconds. 387 already precompiled.
 
     TaskLocalRNG()
 
@@ -122,21 +118,51 @@ println("\nTime: $(round(t_odin, digits=1))s")
 
     ODINSolver: 2 observed states, 61 time points
       8 unknown-function parameters, 100 outer iterations
-      outer 1: loss=10678.0
-      outer 2: loss=10513.0
-      outer 3: loss=10513.0
-      outer 10: loss=10513.0
-      outer 20: loss=10513.0
-      outer 30: loss=10513.0
-      outer 40: loss=10513.0
-      outer 50: loss=10513.0
-      outer 60: loss=10513.0
-      outer 70: loss=10513.0
-      outer 80: loss=10513.0
-      outer 90: loss=10513.0
-      outer 100: loss=10513.0
+      step 1: risk=7023.4
+      step 2: risk=7023.4
+      step 3: risk=7023.4
+      step 50: risk=5892.0
+      step 100: risk=5406.5
+      step 150: risk=5133.0
+      step 200: risk=4886.2
+      step 250: risk=4667.0
+      step 300: risk=4479.0
+      step 350: risk=4320.8
+      step 400: risk=4189.0
+      step 450: risk=4080.2
+      step 500: risk=3991.0
+      step 550: risk=3918.3
+      step 600: risk=3859.7
+      step 650: risk=3812.8
+      step 700: risk=3775.5
+      step 750: risk=3746.0
+      step 800: risk=3722.8
+      step 850: risk=3704.7
+      step 900: risk=3690.6
+      step 950: risk=3679.6
+      step 1000: risk=3671.0
+      step 1050: risk=3664.4
+      step 1100: risk=3659.2
+      step 1150: risk=3655.1
+      step 1200: risk=3651.9
+      step 1250: risk=3649.4
+      step 1300: risk=3647.4
+      step 1350: risk=3645.9
+      step 1400: risk=3644.6
+      step 1450: risk=3643.6
+      step 1500: risk=3642.9
+      step 1550: risk=3642.3
+      step 1600: risk=3641.8
+      step 1650: risk=3641.5
+      step 1700: risk=3641.2
+      step 1750: risk=3641.0
+      step 1800: risk=3640.9
+      step 1850: risk=3640.8
+      step 1900: risk=3640.7
+      step 1950: risk=3640.7
+      step 2000: risk=3640.7
 
-    Time: 4.9s
+    Time: 4.6s
 
 ### Compare with Adaptive Gradient Matching and LAML
 

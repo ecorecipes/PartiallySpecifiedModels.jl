@@ -1,6 +1,6 @@
 # Discrete-Time Population Models
 Simon Frost
-2026-04-03
+2026-06-12
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -111,7 +111,7 @@ scatter!(times, data, label="Observed", ms=4, color=:steelblue, alpha=0.7)
 
 ### Fit with LAML
 
-    LAML — Data loss: 286.0, EDF: 4.6
+    LAML — Data loss: 286.0, EDF: 4.5
 
 ### Fit with GradientMatching
 
@@ -295,7 +295,7 @@ p_data
 range of $N_2$, not the theoretical range. This avoids extrapolation
 artefacts at boundaries.
 
-    LAML — Data loss: 583.5, EDF: 2.7
+    LAML — Data loss: 583.5, EDF: 2.6
 
 ### Compare with GradientMatching
 

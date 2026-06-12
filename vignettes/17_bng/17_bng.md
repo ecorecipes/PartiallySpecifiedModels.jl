@@ -1,6 +1,6 @@
 # Fast Gradient Matching with BNGSolver
 Simon Frost
-2026-04-03
+2026-06-12
 
 - [Overview](#overview)
 - [Lotka-Volterra with Unknown
@@ -116,6 +116,10 @@ prob = PSMProblem(lv!, [50.0, 10.0], (0.0, 30.0), [uf];
 sol_bng = solve(prob, BNGSolver(maxiters=3000, lr=0.01, verbose=false));
 ```
 
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+
 ### Compare with AdamSolver
 
 ``` julia
@@ -191,7 +195,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](17_bng_files/figure-commonmark/cell-10-output-1.svg)
 
-    Durbin-Watson: 0.564, 0.419
+    Durbin-Watson: 0.818, 0.893
 
 ## When to Use BNGSolver
 

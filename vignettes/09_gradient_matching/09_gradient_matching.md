@@ -1,6 +1,6 @@
 # Integration-Free Inference with Gradient Matching
 Simon Frost
-2026-04-02
+2026-06-12
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -106,12 +106,12 @@ prob = PSMProblem(sir!, u0, tspan, [approx_β];
 
     Method               | Time (s) | Data Loss
     -------------------------------------------------------
-    GradientMatching     | 4.14     | 0.0
-    AGM                  | 5.68     | 1184.4
-    LAML                 | 6.2      | 1754.0
-    CollocationLAML      | 1.62     | 1210.1
-    AdamSolver           | 4.31     | 1365.0
-    RodeoSolver          | 4.49     | 1342.4
+    GradientMatching     | 3.81     | 1023.4
+    AGM                  | 5.82     | 1184.4
+    LAML                 | 6.01     | 1740.3
+    CollocationLAML      | 2.09     | 1223.5
+    AdamSolver           | 4.27     | 1365.0
+    RodeoSolver          | 13.42    | 1476.1
 
 ### Compare recovered β(prevalence)
 
@@ -175,9 +175,9 @@ for fitted trajectories.
 ### Inspecting AGM diagnostics
 
     AGM convergence info:
-      GP hyperparams: [(52268.25281995996, 18.0, 52.26825281995996), (864.7704326939464, 12.0, 8.647704326939465), (3.078267445e-314, 3.14e-321, NaN)]
-      Gamma (mismatch): [5.3415, 6.4351, 5.3671]
-      Derivative loss: 11416.7432
+      GP hyperparams: [(52268.25281995996, 18.0, 52.26825281995996), (864.7704326939464, 12.0, 8.647704326939465), (0.0, 0.0, 0.0)]
+      Gamma (mismatch): [3.8718, 2.9089, 32757.23]
+      Derivative loss: 11416.5672
 
 ## Example 2: Logistic Growth — A Clean Demonstration
 
@@ -311,9 +311,9 @@ plot!(u_grid_d, [sol_laml_d.unknown_functions[:r](x) for x in u_grid_d], label="
 
 ![](09_gradient_matching_files/figure-commonmark/cell-12-output-1.svg)
 
-    TwoStage    loss=0.0  r(2)=0.9528
-    BNG         loss=1.4316  r(2)=0.9528
-    LAML        loss=0.3408  r(2)=1.0301
+    TwoStage    loss=0.2547  r(2)=0.9541
+    BNG         loss=1.1447  r(2)=0.9541
+    LAML        loss=0.3444  r(2)=1.0232
     True        r(2)=1.0
 
 TwoStage and BNG use the same derivative-matching objective, so their

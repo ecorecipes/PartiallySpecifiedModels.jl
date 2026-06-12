@@ -185,8 +185,9 @@ end
 """
 Compute the product-of-experts gradient matching loss.
 
-For each state k:
+For each state k (with a Gamma prior on the mismatch variance γ_k):
   L_k = -0.5 (f_k - m_k)ᵀ (A_k + γ_k I)⁻¹ (f_k - m_k) - 0.5 log|A_k + γ_k I|
+        + log γ_k - γ_k/scale_k
 
 Total loss = -Σ_k L_k  (negative because we minimize)
 """
@@ -237,6 +238,16 @@ function agm_loss(prob::PSMProblem, beta::AbstractVector,
         log_det = sum(log.(shifted_eig))
 
         ll_k = -T(0.5) * quad_form - T(0.5) * log_det
+
+        # Weakly-informative Gamma(shape=2, rate=1/scale) prior on the
+        # gradient-mismatch variance γ_k (Dondelinger et al. 2013;
+        # Calderhead et al. 2009 place a Gamma prior on γ precisely to keep
+        # it away from the degenerate γ→0 limit, where the GP-derivative
+        # constraint becomes infinitely tight and overfits). The scale is set
+        # to the mean eigenvalue of A_k, the natural variance scale, so the
+        # prior is uninformative relative to the data term.
+        γ_scale = max(sum(λ_A) / length(λ_A), T(1e-6))
+        ll_k += log(gamma[k]) - gamma[k] / T(γ_scale)
         total_loss -= ll_k
     end
 
