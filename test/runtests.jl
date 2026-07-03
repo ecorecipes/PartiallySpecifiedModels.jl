@@ -1821,9 +1821,14 @@ using StableRNGs
             data_times=sol_true.t, data_values=reshape(y_pois, :, 1),
             obs_to_state=[2], known_params=NamedTuple(),
             likelihood=Poisson(), solver=Tsit5())
-        sol = solve(prob, LAML(maxiters=80, verbose=false))
+        # warmup=10: see the identical rationale on the TruncatedNormal
+        # test above -- this is the same class of strongly nonlinear
+        # ODE+B-spline fit, and was observed to occasionally land in a
+        # much worse basin on some BLAS/platform combinations (92794 on
+        # one CI runner) without it.
+        sol = solve(prob, LAML(maxiters=80, verbose=false, warmup=10))
 
-        # Warm-start should achieve reasonable fit (SS < 20000)
+        # Warm-start should achieve reasonable fit (SS < 30000)
         # Without warm-start this seed gives SS > 200000
         @test sol.data_loss < 30000
         @test sol.edf > 1.5
