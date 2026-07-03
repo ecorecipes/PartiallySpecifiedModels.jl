@@ -192,6 +192,37 @@ function irls_pseudodata(::Poisson, y::AbstractVector,
     z
 end
 
+# ─── Observation-loglik helpers for solver backends ─────────────────
+
+"""
+    observation_loglikelihood(fam, y, mu, w; sigma2=nothing)
+
+Evaluate the weighted observation log-likelihood for matrix-valued predictions.
+For `Gaussian`, callers must provide the observation variance `sigma2`.
+"""
+function observation_loglikelihood(fam::AbstractLikelihood,
+                                   y::AbstractMatrix,
+                                   mu::AbstractMatrix,
+                                   w::AbstractMatrix;
+                                   sigma2=nothing)
+    log_likelihood(fam, vec(y), vec(mu), vec(w))
+end
+
+function observation_loglikelihood(::Gaussian,
+                                   y::AbstractMatrix,
+                                   mu::AbstractMatrix,
+                                   w::AbstractMatrix;
+                                   sigma2)
+    sigma2 === nothing && throw(ArgumentError("Gaussian likelihood requires sigma2"))
+    T = promote_type(eltype(y), eltype(mu), eltype(w), typeof(sigma2))
+    ll = zero(T)
+    log_norm = -T(0.5) * log(T(2π) * T(sigma2))
+    for j in axes(y, 2), i in axes(y, 1)
+        ll += T(w[i, j]) * (log_norm - T(0.5) * (mu[i, j] - y[i, j])^2 / T(sigma2))
+    end
+    ll
+end
+
 function irls_pseudodata(fam::NegativeBinomial, y::AbstractVector,
                          mu::AbstractVector, w::AbstractVector)
     z = similar(y)

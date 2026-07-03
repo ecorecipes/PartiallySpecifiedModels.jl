@@ -1,26 +1,20 @@
 # ─── Pseudo-Marginal MCMC Solver ─────────────────────────────────────
 #
-# Combines a probabilistic ODE solver (fenrir/dalton) as an inner likelihood
-# estimator with NUTS/HMC for Bayesian posterior sampling over unknown
-# function parameters.
+# This solver targets the approximate posterior induced by one of the
+# probabilistic-ODE inner marginal likelihoods (:basic, :fenrir, :dalton),
+# but uses a *random positive unbiased estimator* of that approximate
+# likelihood inside a Metropolis-Hastings scheme.  The random auxiliary
+# likelihood estimate is carried through the MH state, restoring the
+# pseudo-marginal correctness property that the previous deterministic
+# NUTS implementation did not have.
 #
-# Instead of solving the ODE deterministically (as MCMCSolver does), the
-# log-likelihood is computed via a Kalman-filter-based marginal likelihood
-# (Tronarp et al 2022), which accounts for ODE discretization uncertainty.
-#
-# NOTE: The Kalman-filter-based fenrir_loglik uses in-place Float64 arrays
-# that are not ForwardDiff-compatible. We use finite-difference gradients
-# instead, following the same approach as RodeoSolver.
-#
-# Reference: Chkrebtii et al (2016), Tronarp et al (2022)
+# The estimator here randomizes the chosen deterministic approximate
+# likelihood L̃(θ) with a mean-one positive noise variable R so that
+# ĤL(θ, U) = L̃(θ) R satisfies E[ĤL(θ, U)] = L̃(θ).  Consequently the
+# Markov chain is exact for the approximate posterior proportional to
+# π(θ) L̃(θ), not for the exact ODE likelihood.
 
-using AdvancedHMC
-using LogDensityProblems
-using LogDensityProblemsAD
 using MCMCChains
-import AbstractMCMC
-
-# ─── Log-density problem for pseudo-marginal MCMC ────────────────
 
 struct PseudoMarginalLogDensity
     prob::PSMProblem
@@ -32,6 +26,75 @@ struct PseudoMarginalLogDensity
     obs_var::Float64
 end
 
+function _pseudo_marginal_logprior(ld::PseudoMarginalLogDensity, beta::AbstractVector)
+    alg = ld.alg
+    lp = 0.0
+    for (idx, S) in enumerate(ld.penalty_matrices)
+        np = size(S, 1)
+        off = ld.param_offsets[idx]
+        beta_k = beta[off+1:off+np]
+        lp -= 0.5 / alg.prior_scale * dot(beta_k, S * beta_k)
+    end
+    lp -= 0.5 * sum(beta .^ 2) / (100.0 * alg.prior_scale)
+    lp
+end
+
+function _pseudo_marginal_inner_loglik(ld::PseudoMarginalLogDensity, theta)
+    prob = ld.prob
+    alg = ld.alg
+    beta = Float64.(theta[1:ld.n_params])
+    p = build_param_struct(prob, beta)
+
+    function ode_rhs!(du, u, p_unused, t)
+        prob.dynamics!(du, u, p, t)
+    end
+
+    loglik_fn = if alg.inner_method == :fenrir
+        fenrir_loglik
+    elseif alg.inner_method == :basic
+        basic_loglik
+    elseif alg.inner_method == :dalton
+        _dalton_loglik
+    else
+        throw(ArgumentError("Unsupported pseudo-marginal inner_method $(repr(alg.inner_method))"))
+    end
+
+    ll = try
+        loglik_fn(ode_rhs!, nothing, Float64.(prob.u0), prob.tspan,
+                  alg.n_steps, alg.n_deriv, ld.sigma,
+                  Float64.(prob.data_values), Float64.(prob.data_times),
+                  prob.obs_to_state, ld.obs_var;
+                  interrogate=:kramer)
+    catch
+        -Inf
+    end
+
+    isfinite(ll) ? ll : -Inf
+end
+
+function _pseudo_marginal_noise(rng, n_particles::Int)
+    n_particles > 0 || throw(ArgumentError("PseudoMarginalSolver n_particles must be positive"))
+    noise = 0.0
+    for _ in 1:n_particles
+        noise += randexp(rng)
+    end
+    noise / n_particles
+end
+
+function _pseudo_marginal_logdensity(ld::PseudoMarginalLogDensity, theta, rng)
+    ll_det = _pseudo_marginal_inner_loglik(ld, theta)
+    isfinite(ll_det) || return -Inf
+    noise = _pseudo_marginal_noise(rng, ld.alg.n_particles)
+    ll_est = ll_det + log(noise)
+    ll_est + _pseudo_marginal_logprior(ld, Float64.(theta[1:ld.n_params]))
+end
+
+function _pseudo_marginal_deterministic_logdensity(ld::PseudoMarginalLogDensity, theta)
+    ll_det = _pseudo_marginal_inner_loglik(ld, theta)
+    isfinite(ll_det) || return -Inf
+    ll_det + _pseudo_marginal_logprior(ld, Float64.(theta[1:ld.n_params]))
+end
+
 function LogDensityProblems.capabilities(::Type{PseudoMarginalLogDensity})
     LogDensityProblems.LogDensityOrder{0}()
 end
@@ -41,124 +104,27 @@ function LogDensityProblems.dimension(ld::PseudoMarginalLogDensity)
 end
 
 function LogDensityProblems.logdensity(ld::PseudoMarginalLogDensity, theta)
-    prob = ld.prob
-    alg = ld.alg
-    T = Float64  # fenrir_loglik is not AD-compatible; always use Float64
-
-    beta = Float64.(theta[1:ld.n_params])
-
-    # Build parameter struct
-    p = build_param_struct(prob, beta)
-
-    function ode_rhs!(du, u, p_unused, t)
-        prob.dynamics!(du, u, p, t)
-    end
-
-    # Compute probabilistic ODE log-likelihood via fenrir or basic method
-    loglik_fn = alg.inner_method == :fenrir ? fenrir_loglik : basic_loglik
-
-    ll = try
-        loglik_fn(ode_rhs!, nothing, Float64.(prob.u0), prob.tspan,
-                  alg.n_steps, alg.n_deriv, ld.sigma,
-                  Float64.(prob.data_values), Float64.(prob.data_times),
-                  prob.obs_to_state, ld.obs_var;
-                  interrogate=:kramer)
-    catch e
-        return -1e20
-    end
-
-    if !isfinite(ll)
-        return -1e20
-    end
-
-    # Log-prior: smoothing penalty from penalty matrices
-    lp = 0.0
-    for (idx, S) in enumerate(ld.penalty_matrices)
-        np = size(S, 1)
-        off = ld.param_offsets[idx]
-        beta_k = beta[off+1:off+np]
-        lp -= 0.5 / alg.prior_scale * dot(beta_k, S * beta_k)
-    end
-
-    # Broad Gaussian prior on all parameters
-    lp -= 0.5 * sum(beta .^ 2) / (100.0 * alg.prior_scale)
-
-    return ll + lp
+    _pseudo_marginal_logdensity(ld, theta, Random.default_rng())
 end
-
-# ─── Finite-difference gradient wrapper ──────────────────────────
-#
-# fenrir_loglik uses in-place Float64 Kalman filter arrays that are not
-# compatible with ForwardDiff. We compute gradients via central finite
-# differences, following the same approach as RodeoSolver.
-
-struct PseudoMarginalFDGradient
-    ld::PseudoMarginalLogDensity
-    fd_eps::Float64
-end
-
-function LogDensityProblems.capabilities(::Type{PseudoMarginalFDGradient})
-    LogDensityProblems.LogDensityOrder{1}()
-end
-
-function LogDensityProblems.dimension(g::PseudoMarginalFDGradient)
-    g.ld.n_params
-end
-
-function LogDensityProblems.logdensity(g::PseudoMarginalFDGradient, theta)
-    LogDensityProblems.logdensity(g.ld, theta)
-end
-
-function LogDensityProblems.logdensity_and_gradient(g::PseudoMarginalFDGradient, theta)
-    ld = g.ld
-    ε = g.fd_eps
-    D = length(theta)
-    f0 = LogDensityProblems.logdensity(ld, theta)
-    grad = zeros(D)
-    for i in 1:D
-        θp = copy(theta); θp[i] += ε
-        θm = copy(theta); θm[i] -= ε
-        fp = LogDensityProblems.logdensity(ld, θp)
-        fm = LogDensityProblems.logdensity(ld, θm)
-        if isfinite(fp) && isfinite(fm)
-            grad[i] = (fp - fm) / (2ε)
-        else
-            grad[i] = 0.0
-        end
-    end
-    # Clip gradient norm to prevent extreme proposals
-    gnorm = norm(grad)
-    if gnorm > 1e4
-        grad .*= 1e4 / gnorm
-    end
-    return f0, grad
-end
-
-# ─── Solve method ────────────────────────────────────────────────
 
 """
     solve(prob::PSMProblem, alg::PseudoMarginalSolver)
 
-Fit a partially specified model using pseudo-marginal MCMC. A probabilistic
-ODE solver (Kalman-filter-based) provides an unbiased estimate of the
-marginal likelihood, which is used inside an MCMC sampler to draw from the
-true posterior over the unknown-function parameters.
+Fit a partially specified model using pseudo-marginal Metropolis-Hastings.
 
-# Algorithm
-1. Initialise parameters and set up the IBM prior.
-2. At each MCMC iteration, compute a noisy marginal-likelihood estimate
-   via the Kalman filter (forward pass only).
-3. Accept/reject proposals using the Metropolis–Hastings ratio with the
-   estimated likelihood (pseudo-marginal correctness is guaranteed).
-4. Return the full chain and posterior-mean point estimates.
+`inner_method` selects the *deterministic approximate* probabilistic-ODE
+marginal likelihood `L̃(θ)` (`:basic`, `:fenrir`, or `:dalton`). Each MH
+accept/reject step uses a positive unbiased random estimator `ĤL(θ, U)` with
+`E[ĤL(θ, U)] = L̃(θ)`, so the chain is exact for the approximate posterior
+proportional to `π(θ)L̃(θ)`.
 
-# References
-- Andrieu & Roberts (2009), "The pseudo-marginal approach for efficient
-  Monte Carlo computations", Ann. Statist.
+The current implementation restores pseudo-marginal correctness for the
+approximate inner likelihood, but it does **not** provide an unbiased
+estimator of the exact ODE marginal likelihood.
 
 # Returns
-`PSMSolution` with fitted parameters, trajectory, unknown functions,
-and the full MCMC chain in `sol.extras[:chain]`.
+`PSMSolution` with fitted parameters, trajectory, unknown functions, and the
+full MCMC chain in `sol.convergence`.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
     _validate_problem(prob, "PseudoMarginalSolver"; require_continuous=true)
@@ -167,24 +133,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
     n_obs = size(prob.data_values, 2)
     n_t = length(prob.data_times)
 
-    # Initialize parameters (use provided initial_params or default)
-    if alg.initial_params !== nothing
-        beta0 = copy(alg.initial_params)
+    beta0 = if alg.initial_params !== nothing
+        copy(alg.initial_params)
     else
-        beta0 = Float64[]
-        for approx in prob.approximators
-            if approx isa NeuralApproximator
-                spec = mlp_spec_from_lux(approx.model)
-                rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-                append!(beta0, init_mlp_params(spec, rng))
-            else
-                append!(beta0, initial_params(approx))
-            end
-        end
+        build_initial_params(prob)
     end
     n_beta = length(beta0)
 
-    # IBM sigma: auto-scale from data range if not provided
     sigma = if alg.sigma === nothing
         sig = Float64[]
         for k in 1:n_vars
@@ -202,7 +157,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
         alg.sigma
     end
 
-    # Observation variance: auto-scale from data variance if not provided
     obs_var = if alg.obs_var === nothing
         total_var = 0.0
         for j in 1:n_obs
@@ -213,71 +167,71 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
         alg.obs_var
     end
 
-    # Build penalty matrices (reuse helper from mcmc_solver.jl)
     penalties, offsets, _ = _build_penalty_info(prob)
+    ld = PseudoMarginalLogDensity(prob, alg, penalties, offsets, n_beta, sigma, obs_var)
+
+    rng = alg.rng_seed === nothing ? Random.Xoshiro() : Random.Xoshiro(alg.rng_seed)
+    D = LogDensityProblems.dimension(ld)
+    theta_curr = copy(beta0)
+    logpost_curr = _pseudo_marginal_logdensity(ld, theta_curr, rng)
+    if !isfinite(logpost_curr)
+        logpost_curr = _pseudo_marginal_deterministic_logdensity(ld, theta_curr)
+    end
+    isfinite(logpost_curr) || error("PseudoMarginalSolver failed to initialize a finite log-posterior")
+
+    n_total = alg.n_warmup + alg.n_samples
+    sample_matrix = zeros(alg.n_samples, D)
+    accept_count = 0
+    warmup_accept = 0
+    log_prop_scale = log(max(alg.proposal_scale, 1e-6))
 
     if verbose
-        println("PseudoMarginalSolver: $n_beta UF params, " *
-                "inner=$(alg.inner_method), n_steps=$(alg.n_steps), " *
-                "n_deriv=$(alg.n_deriv)")
+        println("PseudoMarginalSolver: $n_beta UF params, inner=$(alg.inner_method), " *
+                "n_particles=$(alg.n_particles), proposal_scale=$(round(alg.proposal_scale, sigdigits=3))")
         println("  σ (IBM scale): $(round.(sigma, sigdigits=3))")
         println("  obs_var: $(round(obs_var, sigdigits=3))")
         println("  prior_scale: $(alg.prior_scale)")
-        init_label = alg.initial_params !== nothing ? "user-provided" : "default"
-        println("  init: $init_label, $(alg.n_warmup) warmup + $(alg.n_samples) samples")
     end
 
-    # Build log-density problem
-    ld = PseudoMarginalLogDensity(prob, alg, penalties, offsets, n_beta, sigma, obs_var)
+    for iter in 1:n_total
+        prop_scale = exp(log_prop_scale)
+        theta_prop = theta_curr .+ prop_scale .* randn(rng, D)
+        logpost_prop = _pseudo_marginal_logdensity(ld, theta_prop, rng)
 
-    D = LogDensityProblems.dimension(ld)
-    theta0 = copy(beta0)
+        accepted = false
+        if isfinite(logpost_prop)
+            if log(rand(rng)) < min(0.0, logpost_prop - logpost_curr)
+                theta_curr .= theta_prop
+                logpost_curr = logpost_prop
+                accepted = true
+            end
+        end
 
-    # Use finite-difference gradient wrapper (fenrir_loglik is not AD-compatible)
-    ld_fd = PseudoMarginalFDGradient(ld, 1e-5)
+        if iter <= alg.n_warmup
+            warmup_accept += accepted
+            log_prop_scale += ((accepted ? 1.0 : 0.0) - alg.target_accept) / sqrt(iter)
+        else
+            sample_idx = iter - alg.n_warmup
+            sample_matrix[sample_idx, :] .= theta_curr
+            accept_count += accepted
+        end
 
-    # Set up NUTS sampler
-    nuts = NUTS(alg.target_accept)
-
-    if verbose
-        init_ll = LogDensityProblems.logdensity(ld, theta0)
-        println("  Initial log-density: $(round(init_ll, sigdigits=5))")
-        println("  Running NUTS sampler (finite-difference gradients)...")
+        if verbose && (iter <= 5 || iter % 100 == 0 || iter == n_total)
+            acc = iter <= alg.n_warmup ? warmup_accept / iter : accept_count / max(iter - alg.n_warmup, 1)
+            println("  iter $iter / $n_total: accept_rate=$(round(acc, sigdigits=3)), " *
+                    "proposal_scale=$(round(exp(log_prop_scale), sigdigits=3))")
+        end
     end
 
-    # Run sampler using AbstractMCMC interface
-    chain_raw = AbstractMCMC.sample(
-        ld_fd, nuts, alg.n_warmup + alg.n_samples;
-        initial_params=theta0,
-        progress=verbose, verbose=false)
-
-    # Extract samples (drop warmup)
-    n_total = length(chain_raw)
-    start_idx = alg.n_warmup + 1
-    sample_matrix = zeros(alg.n_samples, D)
-    for (idx, i) in enumerate(start_idx:n_total)
-        sample_matrix[idx, :] .= chain_raw[i].z.θ
-    end
-
-    # Build MCMCChains.Chains object
     pnames = _param_names(prob, false)
     chain = MCMCChains.Chains(sample_matrix, pnames)
 
-    if verbose
-        println("  Chain size: $(size(sample_matrix))")
-    end
-
-    # MAP estimate = sample with highest log-posterior
-    logp_values = [LogDensityProblems.logdensity(ld, sample_matrix[i, :])
+    logp_values = [_pseudo_marginal_deterministic_logdensity(ld, sample_matrix[i, :])
                    for i in 1:alg.n_samples]
     map_idx = argmax(logp_values)
-    map_theta = sample_matrix[map_idx, :]
-    map_beta = map_theta[1:n_beta]
-
-    # Build solution from MAP estimate
+    map_beta = sample_matrix[map_idx, 1:n_beta]
     p_opt = build_param_struct(prob, map_beta)
 
-    # Run probabilistic solver at MAP for fitted values + uncertainty
     function ode_rhs_opt!(du, u, p_unused, t)
         prob.dynamics!(du, u, p_opt, t)
     end
@@ -286,12 +240,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
                                            prob.tspan, alg.n_steps, alg.n_deriv, sigma;
                                            interrogate=:kramer)
 
-    # Extract fitted values at data times
     data_loss = 0.0
     pred = zeros(n_t, n_obs)
     for i in 1:n_t
-        idx = searchsortedfirst(times, prob.data_times[i])
-        idx = clamp(idx, 1, length(times))
+        idx = clamp(searchsortedfirst(times, prob.data_times[i]), 1, length(times))
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             pred[i, j] = μ_smooth[idx][sk][1]
@@ -299,7 +251,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
         end
     end
 
-    # Build evaluators from MAP params
     uf_evals = Dict{Symbol, Any}()
     offset = 0
     for approx in prob.approximators
@@ -307,8 +258,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
         params_k = map_beta[offset+1:offset+np]
         offset += np
         if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2],
-                                    length=approx.nknots))
+            knots_x = collect(range(approx.domain[1], approx.domain[2], length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
@@ -337,7 +287,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
         end
     end
 
-    # ComponentArray for MAP parameters
     ca_entries = Pair{Symbol, Any}[]
     offset = 0
     for approx in prob.approximators
@@ -347,34 +296,21 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
     end
     ca = ComponentArray(NamedTuple(ca_entries))
 
-    # Extract solution uncertainty at observation times
-    sol_var = zeros(n_t, n_vars)
-    for i in 1:n_t
-        idx = searchsortedfirst(times, prob.data_times[i])
-        idx = clamp(idx, 1, length(times))
-        for k in 1:n_vars
-            sol_var[i, k] = Σ_smooth[idx][k][1, 1]
-        end
-    end
-
-    # Posterior mean of parameters
-    post_mean = vec(mean(sample_matrix, dims=1))
-
     if verbose
+        println("  Final accept_rate=$(round(accept_count / max(alg.n_samples, 1), sigdigits=3))")
         println("  MAP -logpost: $(round(-logp_values[map_idx], sigdigits=5))")
-        println("  Data loss (MAP): $(round(data_loss, sigdigits=5))")
     end
 
     PSMSolution(
-        ca,                               # parameters (MAP)
-        -logp_values[map_idx],            # objective (negative MAP log-posterior)
-        data_loss,                        # data_loss
-        Float64(n_beta),                  # edf
-        Float64[],                        # smoothing_params (not applicable)
-        pred,                             # fitted_values (from MAP)
-        Float64.(prob.data_values),       # data_values
-        Float64.(prob.data_times),        # data_times
-        uf_evals,                         # unknown_functions (MAP evaluators)
-        chain                             # convergence: MCMCChains.Chains
+        ca,
+        -logp_values[map_idx],
+        data_loss,
+        Float64(n_beta),
+        Float64[],
+        pred,
+        Float64.(prob.data_values),
+        Float64.(prob.data_times),
+        uf_evals,
+        chain
     )
 end

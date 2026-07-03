@@ -103,7 +103,11 @@ function logpdf_mvn(x::AbstractVector, μ::AbstractVector, Σ::AbstractMatrix)
     active = w .> 1e-300
     k = sum(active)
     if k == 0
-        return 0.0
+        return norm(r) <= 1e-12 ? 0.0 : -Inf
+    end
+    inactive = .!active
+    if any(abs.(z[inactive]) .> 1e-10)
+        return -Inf
     end
     w_a = w[active]
     z_a = z[active]

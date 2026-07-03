@@ -52,23 +52,6 @@ function _variational_simulate(prob::PSMProblem, beta)
 end
 
 """
-    _gaussian_loglik(pred, data, weights, obs_noise_var)
-
-Gaussian log-likelihood: -0.5 Σ w_ij (pred_ij - data_ij)² / σ²_obs.
-"""
-function _gaussian_loglik(pred, data, weights, obs_noise_var)
-    T = eltype(pred)
-    ll = zero(T)
-    n_t, n_obs = size(data)
-    for j in 1:n_obs
-        for i in 1:n_t
-            ll -= weights[i, j] * (pred[i, j] - data[i, j])^2 / (2 * obs_noise_var)
-        end
-    end
-    ll
-end
-
-"""
     _kl_gaussian(mu, log_sigma, prior_scale)
 
 Analytical KL divergence: KL(q || p) where q = N(μ, σ²), p = N(0, τ²).
@@ -121,8 +104,11 @@ function _compute_elbo(prob::PSMProblem, mu, log_sigma, prior_scale,
             continue
         end
 
-        avg_ll += _gaussian_loglik(pred, prob.data_values, prob.data_weights,
-                                   obs_noise_var)
+        avg_ll += observation_loglikelihood(prob.likelihood,
+                                            prob.data_values,
+                                            pred,
+                                            prob.data_weights;
+                                            sigma2=obs_noise_var)
         n_valid += 1
     end
 
@@ -153,7 +139,7 @@ diagonal Gaussian, optimised by maximising the evidence lower bound (ELBO).
 3. Estimate the ELBO gradient via the reparametrisation trick and update
    (μ, log σ) with Adam.
 4. Return the posterior mean as point estimate and the variational
-   parameters in `sol.extras`.
+   parameters in `sol.convergence`.
 
 # References
 - Blei, Kucukelbir & McAuliffe (2017), "Variational Inference: A Review
@@ -161,7 +147,7 @@ diagonal Gaussian, optimised by maximising the evidence lower bound (ELBO).
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, unknown functions,
-and variational parameters `μ`, `σ` in `sol.extras`.
+and variational parameters `μ`, `σ` in `sol.convergence`.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     _validate_problem(prob, "VariationalSolver")
@@ -174,9 +160,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     log_sigma = fill(-2.0, n_p)  # σ ≈ 0.135
 
     # Observation noise variance: user-specified or estimated from data
-    obs_noise_var = if alg.obs_noise_var !== nothing
+    obs_noise_var = if prob.likelihood isa Gaussian && alg.obs_noise_var !== nothing
         alg.obs_noise_var
-    else
+    elseif prob.likelihood isa Gaussian
         # Estimate from short-range variability in data (successive differences)
         # This is more robust than the data range heuristic
         n_t = size(prob.data_values, 1)
@@ -197,12 +183,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
             data_range = maximum(prob.data_values) - minimum(prob.data_values)
             max((0.05 * data_range)^2, 1e-6)
         end
+    else
+        nothing
     end
 
     if verbose
         println("VariationalSolver: $n_p params, $(alg.maxiters) max iters, " *
                 "lr=$(alg.lr), S=$(alg.n_elbo_samples)")
-        println("  prior_scale=$(alg.prior_scale), obs_noise_var=$(round(obs_noise_var, sigdigits=3))")
+        obs_msg = obs_noise_var === nothing ? "n/a" : string(round(obs_noise_var, sigdigits=3))
+        println("  prior_scale=$(alg.prior_scale), obs_noise_var=$obs_msg")
     end
 
     # Concatenated variational parameters: φ = [μ; log_σ]

@@ -121,7 +121,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
         # to ensure reproducibility regardless of thread scheduling.
         rngs = [Random.Xoshiro(rand(rng, UInt64)) for _ in 1:nboot]
         boot_data = [_resample_data(method, prob.likelihood, fitted, resid,
-                                    σ_hat, n_times, n_obs, rngs[b])
+                                    prob.data_times, σ_hat, n_times, n_obs, rngs[b])
                      for b in 1:nboot]
 
         # Per-replicate result storage (avoid races)
@@ -134,8 +134,8 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
         Threads.@threads for b in 1:nboot
             prob_boot = PSMProblem(prob.dynamics!, prob.u0, prob.tspan,
                 prob.approximators;
-                data_times=prob.data_times,
-                data_values=boot_data[b],
+                data_times=boot_data[b].times,
+                data_values=boot_data[b].values,
                 data_weights=prob.data_weights,
                 obs_to_state=prob.obs_to_state,
                 known_params=prob.known_params,
@@ -208,13 +208,13 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                 println("Bootstrap replicate $b / $nboot")
             end
 
-            y_boot = _resample_data(method, prob.likelihood, fitted, resid,
-                                    σ_hat, n_times, n_obs, rng)
+            boot_sample = _resample_data(method, prob.likelihood, fitted, resid,
+                                         prob.data_times, σ_hat, n_times, n_obs, rng)
 
             prob_boot = PSMProblem(prob.dynamics!, prob.u0, prob.tspan,
                 prob.approximators;
-                data_times=prob.data_times,
-                data_values=y_boot,
+                data_times=boot_sample.times,
+                data_values=boot_sample.values,
                 data_weights=prob.data_weights,
                 obs_to_state=prob.obs_to_state,
                 known_params=prob.known_params,
@@ -298,7 +298,7 @@ end
 # ─── Resampling methods ──────────────────────────────────────────
 
 """
-    _resample_data(method, family, fitted, resid, σ_hat, n_times, n_obs, rng)
+    _resample_data(method, family, fitted, resid, data_times, σ_hat, n_times, n_obs, rng)
 
 Generate bootstrap pseudo-data.
 
@@ -314,9 +314,12 @@ For `:case`, entire observation rows are resampled.
 """
 function _resample_data(method::Symbol, family::AbstractLikelihood,
                         fitted::Matrix{Float64},
-                        resid::Matrix{Float64}, σ_hat::Vector{Float64},
+                        resid::Matrix{Float64},
+                        data_times::AbstractVector,
+                        σ_hat::Vector{Float64},
                         n_times::Int, n_obs::Int, rng)
     y_boot = similar(fitted)
+    t_boot = collect(data_times)
 
     if method == :parametric
         _parametric_resample!(y_boot, family, fitted, σ_hat, n_times, n_obs, rng)
@@ -332,9 +335,10 @@ function _resample_data(method::Symbol, family::AbstractLikelihood,
         for j in 1:n_obs, i in 1:n_times
             y_boot[i, j] = resid[idx[i], j] + fitted[idx[i], j]
         end
+        t_boot .= data_times[idx]
     end
 
-    y_boot
+    (values=y_boot, times=t_boot)
 end
 
 # ─── Parametric samplers per likelihood family ────────────────────

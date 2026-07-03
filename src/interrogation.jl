@@ -81,21 +81,27 @@ function interrogate_kramer(ode_fun!, W_list, t::Float64,
         J[:, j] .= (du_pert .- du) ./ ε
     end
 
-    # Build per-variable measurement parameters
-    # The block-diagonal structure means each variable k gets:
-    #   wgt_meas[k] = -J[k, :] mapped into the full state (only zeroth derivative)
-    #   mean_meas[k] = J[k,:] · u - f_k(u, t)
+    # Build per-variable measurement parameters.
+    #
+    # The Kalman backend propagates one IBM block per state variable, so each
+    # update can only act directly on x_k and its derivatives. We therefore:
+    #   1. keep the within-block Jacobian term -J[k,k] in the measurement weight
+    #   2. retain the full Jacobian row in the measurement offset J[k,:]u - f_k(u,t)
+    #   3. fold off-diagonal state uncertainty into additional measurement noise
+    #      using the predicted marginal variances of the coupled states
     wgt_meas = [zeros(n_meas, n_deriv) for _ in 1:n_vars]
     mean_meas = [zeros(n_meas) for _ in 1:n_vars]
     var_meas = [zeros(n_meas, n_meas) for _ in 1:n_vars]
 
     for k in 1:n_vars
-        # The Jacobian row J[k,:] affects state variable k through the
-        # zeroth derivative of all variables. But in block-diagonal form,
-        # we only capture the diagonal block: ∂f_k/∂x_k
-        # (off-diagonal coupling handled through the shared state evaluation)
         wgt_meas[k][1, 1] = -J[k, k]
-        mean_meas[k][1] = J[k, k] * u[k] - du[k]
+        mean_meas[k][1] = dot(J[k, :], u) - du[k]
+        offdiag_var = 0.0
+        for j in 1:n_vars
+            j == k && continue
+            offdiag_var += J[k, j]^2 * max(Σ_pred[j][1, 1], 0.0)
+        end
+        var_meas[k][1, 1] = offdiag_var
     end
 
     wgt_meas, mean_meas, var_meas

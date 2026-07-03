@@ -1139,8 +1139,9 @@ DaltonSolver(; n_steps::Int=200, n_deriv::Int=3,
 
 Pseudo-marginal MCMC using a probabilistic ODE solver for likelihood estimation.
 
-Uses RODEO/fenrir as an inner solver to compute an unbiased estimate of the
-marginal likelihood p(Y|θ), then samples from the posterior p(θ|Y) via NUTS.
+Uses a positive unbiased random estimator of an approximate probabilistic-ODE
+marginal likelihood, then samples from the corresponding approximate posterior
+via pseudo-marginal Metropolis-Hastings.
 
 # Fields
 - `n_samples`: number of posterior samples (default 1000)
@@ -1151,7 +1152,11 @@ marginal likelihood p(Y|θ), then samples from the posterior p(θ|Y) via NUTS.
 - `obs_var`: observation noise variance (default 0.01)
 - `target_accept`: NUTS target acceptance rate (default 0.8)
 - `prior_scale`: prior standard deviation on parameters (default 1.0)
-- `inner_method`: inner likelihood method `:fenrir` or `:dalton` (default `:fenrir`)
+- `inner_method`: inner approximate marginal likelihood `:fenrir`, `:basic`,
+  or `:dalton` (default `:fenrir`)
+- `n_particles`: number of unbiased likelihood replicates averaged per MH step
+- `proposal_scale`: random-walk proposal scale
+- `rng_seed`: optional RNG seed for reproducible pseudo-marginal randomness
 - `verbose`: print progress
 """
 struct PseudoMarginalSolver
@@ -1164,8 +1169,17 @@ struct PseudoMarginalSolver
     target_accept::Float64
     prior_scale::Float64
     inner_method::Symbol
+    n_particles::Int
+    proposal_scale::Float64
     initial_params::Union{Nothing, Vector{Float64}}
+    rng_seed::Union{Nothing, Int}
     verbose::Bool
+end
+
+function _validate_pseudo_marginal_inner_method(inner_method::Symbol)
+    inner_method in (:fenrir, :basic, :dalton) ||
+        throw(ArgumentError("PseudoMarginalSolver inner_method must be :fenrir, :basic, or :dalton; got $(repr(inner_method))"))
+    inner_method
 end
 
 PseudoMarginalSolver(; n_samples::Int=1000, n_warmup::Int=500,
@@ -1174,11 +1188,16 @@ PseudoMarginalSolver(; n_samples::Int=1000, n_warmup::Int=500,
                        obs_var::Union{Nothing, Float64}=nothing,
                        target_accept::Float64=0.8, prior_scale::Float64=1.0,
                        inner_method::Symbol=:fenrir,
+                       n_particles::Int=8,
+                       proposal_scale::Float64=0.1,
                        initial_params::Union{Nothing, Vector{Float64}}=nothing,
+                       rng_seed::Union{Nothing, Int}=nothing,
                        verbose::Bool=false) =
     PseudoMarginalSolver(n_samples, n_warmup, n_steps, n_deriv, sigma, obs_var,
-                          target_accept, prior_scale, inner_method,
-                          initial_params, verbose)
+                         target_accept, prior_scale,
+                         _validate_pseudo_marginal_inner_method(inner_method),
+                         n_particles, proposal_scale, initial_params, rng_seed,
+                         verbose)
 
 # ─── GCV solver (Wood 2001 / ddefit504) ────────────────────────────
 

@@ -40,7 +40,7 @@ MCMCChains = "7"
 OrdinaryDiffEq = "6"
 Optim = "2"
 SciMLBase = "2"
-julia = "1.10"
+julia = "1.11"
 
 [extras]
 DelayDiffEq = "bcd4f6db-9728-5f36-b5f7-82caef46ccdb"

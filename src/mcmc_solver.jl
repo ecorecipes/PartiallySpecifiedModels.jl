@@ -29,7 +29,7 @@ end
 
 function LogDensityProblems.dimension(ld::PSMLogDensity)
     d = ld.n_params
-    if ld.obs_sigma === nothing; d += 1; end
+    if ld.obs_sigma === nothing && ld.prob.likelihood isa Gaussian; d += 1; end
     if ld.sample_smoothing; d += ld.n_smooths; end
     d
 end
@@ -42,13 +42,15 @@ function LogDensityProblems.logdensity(ld::PSMLogDensity, theta)
     idx = ld.n_params
     beta = theta[1:idx]
 
-    if ld.obs_sigma === nothing
+    estimate_sigma = ld.obs_sigma === nothing && prob.likelihood isa Gaussian
+
+    if estimate_sigma
         idx += 1
         log_sigma = theta[idx]
         sigma2 = exp(2 * log_sigma)
     else
         log_sigma = nothing
-        sigma2 = T(ld.obs_sigma^2)
+        sigma2 = ld.obs_sigma === nothing ? nothing : T(ld.obs_sigma^2)
     end
 
     if ld.sample_smoothing && ld.n_smooths > 0
@@ -81,25 +83,22 @@ function LogDensityProblems.logdensity(ld::PSMLogDensity, theta)
         n_obs = size(prob.data_values, 2)
     end
 
-    # Gaussian log-likelihood (accumulate as scalar to preserve Dual type)
     n_t = size(prob.data_values, 1)
     n_obs = size(prob.data_values, 2)
-    n_data = n_t * n_obs
-    ll = T(-0.5) * n_data * log(T(2π) * sigma2)
-    for j in 1:n_obs
-        if !prob.discrete
-            sk = prob.obs_to_state[j]
+    pred_mat = if prob.discrete
+        pred
+    else
+        pred_tmp = zeros(T, n_t, n_obs)
+        for j in 1:n_obs, i in 1:n_t
+            pred_tmp[i, j] = i <= length(sol.t) ? sol[prob.obs_to_state[j], i] : T(0)
         end
-        for i in 1:n_t
-            w = prob.data_weights[i, j]
-            pred_ij = if prob.discrete
-                pred[i, j]
-            else
-                i <= length(sol.t) ? sol[prob.obs_to_state[j], i] : T(0)
-            end
-            ll -= T(0.5) * w * (pred_ij - T(prob.data_values[i, j]))^2 / sigma2
-        end
+        pred_tmp
     end
+    ll = observation_loglikelihood(prob.likelihood,
+                                   T.(prob.data_values),
+                                   pred_mat,
+                                   T.(prob.data_weights);
+                                   sigma2=sigma2)
 
     # --- Log-prior: penalty matrices + broad prior ---
     lp = zero(T)
@@ -202,7 +201,7 @@ over the unknown-function parameters.
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, unknown functions,
-and the full MCMC chain in `sol.extras[:chain]`.
+and the full MCMC chain in `sol.convergence`.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     _validate_problem(prob, "MCMCSolver")
@@ -235,7 +234,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
                        alg.obs_sigma, alg.sample_smoothing, n_smooths,
                        log_lambda_init)
 
-    estimate_sigma = alg.obs_sigma === nothing
+    estimate_sigma = alg.obs_sigma === nothing && prob.likelihood isa Gaussian
     D = LogDensityProblems.dimension(ld)
 
     # Initial point: beta0 + optional log_sigma + optional log_lambda
@@ -370,7 +369,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     ca = ComponentArray(NamedTuple(ca_entries))
 
     sigma_map = estimate_sigma ? exp(map_theta[end]) : alg.obs_sigma
-    smoothing = [sigma_map]
+    smoothing = sigma_map === nothing ? Float64[] : [sigma_map]
 
     PSMSolution(ca, -logp_values[map_idx], data_loss, Float64(n_beta),
                 smoothing, pred, prob.data_values, collect(prob.data_times),
