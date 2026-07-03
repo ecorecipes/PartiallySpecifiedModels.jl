@@ -6,6 +6,7 @@ using MCMCChains
 using LogDensityProblems
 using Random
 using OrdinaryDiffEq
+using StableRNGs
 
 @testset "PartiallySpecifiedModels.jl" begin
 
@@ -1682,7 +1683,13 @@ using OrdinaryDiffEq
         end
 
         @testset "LAML solver with TruncatedNormal" begin
-            Random.seed!(99)
+            # Use a version-stable RNG (not Random.seed! + global randn())
+            # so this seeded synthetic dataset -- and thus the fit-quality
+            # threshold below -- doesn't depend on which Julia version's
+            # default RNG stream happens to be running (Julia does not
+            # guarantee the global RNG's exact output is stable across
+            # versions for a given seed).
+            rng = StableRNG(99)
             function sir_tn!(du, u, p, t)
                 S, I, R = u
                 λ = max(p.λ(I / 1000.0), 0.0)
@@ -1696,7 +1703,7 @@ using OrdinaryDiffEq
             end,
                 [990.0, 10.0, 0.0], (0.0, 40.0))
             sol_true = OrdinaryDiffEq.solve(prob_true, Tsit5(); saveat=1.0)
-            I_data = [max(sol_true(t)[2] + 5*randn(), 0.01) for t in sol_true.t]
+            I_data = [max(sol_true(t)[2] + 5*randn(rng), 0.01) for t in sol_true.t]
 
             uf = BSplineApproximator(:λ, (0.0, 0.25), 6; initial=x->0.4x)
             prob = PSMProblem(sir_tn!, [990.0, 10.0, 0.0], (0.0, 40.0), [uf];
@@ -1767,7 +1774,8 @@ using OrdinaryDiffEq
     # ─── Poisson warm-start test ──────────────────────────────────
 
     @testset "Poisson LAML warm-start" begin
-        Random.seed!(11)
+        # Version-stable RNG (see note in the TruncatedNormal test above)
+        rng = StableRNG(11)
         function sir_pois!(du, u, p, t)
             S, I, R = u
             λ = max(p.λ(I / 1000.0), 0.0)
@@ -1786,7 +1794,7 @@ using OrdinaryDiffEq
         # Generate Poisson data (simple inversion method)
         function sample_poisson(μ)
             μ = max(μ, 0.01); c = 0; s = 0.0
-            while true; s -= log(rand()); s > μ && break; c += 1; end
+            while true; s -= log(rand(rng)); s > μ && break; c += 1; end
             Float64(c)
         end
         y_pois = sample_poisson.(I_true)
