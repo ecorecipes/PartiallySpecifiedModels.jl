@@ -44,6 +44,11 @@ Detailed documentation for each solver is on the [Solvers](solvers.md) page.
 - [`PseudoMarginalSolver`](@ref)
 - [`VariationalSolver`](@ref)
 - [`ABCSolver`](@ref)
+- [`IntegralMatchingSolver`](@ref)
+- [`ProfileLikelihoodSolver`](@ref)
+- [`EnsembleKalmanSolver`](@ref)
+- [`ODINSolver`](@ref)
+- [`RKHSSolver`](@ref)
 
 ## Likelihood Types
 
@@ -80,6 +85,7 @@ with_range_param
 ```@docs
 bootstrap
 BootstrapResult
+confidence_band
 ```
 
 ## Diagnostics

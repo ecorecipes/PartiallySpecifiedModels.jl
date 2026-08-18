@@ -611,6 +611,11 @@ Figure 7: Posterior credible interval for functional response g(H)
       g(3.0) = 0.7582  [0.2843, 2.1398] (true: 0.375)
       g(4.0) = 0.577  [0.3154, 1.2054] (true: 0.4)
 
+Note that in this partially observed example the posterior misses the
+true functional response — the medians sit well above the truth at low
+prey density and the wide credible intervals reflect weak
+identifiability when the predator state is never observed.
+
 ### Trace Plots
 
 ``` julia
@@ -639,7 +644,7 @@ Figure 8: Trace plots for Lotka-Volterra g(H) spline coefficients
 |----|----|----|
 | **ODE solver per step** | No (GP manifold constraint) | Yes (full ODE solve) |
 | **States sampled?** | Yes (jointly with parameters) | No (determined by the ODE) |
-| **Partially observed** | Natural support | Requires all states |
+| **Partially observed** | Natural support (unobserved states sampled) | Supported via `obs_to_state` (unobserved states come from the ODE solve) |
 | **Speed per iteration** | Matrix ops (scales with grid size) | Slower (ODE integration) |
 | **Accuracy** | Approximate (GP manifold) | Exact (ODE solve) |
 | **Output** | `MCMCChains.Chains` | `MCMCChains.Chains` |

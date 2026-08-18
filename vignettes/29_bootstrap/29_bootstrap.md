@@ -47,15 +47,14 @@ distribution-free (or distribution-aware) approach to estimating the
 variability of both the fitted trajectories and the recovered unknown
 functions.
 
-`PartiallySpecifiedModels.jl` implements three bootstrap methods:
+`PartiallySpecifiedModels.jl` implements two bootstrap methods:
 
 | Method | Description | Assumptions |
 |----|----|----|
 | `:parametric` | Simulate new data from the fitted likelihood (e.g., $N(\hat\mu, \hat\sigma)$ or $\text{Pois}(\hat\mu)$) | Correct likelihood family |
-| `:nonparametric` | Resample residuals with replacement per state | Exchangeable residuals |
-| `:case` | Resample entire observation rows with replacement | Weakest assumptions |
+| `:nonparametric` | Resample residuals with replacement per state (Gaussian likelihood only) | Exchangeable residuals |
 
-This vignette demonstrates all three methods on an SIR epidemic model
+This vignette demonstrates both methods on an SIR epidemic model
 with a nonparametric force of infection, compares the resulting
 confidence intervals, and shows how the parametric bootstrap adapts to
 non-Gaussian likelihoods.
@@ -297,7 +296,7 @@ plot!(prev_grid, λ_est, label="Estimated λ(I/N)", lw=2, color=:red)
 
 > [!WARNING]
 >
-> ### Case bootstrap is not recommended for ODE models
+> ### Case bootstrap has been removed
 >
 > The **case bootstrap** resamples entire observation rows with
 > replacement. For time series data from ODE models, this scrambles the
@@ -306,8 +305,9 @@ plot!(prev_grid, λ_est, label="Estimated λ(I/N)", lw=2, color=:red)
 > high failure rates. Case resampling is designed for cross-sectional
 > (i.i.d.) data, not time-ordered dynamical systems.
 >
-> For ODE-based PSMs, use **parametric** or **nonparametric** bootstrap
-> instead.
+> For this reason `method=:case` has been removed from the package
+> (requesting it raises an error). For ODE-based PSMs, use
+> **parametric** or **nonparametric** bootstrap instead.
 
 ## Section 5: Comparison of Bootstrap Methods
 
@@ -533,9 +533,9 @@ assume approximately independent errors).
 
 > [!NOTE]
 >
-> The `:case` bootstrap (resampling entire rows) is available but **not
-> recommended** for ODE/DDE models because it scrambles the temporal
-> structure of the data.
+> The `:case` bootstrap (resampling entire rows) has been **removed**
+> because it scrambles the temporal structure of ODE/DDE data; the
+> `:nonparametric` method requires a Gaussian likelihood.
 
 ### Tips
 
@@ -546,6 +546,6 @@ assume approximately independent errors).
   the approximator (fewer knots).
 - **Set `rng=Random.Xoshiro(seed)`** for reproducibility.
 - The parametric bootstrap is the default for good reason: it is fast,
-  well-calibrated, and adapts to the likelihood family. Use
-  nonparametric or case bootstrap when you have reason to doubt the
-  error model.
+  well-calibrated, and adapts to the likelihood family. Use the
+  nonparametric bootstrap when you have reason to doubt the
+  error model (Gaussian likelihood only).

@@ -39,8 +39,9 @@ This approach provides:
 2.  **Graceful handling of model misspecification** — the IBM noise
     parameter $\sigma$ controls how strictly the ODE is enforced
 3.  **Marginal likelihood for parameter estimation** — the Kalman filter
-    computes an exact marginal likelihood, avoiding Laplace
-    approximation
+    computes a marginal likelihood that is exact for the linearized
+    Gaussian surrogate model (the ODE itself is nonlinear, so this is
+    still an approximation to the true marginal likelihood)
 
 This vignette demonstrates how to use the RodeoSolver, interpret its
 uncertainty estimates, and tune its key parameters.

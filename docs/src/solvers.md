@@ -1,6 +1,6 @@
 # Solvers
 
-PartiallySpecifiedModels.jl provides 17 solvers for fitting partially specified models. Solvers are passed as the second argument to `solve`:
+PartiallySpecifiedModels.jl provides 22 solvers for fitting partially specified models. Solvers are passed as the second argument to `solve`:
 
 ```@example solvers
 using PartiallySpecifiedModels # hide
@@ -59,7 +59,7 @@ GradientMatching
 
 ### TwoStageSolver
 
-The simplest gradient matching approach: smooth the data with splines, differentiate, then regress the unknown functions on the derivatives. A useful baseline for comparison.
+The simplest gradient matching approach (Varah 1982): smooth the data with splines, differentiate, then regress the unknown functions on the derivatives. A useful baseline for comparison.
 
 ```@docs
 TwoStageSolver
@@ -111,7 +111,7 @@ DerivativeFreeSolver
 
 ### RodeoSolver
 
-**Probabilistic ODE solver** based on Kalman filtering/smoothing. Provides uncertainty estimates from the numerical integration itself, not just from parameter uncertainty.
+**Probabilistic ODE solver** based on Kalman filtering/smoothing (Wu & Lysy 2024; the `:fenrir` likelihood variant follows Tronarp et al. 2022). Provides uncertainty estimates from the numerical integration itself, not just from parameter uncertainty.
 
 ```@docs
 RodeoSolver
@@ -145,7 +145,7 @@ MagiSolver
 
 ### PseudoMarginalSolver
 
-Combines **probabilistic ODE solving** with Bayesian MCMC via pseudo-marginal methods. The ODE solver uncertainty is marginalized out, providing fully Bayesian inference that accounts for numerical error.
+**Pseudo-marginal MCMC** (Andrieu & Roberts 2009): a Metropolis-Hastings sampler that targets the exact posterior using an unbiased likelihood estimate, here computed with a probabilistic ODE solver so that numerical integration error is accounted for.
 
 ```@docs
 PseudoMarginalSolver
@@ -167,6 +167,48 @@ VariationalSolver
 ABCSolver
 ```
 
+## Additional Solvers
+
+### IntegralMatchingSolver
+
+**Integral matching** (Dattner & Klaassen 2015): integrates both sides of the ODE and matches smoothed trajectory increments against the cumulative integral of the right-hand side. Integration-free and more noise-robust than derivative matching.
+
+```@docs
+IntegralMatchingSolver
+```
+
+### ProfileLikelihoodSolver
+
+**Profile likelihood** for identifiability analysis and likelihood-ratio confidence intervals (Simpson & Maclaren 2023). Sweeps each parameter over a grid while re-optimizing the others with the LAML inner solver.
+
+```@docs
+ProfileLikelihoodSolver
+```
+
+### EnsembleKalmanSolver
+
+**Ensemble Kalman Inversion** (Iglesias et al. 2013): propagates an ensemble of parameter particles through the forward model and updates them with the Kalman gain. Derivative-free batch estimation.
+
+```@docs
+EnsembleKalmanSolver
+```
+
+### ODINSolver
+
+**ODIN-style gradient matching** (Wenk et al. 2020): weights the ODE mismatch by the GP's conditional derivative covariance (a Mahalanobis risk). This implementation is a one-shot variant with user-set GP hyperparameters.
+
+```@docs
+ODINSolver
+```
+
+### RKHSSolver
+
+**Reproducing kernel Hilbert space estimation**: represents the unknown function as a kernel expansion and solves a penalized least-squares problem with an RKHS norm penalty (kernel ridge regression). Related in spirit to the RKHS gradient-matching literature (González et al. 2014), which kernelizes the state trajectory instead.
+
+```@docs
+RKHSSolver
+```
+
 ## Choosing a Solver
 
 | Use case | Recommended solver |
@@ -182,3 +224,8 @@ ABCSolver
 | Fast approximate Bayesian | [`VariationalSolver`](@ref) |
 | Intractable likelihood | [`ABCSolver`](@ref) |
 | Probabilistic numerics | [`RodeoSolver`](@ref) or [`DaltonSolver`](@ref) |
+| Noisy data, integration-free | [`IntegralMatchingSolver`](@ref) |
+| Identifiability analysis | [`ProfileLikelihoodSolver`](@ref) |
+| Derivative-free batch estimation | [`EnsembleKalmanSolver`](@ref) |
+| GP-weighted gradient matching | [`ODINSolver`](@ref) |
+| Kernel-based unknown functions | [`RKHSSolver`](@ref) |

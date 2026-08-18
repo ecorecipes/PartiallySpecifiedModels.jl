@@ -17,7 +17,7 @@ PartiallySpecifiedModels.jl provides a unified interface for specifying and fitt
 - **Basis function approximators** (B-splines, shape-constrained splines, Gaussian processes): fewer parameters, automatic smoothing via LAML/GCV, interpretable, and easy to constrain (monotonicity, convexity, positivity).
 - **Neural network approximators** (Lux.jl networks, COMONet): more flexible for high-dimensional or complex functional forms, compatible with gradient-based UDE-style training.
 
-The package builds on the [SciML ecosystem](https://sciml.ai/) and supports 17 fitting algorithms, 7 approximator types, 4 likelihood families, and 14 shape constraint types.
+The package builds on the [SciML ecosystem](https://sciml.ai/) and supports 22 fitting algorithms, 7 approximator types, 5 likelihood families, and 14 shape constraint types.
 
 ## Installation
 
@@ -82,27 +82,32 @@ r_estimated = [r_fitted(N) for N in range(0.1, 11.0, length=100)]
 
 ## Solvers
 
-PartiallySpecifiedModels.jl provides 17 solvers spanning penalized likelihood, gradient matching, probabilistic numerics, and Bayesian inference:
+PartiallySpecifiedModels.jl provides 22 solvers spanning penalized likelihood, gradient matching, probabilistic numerics, and Bayesian inference:
 
 | Solver | Method | ODE-free? | Bayesian? | Reference |
 |--------|--------|:---------:|:---------:|-----------|
 | `LAML` | Penalized IRLS + LAML smoothing | No | No | Wood et al. (2016) |
 | `GCVSolver` | Penalized IRLS + GCV smoothing | No | No | Wood (2001) |
 | `CollocationLAML` | Generalized profiling | No | No | Ramsay et al. (2007) |
-| `GradientMatching` | Smooth then match derivatives | Yes | No | Calderhead et al. (2009) |
-| `TwoStageSolver` | Smooth then match (simple) | Yes | No | Wood (2001) |
-| `BNGSolver` | Bayesian neural gradient matching | Yes | No | Bonnaffé et al. (2023) |
+| `GradientMatching` | Smooth then match derivatives | Yes | No | — |
+| `TwoStageSolver` | Smooth then match (simple) | Yes | No | Varah (1982) |
+| `BNGSolver` | Bayesian neural gradient matching | Yes | No | Bonnaffé & Coulson (2023) |
 | `AdaptiveGradientMatching` | GP product-of-experts | Yes | No | Macdonald & Husmeier (2015) |
 | `AdamSolver` | Adam through ODE (UDE-style) | No | No | Rackauckas et al. (2020) |
 | `MultipleShootingSolver` | Multiple shooting + Adam | No | No | Turan & Jäschke (2021) |
 | `DerivativeFreeSolver` | NelderMead / Particle Swarm | No | No | — |
-| `RodeoSolver` | Probabilistic ODE (Kalman) | No | No | Tronarp et al. (2022) |
+| `RodeoSolver` | Probabilistic ODE (Kalman) | No | No | Wu & Lysy (2024); Tronarp et al. (2022) for `:fenrir` |
 | `DaltonSolver` | Data-adaptive Kalman likelihood | No | No | Wu & Lysy (2024) |
 | `MCMCSolver` | HMC/NUTS posterior sampling | No | Yes | — |
 | `MagiSolver` | Manifold-constrained GP inference | No | Yes | Yang et al. (2021) |
-| `PseudoMarginalSolver` | Probabilistic ODE + NUTS | No | Yes | Chkrebtii et al. (2016) |
+| `PseudoMarginalSolver` | Pseudo-marginal MCMC (probabilistic ODE likelihood) | No | Yes | Andrieu & Roberts (2009) |
 | `VariationalSolver` | Mean-field variational inference | No | Yes | — |
 | `ABCSolver` | ABC-SMC (likelihood-free) | No | Yes | — |
+| `IntegralMatchingSolver` | Integral matching (smooth, then match integrals) | Yes | No | Dattner & Klaassen (2015) |
+| `ProfileLikelihoodSolver` | Profile likelihood identifiability/CIs | No | No | Simpson & Maclaren (2023) |
+| `EnsembleKalmanSolver` | Ensemble Kalman inversion | No | No | Iglesias et al. (2013) |
+| `ODINSolver` | ODIN-style Mahalanobis gradient matching | Yes | No | Wenk et al. (2020) |
+| `RKHSSolver` | RKHS/kernel ridge unknown-function estimation | Yes | No | González et al. (2014) |
 
 ## Approximators
 
@@ -121,9 +126,10 @@ PartiallySpecifiedModels.jl provides 17 solvers spanning penalized likelihood, g
 ### Likelihoods
 
 - **`Gaussian()`** — Gaussian errors with identity link (default)
-- **`Poisson()`** — Count data with log link
-- **`NegativeBinomial()`** — Overdispersed counts with estimated dispersion
-- **`CustomLikelihood(loglik, dloglik, d2loglik)`** — User-defined likelihood
+- **`Poisson()`** — Count data, fitted on the response scale (identity link)
+- **`NegativeBinomial()`** — Overdispersed counts with fixed dispersion θ, identity link
+- **`TruncatedNormal()`** — Continuous data bounded below (e.g. non-negative densities)
+- **`CustomLikelihood(loglik_scalar)`** — User-defined likelihood
 
 ### Dynamical System Support
 
@@ -145,13 +151,15 @@ For `ShapeConstrainedBSplineApproximator` (SCOP-splines):
 | `:inc_zero_left` / `:inc_zero_right` | Increasing, zero at endpoint |
 | `:dec_zero_left` / `:dec_zero_right` | Decreasing, zero at endpoint |
 
+Following Pya & Wood (2015), the monotone and monotone-plus-curvature constraints (`:increasing`, `:decreasing`, `:inc_*`, `:dec_*`) carry a free level, so the fitted function may cross zero. Use `:positive` or `:dec_positive` when positivity is required.
+
 ## Vignettes
 
-The `vignettes/` directory contains 26 worked examples:
+The `vignettes/` directory contains 35 worked examples:
 
 | # | Vignette | Description |
 |---|----------|-------------|
-| 01 | Getting Started | Basic PSM workflow with exponential/logistic growth |
+| 01 | Getting Started | Basic PSM workflow with logistic growth |
 | 02 | Likelihoods | Gaussian, Poisson, Negative Binomial, and custom likelihoods |
 | 03 | Lotka–Volterra | Hare–lynx predator-prey with LAML and collocation |
 | 04 | Copepod | 11-stage structured population model with multiple unknown functions |
@@ -172,11 +180,20 @@ The `vignettes/` directory contains 26 worked examples:
 | 19 | Pseudo-Marginal | Probabilistic ODE + Bayesian MCMC |
 | 20 | DDE | Delay differential equations with unknown functions |
 | 21 | GCV | Generalized Cross-Validation vs LAML smoothing |
-| 22 | Two-Stage | Smooth-then-differentiate baseline approach |
+| 22 | Two-Stage | Redirect to vignette 09, which covers `TwoStageSolver` alongside the other integration-free methods |
 | 23 | Derivative-Free | Nelder-Mead and Particle Swarm optimization |
 | 24 | Variational | Fast approximate Bayesian inference via variational methods |
 | 25 | ABC | Likelihood-free inference with ABC-SMC |
 | 26 | SPDE | Matérn SPDE approximator with shape constraints |
+| 27 | Predator–Prey | Predator-prey functional response with confidence intervals |
+| 28 | Fisheries | Stock-recruitment dynamics with Poisson counts |
+| 29 | Bootstrap | Bootstrap confidence intervals for unknown functions |
+| 30 | Model Selection | Model selection with marginal likelihood |
+| 31 | Integral Matching | Noise-robust integration-free estimation |
+| 32 | Profile Likelihood | Identifiability analysis and likelihood-ratio CIs |
+| 33 | Ensemble Kalman | Derivative-free estimation via ensemble Kalman inversion |
+| 34 | ODIN | ODE-informed Gaussian process regression |
+| 35 | RKHS | Reproducing kernel Hilbert space estimation |
 
 ## References
 
@@ -187,7 +204,17 @@ The `vignettes/` directory contains 26 worked examples:
 - Lindgren, F., Rue, H. & Lindström, J. (2011). "An explicit link between Gaussian fields and Gaussian Markov random fields: the stochastic partial differential equation approach." *JRSS-B*, 73(4), 423–498.
 - Rackauckas, C. et al. (2020). "Universal differential equations for scientific machine learning." *arXiv:2001.04385*.
 - Yang, S., Wong, S.W.K. & Kou, S.C. (2021). "Inference of dynamic systems from noisy and sparse data via manifold-constrained Gaussian processes." *PNAS*, 118(15).
-- Bonnaffé, W., Sheldon, B.C. & Coulson, T. (2023). "Neural ordinary differential equations for ecological and evolutionary time-series analysis." *Methods in Ecology and Evolution*, 14, 1301–1315.
+- Bonnaffé, W., Sheldon, B.C. & Coulson, T. (2021). "Neural ordinary differential equations for ecological and evolutionary time-series analysis." *Methods in Ecology and Evolution*, 12, 1301–1315.
+- Bonnaffé, W. & Coulson, T. (2023). "Fast fitting of neural ordinary differential equations by Bayesian neural gradient matching to infer ecological interactions from time-series data." *Methods in Ecology and Evolution*, 14, 1543–1563.
+- Varah, J.M. (1982). "A spline least squares method for numerical parameter estimation in differential equations." *SIAM Journal on Scientific and Statistical Computing*, 3(1), 28–46.
+- Andrieu, C. & Roberts, G.O. (2009). "The pseudo-marginal approach for efficient Monte Carlo computations." *Annals of Statistics*, 37(2), 697–725.
+- Wu, M. & Lysy, M. (2024). "Data-adaptive probabilistic likelihood approximation for ordinary differential equations." *AISTATS*, PMLR 238.
+- Tronarp, F., Bosch, N. & Hennig, P. (2022). "Fenrir: Physics-enhanced regression for initial value problems." *ICML*.
+- Dattner, I. & Klaassen, C.A.J. (2015). "Optimal rate of direct estimators in systems of ordinary differential equations linear in functions of the parameters." *Electronic Journal of Statistics*, 9(2), 1939–1973.
+- Simpson, M.J. & Maclaren, O.J. (2023). "Profile-wise analysis: a profile likelihood-based workflow for identifiability analysis, estimation, and prediction with mechanistic mathematical models." *PLOS Computational Biology*, 19(9), e1011515.
+- Iglesias, M.A., Law, K.J.H. & Stuart, A.M. (2013). "Ensemble Kalman methods for inverse problems." *Inverse Problems*, 29(4), 045001.
+- Wenk, P., Abbati, G., Osborne, M.A., Schölkopf, B., Krause, A. & Bauer, S. (2020). "ODIN: ODE-informed regression for parameter and state inference in time-continuous dynamical systems." *AAAI*.
+- González, J., Vujačić, I. & Wit, E. (2014). "Reproducing kernel Hilbert space based estimation of systems of ordinary differential equations." *Pattern Recognition Letters*, 45, 26–32.
 
 ## License
 

@@ -4,7 +4,7 @@
 #   Wood, Pya & Säfken (2016) "Smoothing parameter and model selection
 #   for general smooth models", JASA 111(516), 1548-1575.
 #   Wood & Fasiolo (2017) "A generalized Fellner-Schall method for smoothing
-#   parameter optimization", Statistics and Computing 27(3), 759-774.
+#   parameter optimization", Biometrics 73(4), 1071-1081.
 #
 # For Gaussian data with unknown σ², this is equivalent to profiled REML:
 #   V_REML(ρ) = -(n-Mp)/2 log(σ̂²) + ½ log|S^λ|_+ - ½ log|H| + const

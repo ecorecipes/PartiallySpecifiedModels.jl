@@ -1,12 +1,12 @@
 # Vignettes
 
-The `vignettes/` directory contains 30 worked examples covering every solver, approximator, and likelihood type. Each vignette is a self-contained [Quarto](https://quarto.org/) document with rendered markdown available on GitHub.
+The `vignettes/` directory contains 35 worked examples covering every solver, approximator, and likelihood type. Each vignette is a self-contained [Quarto](https://quarto.org/) document with rendered markdown available on GitHub.
 
 ## Getting Started
 
 | # | Vignette | Description |
 |:--|:---------|:------------|
-| 01 | [Getting Started](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/01_getting_started/01_getting_started.md) | Basic PSM workflow with exponential and logistic growth |
+| 01 | [Getting Started](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/01_getting_started/01_getting_started.md) | Basic PSM workflow with logistic growth |
 | 02 | [Likelihoods](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/02_likelihoods/02_likelihoods.md) | Gaussian, Poisson, Negative Binomial, Truncated Normal, and custom likelihoods |
 
 ## Ecological Models
@@ -49,13 +49,18 @@ The `vignettes/` directory contains 30 worked examples covering every solver, ap
 | 23 | [Derivative-Free](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/23_derivative_free/23_derivative_free.md) | Nelder-Mead and Particle Swarm optimization |
 | 24 | [Variational](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/24_variational/24_variational.md) | Fast approximate Bayesian inference via variational methods |
 | 25 | [ABC](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/25_abc/25_abc.md) | Likelihood-free inference with ABC-SMC |
+| 31 | [Integral Matching](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/31_integral_matching/31_integral_matching.md) | Noise-robust integration-free estimation |
+| 33 | [Ensemble Kalman](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/33_ensemble_kalman/33_ensemble_kalman.md) | Derivative-free estimation via ensemble Kalman inversion |
+| 34 | [ODIN](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/34_odin/34_odin.md) | ODE-informed Gaussian process regression |
+| 35 | [RKHS](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/35_rkhs/35_rkhs.md) | Reproducing kernel Hilbert space estimation |
 
 ## Uncertainty Quantification
 
 | # | Vignette | Description |
 |:--|:---------|:------------|
-| 29 | [Bootstrap](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/29_bootstrap/29_bootstrap.md) | Parametric, nonparametric, and case bootstrap CIs (Gaussian and Poisson) |
+| 29 | [Bootstrap](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/29_bootstrap/29_bootstrap.md) | Parametric and nonparametric bootstrap CIs (Gaussian and Poisson) |
 | 30 | [Model Selection](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/30_model_selection/30_model_selection.md) | LAML marginal likelihood for knot, approximator, and structural selection |
+| 32 | [Profile Likelihood](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/32_profile_likelihood/32_profile_likelihood.md) | Identifiability analysis and likelihood-ratio CIs |
 
 ## Running Vignettes Locally
 

@@ -52,6 +52,8 @@ approx_sc = ShapeConstrainedBSplineApproximator(:f, (0.0, 10.0), 8, :increasing)
 
 Zero-at-endpoint constraints fix one knot coefficient to zero, reducing the parameter count by 1.
 
+Following Pya & Wood (2015), the monotone and monotone-plus-curvature constraints (`:increasing`, `:decreasing`, `:inc_*`, `:dec_*`) carry a free level, so the fitted function may cross zero. Use `:positive` or `:dec_positive` when positivity is required.
+
 ```@docs
 ShapeConstrainedBSplineApproximator
 ```
@@ -125,7 +127,7 @@ GPApproximator
 
 ## COMONetApproximator
 
-Constrained Monotone Network — a neural network architecture that guarantees monotonicity by construction using `exp(W)` weight parameterization. Supports a subset of shape constraints.
+Constrained Monotone Network — a neural network architecture that guarantees shape constraints by construction. Each constraint uses the architecture matching its function class: monotone constraints use positive (`exp(W)`) weights with saturating tanh hidden units, curvature-only constraints use a two-branch input-convex form (twice the parameters), and `:positive` exponentiates an unconstrained MLP.
 
 ```@example approx
 approx_comon = COMONetApproximator(:f, (0.0, 10.0), (16, 16), :increasing)
@@ -135,15 +137,15 @@ approx_comon = COMONetApproximator(:f, (0.0, 10.0), (16, 16), :increasing)
 
 | Constraint | Description |
 |------------|-------------|
-| `:increasing` | Monotonically increasing |
+| `:increasing` | Monotonically increasing (tanh units — includes sigmoids and other monotone-nonconvex shapes) |
 | `:decreasing` | Monotonically decreasing |
-| `:convex` | Convex |
-| `:concave` | Concave |
+| `:convex` | Convex, possibly non-monotone (two-branch form, 2× parameters) |
+| `:concave` | Concave, possibly non-monotone (two-branch form, 2× parameters) |
 | `:inc_convex` | Increasing and convex |
 | `:inc_concave` | Increasing and concave |
 | `:dec_convex` | Decreasing and convex |
 | `:dec_concave` | Decreasing and concave |
-| `:positive` | Non-negative output |
+| `:positive` | Strictly positive output (`exp` of an unconstrained MLP) |
 
 ```@docs
 COMONetApproximator
