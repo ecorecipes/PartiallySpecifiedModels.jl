@@ -392,12 +392,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     for k in 1:K
         obs_idx = findfirst(j -> prob.obs_to_state[j] == k, 1:n_obs)
         if obs_idx !== nothing
-            raw = max.(prob.data_values[:, obs_idx], 0.01)
+            # Clamp initial states away from zero only when the data are
+            # themselves non-negative (a positivity-assuming model);
+            # unconditionally forcing ≥ 0.01 corrupted legitimately negative
+            # states (log-abundances, anomalies).
+            col = prob.data_values[:, obs_idx]
+            floor_k = all(>=(0.0), col) ? 0.01 : -Inf
+            raw = max.(col, floor_k)
             if prob.discrete && T_pts >= 4
                 itp = CubicSpline(raw, times;
                                   extrapolation=ExtrapolationType.Extension)
                 for i in 1:T_pts
-                    alpha[i, k] = max(itp(times[i]), 0.01)
+                    alpha[i, k] = max(itp(times[i]), floor_k)
                 end
             else
                 alpha[:, k] .= raw

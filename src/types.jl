@@ -726,7 +726,7 @@ end
 
 """
     LAML(; maxiters=100, tol=1e-6, verbose=false, initial_lambda=nothing,
-           warmup=0, sigma2_init=nothing)
+           warmup=3, sigma2_init=nothing)
 
 Laplace Approximate Marginal Likelihood algorithm.
 Equivalent to REML for Gaussian data.
@@ -737,10 +737,11 @@ Uses Fellner-Schall + Newton for smoothing parameter estimation.
 - `tol::Float64=1e-6`: convergence tolerance on penalized objective
 - `verbose::Bool=false`: print iteration diagnostics
 - `initial_lambda::Union{Nothing,Float64}=nothing`: initial smoothing parameter
-  for all terms.  Default (`nothing`) uses `θ = 1.0`, which gives moderate
-  initial smoothing.  For strongly nonlinear problems, a higher value
-  (e.g. `10.0`) combined with `warmup` helps the IRLS converge to a good
-  basin before LAML refinement.
+  for all terms.  Default (`nothing`) uses the data-driven `θ = 1/tr(S)` per
+  term (values below λ ≈ 4.5e-5 are floored there when LAML starts, to keep
+  the criterion away from its flat tiny-λ region).  For strongly nonlinear
+  problems, a higher value (e.g. `10.0`) combined with `warmup` helps the
+  IRLS converge to a good basin before LAML refinement.
 - `warmup::Int=3`: number of IRLS iterations to run with fixed smoothing before
   engaging LAML estimation.  Allows the coefficient estimates to stabilise
   before the smoothing parameters are adapted.  Increase for strongly

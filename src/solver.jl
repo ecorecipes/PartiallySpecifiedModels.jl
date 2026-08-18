@@ -311,17 +311,25 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
     fp = zeros(n_data)
     fb = zeros(n_data)
 
+    # Absolute FD step floor. DDEfit's fully relative step (da = dam·|β|,
+    # floored at 1e-8·dam ≈ 1e-16 for β = 0) was safe there because Wood
+    # (2001, p.11) reuses the SAME integration time steps for the perturbed
+    # and unperturbed trajectories, so integrator error cancels in the
+    # difference; simulate() re-solves adaptively per perturbation, so a
+    # 1e-16 step measures pure solver noise. Tie the floor to the solver
+    # tolerance instead: differences must exceed integration error.
+    reltol_ode = Float64(get(prob.ode_kwargs, :reltol, 1e-8))
+    abs_floor = max(100.0 * reltol_ode, 1e-7)
+
     for j in 1:n_p
-        da = dam[j] * abs(beta[j])
-        if da < 1e-8 * dam[j]
-            da = 1e-8 * dam[j]
-        end
+        da = max(dam[j] * abs(beta[j]), abs_floor)
 
         # Forward perturbation
         p_pert[j] = beta[j] + da
         pred_fwd = try
             simulate(prob, p_pert)
-        catch
+        catch e
+            _is_program_error(e) && rethrow()
             p_pert[j] = beta[j]
             continue
         end
@@ -579,20 +587,34 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                 a1_pcls, B1 = pcls_step(J, z_pseudo, theta_new, w_gauss)
                 a1, f11 = step_contract(beta, a1_pcls, B1)
 
-                # Accept new θ only if it improves the Gaussian data fit
-                ss_a0 = sum((y_vec[i] - (try; first(eval_model(a0)); catch; f_vec; end)[i])^2 * w_vec[i] for i in 1:n_data)
-                ss_a1 = sum((y_vec[i] - (try; first(eval_model(a1)); catch; f_vec; end)[i])^2 * w_vec[i] for i in 1:n_data)
+                # Accept new θ only if it improves the Gaussian data fit.
+                # Evaluate each candidate's model ONCE (a full ODE solve) —
+                # the previous generator re-solved the ODE per data point.
+                f_a0 = try; first(eval_model(a0)); catch e
+                    _is_program_error(e) && rethrow(); f_vec; end
+                f_a1 = try; first(eval_model(a1)); catch e
+                    _is_program_error(e) && rethrow(); f_vec; end
+                ss_a0 = sum((y_vec[i] - f_a0[i])^2 * w_vec[i] for i in 1:n_data)
+                ss_a1 = sum((y_vec[i] - f_a1[i])^2 * w_vec[i] for i in 1:n_data)
 
                 if ss_a1 <= ss_a0
                     beta .= a1
                     gw_otheta .= theta_new
+                    f_vec .= f_a1
                 else
                     beta .= a0
+                    f_vec .= f_a0
                 end
             else
                 beta .= a0
+                f_new = try; first(eval_model(a0)); catch e
+                    _is_program_error(e) && rethrow(); f_vec; end
+                f_vec .= f_new
             end
 
+            # Convergence monitor uses the CURRENT step's fit (the old code
+            # scored f_vec from before the step — a one-iteration-stale
+            # objective).
             gw_ss = sum((y_vec[i] - f_vec[i])^2 * w_vec[i] for i in 1:n_data)
             gw_obj = 0.5 * (gw_ss + dot(beta, build_B(gw_otheta) * beta))
 
@@ -712,9 +734,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         # haven't been optimised yet and the objective may improve further.
         min_conv_iter = max(3, alg.warmup + 3)
         curr_data_loss = sum((y_vec[i] - f_vec[i])^2 * w_vec[i] for i in 1:n_data)
-        obj_stable = abs(curr_obj - prev_obj) < 1e-6 * max(abs(prev_obj), 1.0)
+        # alg.tol governs the penalized-objective test (as documented); the
+        # data-loss test uses a proportionally looser threshold.
+        obj_stable = abs(curr_obj - prev_obj) < alg.tol * max(abs(prev_obj), 1.0)
         dl_stable = prev_data_loss < Inf &&
-                    abs(curr_data_loss - prev_data_loss) < 1e-4 * max(prev_data_loss, 1.0)
+                    abs(curr_data_loss - prev_data_loss) <
+                        100 * alg.tol * max(prev_data_loss, 1.0)
         if iter >= min_conv_iter && obj_stable && dl_stable
             if verbose; println("Converged at iter $iter (objective stable)"); end
             break
@@ -732,7 +757,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         # doesn't restart from scratch.
         w_irls_for_laml = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
         if m > 0 && iter >= alg.warmup
-            s2cap = alg.sigma2_init !== nothing ? alg.sigma2_init : Inf
+            # sigma2_init caps the FS dispersion during early iterations to
+            # prevent runaway smoothing while the fit is still poor; as
+            # documented, the cap relaxes (×10 per iteration past warmup)
+            # so it cannot permanently bias λ downward.
+            s2cap = if alg.sigma2_init === nothing
+                Inf
+            else
+                alg.sigma2_init * 10.0^clamp(iter - alg.warmup, 0, 300)
+            end
             theta_new, _ = try
                 rho_init = log.(max.(theta, 1e-20))
                 estimate_smoothing_params(J, w_irls_for_laml, w_vec,

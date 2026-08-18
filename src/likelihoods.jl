@@ -61,9 +61,13 @@ end
 """
     log_likelihood(fam, y, mu, w)
 
-Total weighted log-likelihood: Σ_i w_i ℓ(y_i, μ_i). Includes the full
-normalizing constants so the value is comparable across models/families
-(e.g. for AIC), not just up to an additive constant.
+Total weighted log-likelihood: Σ_i w_i ℓ(y_i, μ_i).
+
+Poisson, NegativeBinomial, and TruncatedNormal include their full
+normalizing constants and are mutually comparable (e.g. for AIC). The
+**Gaussian** value is the kernel −½Σw(y−μ)² only — σ² is profiled out
+elsewhere, so the −(n/2)log(2πσ²) term is omitted and Gaussian values are
+NOT comparable across families.
 """
 function log_likelihood(::Gaussian, y::AbstractVector,
                         mu::AbstractVector, w::AbstractVector)
@@ -196,59 +200,3 @@ function irls_weights(fam::CustomLikelihood, y::AbstractVector,
     wt
 end
 
-# ─── IRLS pseudo-data ──────────────────────────────────────────────
-
-"""
-    irls_pseudodata(fam, y, mu, w)
-
-Compute IRLS working response z̃_i for each observation.
-For Gaussian (identity link): z̃ = y.
-For log-link families: z̃ = log(μ) + (y - μ)/μ.
-"""
-function irls_pseudodata(::Gaussian, y::AbstractVector,
-                         mu::AbstractVector, w::AbstractVector)
-    copy(y)
-end
-
-function irls_pseudodata(::Poisson, y::AbstractVector,
-                         mu::AbstractVector, w::AbstractVector)
-    z = similar(y)
-    for i in eachindex(y)
-        mu_i = max(mu[i], 1e-10)
-        z[i] = log(mu_i) + (y[i] - mu_i) / mu_i
-    end
-    z
-end
-
-function irls_pseudodata(fam::NegativeBinomial, y::AbstractVector,
-                         mu::AbstractVector, w::AbstractVector)
-    z = similar(y)
-    for i in eachindex(y)
-        mu_i = max(mu[i], 1e-10)
-        z[i] = log(mu_i) + (y[i] - mu_i) / mu_i
-    end
-    z
-end
-
-function irls_pseudodata(fam::TruncatedNormal, y::AbstractVector,
-                         mu::AbstractVector, w::AbstractVector)
-    # Identity link: z = y (same as Gaussian)
-    copy(y)
-end
-
-function irls_pseudodata(fam::CustomLikelihood, y::AbstractVector,
-                         mu::AbstractVector, w::AbstractVector)
-    # Numerical: z_i = η_i + (y_i - μ_i) / (∂μ/∂η)
-    # For identity link, this reduces to y
-    z = similar(y)
-    for i in eachindex(y)
-        yi = y[i]
-        dl = ForwardDiff.derivative(μ -> fam.loglik_scalar(yi, μ), mu[i])
-        neg_d2l = -ForwardDiff.derivative(
-            μ -> ForwardDiff.derivative(μ2 -> fam.loglik_scalar(yi, μ2), μ),
-            mu[i]
-        )
-        z[i] = mu[i] + dl / max(neg_d2l, 1e-10)
-    end
-    z
-end
