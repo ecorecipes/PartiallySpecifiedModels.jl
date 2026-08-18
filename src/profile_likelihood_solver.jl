@@ -71,6 +71,13 @@ parameter index → NamedTuple of grid values, profile likelihoods, and CI).
 """
 function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
     _validate_problem(prob, "ProfileLikelihoodSolver")
+    # The profile statistic n·log(RSS_p/RSS_min) is the Gaussian
+    # likelihood-ratio with σ² profiled out; its χ²₁ calibration does not
+    # hold for other families, so refuse rather than return wrong CIs.
+    prob.likelihood isa Gaussian ||
+        error("ProfileLikelihoodSolver supports Gaussian likelihoods only " *
+              "(the RSS-based profile statistic is χ²₁-calibrated for " *
+              "Gaussian errors); got $(typeof(prob.likelihood)).")
     verbose = alg.verbose
 
     # ── Step 1: Full LAML fit for MLE ────────────────────────────
@@ -109,41 +116,22 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
     # `with_penalty=false` returns the pure data RSS (used to form the
     # likelihood-ratio statistic, which must be a function of the data
     # fit only, not the penalised objective).
+    # Route the trajectory through `simulate`, which already handles the
+    # ODE, DDE, and discrete-map cases consistently with the LAML fit
+    # (the previous hand-rolled version ignored prob.delays — turning DDE
+    # profiles into constant 1e10 objectives and full-width CIs — and
+    # iterated discrete maps once per observation instead of per step).
     function _profile_objective(prob, β_full; with_penalty::Bool=true)
-        p = build_param_struct(prob, β_full)
         total_loss = 0.0
         try
-            if prob.discrete
-                n_vars = length(prob.u0 isa Function ? prob.u0(p) : prob.u0)
-                u = Float64.(prob.u0 isa Function ? prob.u0(p) : prob.u0)
-                du = zeros(n_vars)
-                for i in 1:length(prob.data_times)
-                    for j in 1:size(prob.data_values, 2)
-                        sk = prob.obs_to_state[j]
-                        total_loss += (prob.data_values[i, j] - u[sk])^2
-                    end
-                    if i < length(prob.data_times)
-                        prob.dynamics!(du, u, p, prob.data_times[i])
-                        u = copy(du)
-                    end
-                end
-            else
-                ode_u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
-                ode_prob = ODEProblem(prob.dynamics!, ode_u0, prob.tspan, p)
-                solver = prob.ode_solver === nothing ? Tsit5() : prob.ode_solver
-                ode_sol = OrdinaryDiffEq.solve(ode_prob, solver;
-                            saveat=prob.data_times, prob.ode_kwargs...)
-                if ode_sol.retcode != :Success && ode_sol.retcode != SciMLBase.ReturnCode.Success
-                    return 1e10
-                end
-                for i in 1:length(prob.data_times)
-                    for j in 1:size(prob.data_values, 2)
-                        sk = prob.obs_to_state[j]
-                        total_loss += (prob.data_values[i, j] - ode_sol.u[i][sk])^2
-                    end
+            pred = simulate(prob, β_full)
+            for i in 1:length(prob.data_times)
+                for j in 1:size(prob.data_values, 2)
+                    total_loss += (prob.data_values[i, j] - pred[i, j])^2
                 end
             end
-        catch
+        catch e
+            _is_program_error(e) && rethrow()
             return 1e10
         end
         # Penalty (only for the regularised objective used in optimisation)
@@ -265,16 +253,27 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
         plr = [isfinite(r) ? n_obs * log(max(r, eps()) / rss_min) : Inf
                for r in profile_rss]
 
-        # Find CI: largest interval where PLR < threshold
+        # Find CI: largest interval where PLR < threshold. An endpoint that
+        # sits on the grid boundary means the profile never crossed the
+        # threshold on that side — the interval is open (parameter weakly
+        # identified or grid too narrow), which callers need to know.
         in_ci = plr .< chi2_threshold
         ci_lo = in_ci[1] ? grid[1] : grid[findfirst(in_ci)]
         ci_hi = in_ci[end] ? grid[end] : grid[findlast(in_ci)]
+        open_left = in_ci[1]
+        open_right = in_ci[end]
 
         profiles[idx] = (grid=grid, objective=profile_obj, plr=plr,
-                         ci=(ci_lo, ci_hi), threshold=chi2_threshold)
+                         ci=(ci_lo, ci_hi), threshold=chi2_threshold,
+                         open_left=open_left, open_right=open_right)
 
         if verbose
-            println("    CI: [$(round(ci_lo, sigdigits=4)), $(round(ci_hi, sigdigits=4))]")
+            lo_br = open_left ? "(" : "["
+            hi_br = open_right ? ")" : "]"
+            println("    CI: $(lo_br)$(round(ci_lo, sigdigits=4)), " *
+                    "$(round(ci_hi, sigdigits=4))$(hi_br)" *
+                    (open_left || open_right ?
+                     "  (open endpoint: profile did not cross threshold)" : ""))
         end
     end
 

@@ -152,11 +152,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
                               domain=domain, n_alpha=n_repr))
             total_alpha += n_repr
         else
-            # For neural/other approximators, fall back to nparams
-            np = nparams(approx)
-            push!(repr_info, (name=approx.name, x_repr=nothing, K_repr=nothing,
-                              domain=nothing, n_alpha=np, approx=approx))
-            total_alpha += np
+            # Neural/COMONet parameters have no kernel representation here.
+            # The old fallback allocated coefficients but never wired an
+            # evaluator into the dynamics, so p.<name>(x) threw inside the
+            # loss, the catch turned every evaluation into the same constant,
+            # and the solver "converged" without fitting anything.
+            error("RKHSSolver requires kernel-representable approximators " *
+                  "(BSplineApproximator, GPApproximator, SPDE approximators); " *
+                  "got $(typeof(approx)) for :$(approx.name). " *
+                  "Use AdamSolver or MultipleShootingSolver for neural " *
+                  "approximators.")
         end
     end
 
@@ -165,14 +170,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
     off = 0
     for (ri, info) in enumerate(repr_info)
         np = info.n_alpha
-        if info.K_repr !== nothing
-            # Use the approximator's initial_params to get target values
-            approx = prob.approximators[ri]
-            ip = initial_params(approx)
-            init_val = sum(ip) / length(ip)  # mean initial value
-            f_target = fill(init_val, np)
-            alpha[off+1:off+np] = info.K_repr \ f_target
-        end
+        # Use the approximator's initial_params to get target values
+        approx = prob.approximators[ri]
+        ip = initial_params(approx)
+        init_val = sum(ip) / length(ip)  # mean initial value
+        f_target = fill(init_val, np)
+        alpha[off+1:off+np] = info.K_repr \ f_target
         off += np
     end
     n_alpha = total_alpha
@@ -207,16 +210,14 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
             ak = α_eval[off+1:off+np]
             off += np
 
-            if info.x_repr !== nothing
-                let xr = info.x_repr, a = ak
-                    push!(uf_entries, info.name => (x -> begin
-                        val = zero(T_el)
-                        for i in eachindex(xr)
-                            val += a[i] * kernel_fn(x, xr[i])
-                        end
-                        val
-                    end))
-                end
+            let xr = info.x_repr, a = ak
+                push!(uf_entries, info.name => (x -> begin
+                    val = zero(T_el)
+                    for i in eachindex(xr)
+                        val += a[i] * kernel_fn(x, xr[i])
+                    end
+                    val
+                end))
             end
         end
 
@@ -242,9 +243,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
             np = info.n_alpha
             ak = α_eval[off+1:off+np]
             off += np
-            if info.K_repr !== nothing
-                loss += lambda_rkhs * dot(ak, info.K_repr * ak)
-            end
+            loss += lambda_rkhs * dot(ak, info.K_repr * ak)
         end
 
         loss
@@ -314,15 +313,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
         np = info.n_alpha
         ak = alpha[off+1:off+np]
         off += np
-        if info.x_repr !== nothing
-            let xr = copy(info.x_repr), a = copy(ak), kf = kernel_fn
-                uf_evals[info.name] = x -> begin
-                    val = 0.0
-                    for i in eachindex(xr)
-                        val += a[i] * kf(Float64(x isa AbstractArray ? x[1] : x), xr[i])
-                    end
-                    val
+        let xr = copy(info.x_repr), a = copy(ak), kf = kernel_fn
+            uf_evals[info.name] = x -> begin
+                val = 0.0
+                for i in eachindex(xr)
+                    val += a[i] * kf(Float64(x isa AbstractArray ? x[1] : x), xr[i])
                 end
+                val
             end
         end
     end
