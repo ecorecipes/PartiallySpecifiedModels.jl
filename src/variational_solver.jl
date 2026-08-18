@@ -17,7 +17,7 @@ function _variational_simulate(prob::PSMProblem, beta)
     p = build_autodiff_param_struct(prob, beta)
 
     if prob.discrete
-        return adam_simulate_discrete(prob, p)
+        return adam_simulate_discrete(prob, p, T)
     end
 
     u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
