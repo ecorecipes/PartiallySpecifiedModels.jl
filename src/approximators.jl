@@ -708,26 +708,42 @@ end
 # COMONet: shape-constrained neural network evaluator
 # ═══════════════════════════════════════════════════════════════════════
 #
-# COMONet guarantees shape constraints architecturally:
-#   - Monotone increasing: all weights W > 0 (via exp(W̃)) + non-decreasing activation
-#   - Convex: positive weights + ReLU (convex, non-decreasing) composition
-#   - Concave: negate the convex network: f(x) = -g(x) where g is convex
-#   - Decreasing: negate input: f(x) = g(-x) where g is increasing
+# COMONet guarantees shape constraints architecturally. The architecture
+# is chosen PER CONSTRAINT CLASS so that each advertised constraint is the
+# network's actual function class (positive weights composed with a convex
+# nondecreasing activation are always convex — so a ReLU network cannot be
+# "monotone but not convex", and a single positive-weight branch cannot be
+# "convex but not monotone"):
+#   - Pure monotone (:increasing/:decreasing): exp(W̃)/fanin weights + tanh
+#     hidden units. tanh is nondecreasing but saturating (neither convex
+#     nor concave), so the class is all monotone shapes — including
+#     sigmoids and Holling type-II/III responses.
+#   - Curvature-and-monotone (:inc_convex, :inc_concave, :dec_convex,
+#     :dec_concave): positive weights + ReLU/softplus (or their negated
+#     concave forms); decreasing variants negate the input.
+#   - Curvature only (:convex/:concave): two-branch input-convex form
+#     g₁(x) + g₂(−x) with both branches positive-weight convex-increasing
+#     nets — the sum is convex and may be non-monotone (U-shapes);
+#     :concave negates the sum.
+#   - :positive: an UNCONSTRAINED tanh MLP with exp output — positivity
+#     comes from exp alone, so humps are representable.
 #
-# Parameters are stored unconstrained (W̃, b); at evaluation time we apply
-# exp(W̃) to get positive weights.
+# Positive weights are exp(W̃)/fanin: the fan-in scaling makes W̃ = 0 a
+# unit-gain network, so the L2 penalty on W̃ shrinks toward a tame function
+# (raw exp(W̃) weights ≈ 1 amplify the signal by ∏ layer widths, and
+# penalizing W̃ → 0 pushed toward that amplifier — backwards for smoothing).
 
 """
-    _comonet_unpack(a::COMONetApproximator, theta)
+    _comonet_unpack_single(hidden_sizes, theta)
 
-Unpack flat parameter vector into (weights, biases) pairs per layer.
-Returns vector of (W_matrix, b_vector) tuples.
+Unpack a flat parameter vector into (weights, biases) pairs per layer for
+one network (input 1 → hidden_sizes… → 1).
 """
-function _comonet_unpack(a::COMONetApproximator, theta::AbstractVector{T}) where T
+function _comonet_unpack_single(hidden_sizes, theta::AbstractVector{T}) where T
     layers = Tuple{Matrix{T}, Vector{T}}[]
     idx = 1
     prev = 1  # input dimension
-    for h in a.hidden_sizes
+    for h in hidden_sizes
         n_w = prev * h
         W = reshape(theta[idx:idx+n_w-1], h, prev)
         idx += n_w
@@ -746,69 +762,98 @@ function _comonet_unpack(a::COMONetApproximator, theta::AbstractVector{T}) where
 end
 
 """
-    _comonet_forward(layers, x_norm, constraint, activation)
+    _comonet_unpack(a::COMONetApproximator, theta)
 
-Forward pass through COMONet. `x_norm` is normalized to [0,1].
-All hidden layers use exp(W̃) for positive weights + activation function.
-Output layer uses exp(W̃) + identity (no activation).
-
-Activations:
-- `:relu`: ReLU / min(0,·) — piecewise linear (C⁰), exact theoretical match
-- `:softplus`: softplus / -softplus(-·) — smooth (C∞), same guarantees
-
-Constraint-specific input/output transforms:
-- `:decreasing` / `:dec_*`: negate input
-- `:concave` / `:inc_concave` / `:dec_concave`: concave-branch activation
-- `:positive`: apply exp to output
+Unpack the parameter vector: one network for most constraints, a pair of
+branch networks (θ split in half) for the two-branch `:convex`/`:concave`.
 """
-function _comonet_forward(layers, x_norm, constraint::Symbol, activation::Symbol=:relu)
-    # Input transform for decreasing constraints
-    x = if constraint in (:decreasing, :dec_convex, :dec_concave)
-        -x_norm
-    else
-        x_norm
+function _comonet_unpack(a::COMONetApproximator, theta::AbstractVector)
+    if a.constraint in (:convex, :concave)
+        nh = length(theta) ÷ 2
+        return (_comonet_unpack_single(a.hidden_sizes, theta[1:nh]),
+                _comonet_unpack_single(a.hidden_sizes, theta[nh+1:end]))
     end
+    _comonet_unpack_single(a.hidden_sizes, theta)
+end
 
-    # Use concave-branch activation?
-    use_concave = constraint in (:concave, :inc_concave, :dec_concave)
-
-    # Forward pass through hidden layers — use promote_type for ForwardDiff compatibility
+"""
+Positive-weight branch: exp(W̃)/fanin weights, ReLU/softplus (or negated
+concave) hidden activations, linear output. Convex-nondecreasing (or
+concave-nondecreasing) by construction.
+"""
+function _comonet_branch(layers, x, use_concave::Bool, activation::Symbol)
     h = [x]
     n_layers = length(layers)
     for (i, (W_tilde, b)) in enumerate(layers)
-        W_pos = exp.(W_tilde)  # guaranteed positive weights
+        W_pos = exp.(W_tilde) ./ size(W_tilde, 2)   # positive, fan-in scaled
         z = W_pos * h .+ b
         if i < n_layers
-            # Hidden layer activation
             if activation == :softplus
-                if use_concave
-                    # -softplus(-z): smooth, concave, non-decreasing, ≤ 0
-                    h = [-_softplus(-zi) for zi in z]
-                else
-                    # softplus(z): smooth, convex, non-decreasing, ≥ 0
-                    h = [_softplus(zi) for zi in z]
-                end
+                h = use_concave ? [-_softplus(-zi) for zi in z] :
+                                  [_softplus(zi) for zi in z]
             else  # :relu (default)
-                if use_concave
-                    h = [-max(zero(eltype(z)), -zi) for zi in z]
-                else
-                    h = [max(zero(eltype(z)), zi) for zi in z]
-                end
+                h = use_concave ? [-max(zero(eltype(z)), -zi) for zi in z] :
+                                  [max(zero(eltype(z)), zi) for zi in z]
             end
         else
-            # Output layer: linear (no activation)
-            h = z
+            h = z   # linear output
         end
     end
+    h[1]
+end
 
-    out = h[1]  # scalar output
-
-    # Output transform
-    if constraint == :positive
-        return exp(out)
-    else
-        return out
+"""
+Positive-weight monotone net: exp(W̃)/fanin weights with tanh hidden units.
+Monotone nondecreasing (positive weights + nondecreasing activation) but
+NOT constrained in curvature — tanh saturates, so sigmoids and other
+monotone-nonconvex shapes are representable.
+"""
+function _comonet_monotone(layers, x)
+    h = [x]
+    n_layers = length(layers)
+    for (i, (W_tilde, b)) in enumerate(layers)
+        W_pos = exp.(W_tilde) ./ size(W_tilde, 2)
+        z = W_pos * h .+ b
+        h = i < n_layers ? [tanh(zi) for zi in z] : z
     end
+    h[1]
+end
+
+"""
+Unconstrained tanh MLP (raw weights): used inside `exp(·)` for `:positive`,
+where positivity comes from the output transform alone.
+"""
+function _comonet_raw_mlp(layers, x)
+    h = [x]
+    n_layers = length(layers)
+    for (i, (W, b)) in enumerate(layers)
+        z = W * h .+ b
+        h = i < n_layers ? [tanh(zi) for zi in z] : z
+    end
+    h[1]
+end
+
+function _comonet_forward(layers, x_norm, constraint::Symbol, activation::Symbol=:relu)
+    if constraint in (:convex, :concave)
+        # Two-branch input-convex construction: g₁(x) + g₂(−x), both convex
+        # nondecreasing ⇒ sum convex, possibly non-monotone (U-shapes).
+        l1, l2 = layers
+        s = _comonet_branch(l1, x_norm, false, activation) +
+            _comonet_branch(l2, -x_norm, false, activation)
+        return constraint == :convex ? s : -s
+    elseif constraint == :positive
+        return exp(_comonet_raw_mlp(layers, x_norm))
+    end
+
+    # Input transform for decreasing constraints
+    x = constraint in (:decreasing, :dec_convex, :dec_concave) ? -x_norm : x_norm
+
+    if constraint in (:increasing, :decreasing)
+        return _comonet_monotone(layers, x)
+    end
+
+    use_concave = constraint in (:inc_concave, :dec_concave)
+    _comonet_branch(layers, x, use_concave, activation)
 end
 
 """
