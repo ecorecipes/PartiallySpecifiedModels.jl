@@ -25,15 +25,14 @@ one-sided differences at boundaries.
 """
 function build_diff_matrix(times::AbstractVector{Float64})
     T = length(times)
+    T >= 3 || error("build_diff_matrix: need at least 3 time points for " *
+                    "second-order differences, got $T")
     for i in 1:T-1
         times[i+1] <= times[i] && error("build_diff_matrix: times must be strictly increasing (duplicate at index $i)")
     end
     D = zeros(T, T)
 
-    # Forward difference at t_1 (second-order)
-    h1, h2 = times[2] - times[1], times[3] - times[1]
-    D[1, 1] = -(2*h1 + h2 - h1) / (h1 * (h2 - h1) + 1e-30)
-    # Use general 3-point forward formula
+    # Forward difference at t_1: general 3-point second-order formula
     dt1, dt2 = times[2] - times[1], times[3] - times[1]
     D[1, 1] = -(dt2 + dt1) / (dt1 * dt2)
     D[1, 2] = dt2 / (dt1 * (dt2 - dt1))
@@ -500,14 +499,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
             end
             prev_obj = curr_obj
 
-            # Gauss-Newton step: minimize ||r + J δ||² + δ'B δ
-            # Normal equations: (J'J + B) δ = -J'r → δ = -(J'J + B)⁻¹ J'r
-            # Update: params_new = params + δ (already negative from the -J'r)
+            # Gauss-Newton step for the penalized objective
+            #   f(p) = ||r(p)||² + p'B p,  ∇f = 2(J'r + B p),
+            # so the normal equations are (J'J + B) δ = -(J'r + B p).
+            # Omitting the B·p term makes δ nonzero at the true optimum
+            # (where J'r = -B p) and stalls the line search short of it.
             alpha_flat = vec(alpha)
             params_vec = vcat(alpha_flat, beta)
 
             JtJ = J_full' * J_full + B_full
-            neg_Jtr = -(J_full' * resid)  # Note: negative!
+            neg_Jtr = -(J_full' * resid .+ B_full * params_vec)
 
             delta = try
                 JtJ \ neg_Jtr
@@ -598,9 +599,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                     idx = (uf_offsets[l]+1):(uf_offsets[l]+uf_nk[l])
                     beta_k = beta[idx]
                     bSb = dot(beta_k, S_list[l] * beta_k)
-                    edf_k = clamp(tr(H_inv[idx, idx] * JWJ[idx, idx]), 0.01, uf_nk[l] - 0.01)
+                    # Fellner–Schall numerator (Wood & Fasiolo 2017):
+                    #   rank(S_k) − θ_k·tr(H⁻¹S_k),
+                    # matching estimate_smoothing_params in laml.jl. Using the
+                    # hat-trace edf_k here instead would include the penalty
+                    # null space (rank + nullity − θtr(H⁻¹S)) and bias θ up.
+                    r_k = _rank_penalty(S_list[l])
+                    trHS = tr(H_inv[idx, idx] * S_list[l])
+                    fs_num = clamp(r_k - theta[l] * trHS, 0.01, Float64(uf_nk[l]))
                     if bSb > 1e-30
-                        theta[l] = clamp(sigma2_est * edf_k / bSb, 1e-20, 1e20)
+                        theta[l] = clamp(sigma2_est * fs_num / bSb, 1e-20, 1e20)
                     end
                 end
                 if verbose
