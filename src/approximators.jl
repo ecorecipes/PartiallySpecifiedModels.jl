@@ -14,7 +14,10 @@
 Evaluate a cubic spline interpolant at point `x`.
 """
 function evaluate_bspline(knots_x::AbstractVector, knots_y::AbstractVector, x::Real)
-    itp = CubicSpline(knots_y, knots_x; extrapolation=ExtrapolationType.Extension)
+    # Linear extrapolation: continuing the boundary CUBIC outside the domain
+    # grows without bound and can destabilize the ODE solve whenever a state
+    # wanders past the fitted range mid-integration.
+    itp = CubicSpline(knots_y, knots_x; extrapolation=ExtrapolationType.Linear)
     return itp(x)
 end
 
@@ -24,7 +27,9 @@ end
 Build a callable cubic spline evaluator (caches the interpolation object).
 """
 function build_bspline_evaluator(knots_x::AbstractVector, knots_y::AbstractVector)
-    CubicSpline(knots_y, knots_x; extrapolation=ExtrapolationType.Extension)
+    # Linear (slope-preserving) extrapolation outside the fitted domain —
+    # see evaluate_bspline.
+    CubicSpline(knots_y, knots_x; extrapolation=ExtrapolationType.Linear)
 end
 
 """
@@ -164,9 +169,24 @@ function build_gp_evaluator(a::GPApproximator, params::AbstractVector)
     kfunc = _kernel_func(a.kernel, a.lengthscale, a.variance)
     weights = a.K_inv * params  # precompute α = K⁻¹ f
     x_ind = a.inducing_points
+    raw = xv -> sum(kfunc(xv, x_ind[j]) * weights[j] for j in eachindex(x_ind))
+    # Outside the inducing-point range the kernel decays and the predictive
+    # mean reverts to 0 REGARDLESS of the fitted level — an ODE excursion
+    # past the domain saw f ≈ 0. Extrapolate linearly from the boundary
+    # value and slope instead (consistent with the spline evaluators).
+    lo, hi = extrema(x_ind)
+    h = (hi - lo) * 1e-6
+    f_lo = raw(lo);  s_lo = (raw(lo + h) - f_lo) / h
+    f_hi = raw(hi);  s_hi = (f_hi - raw(hi - h)) / h
     x -> begin
         xv = Float64(x isa AbstractArray ? x[1] : x)
-        sum(kfunc(xv, x_ind[j]) * weights[j] for j in eachindex(x_ind))
+        if xv < lo
+            f_lo + s_lo * (xv - lo)
+        elseif xv > hi
+            f_hi + s_hi * (xv - hi)
+        else
+            raw(xv)
+        end
     end
 end
 
@@ -262,7 +282,7 @@ Build a callable cubic spline evaluator for the SPDE mesh node values.
 Uses cubic spline interpolation for smooth ODE-compatible evaluation.
 """
 function build_spde_evaluator(mesh_x::AbstractVector, params::AbstractVector)
-    CubicSpline(params, mesh_x; extrapolation=ExtrapolationType.Extension)
+    CubicSpline(params, mesh_x; extrapolation=ExtrapolationType.Linear)
 end
 
 # ─── Shape-constrained SPDE: evaluator and penalty ────────────────
@@ -281,7 +301,10 @@ between nodes may slightly overshoot.
 function build_constrained_spde_evaluator(a::ShapeConstrainedSPDEApproximator,
                                           gamma::AbstractVector)
     mesh_values = gamma_to_mesh_values(a, gamma)
-    CubicSpline(mesh_values, a.mesh_points; extrapolation=ExtrapolationType.Extension)
+    # Linear extrapolation also preserves the boundary monotonicity of the
+    # constrained fit, which the boundary cubic could invert just outside
+    # the domain.
+    CubicSpline(mesh_values, a.mesh_points; extrapolation=ExtrapolationType.Linear)
 end
 
 """
