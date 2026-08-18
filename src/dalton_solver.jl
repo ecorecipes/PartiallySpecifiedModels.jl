@@ -14,24 +14,26 @@
 #
 # Reference: Wu & Lysy (2024)
 
-# ─── Core: frozen-linearization joint filter ──────────────────────
+# ─── Core: data-adaptive joint filter (Wu & Lysy 2024) ─────────────
 #
-# Correctness note (the heart of DALTON):
-#   logp(Y|Z) = logp(Y,Z) − logp(Z)
-# holds ONLY if both evidences are computed under the SAME, data-INDEPENDENT
-# linear-Gaussian model.  The ODE pseudo-observation Z is a linearization
-# of W·X − f(X) about a reference trajectory; if that linearization point
-# moves when data are assimilated (as in a naive joint filter), the two
-# passes use different models and the Z-terms do not cancel.  We therefore
-# compute the linearization (Hₙ, bₙ) ONCE from an ODE-only "reference"
-# filter and FREEZE it, then reuse those exact measurement models in the
-# joint pass.  Both passes then share one model and the identity is exact.
+# DALTON approximates logp(Y|Z) ≈ logp(Y,Z) − logp(Z), where EACH evidence
+# is computed under its own pass's linearization: the joint pass
+# re-interrogates the ODE at its DATA-INFORMED predicted means
+# (rodeo dalton.py:124-131), while the marginal pass linearizes about the
+# ODE-only trajectory (dalton.py:176-183).  This data-adaptive
+# linearization is the method's defining feature — it keeps the surrogate
+# accurate precisely when the ODE-only solution drifts away from the data
+# (chaotic/stiff regimes, Wu & Lysy §4).  The two linear models differ, so
+# the identity is approximate rather than exact; freezing one shared model
+# (as an earlier version here did) makes the subtraction exact but reduces
+# the likelihood to a Fenrir-style ODE-only-linearized evidence, discarding
+# the adaptivity the method is named for.
 
 """
     _dalton_reference(ode_fun!, p, u0, tspan, n_steps, q, sigma; interrogate)
 
-ODE-only joint Kalman filter. Returns the frozen interrogation models
-`(Hs, bs)` (one per step) and the marginal ODE log-evidence `logp(Z)`.
+ODE-only joint Kalman filter: the marginal ODE log-evidence `logp(Z)`,
+linearized about its own (data-free) predicted means.
 """
 function _dalton_reference(ode_fun!, p, u0::AbstractVector,
                            tspan::Tuple{Float64,Float64},
@@ -45,8 +47,6 @@ function _dalton_reference(ode_fun!, p, u0::AbstractVector,
 
     μf = _joint_init(ode_fun!, Float64.(u0), t_min, p, q)
     Σf = zeros(D, D)
-    Hs = Vector{Matrix{Float64}}(undef, n_steps)
-    bs = Vector{Vector{Float64}}(undef, n_steps)
     logZ = 0.0
     ztarget = zeros(n_vars)
 
@@ -55,7 +55,6 @@ function _dalton_reference(ode_fun!, p, u0::AbstractVector,
         μp = A * μf; Σp = A * Σf * A' + Qmat; Σp = 0.5 * (Σp + Σp')
         H, b = _joint_interrogate(ode_fun!, E0, E1, t_n, μp, p, n_vars;
                                   method=interrogate)
-        Hs[n] = H; bs[n] = b
         zmean = H * μp + b
         S = H * Σp * H' + V; S = 0.5 * (S + S')
         logZ += logpdf_mvn(ztarget, zmean, S)
@@ -63,34 +62,36 @@ function _dalton_reference(ode_fun!, p, u0::AbstractVector,
         K = (Σp * H') * (issuccess(Sf) ? inv(Sf) : pinv(S))
         μf = μp - K * zmean; Σf = Σp - K * H * Σp; Σf = 0.5 * (Σf + Σf')
     end
-    Hs, bs, logZ
+    logZ
 end
 
 """
-    _dalton_joint_evidence(ode_fun!, p, u0, tspan, n_steps, q, sigma, Hs, bs,
-                           obs_data, obs_times, obs_to_state, obs_var)
+    _dalton_joint_evidence(ode_fun!, p, u0, tspan, n_steps, q, sigma,
+                           obs_data, obs_times, obs_to_state, obs_var;
+                           interrogate)
 
-Joint Kalman filter using the FROZEN interrogation models `(Hs, bs)`,
-assimilating both the ODE pseudo-observations and the data. Returns the
-joint log-evidence `logp(Y,Z)`.
+Joint Kalman filter assimilating both the ODE pseudo-observations and the
+data, RE-INTERROGATING the ODE at each step's data-informed predicted mean
+(the data-adaptive linearization of Wu & Lysy 2024). Returns the joint
+log-evidence `logp(Y,Z)`.
 """
 function _dalton_joint_evidence(ode_fun!, p, u0::AbstractVector,
                                 tspan::Tuple{Float64,Float64},
                                 n_steps::Int, q::Int, sigma::Vector{Float64},
-                                Hs::Vector{Matrix{Float64}}, bs::Vector{Vector{Float64}},
                                 obs_data::Matrix{Float64}, obs_times::Vector{Float64},
-                                obs_to_state::Vector{Int}, obs_var::Float64)
+                                obs_to_state::Vector{Int}, obs_var::Float64;
+                                interrogate::Symbol=:kramer)
     t_min, t_max = tspan
     n_vars = length(u0); D = n_vars * q
     A, Qmat = _joint_ibm((t_max - t_min) / n_steps, q, sigma)
+    E0, E1 = _joint_selectors(n_vars, q)
     V = Matrix(1e-10 * I, n_vars, n_vars)
 
     μf = _joint_init(ode_fun!, Float64.(u0), t_min, p, q)
     Σf = zeros(D, D)
     times = collect(range(t_min, t_max, length = n_steps + 1))
     n_t_obs = size(obs_data, 1); n_obs_vars = length(obs_to_state)
-    obs_ind = clamp.([searchsortedfirst(times, obs_times[i]) for i in 1:n_t_obs],
-                     1, n_steps + 1)
+    obs_ind = _nearest_grid_indices(times, obs_times)
     Dmats = [reshape([(c == (obs_to_state[j]-1)*q + 1) ? 1.0 : 0.0 for c in 1:D], 1, D)
              for j in 1:n_obs_vars]
     Vobs = fill(obs_var, 1, 1)
@@ -111,8 +112,12 @@ function _dalton_joint_evidence(ode_fun!, p, u0::AbstractVector,
 
     assimilate_data!(1)
     for n in 1:n_steps
+        t_n = t_min + (t_max - t_min) * n / n_steps
         μp = A * μf; Σp = A * Σf * A' + Qmat; Σp = 0.5 * (Σp + Σp')
-        H = Hs[n]; b = bs[n]
+        # Data-adaptive: linearize at THIS pass's predicted mean, which has
+        # been informed by all data assimilated so far.
+        H, b = _joint_interrogate(ode_fun!, E0, E1, t_n, μp, p, n_vars;
+                                  method=interrogate)
         zmean = H * μp + b
         S = H * Σp * H' + V; S = 0.5 * (S + S')
         logEv += logpdf_mvn(ztarget, zmean, S)
@@ -131,9 +136,9 @@ end
                    obs_data, obs_times, obs_to_state, obs_var;
                    interrogate=:kramer)
 
-DALTON data-conditional log-likelihood `logp(Y|Z) = logp(Y,Z) − logp(Z)`
-(Wu & Lysy 2024). Computed with a frozen, data-independent ODE
-linearization so the identity is exact (see note above).
+DALTON data-conditional log-likelihood `logp(Y|Z) ≈ logp(Y,Z) − logp(Z)`
+(Wu & Lysy 2024), with each pass linearized about its own predicted means:
+data-informed for the joint pass, ODE-only for the marginal (see note above).
 """
 function _dalton_loglik(ode_fun!, p, u0::AbstractVector,
                         tspan::Tuple{Float64, Float64},
@@ -145,10 +150,11 @@ function _dalton_loglik(ode_fun!, p, u0::AbstractVector,
                         obs_var::Float64;
                         interrogate::Symbol=:kramer)
     q = n_deriv
-    Hs, bs, logZ = _dalton_reference(ode_fun!, p, u0, tspan, n_steps, q, sigma;
-                                     interrogate=interrogate)
+    logZ = _dalton_reference(ode_fun!, p, u0, tspan, n_steps, q, sigma;
+                             interrogate=interrogate)
     logYZ = _dalton_joint_evidence(ode_fun!, p, u0, tspan, n_steps, q, sigma,
-                                   Hs, bs, obs_data, obs_times, obs_to_state, obs_var)
+                                   obs_data, obs_times, obs_to_state, obs_var;
+                                   interrogate=interrogate)
     ll = logYZ - logZ
     isfinite(ll) ? ll : -Inf
 end
@@ -160,18 +166,20 @@ end
 
 Fit a partially specified model using the DALTON (Data-Adaptive Likelihood
 with Transformed ObservatioNs) probabilistic ODE solver of Wu & Lysy
-(2024). The data-conditional likelihood `logp(Y|Z) = logp(Y,Z) − logp(Z)`
-is evaluated with two joint Kalman-filter passes that share a single,
-data-independent ODE linearization, then the unknown-function parameters
-are optimized to maximize it.
+(2024). The data-conditional likelihood `logp(Y|Z) ≈ logp(Y,Z) − logp(Z)`
+is evaluated with two joint Kalman-filter passes, each linearized about
+its own predicted means — the joint pass's linearization is informed by
+the assimilated data (the method's defining data-adaptivity), the
+marginal pass's by the ODE alone.
 
 # Algorithm
 1. Set up the IBM prior of order `n_deriv` for each state variable.
-2. Reference pass: ODE-only joint filter giving the marginal evidence
-   `logp(Z)` and the frozen EKF1 linearization models `(Hₙ, bₙ)`.
-3. Joint pass: re-filter with the same frozen models, additionally
-   assimilating the data, giving `logp(Y,Z)`.
-4. `logp(Y|Z) = logp(Y,Z) − logp(Z)`; optimize the parameters.
+2. Marginal pass: ODE-only joint filter giving `logp(Z)`, EKF-linearized
+   about its own trajectory.
+3. Joint pass: filter assimilating both the ODE pseudo-observations and
+   the data, re-interrogating the ODE at each data-informed predicted
+   mean, giving `logp(Y,Z)`.
+4. `logp(Y|Z) ≈ logp(Y,Z) − logp(Z)`; optimize the parameters.
 
 # References
 - Wu, M. & Lysy, M. (2024), "Data-adaptive probabilistic likelihood
@@ -446,7 +454,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
     data_loss = 0.0
     pred = zeros(n_t, n_obs)
     for i in 1:n_t
-        idx = searchsortedfirst(times, prob.data_times[i])
+        idx = _nearest_grid_index(times, prob.data_times[i])
         idx = clamp(idx, 1, length(times))
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
@@ -518,7 +526,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
     # Solution uncertainty at observation times
     sol_var = zeros(n_t, n_vars)
     for i in 1:n_t
-        idx = searchsortedfirst(times, prob.data_times[i])
+        idx = _nearest_grid_index(times, prob.data_times[i])
         idx = clamp(idx, 1, length(times))
         for k in 1:n_vars
             sol_var[i, k] = Σ_smooth[idx][k][1, 1]

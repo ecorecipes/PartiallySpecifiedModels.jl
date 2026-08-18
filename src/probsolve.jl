@@ -17,6 +17,24 @@
 # Reference: Tronarp et al (2019, 2022), Krämer et al (2021),
 #            Bosch et al (2021), Wu & Lysy (2024)
 
+"""
+    _nearest_grid_index(times, t) -> Int
+
+Index of the solver-grid time closest to `t` (ties to the earlier point).
+Observations snap to the NEAREST grid point — matching rodeo's convention —
+rather than the next one, which introduced a systematic forward shift of
+up to one grid step in every likelihood evaluation.
+"""
+function _nearest_grid_index(times::AbstractVector, t::Real)
+    k = searchsortedfirst(times, t)
+    k <= 1 && return 1
+    k > length(times) && return length(times)
+    (t - times[k-1] <= times[k] - t) ? k - 1 : k
+end
+
+_nearest_grid_indices(times::AbstractVector, ts::AbstractVector) =
+    [_nearest_grid_index(times, t) for t in ts]
+
 # ── joint state-space building blocks ────────────────────────────────
 
 """
@@ -282,7 +300,7 @@ function basic_loglik(ode_fun!, p, u0::AbstractVector,
     n_obs = size(obs_data, 2); n_t = size(obs_data, 1)
     ll = 0.0
     for i in 1:n_t
-        idx = clamp(searchsortedfirst(times, obs_times[i]), 1, length(times))
+        idx = _nearest_grid_index(times, obs_times[i])
         for j in 1:n_obs
             sk = obs_to_state[j]
             pred = μ_smooth[idx][sk][1]
@@ -322,8 +340,7 @@ function fenrir_loglik(ode_fun!, p, u0::AbstractVector,
     A = filt_out["A"]; times = filt_out["times"]
 
     n_t_obs = size(obs_data, 1)
-    obs_ind = clamp.([searchsortedfirst(times, obs_times[i]) for i in 1:n_t_obs],
-                     1, n_steps + 1)
+    obs_ind = _nearest_grid_indices(times, obs_times)
 
     # Data observation operators (one scalar per observed variable).
     Dmats = [reshape([(c == (obs_to_state[j]-1)*q + 1) ? 1.0 : 0.0 for c in 1:D], 1, D)
@@ -343,7 +360,11 @@ function fenrir_loglik(ode_fun!, p, u0::AbstractVector,
         end
     end
 
-    if obs_ptr >= 1 && obs_ind[obs_ptr] >= n_steps + 1
+    # `while` (not `if`): several observations can map to the same grid
+    # index when data are denser than the solver grid. The old single-shot
+    # check left the pointer stuck at the unconsumed duplicate and silently
+    # skipped every earlier observation from the likelihood.
+    while obs_ptr >= 1 && obs_ind[obs_ptr] >= n_steps + 1
         condition!(obs_ptr); obs_ptr -= 1
     end
 
@@ -354,7 +375,7 @@ function fenrir_loglik(ode_fun!, p, u0::AbstractVector,
         bμ = μ_filt[n] + G * (bμ - μ_pred[n+1])
         bΣ = Σ_filt[n] + G * (bΣ - Σ_pred[n+1]) * G'
         bΣ = 0.5 * (bΣ + bΣ')
-        if obs_ptr >= 1 && obs_ind[obs_ptr] == n
+        while obs_ptr >= 1 && obs_ind[obs_ptr] == n
             condition!(obs_ptr); obs_ptr -= 1
         end
     end
