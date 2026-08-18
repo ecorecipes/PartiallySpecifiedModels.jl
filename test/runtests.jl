@@ -1791,11 +1791,12 @@ using OrdinaryDiffEq
             @test all(bs.ci_fitted.lower .<= bs.ci_fitted.upper)
         end
 
-        @testset "case bootstrap" begin
-            bs = bootstrap(sol, prob, LAML(maxiters=50, verbose=false);
+        @testset "case bootstrap removed" begin
+            # :case resampled observation rows onto the original time stamps,
+            # destroying temporal structure — now rejected with guidance.
+            @test_throws ErrorException bootstrap(sol, prob,
+                LAML(maxiters=50, verbose=false);
                 nboot=10, method=:case, rng=Random.Xoshiro(3))
-            @test bs.n_success >= 5
-            @test all(bs.ci_fitted.lower .<= bs.ci_fitted.upper)
         end
 
         @testset "custom level" begin

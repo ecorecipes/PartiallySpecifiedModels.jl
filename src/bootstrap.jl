@@ -57,7 +57,12 @@ Compute bootstrap confidence intervals for a PSM solution.
   - `:parametric` — sample from the fitted distribution (Gaussian, Poisson,
     NegBin, TruncatedNormal — uses the problem's likelihood family)
   - `:nonparametric` — resample residuals with replacement per state
-  - `:case` — resample entire observations (rows) with replacement
+    (Gaussian likelihoods only: additive residuals are invalid pseudo-data
+    for count or truncated families)
+
+Each replicate is refit from scratch with `alg`, so smoothing parameters are
+re-estimated per replicate; the intervals therefore include smoothing-
+selection variability (unlike a fixed-λ conditional bootstrap).
 - `level::Float64=0.95`: confidence level for CIs
 - `uf_ngrid::Int=100`: number of grid points for unknown function CIs
 - `rng`: random number generator
@@ -93,8 +98,20 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                    parallel::Bool=false,
                    verbose::Bool=false)
 
-    method in (:parametric, :nonparametric, :case) ||
-        error("bootstrap: method must be :parametric, :nonparametric, or :case")
+    method == :case &&
+        error("bootstrap: the :case method has been removed. Resampling " *
+              "observation rows onto the original time stamps destroys the " *
+              "temporal structure of trajectory data, so its confidence " *
+              "intervals had no statistical meaning for dynamical models. " *
+              "Use :parametric (any likelihood) or :nonparametric (Gaussian).")
+    method in (:parametric, :nonparametric) ||
+        error("bootstrap: method must be :parametric or :nonparametric")
+    method == :nonparametric && !(prob.likelihood isa Gaussian) &&
+        error("bootstrap: :nonparametric residual resampling produces " *
+              "invalid pseudo-data for $(typeof(prob.likelihood)) " *
+              "(negative/non-integer counts, values below a truncation " *
+              "bound). Use method=:parametric, which samples from the " *
+              "fitted distribution.")
     0.0 < level < 1.0 || error("bootstrap: level must be in (0, 1)")
 
     n_times = length(sol.data_times)
@@ -102,12 +119,23 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
     fitted = sol.fitted_values  # n_times × n_obs
     resid = sol.data_values .- fitted
 
-    # Compute residual statistics per observed state
-    σ_hat = Float64[std(resid[:, j]; corrected=true) for j in 1:n_obs]
+    # Residual scale per observed state, corrected for the effective model
+    # degrees of freedom (a flexible smooth absorbs part of the noise, so a
+    # raw n−1 denominator understates σ and narrows parametric CIs). The
+    # total edf is allocated evenly across observed states.
+    edf_j = sol.edf / n_obs
+    σ_hat = Float64[sqrt(sum(abs2, resid[:, j]) /
+                         max(n_times - edf_j, 1.0)) for j in 1:n_obs]
 
-    # Build UF evaluation grids
+    # Build UF evaluation grids (approximators without a domain — e.g. a
+    # NeuralApproximator constructed without one — cannot be gridded)
     uf_grids = Dict{Symbol, Vector{Float64}}()
     for approx in prob.approximators
+        if approx.domain === nothing
+            @warn "bootstrap: approximator :$(approx.name) has no domain; " *
+                  "skipping its unknown-function confidence band"
+            continue
+        end
         lo, hi = approx.domain
         uf_grids[approx.name] = collect(range(lo, hi, length=uf_ngrid))
     end
@@ -179,8 +207,11 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
 
         coef_samples = zeros(n_success, n_p)
         fitted_samples = zeros(n_times, n_obs, n_success)
+        # NaN marks replicates where a UF was absent or failed to evaluate;
+        # the quantile step below skips NaN columns instead of treating
+        # them as zeros.
         uf_samples = Dict{Symbol, Matrix{Float64}}(
-            name => zeros(uf_ngrid, n_success) for name in uf_names)
+            name => fill(NaN, uf_ngrid, n_success) for name in uf_names)
 
         for (k, r) in enumerate(successful)
             coef_samples[k, :] .= r.coefs
@@ -199,8 +230,9 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
         # ─── Sequential bootstrap ─────────────────────────────────
         coef_samples = zeros(nboot, n_p)
         fitted_samples = zeros(n_times, n_obs, nboot)
+        # NaN marks absent/failed UF evaluations (see threaded path)
         uf_samples = Dict{Symbol, Matrix{Float64}}(
-            name => zeros(uf_ngrid, nboot) for name in uf_names)
+            name => fill(NaN, uf_ngrid, nboot) for name in uf_names)
         n_success = 0
 
         for b in 1:nboot
@@ -281,10 +313,22 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
         ci_upper[i, j] = quantile(vals, α_hi)
     end
 
+    # UF bands: skip NaN entries (absent UF in a replicate, or a failed
+    # pointwise evaluation) — quantile() throws on NaN, which previously
+    # killed an entire completed bootstrap run at this final step.
     ci_uf = Dict{Symbol, NamedTuple{(:lower, :upper), Tuple{Vector{Float64}, Vector{Float64}}}}()
     for (name, mat) in uf_samples
-        lo = [quantile(mat[k, :], α_lo) for k in 1:uf_ngrid]
-        hi = [quantile(mat[k, :], α_hi) for k in 1:uf_ngrid]
+        lo = Vector{Float64}(undef, uf_ngrid)
+        hi = Vector{Float64}(undef, uf_ngrid)
+        for k in 1:uf_ngrid
+            vals = filter(!isnan, view(mat, k, :))
+            if isempty(vals)
+                lo[k] = NaN; hi[k] = NaN
+            else
+                lo[k] = quantile(vals, α_lo)
+                hi[k] = quantile(vals, α_hi)
+            end
+        end
         ci_uf[name] = (lower=lo, upper=hi)
     end
 
@@ -309,8 +353,8 @@ For `:parametric`, the sampling distribution depends on the likelihood family:
 - `TruncatedNormal(lower, σ)`: y* ~ TruncNorm(μ̂, σ, lower)
 - Other: falls back to Gaussian residuals
 
-For `:nonparametric`, residuals are resampled with replacement per state.
-For `:case`, entire observation rows are resampled.
+For `:nonparametric`, residuals are resampled with replacement per state
+(valid for Gaussian likelihoods; rejected earlier for other families).
 """
 function _resample_data(method::Symbol, family::AbstractLikelihood,
                         fitted::Matrix{Float64},
@@ -326,11 +370,6 @@ function _resample_data(method::Symbol, family::AbstractLikelihood,
             for i in 1:n_times
                 y_boot[i, j] = fitted[i, j] + resid[idx[i], j]
             end
-        end
-    elseif method == :case
-        idx = rand(rng, 1:n_times, n_times)
-        for j in 1:n_obs, i in 1:n_times
-            y_boot[i, j] = resid[idx[i], j] + fitted[idx[i], j]
         end
     end
 
