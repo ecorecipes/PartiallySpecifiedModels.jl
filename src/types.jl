@@ -526,20 +526,29 @@ architecturally using `exp(W)` weights and specialized activations.
 Constraints are guaranteed everywhere by construction — not just at
 knot points.
 
-**Monotonicity:**
-- `:increasing`    — f'(x) ≥ 0 (exp(W) weights + ReLU)
+Each constraint uses the architecture that makes it the network's actual
+function class (a positive-weight ReLU network is always convex, so it
+cannot serve as a general monotone or general positive class):
+
+**Monotonicity** (positive weights + saturating tanh hidden units — the
+class includes sigmoids and other monotone-nonconvex shapes):
+- `:increasing`    — f'(x) ≥ 0
 - `:decreasing`    — f'(x) ≤ 0 (negate input)
 
-**Curvature:**
-- `:convex`        — f''(x) ≥ 0 (exp(W) weights + ReLU)
-- `:concave`       — f''(x) ≤ 0 (-ReLU(-·))
+**Curvature only** (two-branch input-convex form g₁(x) + g₂(−x): convex
+and possibly non-monotone, e.g. U-shapes; twice the parameters):
+- `:convex`        — f''(x) ≥ 0
+- `:concave`       — f''(x) ≤ 0 (negated sum)
 
-**Combined:**
+**Monotone + curvature** (positive weights + ReLU/softplus or their
+negated concave forms):
 - `:inc_convex`    — increasing + convex
 - `:inc_concave`   — increasing + concave
 - `:dec_convex`    — decreasing + convex
 - `:dec_concave`   — decreasing + concave
-- `:positive`      — f(x) ≥ 0 (exp output)
+
+**Positivity** (unconstrained tanh MLP inside exp(·) — humps allowed):
+- `:positive`      — f(x) > 0
 """
 const COMONET_CONSTRAINTS = (
     :increasing, :decreasing,
@@ -593,6 +602,7 @@ struct COMONetApproximator <: AbstractApproximator
     constraint::Symbol
     penalty_weight::Float64
     activation::Symbol
+    rng_seed::Union{Nothing, Int}
 end
 
 function COMONetApproximator(name::Union{Symbol,String},
@@ -600,7 +610,8 @@ function COMONetApproximator(name::Union{Symbol,String},
                              hidden_sizes::Union{Tuple{Vararg{Int}}, Vector{Int}},
                              constraint::Symbol;
                              penalty_weight::Float64=0.01,
-                             activation::Symbol=:relu)
+                             activation::Symbol=:relu,
+                             rng_seed::Union{Nothing, Int}=nothing)
     name = Symbol(name)
     d = (Float64(domain[1]), Float64(domain[2]))
     constraint in COMONET_CONSTRAINTS || throw(ArgumentError(
@@ -609,42 +620,48 @@ function COMONetApproximator(name::Union{Symbol,String},
         "Unknown activation :$activation. Must be one of $COMONET_ACTIVATIONS"))
     hs = hidden_sizes isa Vector ? Tuple(hidden_sizes...) : hidden_sizes
     length(hs) >= 1 || throw(ArgumentError("Need at least 1 hidden layer"))
-    COMONetApproximator(name, d, hs, constraint, penalty_weight, activation)
+    COMONetApproximator(name, d, hs, constraint, penalty_weight, activation,
+                        rng_seed)
 end
 
-function nparams(a::COMONetApproximator)
-    # Count parameters: input→h1, h1→h2, ..., hL→1 (weights + biases)
+function _comonet_nparams_single(hidden_sizes)
     np = 0
     prev = 1  # single input (1D)
-    for h in a.hidden_sizes
+    for h in hidden_sizes
         np += prev * h + h  # W (prev×h) + b (h)
         prev = h
     end
-    np += prev + 1  # output layer: W (prev×1) + b (1)
-    return np
+    np + prev + 1  # output layer: W (prev×1) + b (1)
+end
+
+function nparams(a::COMONetApproximator)
+    n1 = _comonet_nparams_single(a.hidden_sizes)
+    # Two-branch input-convex constraints carry a pair of networks
+    a.constraint in (:convex, :concave) ? 2 * n1 : n1
 end
 
 function initial_params(a::COMONetApproximator)
+    rng = a.rng_seed === nothing ? Random.default_rng() :
+                                   Random.Xoshiro(a.rng_seed)
     np = nparams(a)
-    # Xavier-like initialization scaled for exp(W) transform
-    params = 0.1 .* randn(np)
+    # W̃ ≈ 0 corresponds to fan-in-scaled unit-gain weights exp(0)/fanin
+    # (see _comonet_branch), so a small-scale init starts near a tame,
+    # roughly linear network.
+    params = 0.1 .* randn(rng, np)
 
-    # For concave activations (min(0,z)), biases must be initialized negatively
-    # so that pre-activations z = exp(W)*x + b can be negative.
-    # With b≈0 and x∈[0,1], z>0 always, so min(0,z)=0 (dead neurons).
-    # Also set output bias positive since hidden outputs are ≤ 0.
-    use_concave = a.constraint in (:concave, :inc_concave, :dec_concave)
-    if use_concave
+    # For the single-branch concave activations (-relu(-z)), biases must
+    # start negative so pre-activations can be negative (else min(0,z)=0:
+    # dead neurons); the output bias compensates.
+    if a.constraint in (:inc_concave, :dec_concave)
         idx = 1
         prev = 1
         for h in a.hidden_sizes
             n_w = prev * h
             idx += n_w  # skip weights
-            params[idx:idx+h-1] .= -1.0 .+ 0.1 .* randn(h)  # negative biases
+            params[idx:idx+h-1] .= -1.0 .+ 0.1 .* randn(rng, h)
             idx += h
             prev = h
         end
-        # Output bias: set positive to compensate for negative hidden outputs
         params[end] = 1.0
     end
 
