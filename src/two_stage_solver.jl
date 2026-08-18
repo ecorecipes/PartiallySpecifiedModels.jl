@@ -146,6 +146,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
                 du .= T_el(1e6)
             end
             for k in 1:n_vars
+                # Only observed states carry real targets; unobserved ones
+                # were filled with a constant state and zero derivative,
+                # and matching those fabricated values biases the fit.
+                k in observed_states || continue
                 loss_val += (dydt[i, k] - du[k])^2
             end
         end
