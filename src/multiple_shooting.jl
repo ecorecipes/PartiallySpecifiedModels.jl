@@ -435,7 +435,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
     u0 = prob.u0 isa Function ? prob.u0(p_opt) : prob.u0
 
     if prob.discrete
-        pred = Float64.(adam_simulate_discrete(prob, p_opt))
+        pred = Float64.(adam_simulate_discrete(prob, p_opt, Float64))
     else
         ode_fn = ODEFunction{true, SciMLBase.FullSpecialize}(
             (du, u, params, t) -> prob.dynamics!(du, u, params, t))

@@ -61,7 +61,7 @@ function LogDensityProblems.logdensity(ld::PSMLogDensity, theta)
     p = build_autodiff_param_struct(prob, beta)
 
     if prob.discrete
-        pred = adam_simulate_discrete(prob, p)
+        pred = adam_simulate_discrete(prob, p, T)
     else
         u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
         u0_T = T.(u0)
@@ -310,7 +310,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
 
     if prob.discrete
         p_ad = build_autodiff_param_struct(prob, map_beta)
-        pred = Float64.(adam_simulate_discrete(prob, p_ad))
+        pred = Float64.(adam_simulate_discrete(prob, p_ad, Float64))
     else
         u0 = prob.u0 isa Function ? prob.u0(p_opt) : prob.u0
         ode_prob = ODEProblem((du, u, params, t) -> prob.dynamics!(du, u, p_opt, t),

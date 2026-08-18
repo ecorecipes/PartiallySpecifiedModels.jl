@@ -7,7 +7,7 @@
 # For neural networks, we bypass Lux and use a lightweight MLP evaluator
 # that is fully compatible with ForwardDiff's Dual numbers.
 
-using LinearAlgebra: norm
+using LinearAlgebra: norm, dot
 using ForwardDiff
 
 # ─── ForwardDiff-compatible MLP ──────────────────────────────────
@@ -42,6 +42,14 @@ function mlp_spec_from_lux(model::Lux.Chain)
             n_params += n_in * n_out + n_out  # weights + bias
         end
     end
+    # Any parameterized non-Dense layer (Scale, SkipConnection, nested Chain…)
+    # would be counted by nparams() but skipped here, leaving its parameters
+    # silently untrained — refuse instead.
+    n_params == Lux.parameterlength(model) ||
+        error("AdamSolver's MLP evaluator supports Chains of Lux.Dense layers " *
+              "only; the given model has $(Lux.parameterlength(model)) " *
+              "parameters but its Dense layers account for $n_params. " *
+              "Restructure the network or use a different solver.")
     MLPSpec(layers, activations, n_params)
 end
 
@@ -158,12 +166,15 @@ end
 # ─── Loss functions ──────────────────────────────────────────────
 
 """
-    adam_simulate_discrete(prob, beta, p)
+    adam_simulate_discrete(prob, p, T)
 
-Discrete-time simulation for AdamSolver, compatible with ForwardDiff Dual numbers.
+Discrete-time simulation for AdamSolver, compatible with ForwardDiff Dual
+numbers. `T` is the state element type — pass `eltype(beta)` so Dual
+parameters propagate (the old trial-evaluation inference failed whenever the
+first state's derivative did not touch an approximator).
 Returns matrix of predictions at data_times (n_times × n_obs).
 """
-function adam_simulate_discrete(prob::PSMProblem, p)
+function adam_simulate_discrete(prob::PSMProblem, p, ::Type{T}) where {T}
     u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
 
     n_vars = length(u0)
@@ -184,19 +195,7 @@ function adam_simulate_discrete(prob::PSMProblem, p)
         push!(data_time_set[t_nearest], di)
     end
 
-    # Determine output element type by trial evaluation
-    # (dynamics may return Dual numbers when p contains Dual-typed evaluators)
-    u0_f = Float64.(u0)
-    u_trial = Vector{Any}(undef, n_vars)
-    u_trial .= 0.0
-    try
-        prob.dynamics!(u_trial, u0_f, p, t_start)
-    catch
-        u_trial .= u0_f
-    end
-    T = promote_type(eltype(u0), typeof(u_trial[1]))
-
-    # Allocate prediction matrix
+    # Allocate prediction matrix in the caller-supplied element type
     pred = zeros(T, n_times, n_obs)
 
     u = T.(u0)
@@ -230,12 +229,35 @@ function adam_simulate_discrete(prob::PSMProblem, p)
     pred
 end
 
-function adam_loss_mse(prob::PSMProblem, beta)
+"""
+    adam_penalty(prob, beta, w)
+
+Fixed quadratic smoothing penalty `w · Σₖ βₖ' Sₖ βₖ` over all approximators
+with a penalty matrix. Returns `zero(eltype(beta))` when `w == 0`.
+"""
+function adam_penalty(prob::PSMProblem, beta, w::Float64)
+    T = eltype(beta)
+    w == 0.0 && return zero(T)
+    pen = zero(T)
+    off = 0
+    for approx in prob.approximators
+        np = nparams(approx)
+        S = penalty_matrix(approx)
+        if S !== nothing
+            bk = @view beta[off+1:off+np]
+            pen += dot(bk, S * bk)
+        end
+        off += np
+    end
+    T(w) * pen
+end
+
+function adam_loss_mse(prob::PSMProblem, beta, penalty_w::Float64=0.0)
     p = build_autodiff_param_struct(prob, beta)
     T = eltype(beta)
 
     if prob.discrete
-        pred = adam_simulate_discrete(prob, p)
+        pred = adam_simulate_discrete(prob, p, T)
         loss = zero(T)
         n_obs = size(prob.data_values, 2)
         n_t = length(prob.data_times)
@@ -244,7 +266,7 @@ function adam_loss_mse(prob::PSMProblem, beta)
                 loss += prob.data_weights[i, j] * (pred[i, j] - prob.data_values[i, j])^2
             end
         end
-        return loss
+        return loss + adam_penalty(prob, beta, penalty_w)
     end
 
     u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
@@ -258,8 +280,9 @@ function adam_loss_mse(prob::PSMProblem, beta)
         ode_prob = ODEProblem(ode_fn, u0_T, prob.tspan, p)
         OrdinaryDiffEq.solve(ode_prob, prob.ode_solver;
                              saveat=prob.data_times,
-                             abstol=1e-7, reltol=1e-7,
-                             maxiters=10000)
+                             abstol=get(prob.ode_kwargs, :abstol, 1e-7),
+                             reltol=get(prob.ode_kwargs, :reltol, 1e-7),
+                             maxiters=get(prob.ode_kwargs, :maxiters, 10000))
     end
 
     if sol.retcode != :Success && sol.retcode != SciMLBase.ReturnCode.Success
@@ -277,15 +300,15 @@ function adam_loss_mse(prob::PSMProblem, beta)
             loss += prob.data_weights[i, j] * (pred - obs)^2
         end
     end
-    loss
+    loss + adam_penalty(prob, beta, penalty_w)
 end
 
-function adam_loss_poisson(prob::PSMProblem, beta)
+function adam_loss_poisson(prob::PSMProblem, beta, penalty_w::Float64=0.0)
     p = build_autodiff_param_struct(prob, beta)
     T = eltype(beta)
 
     if prob.discrete
-        pred = adam_simulate_discrete(prob, p)
+        pred = adam_simulate_discrete(prob, p, T)
         loss = zero(T)
         n_obs = size(prob.data_values, 2)
         n_t = length(prob.data_times)
@@ -293,10 +316,10 @@ function adam_loss_poisson(prob::PSMProblem, beta)
             for i in 1:n_t
                 mu = max(pred[i, j], T(1e-10))
                 y = prob.data_values[i, j]
-                loss -= y * log(mu) - mu
+                loss -= prob.data_weights[i, j] * (y * log(mu) - mu)
             end
         end
-        return loss
+        return loss + adam_penalty(prob, beta, penalty_w)
     end
 
     u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
@@ -310,8 +333,9 @@ function adam_loss_poisson(prob::PSMProblem, beta)
         ode_prob = ODEProblem(ode_fn, u0_T, prob.tspan, p)
         OrdinaryDiffEq.solve(ode_prob, prob.ode_solver;
                              saveat=prob.data_times,
-                             abstol=1e-7, reltol=1e-7,
-                             maxiters=10000)
+                             abstol=get(prob.ode_kwargs, :abstol, 1e-7),
+                             reltol=get(prob.ode_kwargs, :reltol, 1e-7),
+                             maxiters=get(prob.ode_kwargs, :maxiters, 10000))
     end
 
     if sol.retcode != :Success && sol.retcode != SciMLBase.ReturnCode.Success
@@ -326,10 +350,10 @@ function adam_loss_poisson(prob::PSMProblem, beta)
         for i in 1:min(n_t, length(sol.t))
             mu = max(sol[sk, i], T(1e-10))
             y = prob.data_values[i, j]
-            loss -= y * log(mu) - mu
+            loss -= prob.data_weights[i, j] * (y * log(mu) - mu)
         end
     end
-    loss
+    loss + adam_penalty(prob, beta, penalty_w)
 end
 
 # ─── Main Adam solver ────────────────────────────────────────────
@@ -375,11 +399,33 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
     end
     n_beta = length(beta)
 
-    # Select loss function
-    loss_fn = if alg.loss == :poisson
-        β -> adam_loss_poisson(prob, β)
+    # Select loss function. :auto follows prob.likelihood; an explicit
+    # choice is honored but warned about on mismatch.
+    loss_sym = alg.loss
+    if loss_sym == :auto
+        loss_sym = if prob.likelihood isa Gaussian
+            :mse
+        elseif prob.likelihood isa Poisson
+            :poisson
+        else
+            error("AdamSolver has no loss for $(typeof(prob.likelihood)); " *
+                  "it supports Gaussian (:mse) and Poisson (:poisson). " *
+                  "Use LAML for other likelihood families.")
+        end
     else
-        β -> adam_loss_mse(prob, β)
+        expected = prob.likelihood isa Poisson ? :poisson : :mse
+        if !(prob.likelihood isa Gaussian || prob.likelihood isa Poisson)
+            @warn "AdamSolver: prob.likelihood is $(typeof(prob.likelihood)), " *
+                  "which this solver cannot honor; fitting with loss=$loss_sym instead"
+        elseif loss_sym != expected
+            @warn "AdamSolver: loss=$loss_sym does not match " *
+                  "prob.likelihood=$(typeof(prob.likelihood)) (expected :$expected)"
+        end
+    end
+    loss_fn = if loss_sym == :poisson
+        β -> adam_loss_poisson(prob, β, alg.penalty_weight)
+    else
+        β -> adam_loss_mse(prob, β, alg.penalty_weight)
     end
 
     if verbose
@@ -438,8 +484,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
             println("  iter $iter: loss=$(round(loss_val, sigdigits=5)) lr=$(round(lr_t, sigdigits=3))")
         end
 
-        # Convergence: loss plateau
-        if iter > 60
+        # Convergence: loss plateau. A plateau at the 1e10 failure sentinel
+        # is a stuck solver, not convergence — keep iterating (the Adam
+        # moments may still walk out of the failing region).
+        if iter > 60 && best_loss < 1e9
             recent_min = minimum(loss_window)
             recent_max = maximum(loss_window)
             if (recent_max - recent_min) / max(abs(recent_min), 1.0) < 1e-4
@@ -461,7 +509,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
     u0 = prob.u0 isa Function ? prob.u0(p_opt) : prob.u0
 
     if prob.discrete
-        pred = adam_simulate_discrete(prob, p_opt)
+        pred = adam_simulate_discrete(prob, p_opt, Float64)
         pred = Float64.(pred)
     elseif !isempty(prob.delays)
         sol_dde = adam_solve_dde_final(prob, p_opt, Float64.(u0))

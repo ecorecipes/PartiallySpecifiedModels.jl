@@ -823,7 +823,8 @@ GradientMatching(; maxiters::Int=500, tol::Float64=1e-6, verbose::Bool=false,
     GradientMatching(maxiters, tol, verbose, sigma2_init, lr, refine_iters)
 
 """
-    AdamSolver(; maxiters=300, lr=0.01, verbose=false, loss=:mse, autodiff=true)
+    AdamSolver(; maxiters=300, lr=0.01, verbose=false, loss=:auto,
+                 penalty_weight=0.0, autodiff=true)
 
 Adam optimizer that trains unknown function parameters through ODE integration.
 
@@ -836,11 +837,21 @@ For B-splines and GPs: also supported, uses the standard evaluators.
 The loss function computes `solve(ODEProblem(...), solver)` at each step and
 compares with data. ForwardDiff computes exact gradients through the ODE solve.
 
+Unlike `LAML`/`GCVSolver`, this solver performs no automatic smoothing-parameter
+selection: with the default `penalty_weight = 0` the fit is *unpenalized*
+(spline coefficients are free). Set `penalty_weight > 0` to add the fixed
+quadratic roughness penalty `penalty_weight · Σₖ βₖ' Sₖ βₖ` to the loss.
+
 # Arguments
 - `maxiters::Int=300`: maximum Adam iterations
 - `lr::Float64=0.01`: learning rate (with cosine annealing)
 - `verbose::Bool=false`: print iteration details
-- `loss::Symbol=:mse`: loss function (:mse or :poisson)
+- `loss::Symbol=:auto`: loss function; `:auto` selects `:mse` for `Gaussian`
+  and `:poisson` for `Poisson` likelihoods (other families are not supported
+  by this solver — use `LAML`). Explicit `:mse`/`:poisson` override with a
+  warning on mismatch.
+- `penalty_weight::Float64=0.0`: fixed weight of the quadratic smoothing
+  penalty added to the loss (0 disables)
 - `autodiff::Bool=true`: use ForwardDiff (true) or finite differences (false)
 """
 struct AdamSolver
@@ -848,12 +859,14 @@ struct AdamSolver
     lr::Float64
     verbose::Bool
     loss::Symbol
+    penalty_weight::Float64
     autodiff::Bool
 end
 
 AdamSolver(; maxiters::Int=300, lr::Float64=0.01, verbose::Bool=false,
-             loss::Symbol=:mse, autodiff::Bool=true) =
-    AdamSolver(maxiters, lr, verbose, loss, autodiff)
+             loss::Symbol=:auto, penalty_weight::Float64=0.0,
+             autodiff::Bool=true) =
+    AdamSolver(maxiters, lr, verbose, loss, penalty_weight, autodiff)
 
 """
     MultipleShootingSolver(; n_intervals=10, maxiters_inner=100, maxiters_outer=20,
