@@ -1604,6 +1604,26 @@ using OrdinaryDiffEq
             @test all(isfinite, wi)
         end
 
+        @testset "irls_weights match -d²ℓ/dμ² (regression: info sign)" begin
+            using PartiallySpecifiedModels: irls_weights, log_likelihood
+            # Central finite differences of the exact log-density in μ must
+            # reproduce the analytic information used as the IRLS weight,
+            # including at ξ < 0 where the old (1 + ξλ - λ²) formula went
+            # negative and was clamped to 1e-10.
+            fam = TruncatedNormal(sigma=1.0, lower=0.0)
+            h = 1e-4
+            for μ in (-1.0, 0.3, 1.0, 2.5)   # ξ = μ/σ spans negative and positive
+                y = [max(μ, 0.1) + 0.2]      # any y ≥ lower; info is y-free
+                ll(m) = log_likelihood(fam, y, [m], [1.0])
+                fd_info = -(ll(μ + h) - 2ll(μ) + ll(μ - h)) / h^2
+                wi = irls_weights(fam, y, [μ], [1.0])[1]
+                # rtol accommodates FD truncation + _normcdf approximation error;
+                # the old sign-flipped formula was off by 2× to ∞ here.
+                @test isapprox(wi, fd_info; rtol=1e-3)
+                @test 0.0 < wi < 1.0 / fam.sigma^2 + 1e-12  # I(μ) ∈ (0, 1/σ²)
+            end
+        end
+
         @testset "LAML solver with TruncatedNormal" begin
             Random.seed!(99)
             function sir_tn!(du, u, p, t)

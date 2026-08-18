@@ -162,10 +162,12 @@ end
 
 function irls_weights(fam::TruncatedNormal, y::AbstractVector,
                       mu::AbstractVector, w::AbstractVector)
-    # For TruncatedNormal(a, σ), the Fisher information is:
-    #   I(μ) = (1/σ²)(1 + ξ·λ(ξ) - λ(ξ)²)
-    # where ξ = (μ-a)/σ, λ(ξ) = φ(ξ)/Φ(ξ) (inverse Mills ratio).
-    # Working weight: W̃ = w × I(μ) = w × (-∂²ℓ/∂μ²)
+    # For TruncatedNormal(a, σ), the observed (= Fisher) information is:
+    #   I(μ) = (1/σ²)(1 - ξ·λ(ξ) - λ(ξ)²)
+    # where ξ = (μ-a)/σ, λ(ξ) = φ(ξ)/Φ(ξ) (inverse Mills ratio), from
+    # -∂²ℓ/∂μ² = (1 + λ'(ξ))/σ² with λ'(ξ) = -ξλ - λ².
+    # Analytically I(μ) ∈ (0, 1/σ²); the floor guards roundoff at ξ ≪ 0.
+    # Working weight: W̃ = w × I(μ)
     σ = fam.sigma
     a = fam.lower
     wt = similar(w)
@@ -173,7 +175,7 @@ function irls_weights(fam::TruncatedNormal, y::AbstractVector,
         ξ = (mu[i] - a) / σ
         Φξ = max(_normcdf(ξ), 1e-15)
         λξ = _normpdf(ξ) / Φξ          # inverse Mills ratio
-        info = (1.0 + ξ * λξ - λξ^2) / σ^2
+        info = (1.0 - ξ * λξ - λξ^2) / σ^2
         wt[i] = w[i] * max(info, 1e-10)
     end
     wt
