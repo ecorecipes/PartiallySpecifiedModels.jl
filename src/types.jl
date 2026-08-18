@@ -374,9 +374,14 @@ end
 
 function initial_params(a::ShapeConstrainedSPDEApproximator)
     beta_target = Float64[a.initial_func(x) for x in a.mesh_points]
-    ν = a.Sigma \ beta_target
-    ν = max.(ν, 0.01)
-    return [v > 20.0 ? v : log(exp(v) - 1.0) for v in ν]
+    d = a.Sigma \ beta_target
+    lin = _linear_param_indices(a.constraint)
+    # Free (linear) components pass through; nonnegative ones get a small
+    # positive floor (large floors visibly distorted flat initial functions
+    # into ramps) and are inverted through softplus.
+    return [i in lin ? d[i] :
+            (v = max(d[i], 1e-4); v > 20.0 ? v : log(exp(v) - 1.0))
+            for i in eachindex(d)]
 end
 
 # ─── Shape-constrained B-spline approximator ──────────────────────
@@ -408,7 +413,10 @@ Supported shape constraints for B-spline approximators.
 - `:inc_zero_right` — increasing with f(x_max) = 0
 - `:dec_zero_left`  — decreasing with f(x_min) = 0
 
-Note: `:increasing` already implies f(x) > 0 since softplus increments are positive.
+Note: following Pya & Wood (2015), the monotone and combined
+monotone/curvature constraints carry a *free* level parameter (β₁ = γ₁),
+so e.g. an `:increasing` function may cross zero; use `:positive` or
+`:dec_positive` when positivity itself is required.
 """
 const SHAPE_CONSTRAINTS = (
     :increasing, :decreasing, :convex, :concave,
@@ -501,9 +509,10 @@ function initial_params(a::ShapeConstrainedBSplineApproximator)
     d = a.Sigma \ beta_target
     lin = _linear_param_indices(a.constraint)
     # Linear (free) components pass through unchanged; nonnegative components
-    # are clamped positive and inverted through softplus.
+    # get a small positive floor (a large floor turned flat initial functions
+    # into visible ramps) and are inverted through softplus.
     return [i in lin ? d[i] :
-            (v = max(d[i], 0.01); v > 20.0 ? v : log(exp(v) - 1.0))
+            (v = max(d[i], 1e-4); v > 20.0 ? v : log(exp(v) - 1.0))
             for i in eachindex(d)]
 end
 
