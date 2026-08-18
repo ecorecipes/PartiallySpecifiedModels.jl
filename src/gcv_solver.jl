@@ -186,6 +186,72 @@ function _grid_then_refine_gcv(J::AbstractMatrix, W_irls::AbstractVector,
     end
 end
 
+"""
+    _coordinate_gcv(J, W_irls, z, S_list, offsets, nknots_list, n_p, n,
+                    gamma, rho0, tol; sweeps=3)
+
+Per-approximator GCV: coordinate descent over the vector ρ, minimizing each
+component by golden section while the others are held fixed. Wood (2001)
+treats λ as a VECTOR with one smoothing parameter per unknown function
+(as does ddefit's gcv.c); a single shared λ mis-smooths whenever the
+functions differ in scale or wiggliness. Started from the shared-λ optimum,
+2–3 sweeps typically converge.
+"""
+function _coordinate_gcv(J::AbstractMatrix, W_irls::AbstractVector,
+                         z::AbstractVector,
+                         S_list::Vector{Matrix{Float64}},
+                         offsets::Vector{Int}, nknots_list::Vector{Int},
+                         n_p::Int, n::Int, gamma::Float64,
+                         rho0::Vector{Float64}, tol::Float64;
+                         sweeps::Int=3)
+    m = length(S_list)
+    rho = copy(rho0)
+    gr = (sqrt(5.0) + 1.0) / 2.0
+
+    eval_vec = function (rv)
+        S_lam = build_S_lambda(S_list, offsets, nknots_list, rv, n_p)
+        _gcv_score(J, W_irls, z, S_lam, n, gamma)
+    end
+
+    best_gcv, best_beta, _, best_trA = eval_vec(rho)
+    for _ in 1:sweeps
+        improved = false
+        for k in 1:m
+            a, b = RHO_MIN, RHO_MAX
+            c = b - (b - a) / gr
+            d = a + (b - a) / gr
+            rc = copy(rho); rc[k] = c
+            rd = copy(rho); rd[k] = d
+            gc_, _, _, _ = eval_vec(rc)
+            gd_, _, _, _ = eval_vec(rd)
+            for _ in 1:60
+                abs(b - a) < tol && break
+                if gc_ < gd_
+                    b, d, gd_ = d, c, gc_
+                    c = b - (b - a) / gr
+                    rc[k] = c
+                    gc_, _, _, _ = eval_vec(rc)
+                else
+                    a, c, gc_ = c, d, gd_
+                    d = a + (b - a) / gr
+                    rd[k] = d
+                    gd_, _, _, _ = eval_vec(rd)
+                end
+            end
+            rho_k_new = (a + b) / 2
+            rtrial = copy(rho); rtrial[k] = rho_k_new
+            g_new, beta_new, _, trA_new = eval_vec(rtrial)
+            if g_new < best_gcv - 1e-12
+                rho = rtrial
+                best_gcv, best_beta, best_trA = g_new, beta_new, trA_new
+                improved = true
+            end
+        end
+        improved || break
+    end
+    rho, best_beta, best_gcv, best_trA
+end
+
 # ─── Main GCV solve function ─────────────────────────────────────
 
 """
@@ -338,12 +404,22 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
                 n_p, n_data, gamma,
                 n_grid, tol)
 
-            # Convert shared rho to per-approximator theta
-            theta .= exp(best_rho)
+            if m == 1
+                theta .= exp(best_rho)
+            else
+                # Per-approximator λ (Wood 2001 treats λ as a vector):
+                # refine each component by coordinate descent from the
+                # shared-λ optimum.
+                rho_vec, beta_gcv, gcv_val, trA = _coordinate_gcv(
+                    J, w_irls, z_pseudo,
+                    S_list, uf_offsets, uf_nk,
+                    n_p, n_data, gamma,
+                    fill(best_rho, m), tol)
+                theta .= exp.(rho_vec)
+            end
 
             if verbose && (iter <= 4 || iter % 10 == 0)
-                println("  GCV iter $iter: ρ=$(round(best_rho, digits=3)), " *
-                        "λ=$(round(exp(best_rho), sigdigits=4)), " *
+                println("  GCV iter $iter: λ=$(round.(theta, sigdigits=4)), " *
                         "GCV=$(round(gcv_val, sigdigits=6)), " *
                         "tr(A)=$(round(trA, digits=2))")
             end
