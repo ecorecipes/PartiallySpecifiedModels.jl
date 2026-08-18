@@ -114,11 +114,18 @@ function _compute_elbo(prob::PSMProblem, mu, log_sigma, Λ, logdetΛ,
 
         pred = try
             _variational_simulate(prob, theta_s)
-        catch
+        catch e
+            _is_program_error(e) && rethrow()
             nothing
         end
 
         if pred === nothing
+            # A failed simulation is a draw of effectively zero likelihood.
+            # Averaging only over the successes would bias the ELBO toward
+            # the non-failing region and hide infeasible posterior mass, so
+            # count the failure with a large finite log-likelihood penalty.
+            avg_ll += T(-1e8)
+            n_valid += 1
             continue
         end
 

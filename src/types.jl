@@ -939,13 +939,17 @@ MultipleShootingSolver(; n_intervals::Int=10, maxiters_inner::Int=100,
     AdaptiveGradientMatching(; maxiters=200, verbose=false, gamma_init=1.0,
                                fit_gamma=true, kernel=:rbf)
 
-Adaptive Gradient Matching solver following Dondelinger et al. (2013) and the
-deGradInfer R package. Uses Gaussian processes to smooth data and compute
-gradient estimates with uncertainty, then matches ODE-predicted gradients
-using a "product of experts" formulation.
+Adaptive Gradient Matching solver using the product-of-experts objective of
+Dondelinger et al. (2013). Gaussian processes smooth the data and supply
+gradient estimates with uncertainty; the ODE-predicted gradients are matched
+under the product-of-experts likelihood.
 
-For partially specified models, the unknown function coefficients are optimized
-jointly with the mismatch parameter γ via L-BFGS.
+**This is a MAP variant of the cited method**: GP hyperparameters are chosen
+by a marginal-likelihood grid search, the latent states are fixed at the GP
+posterior mean given the data, and (β, log γ) are optimized once by L-BFGS.
+The tempered population-MCMC sampler of Dondelinger et al./deGradInfer
+(which samples states, hyperparameters, and γ) is not implemented — no
+posterior samples are produced.
 
 The loss function for each state k is:
     L_k = -0.5 (f_k - m_k)ᵀ (A_k + γ_k I)⁻¹ (f_k - m_k) - 0.5 log|A_k + γ_k I|
@@ -1054,8 +1058,8 @@ MCMCSolver(; n_samples::Int=1000, n_warmup::Int=500, n_chains::Int=1,
 
 """
     MagiSolver(; n_samples=1000, n_warmup=500, n_deriv=3, n_gridpoints=200,
-                 sigma=nothing, obs_var=0.01, target_accept=0.8,
-                 prior_scale=1.0, verbose=false)
+                 sigma=nothing, obs_var=nothing, target_accept=0.8,
+                 prior_scale=1.0, preoptimize=true, verbose=false)
 
 Manifold-constrained Gaussian process inference (MAGI) for ODE systems.
 
@@ -1073,12 +1077,19 @@ Returns an `MCMCChains.Chains` object with posterior samples.
 # Fields
 - `n_samples`: number of posterior samples after warmup
 - `n_warmup`: warmup/adaptation iterations
-- `n_deriv`: derivatives in IBM prior (2 or 3)
-- `n_gridpoints`: number of time discretization points for Kalman filter
-- `sigma`: IBM scale per state (auto-estimated if `nothing`)
-- `obs_var`: observation noise variance
+- `n_deriv`: retained for interface compatibility (the Matérn-3/2 GP prior
+  is once mean-square differentiable; this field is not used by the GP)
+- `n_gridpoints`: number of discretization grid points for the GP/manifold
+  constraint
+- `sigma`: GP marginal-variance scale per state (auto-estimated if `nothing`)
+- `obs_var`: observation noise variance; `nothing` (default) estimates it
+  from the data via the second-difference estimator Var(Δ²y) = 6σ²
+  (a fixed scale-blind default distorted the posterior whenever the
+  data's units differed from O(0.1))
 - `target_accept`: NUTS target acceptance rate
 - `prior_scale`: scale for Gaussian prior on parameters
+- `preoptimize`: run a short MAP pre-optimization to initialize the
+  sampler (default `true`)
 - `verbose`: print progress
 
 # References
@@ -1091,7 +1102,7 @@ struct MagiSolver
     n_deriv::Int
     n_gridpoints::Int
     sigma::Union{Nothing, Vector{Float64}}
-    obs_var::Float64
+    obs_var::Union{Nothing, Float64}
     target_accept::Float64
     prior_scale::Float64
     preoptimize::Bool
@@ -1101,7 +1112,7 @@ end
 MagiSolver(; n_samples::Int=1000, n_warmup::Int=500, n_deriv::Int=3,
              n_gridpoints::Int=200,
              sigma::Union{Nothing, Vector{Float64}}=nothing,
-             obs_var::Float64=0.01,
+             obs_var::Union{Nothing, Float64}=nothing,
              target_accept::Float64=0.8, prior_scale::Float64=1.0,
              preoptimize::Bool=true, verbose::Bool=false) =
     MagiSolver(n_samples, n_warmup, n_deriv, n_gridpoints, sigma, obs_var,
@@ -1112,11 +1123,20 @@ MagiSolver(; n_samples::Int=1000, n_warmup::Int=500, n_deriv::Int=3,
 """
     BNGSolver
 
-Bayesian Neural Gradient matching solver (Bonnaffé et al. 2023).
+Gradient-matching solver in the style of Bonnaffé & Coulson (2023)'s
+neural gradient matching.
 
 Two-step approach that avoids ODE integration entirely:
 1. Smooth observed time series to get interpolated states and derivatives
 2. Fit unknown functions by matching the smoothed derivatives
+
+**Scope**: this is a deterministic point-estimate implementation of the
+smooth-then-match loss. The *Bayesian* machinery of the cited paper —
+K_o × K_p ensembles of repeated fits, variance-marginalized posterior
+regularization, and the per-capita-growth-rate process model — is not
+implemented, so no uncertainty quantification is produced. For a
+Bayesian gradient-matching posterior use `MagiSolver` or `MCMCSolver`;
+for uncertainty on this solver's output use `bootstrap`.
 
 # Fields
 - `n_basis`: number of spline basis functions for data smoothing (default 20)
@@ -1359,11 +1379,19 @@ Likelihood-free inference using simulation-based rejection sampling with
 adaptive tolerance scheduling. Works for any simulator, including those
 where the likelihood is intractable.
 
+**Prior**: the prior over every coefficient is a *uniform box* of
+half-width `prior_scale` centered on the approximators' initial values —
+there is no smoothness structure (unlike the GMRF priors of `MCMCSolver`/
+`VariationalSolver`), so the reported posterior depends on the
+initialization and on `prior_scale`. Choose `prior_scale` generously and
+treat the output as approximate.
+
 # Fields
 - `n_particles`: number of ABC particles (default 500)
 - `n_generations`: number of SMC generations (default 10)
 - `summary_fn`: summary statistic function, or `:auto` for MSE-based (default `:auto`)
-- `prior_scale`: prior half-width on parameters (default 2.0)
+- `prior_scale`: half-width of the uniform box prior around the initial
+  coefficient values (default 2.0)
 - `quantile_eps`: quantile for tolerance schedule (default 0.5)
 - `verbose`: print progress
 """
@@ -1486,15 +1514,16 @@ EnsembleKalmanSolver(; n_ensemble::Int=50, n_iterations::Int=30,
 """
     ODINSolver
 
-ODE-Informed regression (Wenk & Abbati 2020): GP smoothing with an
-ODE-informed mean function.
+Gradient matching with the ODIN-style Mahalanobis risk (Wenk, Abbati
+et al. 2020): the ODE mismatch is weighted by the GP's conditional
+derivative covariance, so poorly-determined derivative directions carry
+less weight.
 
-Fits a Gaussian process to each state, then iterates between:
-1. GP hyper-parameter optimisation (marginal likelihood)
-2. ODE parameter optimisation (penalised ODE mismatch on GP mean)
-
-Tighter ODE coupling than AdaptiveGradientMatching because the ODE
-residual enters the GP's marginal likelihood directly.
+**Scope**: this is a one-shot variant. The GP hyperparameters are set by
+the user (`gp_lengthscale`, `gp_variance`) and the states are held at the
+GP posterior mean; ODIN's defining *joint* optimisation over states, ODE
+parameters, and GP hyperparameters is not implemented. The adaptive
+weighting is therefore only as good as the supplied hyperparameters.
 
 # Fields
 - `maxiters`: outer EM iterations (default 50)
@@ -1534,6 +1563,11 @@ kernel (default: squared-exponential) and xᵢ are representative points.
 Solves a penalised least-squares problem with an RKHS norm penalty
 ‖f‖² = α' K α, yielding a kernel ridge regression-like estimator within
 the ODE fitting loop.
+
+Note this kernelizes the *unknown function* — a different design from the
+RKHS gradient-matching literature (González et al. 2014; Niu et al. 2016),
+which places the state *trajectory* x(t) in the RKHS. The penalty idea is
+shared; the estimator is not the cited papers' method.
 
 # Fields
 - `kernel`: kernel type `:rbf`, `:matern32`, `:matern52` (default `:rbf`)

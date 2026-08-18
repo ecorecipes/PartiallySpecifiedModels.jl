@@ -49,14 +49,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
     dydt = zeros(n_times, n_vars)
     observed_states = Set{Int}()
 
+    # Penalized GCV smoother: an interpolating spline evaluated at its own
+    # knots is a no-op, and differentiating an interpolant AMPLIFIES the
+    # observation noise the smoothing stage exists to suppress.
     if prob.discrete
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             push!(observed_states, sk)
-            itp = CubicSpline(prob.data_values[:, j], times;
-                              extrapolation=ExtrapolationType.Extension)
+            sval, _ = _smoothing_spline(times, Float64.(prob.data_values[:, j]))
             for i in 1:n_times
-                y_smooth[i, sk] = itp(times[i])
+                y_smooth[i, sk] = sval(times[i])
             end
         end
         for k in 1:n_vars
@@ -69,11 +71,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             push!(observed_states, sk)
-            itp = CubicSpline(prob.data_values[:, j], times;
-                              extrapolation=ExtrapolationType.Extension)
+            sval, sder = _smoothing_spline(times, Float64.(prob.data_values[:, j]))
             for i in 1:n_times
-                y_smooth[i, sk] = itp(times[i])
-                dydt[i, sk] = DataInterpolations.derivative(itp, times[i])
+                y_smooth[i, sk] = sval(times[i])
+                dydt[i, sk] = sder(times[i])
             end
         end
     end

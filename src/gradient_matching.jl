@@ -209,19 +209,14 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
         # For discrete models, smooth data first (just like continuous) then
         # use smoothed next-state values as matching targets.
         # Without smoothing, noisy data→noisy targets produces poor recovery.
-        y_raw = zeros(T_pts, K)
-        for j in 1:n_obs
-            sk = prob.obs_to_state[j]
-            y_raw[:, sk] .= prob.data_values[:, j]
-        end
-        # Smooth each observed state with a cubic spline
+        # (An interpolating spline evaluated at its own knots returns the raw
+        # data — a no-op; use the genuine penalized GCV smoother.)
         y_smooth = zeros(T_pts, K)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
-            itp = CubicSpline(prob.data_values[:, j], times;
-                              extrapolation=ExtrapolationType.Extension)
+            sval, _ = _smoothing_spline(times, Float64.(prob.data_values[:, j]))
             for i in 1:T_pts
-                y_smooth[i, sk] = itp(times[i])
+                y_smooth[i, sk] = sval(times[i])
             end
         end
         # Target: smoothed next-state value u[t+1] = f(u[t], p, t)
@@ -269,6 +264,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
                 idx = (k - 1) * n_match + i
                 w[idx] = 1.0 / scale_k^2
             end
+        end
+    end
+    # Unobserved states carry fabricated targets (constant state, zero
+    # derivative); including them would push the unknown functions to zero
+    # the RHS along a fictitious trajectory. Zero their weights so both the
+    # loss and the Gauss-Newton residuals ignore them.
+    obs_set = Set(prob.obs_to_state)
+    for k in 1:K
+        k in obs_set && continue
+        for i in 1:n_match
+            w[(k - 1) * n_match + i] = 0.0
         end
     end
 

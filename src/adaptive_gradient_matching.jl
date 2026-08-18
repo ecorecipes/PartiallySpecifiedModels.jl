@@ -100,28 +100,33 @@ function optimize_gp_hyperparams(times::Vector{Float64}, y::Vector{Float64},
     best_σn² = 0.01 * y_var
     best_nll = Inf
 
-    # Grid search over lengthscales and noise levels
+    # Grid search over lengthscale, signal variance, and noise level
+    # (all three are optimized against the marginal likelihood; σ² was
+    # previously pinned at var(y) despite the docstring saying otherwise)
     for ℓ_frac in [0.05, 0.1, 0.15, 0.2, 0.3, 0.5]
         ℓ_try = time_span * ℓ_frac
-        for σn_frac in [1e-4, 1e-3, 1e-2, 5e-2, 0.1]
-            σn²_try = σn_frac * y_var
-            K, _, _ = if kernel == :matern32
-                matern32_kernel_with_derivs(times, y_var, ℓ_try)
-            else
-                rbf_kernel_with_derivs(times, y_var, ℓ_try)
-            end
-            Ky = K + σn²_try * I(n)
-            try
-                C = cholesky(Symmetric(Ky))
-                α = C \ y
-                nll = 0.5 * dot(y, α) + 0.5 * logdet(C) + 0.5 * n * log(2π)
-                if nll < best_nll
-                    best_nll = nll
-                    best_σ² = y_var
-                    best_ℓ = ℓ_try
-                    best_σn² = σn²_try
+        for σ_mult in [0.5, 1.0, 2.0]
+            σ²_try = σ_mult * y_var
+            for σn_frac in [1e-4, 1e-3, 1e-2, 5e-2, 0.1]
+                σn²_try = σn_frac * y_var
+                K, _, _ = if kernel == :matern32
+                    matern32_kernel_with_derivs(times, σ²_try, ℓ_try)
+                else
+                    rbf_kernel_with_derivs(times, σ²_try, ℓ_try)
                 end
-            catch
+                Ky = K + σn²_try * I(n)
+                try
+                    C = cholesky(Symmetric(Ky))
+                    α = C \ y
+                    nll = 0.5 * dot(y, α) + 0.5 * logdet(C) + 0.5 * n * log(2π)
+                    if nll < best_nll
+                        best_nll = nll
+                        best_σ² = σ²_try
+                        best_ℓ = ℓ_try
+                        best_σn² = σn²_try
+                    end
+                catch
+                end
             end
         end
     end

@@ -27,8 +27,10 @@ to the model right-hand side.
 3. Reconstruct trajectories from the fitted spline coefficients.
 
 # References
-- Niu et al. (2016), "Fast Parameter Inference in Nonlinear Dynamical
-  Systems using Iterative Gradient Matching", ICML.
+- Bonnaffé & Coulson (2023), "Fast fitting of neural ordinary differential
+  equations by Bayesian neural gradient matching...", Methods Ecol Evol 14
+  (loss structure; see the BNGSolver docstring for what is and is not
+  implemented from that paper).
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
@@ -142,6 +144,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
                 du .= T_el(1e6)
             end
             for k in 1:n_vars
+                # Match only observed states (unobserved targets are
+                # fabricated constants — see two_stage_solver.jl).
+                k in observed_states || continue
                 loss_val += (dydt[i, k] - du[k])^2
             end
         end

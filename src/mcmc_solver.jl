@@ -81,25 +81,29 @@ function LogDensityProblems.logdensity(ld::PSMLogDensity, theta)
         n_obs = size(prob.data_values, 2)
     end
 
-    # Gaussian log-likelihood (accumulate as scalar to preserve Dual type)
+    # Gaussian log-likelihood (accumulate as scalar to preserve Dual type).
+    # The normalizer counts only weight-carrying finite observations: a
+    # zero weight encodes a masked/missing point, and counting it in n_data
+    # biases the estimated σ² low; NaN data are skipped consistently.
     n_t = size(prob.data_values, 1)
     n_obs = size(prob.data_values, 2)
-    n_data = n_t * n_obs
-    ll = T(-0.5) * n_data * log(T(2π) * sigma2)
+    ll = zero(T)
+    n_eff = 0
     for j in 1:n_obs
-        if !prob.discrete
-            sk = prob.obs_to_state[j]
-        end
         for i in 1:n_t
             w = prob.data_weights[i, j]
+            y = prob.data_values[i, j]
+            (w > 0 && !isnan(y)) || continue
+            n_eff += 1
             pred_ij = if prob.discrete
                 pred[i, j]
             else
                 i <= length(sol.t) ? sol[prob.obs_to_state[j], i] : T(0)
             end
-            ll -= T(0.5) * w * (pred_ij - T(prob.data_values[i, j]))^2 / sigma2
+            ll -= T(0.5) * w * (pred_ij - T(y))^2 / sigma2
         end
     end
+    ll -= T(0.5) * n_eff * log(T(2π) * sigma2)
 
     # --- Log-prior: penalty (Gaussian GMRF prior) + broad prior ---
     # The roughness penalty is the prior precision λS/σ²; the prior is
@@ -124,7 +128,9 @@ function LogDensityProblems.logdensity(ld::PSMLogDensity, theta)
     # Broad Gaussian prior on all params
     lp -= T(0.5) * sum(beta .^ 2) / T(100.0 * ld.prior_scale)
 
-    # Jeffrey's prior on sigma via log transform
+    # Sampling s = log σ with a FLAT prior on σ: the +log σ term is the
+    # log-transform Jacobian |dσ/ds| = σ. (A Jeffreys prior p(σ) ∝ 1/σ
+    # would contribute no term in log-σ space.)
     if log_sigma !== nothing
         lp += log_sigma
     end
@@ -271,33 +277,41 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     # draws could include iterations taken while step size and mass matrix
     # were still adapting (not valid posterior samples).
     # Suppress AdvancedHMC "Verbosity toggle: max_iters" warnings
-    chain_raw = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
-        AbstractMCMC.sample(
-            ld_ad, nuts, alg.n_warmup + alg.n_samples;
-            n_adapts=alg.n_warmup,
-            initial_params=theta0,
-            progress=verbose, verbose=false)
+    n_ch = max(alg.n_chains, 1)
+    all_samples = zeros(alg.n_samples, D, n_ch)
+    for c in 1:n_ch
+        # Overdisperse the later chains' starts slightly so R̂-style
+        # diagnostics on the returned Chains object are meaningful.
+        θ0c = c == 1 ? theta0 : theta0 .+ 0.1 .* randn(length(theta0))
+        chain_raw = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+            AbstractMCMC.sample(
+                ld_ad, nuts, alg.n_warmup + alg.n_samples;
+                n_adapts=alg.n_warmup,
+                initial_params=θ0c,
+                progress=verbose, verbose=false)
+        end
+        # Extract samples (drop warmup)
+        start_idx = alg.n_warmup + 1
+        for (idx, i) in enumerate(start_idx:length(chain_raw))
+            all_samples[idx, :, c] .= chain_raw[i].z.θ
+        end
     end
+    # Pool chains for point estimates
+    sample_matrix = reshape(permutedims(all_samples, (1, 3, 2)),
+                            alg.n_samples * n_ch, D)
 
-    # Extract samples as matrix (drop warmup)
-    n_total = length(chain_raw)
-    start_idx = alg.n_warmup + 1
-    sample_matrix = zeros(alg.n_samples, D)
-    for (idx, i) in enumerate(start_idx:n_total)
-        sample_matrix[idx, :] .= chain_raw[i].z.θ
-    end
-
-    # Build MCMCChains.Chains object
+    # Build MCMCChains.Chains object (iterations × params × chains)
     pnames = _param_names(prob, estimate_sigma;
                           sample_smoothing=alg.sample_smoothing)
-    chain = MCMCChains.Chains(sample_matrix, pnames)
+    chain = MCMCChains.Chains(all_samples, pnames)
 
     if verbose
-        println("  Chain size: $(size(sample_matrix))")
+        println("  Chain size: $(size(all_samples))")
     end
 
-    # MAP estimate = sample with highest log-posterior
-    logp_values = [LogDensityProblems.logdensity(ld, sample_matrix[i, :]) for i in 1:alg.n_samples]
+    # MAP estimate = pooled sample with highest log-posterior
+    logp_values = [LogDensityProblems.logdensity(ld, sample_matrix[i, :])
+                   for i in 1:size(sample_matrix, 1)]
     map_idx = argmax(logp_values)
     map_theta = sample_matrix[map_idx, :]
     map_beta = map_theta[1:n_beta]

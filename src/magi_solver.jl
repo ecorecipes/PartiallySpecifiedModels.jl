@@ -265,6 +265,26 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
         push!(obs_indices, idx)
     end
 
+    # ── Observation noise variance ──
+    # If unspecified, estimate per observed column with the second-difference
+    # estimator Var(Δ²y) = 6σ² (exact for locally-linear signal + iid noise)
+    # and average across columns. A fixed default is scale-blind: with data
+    # in units ≫ 0.1 it made the data term overwhelm the GP and manifold
+    # terms, silently distorting the posterior.
+    obs_var = alg.obs_var
+    if obs_var === nothing
+        ests = Float64[]
+        for j in 1:size(prob.data_values, 2)
+            y = Float64.(prob.data_values[:, j])
+            y = y[.!isnan.(y)]
+            length(y) >= 4 || continue
+            d2 = diff(diff(y))
+            push!(ests, max(sum(abs2, d2) / (6 * length(d2)), 1e-10))
+        end
+        obs_var = isempty(ests) ? 0.01 : Statistics.mean(ests)
+        verbose && println("MAGI: estimated obs_var = $(round(obs_var, sigdigits=3))")
+    end
+
     # ── GP hyperparameters and precomputed matrices per component ──
     data_times = Float64.(prob.data_times)
     Cinv = Vector{Matrix{Float64}}(undef, n_vars)
@@ -281,7 +301,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
             yobs = Float64.(prob.data_values[:, ocol])
             keep = .!isnan.(yobs)
             td = data_times[keep]; yv = yobs[keep]
-            ℓ, σ2 = _magi_fit_hyperparams(td, yv, alg.obs_var)
+            ℓ, σ2 = _magi_fit_hyperparams(td, yv, obs_var)
             ybar = Statistics.mean(yv)
             for i in 1:n_grid
                 Xinit[i, d] = _magi_linear_interp(td, yv, grid_times[i])
@@ -314,7 +334,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     end
     v0 = vcat(theta0, vec(Xinit))
 
-    ld = MAGILogDensity(prob, grid_times, obs_indices, alg.obs_var, alg.prior_scale,
+    ld = MAGILogDensity(prob, grid_times, obs_indices, obs_var, alg.prior_scale,
                         n_vars, n_grid, n_params, Cinv, mmap, Kstar_inv, μ)
 
     ld_ad = LogDensityProblemsAD.ADgradient(Val(:ForwardDiff), ld)
@@ -363,7 +383,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     end
     chains = MCMCChains.Chains(sample_matrix, Symbol.(param_names))
 
-    map_beta = vec(Statistics.mean(sample_matrix, dims=1))
+    # Posterior mean of the pooled draws (a point summary; not a MAP)
+    posterior_mean_beta = vec(Statistics.mean(sample_matrix, dims=1))
+    map_beta = posterior_mean_beta  # retained name for downstream code
     uf_evals = Dict{Symbol, Any}()
     offset = 0
     for approx in prob.approximators
