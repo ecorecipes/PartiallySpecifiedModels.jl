@@ -342,7 +342,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     n_total = alg.n_warmup + alg.n_samples
     nuts = AdvancedHMC.NUTS(alg.target_accept)
     verbose && println("MAGI: NUTS sampling ($n_total iterations, $(alg.n_warmup) warmup)...")
+    # n_adapts must equal n_warmup so all discarded draws are adaptation
+    # and all retained draws come from the frozen kernel.
     chain_raw = AbstractMCMC.sample(ld_ad, nuts, n_total;
+                                    n_adapts=alg.n_warmup,
                                     initial_params=v0, progress=verbose)
 
     n_keep = alg.n_samples
