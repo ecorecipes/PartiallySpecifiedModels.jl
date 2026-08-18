@@ -266,11 +266,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     # Set up NUTS sampler with target acceptance rate
     nuts = NUTS(alg.target_accept)
 
-    # Run sampler using AbstractMCMC interface (handles adaptation internally)
+    # Run sampler via AbstractMCMC. n_adapts must equal n_warmup: without it
+    # AdvancedHMC adapts for only min(N/10, 1000) steps, so the retained
+    # draws could include iterations taken while step size and mass matrix
+    # were still adapting (not valid posterior samples).
     # Suppress AdvancedHMC "Verbosity toggle: max_iters" warnings
     chain_raw = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
         AbstractMCMC.sample(
             ld_ad, nuts, alg.n_warmup + alg.n_samples;
+            n_adapts=alg.n_warmup,
             initial_params=theta0,
             progress=verbose, verbose=false)
     end
