@@ -20,13 +20,34 @@ using LinearAlgebra: norm, dot
 Partition data times into shooting intervals, returning interval boundaries
 and data point indices per interval.
 """
-function partition_intervals(data_times::Vector{Float64}, n_intervals::Int)
+function partition_intervals(data_times::Vector{Float64}, n_intervals::Int;
+                             t0::Float64=data_times[1],
+                             discrete::Bool=false)
     n_t = length(data_times)
-    t_start = data_times[1]
+    # Start segments at t0 (the time where u0 is defined), not at the first
+    # observation: anchoring u0 at data_times[1] when tspan[1] < data_times[1]
+    # made the training objective disagree with the final single-shoot fit.
+    t_start = min(t0, data_times[1])
     t_end = data_times[end]
 
     # Create evenly spaced interval boundaries
     boundaries = collect(range(t_start, t_end, length=n_intervals + 1))
+
+    if discrete
+        # Discrete maps advance on integer steps; fractional boundaries made
+        # the step grid miss both the data times (zero data loss) and the
+        # segment ends (continuity constraints silently dropped).
+        boundaries = unique(round.(boundaries) .+ 0.0)   # .+ 0.0 folds -0.0 into 0.0
+        if length(boundaries) - 1 < n_intervals
+            @warn "MultipleShooting: reduced n_intervals from $n_intervals " *
+                  "to $(length(boundaries) - 1) after snapping interval " *
+                  "boundaries to integer time steps"
+            n_intervals = length(boundaries) - 1
+        end
+        n_intervals >= 1 ||
+            error("MultipleShooting: fewer than one interval after snapping " *
+                  "boundaries to integer steps; use single shooting instead")
+    end
 
     # Assign data points to intervals
     intervals = Vector{Vector{Int}}(undef, n_intervals)
@@ -114,40 +135,39 @@ function ms_loss(prob::PSMProblem, z, n_theta::Int, K::Int,
         local_times = prob.data_times[idx]
 
         if prob.discrete
-            # Discrete-time: iterate from t_lo to t_hi
+            # Discrete-time: iterate from t_lo to t_hi. Boundaries are
+            # snapped to integers in partition_intervals, so the unit-step
+            # grid lands exactly on t_hi and on rounded data times.
             u = copy(u0_k)
             u_next = similar(u)
             all_steps = collect(t_lo:1.0:t_hi)
 
-            # Build lookup for data times and interval end
             time_states = Dict{Float64, Vector{T}}()
-            if haskey(Dict(t_lo => true), t_lo)
-                time_states[t_lo] = copy(u)
-            end
-            # Record at t_lo if needed
-            for gi in idx
-                if abs(prob.data_times[gi] - t_lo) < 1e-10
-                    time_states[t_lo] = copy(u)
-                end
-            end
             time_states[t_lo] = copy(u)
 
             for si in 1:(length(all_steps)-1)
                 t_cur = all_steps[si]
                 prob.dynamics!(u_next, u, p, t_cur)
                 u = copy(u_next)
+                # Guard map blow-up: a NaN/Inf state would otherwise reach
+                # the spline evaluators (which cannot bracket a NaN knot
+                # position) deep inside the AD-driven line search.
+                all(isfinite, u) || return T(1e10)
                 t_now = all_steps[si + 1]
                 time_states[t_now] = copy(u)
             end
 
-            # Data fit loss
+            # Data fit loss. A missing entry indicates an internal
+            # inconsistency between the boundary grid and the data times —
+            # fail loudly rather than silently dropping observations.
             for gi in idx
                 t_data = prob.data_times[gi]
                 t_nearest = round(t_data)
                 u_at_t = get(time_states, t_nearest, nothing)
-                if u_at_t === nothing
-                    continue
-                end
+                u_at_t === nothing &&
+                    error("MultipleShooting internal error: no state " *
+                          "recorded at t=$t_nearest for observation at " *
+                          "t=$t_data in interval [$t_lo, $t_hi]")
                 for j in 1:size(prob.data_values, 2)
                     sk = prob.obs_to_state[j]
                     pred = u_at_t[sk]
@@ -156,15 +176,13 @@ function ms_loss(prob::PSMProblem, z, n_theta::Int, K::Int,
                 end
             end
 
-            # Shooting constraint
+            # Shooting constraint: t_hi is always on the step grid.
             if k < n_intervals
-                u_end = get(time_states, t_hi, nothing)
-                if u_end !== nothing
-                    for s in 1:K
-                        gap = u_end[s] - shooting_vars[k, s]
-                        lagrangian_term += lagrange_mult[k, s] * gap
-                        constraint_violation += T(rho) / 2 * gap^2
-                    end
+                u_end = time_states[t_hi]
+                for s in 1:K
+                    gap = u_end[s] - shooting_vars[k, s]
+                    lagrangian_term += lagrange_mult[k, s] * gap
+                    constraint_violation += T(rho) / 2 * gap^2
                 end
             end
         else
@@ -224,13 +242,20 @@ divided into intervals, each with its own initial condition; a combined
 objective penalises data misfit and continuity gaps between intervals.
 
 # Algorithm
-1. Partition the time span into `n_intervals` sub-intervals.
-2. Introduce free initial conditions at each interval boundary.
-3. Define a loss combining data-fit residuals and continuity penalties
-   (weighted by `continuity_weight`).
-4. Minimise with Adam (autodiff through the ODE/map solver) using
-   learning-rate scheduling and gradient clipping.
-5. Return the parameters at the lowest observed loss.
+1. Partition the time span into `n_intervals` sub-intervals (integer
+   boundaries for discrete-time models).
+2. Introduce free initial conditions at each interval boundary, optimized
+   jointly with the model parameters.
+3. Form the augmented Lagrangian: data-fit residuals + v'h + (ρ/2)‖h‖²
+   over the continuity gaps h, with multiplier updates v ← v + ρh.
+4. Minimise each subproblem with L-BFGS (ForwardDiff gradients through
+   the ODE/map solve), escalating ρ while gaps stagnate.
+5. Return the final iterate (which best satisfies the continuity
+   constraints); fitted values are produced by a final single-shoot
+   simulation at those parameters.
+
+DDE problems are not supported (segment initial states cannot supply the
+delayed history).
 
 # References
 - Bock & Plitt (1984), "A Multiple Shooting Algorithm for Direct Solution
@@ -241,8 +266,11 @@ objective penalises data misfit and continuity gaps between intervals.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
     _validate_problem(prob, "MultipleShootingSolver")
+    isempty(prob.delays) ||
+        error("MultipleShootingSolver does not support DDE problems: " *
+              "segment initial states cannot supply the delayed history. " *
+              "Use LAML or AdamSolver for DDEs.")
     verbose = alg.verbose
-    K = length(prob.u0)
     n_obs = size(prob.data_values, 2)
     T_pts = length(prob.data_times)
     n_intervals = alg.n_intervals
@@ -263,8 +291,19 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
     end
     n_theta = length(theta)
 
-    # Partition time span
-    boundaries, intervals = partition_intervals(Float64.(prob.data_times), n_intervals)
+    # u0 may be a function of the parameters; evaluate it at the initial
+    # parameters to obtain the state dimension and scale.
+    u0_init = prob.u0 isa Function ?
+        prob.u0(build_autodiff_param_struct(prob, theta)) : prob.u0
+    K = length(u0_init)
+
+    # Partition time span (anchored at tspan[1], where u0 lives; integer
+    # boundaries for discrete maps)
+    boundaries, intervals = partition_intervals(Float64.(prob.data_times),
+                                                n_intervals;
+                                                t0=Float64(prob.tspan[1]),
+                                                discrete=prob.discrete)
+    n_intervals = length(boundaries) - 1   # may shrink after integer snapping
     n_interior = n_intervals - 1
 
     # Initialize shooting variables from data
@@ -285,8 +324,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
     lagrange_mult = zeros(n_interior, K)
     rho = alg.rho_init
 
-    best_z_global = copy(z)
-    best_data_loss_global = Inf
     prev_max_gap = Inf
 
     # Outer loop: augmented Lagrangian
@@ -369,21 +406,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
             end
         end
 
-        # Also compute data-only loss (for tracking best overall fit)
-        data_only_loss = ms_loss(prob, z, n_theta, K, boundaries, intervals,
-                                 zeros(n_interior, K), 0.0)
-        if data_only_loss < best_data_loss_global
-            best_data_loss_global = data_only_loss
-            best_z_global .= z
-        end
-
         if verbose
+            data_only_loss = ms_loss(prob, z, n_theta, K, boundaries,
+                                     intervals, zeros(n_interior, K), 0.0)
             println("  Max shooting gap: $(round(max_gap, sigdigits=4))")
             println("  Data-only loss: $(round(data_only_loss, sigdigits=5))")
         end
 
         # Check convergence (relative to state scale)
-        state_scale = norm(prob.u0)
+        state_scale = norm(u0_init)
         if max_gap < 1e-2 * state_scale
             if verbose; println("  Shooting gaps converged!"); end
             break
@@ -484,6 +515,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
     PSMSolution(params, data_loss, data_loss, edf, Float64[],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (optimizer=:adam, method=:multiple_shooting,
+                (optimizer=:lbfgs, method=:multiple_shooting,
                  n_intervals=n_intervals))
 end

@@ -286,6 +286,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
 
             return -ll + penalty
         catch e
+            _is_program_error(e) && rethrow()
             return 1e10
         end
     end

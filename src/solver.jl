@@ -123,6 +123,30 @@ function build_param_struct(prob::PSMProblem, beta::AbstractVector)
     merge(uf_nt, prob.known_params)
 end
 
+"""
+    _is_program_error(e)
+
+Classify an exception caught inside a solver objective. Programming
+errors (wrong method signature, out-of-bounds indexing, type bugs) must
+be rethrown so they surface immediately; only genuinely numerical
+failures (domain errors, singular factorizations, solver blow-ups) may
+be converted into a large-but-finite penalty for the optimizer.
+
+`InexactError` is special-cased: converting a NaN/Inf (e.g. inside
+DataInterpolations when a diverged trajectory reaches a spline) is a
+numerical failure the optimizer must survive, while converting a finite
+value (`Int(3.7)`) is a genuine bug.
+"""
+function _is_program_error(e::InexactError)
+    # Julia ≥ 1.12 stores the offending value as the last element of e.args;
+    # earlier versions expose it as e.val.
+    val = hasfield(InexactError, :val) ? e.val : e.args[end]
+    val isa Number && isfinite(val)
+end
+_is_program_error(e) = e isa Union{MethodError, BoundsError, UndefVarError,
+                                   TypeError, KeyError, DimensionMismatch,
+                                   UndefRefError}
+
 # ─── Simulation ───────────────────────────────────────────────────
 
 """

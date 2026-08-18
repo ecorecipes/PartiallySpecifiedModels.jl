@@ -181,7 +181,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
         try
             _pm_loglik_hat(rhs!, u0, prob.tspan, alg.n_steps, alg.n_deriv, sigma,
                            data, dtimes, prob.obs_to_state, obs_var, n_particles, rng)
-        catch
+        catch e
+            _is_program_error(e) && rethrow()
             -Inf
         end
     end
