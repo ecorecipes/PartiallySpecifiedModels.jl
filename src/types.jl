@@ -99,12 +99,17 @@ end
     GPApproximator(name, domain, n_inducing; kernel=:sqexp, lengthscale=nothing,
                    variance=1.0, initial=nothing)
 
-Gaussian process approximator. Parameters are function values at uniformly
-spaced inducing points; the penalty matrix is the inverse kernel matrix K⁻¹,
-which corresponds to the GP prior `f ~ N(0, K/θ)`.
+Kernel-interpolation approximator. Parameters are function values at
+uniformly spaced inducing points, evaluated between points through the
+kernel weights `k(x,X)K⁻¹f_X` (the GP predictive-mean formula with fixed
+hyperparameters). Note this is a fixed basis expansion, not full GP
+inference: `lengthscale`/`variance` are set at construction and never
+estimated, and no predictive variance is produced.
 
-This provides automatic smoothing via LAML (like B-splines) but with
-kernel-based correlation structure instead of polynomial smoothness.
+The LAML/GCV penalty is a spline-style second-derivative penalty on the
+inducing values — not the theoretical GP prior precision `K⁻¹`, whose
+narrow eigenvalue spectrum makes smoothing-parameter estimation
+unreliable (see `penalty_matrix(::GPApproximator)` in approximators.jl).
 
 # Kernels
 - `:sqexp`  — Squared exponential: `k(r) = σ² exp(-r²/(2ℓ²))`
@@ -169,9 +174,21 @@ function GPApproximator(name::Union{Symbol,String},
     # Build kernel matrix
     K = _build_kernel_matrix(kfunc, x_ind)
 
-    # Invert with jitter for numerical stability
-    K_jitter = K + 1e-8 * I
-    K_inv = inv(K_jitter)
+    # Factor with scaled jitter. Squared-exponential Gram matrices are
+    # notoriously ill-conditioned as n_inducing grows; a fixed 1e-8 jitter
+    # plus explicit inv() produced large oscillatory weights K⁻¹f between
+    # inducing points. Scale the jitter to the kernel magnitude and escalate
+    # until the Cholesky succeeds.
+    scale = max(maximum(abs, K), 1.0)
+    K_inv = nothing
+    for jit in (1e-8, 1e-6, 1e-4)
+        F = cholesky(Symmetric(K + jit * scale * I), check=false)
+        if issuccess(F)
+            K_inv = Matrix(inv(F))
+            break
+        end
+    end
+    K_inv === nothing && (K_inv = pinv(K + 1e-4 * scale * I))
     K_inv = 0.5 * (K_inv + K_inv')  # symmetrize
 
     init_func = if initial === nothing
@@ -1317,7 +1334,7 @@ objectives, stiff dynamics, poor conditioning). Uses simulation-based
 loss without requiring autodiff through ODE solves.
 
 # Fields
-- `method`: optimization method — `:nelder_mead`, `:particle_swarm`, `:cmaes` (default `:nelder_mead`)
+- `method`: optimization method — `:nelder_mead` or `:particle_swarm` (default `:nelder_mead`)
 - `maxiters`: maximum function evaluations (default 10000)
 - `n_particles`: particle count for swarm methods (default 20)
 - `loss`: loss type `:mse` or `:likelihood` (default `:mse`)
@@ -1678,8 +1695,21 @@ function PSMProblem(dynamics!, u0, tspan,
                     solver_kwargs...)
     n_times = length(data_times)
     n_obs = size(data_values, 2)
-    @assert size(data_values, 1) == n_times "data_values rows must match data_times length"
-    @assert length(obs_to_state) == n_obs
+    size(data_values, 1) == n_times ||
+        throw(ArgumentError("data_values has $(size(data_values, 1)) rows " *
+                            "but data_times has $n_times entries"))
+    length(obs_to_state) == n_obs ||
+        throw(ArgumentError("obs_to_state has $(length(obs_to_state)) " *
+                            "entries but data_values has $n_obs columns"))
+    # A known parameter sharing a name with an approximator would silently
+    # SHADOW the fitted function in the merged parameter NamedTuple
+    # (later entries win in merge), producing baffling non-fits.
+    for approx in approximators
+        haskey(known_params, approx.name) &&
+            throw(ArgumentError("known_params has an entry :$(approx.name) " *
+                                "that collides with an approximator of the " *
+                                "same name; rename one of them"))
+    end
 
     w = if data_weights === nothing
         ones(Float64, n_times, n_obs)

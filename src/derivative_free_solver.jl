@@ -82,7 +82,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::DerivativeFreeSolver)
                 s += w_vec[k] * (y_vec[k] - pred[ti, oi])^2
                 k += 1
             end
-            s / n_data
+            # Unscaled SS: dividing by n here (but not in :likelihood mode,
+            # nor in the penalty) made the effective smoothing strength
+            # depend on sample size and flip by a factor n between modes.
+            s
         else  # :likelihood — negative log-likelihood
             f_vec = zeros(n_data)
             k = 1
@@ -109,14 +112,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::DerivativeFreeSolver)
 
     # ── Choose optimizer ──
     if alg.method == :particle_swarm
-        # ParticleSwarm needs bounds
-        lower = fill(-10.0, n_p)
-        upper = fill( 10.0, n_p)
-        # Widen bounds if initial params fall outside [-10, 10]
-        for i in 1:n_p
-            lower[i] = min(lower[i], beta0[i] - 5.0)
-            upper[i] = max(upper[i], beta0[i] + 5.0)
-        end
+        # ParticleSwarm needs bounds. Scale them to the initial values —
+        # fixed [-10, 10] boxes silently clamped coefficients for data on
+        # larger scales, excluding the optimum entirely.
+        span = max(10.0, 10.0 * maximum(abs, beta0))
+        lower = beta0 .- span
+        upper = beta0 .+ span
         optimizer = Optim.ParticleSwarm(; lower=lower, upper=upper,
                                           n_particles=alg.n_particles)
         result = Optim.optimize(loss_fn, beta0, optimizer,
@@ -128,11 +129,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::DerivativeFreeSolver)
                                 Optim.Options(iterations=alg.maxiters,
                                               show_trace=verbose))
     else
-        # Fallback: Nelder-Mead
-        optimizer = Optim.NelderMead()
-        result = Optim.optimize(loss_fn, beta0, optimizer,
-                                Optim.Options(iterations=alg.maxiters,
-                                              show_trace=verbose))
+        error("DerivativeFreeSolver: unknown method :$(alg.method). " *
+              "Supported: :nelder_mead, :particle_swarm. (:cmaes is not " *
+              "implemented; it previously fell back to NelderMead silently.)")
     end
 
     beta_opt = Optim.minimizer(result)
