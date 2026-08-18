@@ -340,7 +340,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
     data_loss = 0.0
     pred = zeros(n_t, n_obs)
     for i in 1:n_t
-        idx = searchsortedfirst(times, prob.data_times[i])
+        idx = _nearest_grid_index(times, prob.data_times[i])
         idx = clamp(idx, 1, length(times))
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
@@ -404,7 +404,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
     # Extract solution uncertainty at observation times
     sol_var = zeros(n_t, n_vars)
     for i in 1:n_t
-        idx = searchsortedfirst(times, prob.data_times[i])
+        idx = _nearest_grid_index(times, prob.data_times[i])
         idx = clamp(idx, 1, length(times))
         for k in 1:n_vars
             sol_var[i, k] = Σ_smooth[idx][k][1, 1]  # variance of zeroth derivative

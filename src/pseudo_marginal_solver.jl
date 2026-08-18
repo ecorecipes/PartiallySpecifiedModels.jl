@@ -70,8 +70,7 @@ function _pm_loglik_hat(ode_rhs!, u0, tspan, n_steps, n_deriv, sigma,
                             interrogate=interrogate)
     times = filt["times"]; q = filt["q"]
     n_obs = size(data, 2)
-    obs_ind = clamp.([searchsortedfirst(times, dtimes[i]) for i in 1:length(dtimes)],
-                     1, n_steps + 1)
+    obs_ind = _nearest_grid_indices(times, dtimes)
     logws = Vector{Float64}(undef, n_particles)
     c = -0.5 * log(2π * obs_var)
     for s in 1:n_particles
@@ -250,7 +249,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
     data_loss = 0.0
     pred = zeros(n_t, n_obs)
     for i in 1:n_t
-        idx = clamp(searchsortedfirst(times, prob.data_times[i]), 1, length(times))
+        idx = _nearest_grid_index(times, prob.data_times[i])
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             pred[i, j] = μ_smooth[idx][sk][1]
@@ -303,7 +302,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
 
     sol_var = zeros(n_t, n_vars)
     for i in 1:n_t
-        idx = clamp(searchsortedfirst(times, prob.data_times[i]), 1, length(times))
+        idx = _nearest_grid_index(times, prob.data_times[i])
         for k in 1:n_vars
             sol_var[i, k] = Σ_smooth[idx][k][1, 1]
         end
