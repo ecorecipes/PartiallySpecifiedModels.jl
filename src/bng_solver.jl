@@ -118,9 +118,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
             (mlp_specs[approx.name] = mlp_spec_from_lux(approx.model))
     end
 
-    # kp = 1 uses the default initialisation; kp > 1 perturbs it (fresh
-    # random weights for neural approximators, jittered coefficients
-    # otherwise) so the process ensemble explores distinct basins.
+    # kp = 1 uses the default initialisation (a seeded neural approximator
+    # keeps its own seed; unseeded ones draw fresh weights); kp > 1 perturbs
+    # it — fresh random weights for neural approximators, jittered
+    # coefficients otherwise — so the process ensemble explores distinct
+    # basins.
     function init_beta(kp::Int)
         beta = Float64[]
         for approx in prob.approximators
@@ -235,12 +237,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
         data_ko = if ko == 1
             Float64.(prob.data_values)
         else
-            # Residual bootstrap: smoother fit + column-wise resampled residuals
-            boot = copy(base_fit)
-            for j in 1:n_obs
-                boot[:, j] .+= resid[rand(rng, 1:n_times, n_times), j]
-            end
-            boot
+            # Residual bootstrap: smoother fit + resampled residual rows
+            # (rows resampled jointly across columns, preserving any
+            # cross-series residual correlation)
+            idx_boot = rand(rng, 1:n_times, n_times)
+            base_fit .+ resid[idx_boot, :]
         end
         y_smooth, dydt = smooth_targets(data_ko)
         for kp in 1:alg.k_proc
@@ -354,11 +355,23 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
         end
     end
 
-    # Posterior weights: the member losses are negative log-posteriors, so
-    # exp(−Δloss) is each member's relative posterior mass. This lets
-    # divergent restarts (which land at much higher loss) contribute
-    # essentially nothing to the ensemble mean instead of contaminating it.
-    w_members = exp.(-(member_losses .- minimum(member_losses)))
+    # Posterior weights. Losses are only comparable WITHIN an observation
+    # ensemble (each bootstrap has its own data), so exp(−Δloss) weights are
+    # formed over the k_proc restarts of each obs-ensemble — zeroing
+    # divergent restarts — and the obs-ensembles then count equally.
+    # Non-finite losses are masked out entirely.
+    w_members = zeros(K_total)
+    for ko in 1:alg.k_obs
+        idx = ((ko - 1) * alg.k_proc + 1):(ko * alg.k_proc)
+        ls = member_losses[idx]
+        ok = isfinite.(ls)
+        any(ok) || continue
+        lmin = minimum(ls[ok])
+        w = [ok[i] ? exp(-(ls[i] - lmin)) : 0.0 for i in eachindex(ls)]
+        w_members[idx] = w ./ sum(w)
+    end
+    sum(w_members) > 0 ||
+        error("BNGSolver: every ensemble member diverged (non-finite loss)")
     w_members ./= sum(w_members)
 
     # Weighted ensemble-mean unknown functions + pointwise-sd companions.
