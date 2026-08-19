@@ -8,6 +8,11 @@ using OrdinaryDiffEq
 
 @testset "PartiallySpecifiedModels.jl" begin
 
+    # Deterministic suite: all unseeded rand/randn sites below draw from
+    # this stream (order-coupled by design; per-site Xoshiro rngs are
+    # used where reproducibility of an individual value matters).
+    Random.seed!(20260818)
+
     @testset "Spline penalty matrix" begin
         # Uniform knots
         x = collect(range(0.0, 1.0, length=10))
@@ -592,6 +597,8 @@ using OrdinaryDiffEq
         @test size(sol_magi.convergence.chains, 1) == 50  # n_samples
         @test size(sol_magi.convergence.chains, 2) == 6   # 6 B-spline params
         @test haskey(sol_magi.unknown_functions, :r)
+        # posterior-mean recovery of the constant true rate r(t) = 0.3
+        @test abs(sol_magi.unknown_functions[:r](5.0) - 0.3) < 0.15
     end
 
     # ─── Discrete-time model tests ─────────────────────────────────
@@ -643,7 +650,7 @@ using OrdinaryDiffEq
                           solver=nothing)
 
         sol = solve(prob, LAML(maxiters=50, verbose=false))
-        @test sol.data_loss < sum((data .- N_true).^2) * 5  # reasonable fit
+        @test sol.data_loss < sum((data .- N_true).^2) * 2  # near the noise floor
 
         f_eval = sol.unknown_functions[:f]
         # At N=50 (half K), true f = 0.8*(1-50/100) = 0.4
@@ -696,8 +703,12 @@ using OrdinaryDiffEq
         @test haskey(sol.unknown_functions, :f)
 
         f_eval = sol.unknown_functions[:f]
-        # At N=250, true f = 2*250/(1 + 1/500*250) = 500/1.5 = 333.3
-        @test abs(f_eval(250.0) - 333.3) < 100
+        # The trajectory passes N=250 only once en route to the fixed point
+        # N*=500, so accuracy is graded by data density: tight at the
+        # fixed point, loose in the transient region.
+        @test abs(f_eval(500.0) - 500.0) < 20    # data-rich (many points near N*)
+        @test abs(f_eval(450.0) - 473.7) < 45
+        @test abs(f_eval(250.0) - 333.3) < 100   # visited once — sanity only
     end
 
     @testset "Discrete-time: GradientMatching" begin
@@ -727,7 +738,7 @@ using OrdinaryDiffEq
 
         f_eval = sol.unknown_functions[:f]
         # At N=10, true f = 10.5; at N=15, true f = 15.75
-        @test abs(f_eval(10.0) - 10.5) < 2.0
+        @test abs(f_eval(10.0) - 10.5) < 1.0    # identity init errs by 0.5 pre-fit; smoothed GM should do far better
     end
 
     @testset "Discrete-time: CollocationLAML" begin
@@ -1127,10 +1138,10 @@ using OrdinaryDiffEq
         sol_bng = solve(prob_bng, BNGSolver(maxiters=500, verbose=false))
 
         @test sol_bng isa PSMSolution
-        @test sol_bng.data_loss < 50.0
+        @test sol_bng.data_loss < 2.0   # noise floor ≈ 0.16 (16 pts × 0.1²)
         @test haskey(sol_bng.unknown_functions, :r)
         r_fitted = sol_bng.unknown_functions[:r]
-        @test r_fitted(5.0) isa Float64
+        @test abs(r_fitted(5.0) - 0.25) < 0.12   # true r(5) = 0.5(1 − 5/10)
     end
 
     @testset "DaltonSolver — exponential decay" begin
@@ -1154,6 +1165,7 @@ using OrdinaryDiffEq
         @test sol_dal isa PSMSolution
         @test isfinite(sol_dal.objective)
         @test haskey(sol_dal.unknown_functions, :f)
+        @test abs(sol_dal.unknown_functions[:f](3.0) - 1.5) < 0.35  # f(x)=0.5x
     end
 
     @testset "PseudoMarginalSolver — logistic growth" begin
@@ -1179,6 +1191,8 @@ using OrdinaryDiffEq
         @test sol_pm isa PSMSolution
         @test sol_pm.convergence isa MCMCChains.Chains
         @test size(sol_pm.convergence, 1) == 50  # n_samples
+        # short chain: generous tolerance, but a do-nothing sampler fails it
+        @test abs(sol_pm.unknown_functions[:r](5.0) - 0.25) < 0.25
     end
 
     @testset "DDE support — delay exponential decay" begin
@@ -1217,6 +1231,7 @@ using OrdinaryDiffEq
         @test sol_dde isa PSMSolution
         @test isfinite(sol_dde.data_loss)
         @test haskey(sol_dde.unknown_functions, :f)
+        @test abs(sol_dde.unknown_functions[:f](0.8) - 0.4) < 0.1  # f(x)=0.5x
     end
 
     # ─── New solver tests ─────────────────────────────────────────────
@@ -1244,7 +1259,7 @@ using OrdinaryDiffEq
         @test isfinite(sol_gcv.data_loss)
         @test haskey(sol_gcv.unknown_functions, :r)
         r_fitted_gcv = sol_gcv.unknown_functions[:r]
-        @test r_fitted_gcv(5.0) isa Float64
+        @test abs(r_fitted_gcv(5.0) - 0.25) < 0.12
     end
 
     @testset "TwoStageSolver — logistic growth" begin
@@ -1269,6 +1284,7 @@ using OrdinaryDiffEq
         @test sol_ts isa PSMSolution
         @test isfinite(sol_ts.data_loss)
         @test haskey(sol_ts.unknown_functions, :r)
+        @test abs(sol_ts.unknown_functions[:r](5.0) - 0.25) < 0.12
     end
 
     @testset "DerivativeFreeSolver — exponential decay" begin
@@ -1292,6 +1308,7 @@ using OrdinaryDiffEq
         @test sol_df isa PSMSolution
         @test isfinite(sol_df.objective)
         @test haskey(sol_df.unknown_functions, :f)
+        @test abs(sol_df.unknown_functions[:f](3.0) - 1.5) < 0.35
     end
 
     @testset "VariationalSolver — logistic growth" begin
@@ -1317,6 +1334,7 @@ using OrdinaryDiffEq
         @test isfinite(sol_vi.objective)
         @test haskey(sol_vi.unknown_functions, :r)
         @test haskey(sol_vi.convergence, :posterior_std)
+        @test abs(sol_vi.unknown_functions[:r](5.0) - 0.25) < 0.2
     end
 
     @testset "ABCSolver — exponential decay" begin
@@ -1340,6 +1358,8 @@ using OrdinaryDiffEq
         @test sol_abc isa PSMSolution
         @test isfinite(sol_abc.objective)
         @test haskey(sol_abc.unknown_functions, :f)
+        # box-prior ABC with 3 generations: generous, but nonvacuous
+        @test abs(sol_abc.unknown_functions[:f](3.0) - 1.5) < 0.6
     end
 
     # ─── Discrete-time tests for additional solvers ───────────────────
@@ -1907,6 +1927,7 @@ using OrdinaryDiffEq
         @test isfinite(sol_im.objective)
         @test haskey(sol_im.unknown_functions, :r)
         @test sol_im.convergence.method == :integral_matching
+        @test abs(sol_im.unknown_functions[:r](5.0) - 0.25) < 0.12
     end
 
     @testset "EnsembleKalmanSolver — exponential decay" begin
@@ -1932,6 +1953,7 @@ using OrdinaryDiffEq
         @test haskey(sol_ek.unknown_functions, :f)
         @test sol_ek.convergence.method == :ensemble_kalman
         @test haskey(sol_ek.convergence, :ensemble_std)
+        @test abs(sol_ek.unknown_functions[:f](3.0) - 1.5) < 0.45  # stochastic ensemble (30 particles)
     end
 
     @testset "ODINSolver — logistic growth" begin
@@ -1957,6 +1979,7 @@ using OrdinaryDiffEq
         @test isfinite(sol_od.objective)
         @test haskey(sol_od.unknown_functions, :r)
         @test sol_od.convergence.method == :odin
+        @test abs(sol_od.unknown_functions[:r](5.0) - 0.25) < 0.15
     end
 
     @testset "RKHSSolver — exponential decay" begin
@@ -1983,6 +2006,7 @@ using OrdinaryDiffEq
         @test haskey(sol_rk.unknown_functions, :f)
         @test sol_rk.convergence.method == :rkhs
         @test sol_rk.convergence.kernel == :rbf
+        @test abs(sol_rk.unknown_functions[:f](3.0) - 1.5) < 0.35
     end
 
     @testset "ProfileLikelihoodSolver — logistic growth" begin
@@ -2015,6 +2039,199 @@ using OrdinaryDiffEq
         @test haskey(profiles, 2)
         @test length(profiles[1].grid) == 10
         @test length(profiles[1].ci) == 2
+        # the fitted parameter sits inside its own profile CI (PLR = 0 there)
+        @test profiles[1].ci[1] <= sol_pl.parameters[1] <= profiles[1].ci[2]
+    end
+
+
+    # ─── Review additions: features previously untested ───────────────
+
+    @testset "Multiple approximators in one model" begin
+        # Headline composability claim: two unknown functions fitted jointly.
+        Random.seed!(4242)
+        function two_uf!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1] - p.g(u[1])
+        end
+        pt = ODEProblem((du,u,p,t) -> (du[1] = 0.4u[1] - 0.05u[1]), [1.0], (0.0, 5.0))
+        st = OrdinaryDiffEq.solve(pt, Tsit5(); saveat=0.25)
+        tt = collect(st.t)
+        dv = reshape([st(t)[1] for t in tt] .+ 0.02 .* randn(Random.Xoshiro(7), length(tt)), :, 1)
+        prob2 = PSMProblem(two_uf!, [1.0], (0.0, 5.0),
+            [BSplineApproximator(:r, (0.5, 6.0), 5; initial=x -> 0.3),
+             BSplineApproximator(:g, (0.5, 6.0), 5; initial=x -> 0.03x)];
+            data_times=tt, data_values=dv, obs_to_state=[1],
+            known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+        sol2 = solve(prob2, LAML(maxiters=60, verbose=false))
+        @test haskey(sol2.unknown_functions, :r)
+        @test haskey(sol2.unknown_functions, :g)
+        @test length(sol2.smoothing_params) == 2
+        # only the combination r(N)N − g(N) is identified; check it
+        net(N) = sol2.unknown_functions[:r](N) * N - sol2.unknown_functions[:g](N)
+        for N in (1.0, 2.0, 4.0)
+            @test abs(net(N) - 0.35N) < 0.1 * max(0.35N, 1.0)
+        end
+    end
+
+    @testset "known_params mixed with an approximator" begin
+        Random.seed!(4243)
+        function sir_kp!(du, u, p, t)
+            S, I = u
+            β = p.β(I)
+            du[1] = -β * S * I
+            du[2] =  β * S * I - p.γ * I
+        end
+        βtrue_kp(I) = 0.5 * exp(-5.0 * I)
+        pt = ODEProblem((du,u,p,t) -> begin
+            S, I = u; b = 0.5 * exp(-5.0 * I)
+            du[1] = -b * S * I; du[2] = b * S * I - 0.25I
+        end, [0.99, 0.01], (0.0, 30.0))
+        st = OrdinaryDiffEq.solve(pt, Tsit5(); saveat=1.0)
+        data = hcat([u[1] for u in st.u], [u[2] for u in st.u]) .+
+               0.004 .* randn(Random.Xoshiro(9), length(st.t), 2)
+        prob = PSMProblem(sir_kp!, [0.99, 0.01], (0.0, 30.0),
+            [ShapeConstrainedBSplineApproximator(:β, (0.0, 0.15), 7, :decreasing;
+                                                 initial=0.4)];
+            data_times=collect(st.t), data_values=data,
+            obs_to_state=[1, 2], known_params=(γ=0.25,),
+            likelihood=Gaussian(), solver=Tsit5())
+        sol = solve(prob, LAML(maxiters=50, verbose=false))
+        @test abs(sol.unknown_functions[:β](0.05) - βtrue_kp(0.05)) < 0.08
+        # name collision is rejected
+        @test_throws ArgumentError PSMProblem(sir_kp!, [0.99, 0.01], (0.0, 30.0),
+            [BSplineApproximator(:β, (0.0, 0.15), 6)];
+            data_times=collect(st.t), data_values=data,
+            obs_to_state=[1, 2], known_params=(β=0.5,),
+            likelihood=Gaussian(), solver=Tsit5())
+    end
+
+    @testset "CustomLikelihood end-to-end matches Gaussian" begin
+        Random.seed!(4244)
+        function growth_cl!(du, u, p, t); du[1] = p.r(u[1]) * u[1]; end
+        tt = collect(range(0.0, 5.0, length=20))
+        dv = reshape(exp.(0.3 .* tt) .+ 0.05 .* randn(Random.Xoshiro(11), 20), :, 1)
+        mk_cl(lik) = PSMProblem(growth_cl!, [1.0], (0.0, 5.0),
+            [BSplineApproximator(:r, (0.5, 5.0), 5; initial=x -> 0.25)];
+            data_times=tt, data_values=dv, obs_to_state=[1],
+            known_params=NamedTuple(), likelihood=lik, solver=Tsit5())
+        sol_g = solve(mk_cl(Gaussian()), LAML(maxiters=40, verbose=false))
+        # CustomLikelihood with the Gaussian kernel drives the same IRLS
+        cl = CustomLikelihood((y, mu) -> -0.5 * (y - mu)^2)
+        sol_c = solve(mk_cl(cl), LAML(maxiters=40, verbose=false))
+        @test abs(sol_c.unknown_functions[:r](2.0) -
+                  sol_g.unknown_functions[:r](2.0)) < 0.05
+    end
+
+    @testset "Permuted obs_to_state and data_weights masking" begin
+        Random.seed!(4245)
+        # 2-state system observed in REVERSED column order
+        function two_state_p!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+            du[2] = 0.1 * u[1]
+        end
+        pt = ODEProblem((du,u,p,t) -> (du[1]=0.3u[1]; du[2]=0.1u[1]),
+                        [1.0, 0.0], (0.0, 5.0))
+        st = OrdinaryDiffEq.solve(pt, Tsit5(); saveat=0.25)
+        tt = collect(st.t)
+        rng_p = Random.Xoshiro(13)
+        col_u2 = [st(t)[2] for t in tt] .+ 0.02 .* randn(rng_p, length(tt))
+        col_u1 = [st(t)[1] for t in tt] .+ 0.02 .* randn(rng_p, length(tt))
+        data = hcat(col_u2, col_u1)          # column 1 ↦ state 2, column 2 ↦ state 1
+        # corrupt two entries of column 2 and mask them with zero weights
+        data[5, 2] = 100.0
+        data[9, 2] = -50.0
+        w = ones(length(tt), 2); w[5, 2] = 0.0; w[9, 2] = 0.0
+        prob = PSMProblem(two_state_p!, [1.0, 0.0], (0.0, 5.0),
+            [BSplineApproximator(:r, (0.5, 5.0), 5; initial=x -> 0.25)];
+            data_times=tt, data_values=data, data_weights=w,
+            obs_to_state=[2, 1], known_params=NamedTuple(),
+            likelihood=Gaussian(), solver=Tsit5())
+        sol = solve(prob, LAML(maxiters=50, verbose=false))
+        # masked outliers must not derail the fit; permuted mapping honored
+        @test abs(sol.unknown_functions[:r](2.0) - 0.3) < 0.1
+    end
+
+    @testset "confidence_band" begin
+        Random.seed!(4246)
+        function growth_cb!(du, u, p, t); du[1] = p.r(u[1]) * u[1]; end
+        tt = collect(range(0.0, 5.0, length=25))
+        dv = reshape(exp.(0.3 .* tt) .+ 0.05 .* randn(Random.Xoshiro(15), 25), :, 1)
+        prob = PSMProblem(growth_cb!, [1.0], (0.0, 5.0),
+            [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.25)];
+            data_times=tt, data_values=dv, obs_to_state=[1],
+            known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+        sol = solve(prob, LAML(maxiters=50, verbose=false))
+        bands = confidence_band(sol, prob; level=0.95)
+        @test haskey(bands, :r)
+        band = bands[:r]
+        @test length(band.lower) == length(band.upper) == length(band.grid)
+        @test all(band.lower .<= band.upper)
+        # true constant r = 0.3 inside the band over the data-supported range
+        inside = [band.lower[i] <= 0.3 <= band.upper[i]
+                  for i in eachindex(band.grid) if 1.0 <= band.grid[i] <= 4.0]
+        @test sum(inside) / length(inside) > 0.7
+        # non-LAML solutions raise the documented error
+        sol_adam = solve(prob, AdamSolver(maxiters=20, verbose=false))
+        @test_throws ErrorException confidence_band(sol_adam, prob)
+    end
+
+    @testset "shape transforms: remaining six constraints" begin
+        using PartiallySpecifiedModels: build_constrained_bspline_evaluator, nparams
+        grid_sc = collect(range(0.05, 0.95, length=40))
+        d1_sc(v) = diff(v); d2_sc(v) = diff(diff(v))
+        checks = Dict(
+            :inc_convex     => v -> all(d1_sc(v) .>= -1e-9) && all(d2_sc(v) .>= -1e-7),
+            :inc_concave    => v -> all(d1_sc(v) .>= -1e-9) && all(d2_sc(v) .<= 1e-7),
+            :dec_convex     => v -> all(d1_sc(v) .<= 1e-9)  && all(d2_sc(v) .>= -1e-7),
+            :dec_concave    => v -> all(d1_sc(v) .<= 1e-9)  && all(d2_sc(v) .<= 1e-7),
+            :inc_zero_right => v -> all(d1_sc(v) .>= -1e-9),
+            :dec_zero_left  => v -> all(d1_sc(v) .<= 1e-9))
+        for (c, chk) in checks, trial in 1:3
+            a = ShapeConstrainedBSplineApproximator(:f, (0.0, 1.0), 7, c)
+            γ = 2 .* randn(Random.Xoshiro(97trial + Int(hash(c) % 512)), nparams(a))
+            f = build_constrained_bspline_evaluator(a, γ)
+            v = [f(x) for x in grid_sc]
+            @test chk(v)
+            if c == :inc_zero_right
+                @test abs(f(1.0)) < 1e-10
+            elseif c == :dec_zero_left
+                @test abs(f(0.0)) < 1e-10
+            end
+        end
+    end
+
+    @testset "AD gradient matches finite differences (Adam loss)" begin
+        using PartiallySpecifiedModels: adam_loss_mse
+        import ForwardDiff
+        function growth_ad!(du, u, p, t); du[1] = p.r(u[1]) * u[1]; end
+        tt = collect(range(0.0, 4.0, length=15))
+        dv = reshape(exp.(0.3 .* tt), :, 1)
+        prob = PSMProblem(growth_ad!, [1.0], (0.0, 4.0),
+            [BSplineApproximator(:r, (0.5, 4.5), 5; initial=x -> 0.25)];
+            data_times=tt, data_values=dv, obs_to_state=[1],
+            known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+        β0 = collect(PartiallySpecifiedModels.initial_params(prob.approximators[1]))
+        L(β) = adam_loss_mse(prob, β)
+        g_ad = ForwardDiff.gradient(L, β0)
+        h = 1e-6
+        g_fd = [(L(β0 .+ h .* ((1:5) .== j)) - L(β0 .- h .* ((1:5) .== j))) / 2h
+                for j in 1:5]
+        @test maximum(abs.(g_ad .- g_fd)) < 1e-3 * max(maximum(abs.(g_fd)), 1.0)
+    end
+
+    @testset "simulate and predict" begin
+        function growth_sp!(du, u, p, t); du[1] = p.r(u[1]) * u[1]; end
+        tt = collect(range(0.0, 3.0, length=10))
+        dv = reshape(exp.(0.3 .* tt), :, 1)
+        prob = PSMProblem(growth_sp!, [1.0], (0.0, 3.0),
+            [BSplineApproximator(:r, (0.5, 3.5), 5; initial=x -> 0.3)];
+            data_times=tt, data_values=dv, obs_to_state=[1],
+            known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+        β0 = collect(PartiallySpecifiedModels.initial_params(prob.approximators[1]))
+        pred = simulate(prob, β0)
+        @test size(pred) == (10, 1)
+        @test all(isfinite, pred)
+        sol = solve(prob, LAML(maxiters=30, verbose=false))
+        @test predict(sol, prob) === sol.fitted_values
     end
 
 end

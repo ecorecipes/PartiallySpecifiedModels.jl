@@ -516,13 +516,28 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         W_sqrt = sqrt.(max.(w_irls, 1e-15))
         F_aug = vcat(Diagonal(W_sqrt) * J_mat, C)
         z_aug = vcat(W_sqrt .* z_pseudo, zeros(n_pen))
-        F_aug \ z_aug, B
+        # Truncated-SVD least squares. The FD Jacobian is trajectory-local:
+        # at a poor initialization (e.g. the x -> 0 default, where the
+        # trajectory sits at u0) most basis columns are numerically null,
+        # and a plain QR solve returns O(1e9) coefficients along those
+        # directions — a step no contraction can rescue. Zeroing components
+        # with σ < 1e-7·σ_max keeps the step inside the identified subspace;
+        # for well-conditioned systems the result matches backslash to 1e-7.
+        F = svd(F_aug)
+        σmax = F.S[1]
+        d = [σ > 1e-7 * σmax ? 1.0 / σ : 0.0 for σ in F.S]
+        a = F.V * (d .* (F.U' * z_aug))
+        a, B
     end
 
-    # Step contraction: backtracking line search with exponential step sizes
-    # Tries α = 1, 0.5, 0.25, ..., 2^(-15) ≈ 3e-5 to find a step that
-    # reduces the penalized objective. This handles highly nonlinear models
-    # where the full PCLS step overshoots badly.
+    # Step contraction: backtracking line search with exponential step sizes.
+    # Phase 1 tries α = 1, 0.5, ..., 2^(-15) and keeps the best (unchanged
+    # legacy behavior for sane steps). Phase 2 rescues EXPLOSIVE steps: when
+    # the trajectory-localized Jacobian is numerically rank-deficient (e.g.
+    # every coefficient at the x -> 0 default initialization), the PCLS
+    # solution can be O(1e9) along near-null directions and even 2^(-15) of
+    # it still blows up the ODE; continue halving with a first-improvement
+    # exit so the fit can escape instead of silently rejecting every step.
     function step_contract(a_old, a_new, B)
         f_old = penalized_objective(a_old, B)
         direction = a_new .- a_old
@@ -537,6 +552,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             if f_try < best_f
                 best_f = f_try
                 best_a = copy(a_try)
+            end
+        end
+        if best_f >= f_old
+            for k in 16:50
+                α = 2.0^(-k)
+                a_try = a_old .+ α .* direction
+                f_try = penalized_objective(a_try, B)
+                if f_try < f_old
+                    return a_try, f_try
+                end
             end
         end
         best_a, best_f

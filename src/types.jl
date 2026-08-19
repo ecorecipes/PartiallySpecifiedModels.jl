@@ -699,10 +699,10 @@ abstract type AbstractLikelihood end
 """Gaussian likelihood with identity link (unknown σ² profiled out in REML)."""
 struct Gaussian <: AbstractLikelihood end
 
-"""Poisson likelihood with log link."""
+"""Poisson likelihood, fitted on the response scale (identity link)."""
 struct Poisson <: AbstractLikelihood end
 
-"""Negative Binomial likelihood with log link."""
+"""Negative Binomial likelihood, fitted on the response scale (identity link)."""
 struct NegativeBinomial <: AbstractLikelihood
     theta::Float64  # overdispersion: Var = μ + μ²/θ
 end
