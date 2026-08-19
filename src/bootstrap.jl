@@ -162,7 +162,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
 
         Threads.@threads for b in 1:nboot
             prob_boot = PSMProblem(prob.dynamics!, prob.u0, prob.tspan,
-                prob.approximators;
+                deepcopy(prob.approximators);   # isolate adaptive (mutable) state per replicate
                 data_times=prob.data_times,
                 data_values=boot_data[b],
                 data_weights=prob.data_weights,
@@ -245,7 +245,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                                     σ_hat, n_times, n_obs, rng)
 
             prob_boot = PSMProblem(prob.dynamics!, prob.u0, prob.tspan,
-                prob.approximators;
+                deepcopy(prob.approximators);   # isolate adaptive (mutable) state per replicate
                 data_times=prob.data_times,
                 data_values=y_boot,
                 data_weights=prob.data_weights,

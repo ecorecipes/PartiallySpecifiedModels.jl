@@ -151,6 +151,26 @@ _is_program_error(e) = e isa Union{MethodError, BoundsError, UndefVarError,
                                    TypeError, KeyError, DimensionMismatch,
                                    UndefRefError}
 
+"""
+    _adapt_gp_approximators!(prob, beta) -> Bool
+
+Run the empirical-Bayes hyperparameter update for every `GPApproximator`
+with `adapt=true`, using its slice of the current coefficient vector.
+Returns whether any kernel changed (callers should re-evaluate the model).
+"""
+function _adapt_gp_approximators!(prob::PSMProblem, beta::AbstractVector)
+    off = 0
+    changed = false
+    for a in prob.approximators
+        np = nparams(a)
+        if a isa GPApproximator && a.adapt
+            changed |= _adapt_gp_hyperparams!(a, Float64.(beta[off+1:off+np]))
+        end
+        off += np
+    end
+    changed
+end
+
 # ─── Simulation ───────────────────────────────────────────────────
 
 """
@@ -672,6 +692,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     prev_data_loss = Inf  # Track data loss for non-Gaussian convergence
 
     for iter in 0:(maxiters-1)
+        # Adapt GP kernel hyperparameters to the evolving fit (before the
+        # model evaluation so f/J/W below are consistent with the new kernel)
+        if iter >= alg.warmup
+            _adapt_gp_approximators!(prob, beta)
+        end
         # Re-evaluate model + Jacobian
         f_vec_new, _ = try; eval_model(beta); catch e
             if verbose; println("Iter $iter: simulation failed ($e)"); end
