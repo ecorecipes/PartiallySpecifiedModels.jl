@@ -101,10 +101,20 @@ end
 
 Kernel-interpolation approximator. Parameters are function values at
 uniformly spaced inducing points, evaluated between points through the
-kernel weights `k(x,X)K⁻¹f_X` (the GP predictive-mean formula with fixed
-hyperparameters). Note this is a fixed basis expansion, not full GP
-inference: `lengthscale`/`variance` are set at construction and never
-estimated, and no predictive variance is produced.
+kernel weights `k(x,X)K⁻¹f_X` (the GP predictive-mean formula). Note this
+is a basis expansion, not full GP inference: no predictive variance is
+produced.
+
+Kernel hyperparameters are handled two ways:
+- `lengthscale=nothing` (default): adaptive. During LAML (after `warmup`
+  iterations) and GCV fits, `(lengthscale, variance)` are re-estimated by
+  empirical Bayes — maximizing the GP marginal likelihood of the current
+  inducing values over a lengthscale × variance grid — and `K`/`K⁻¹` are
+  rebuilt. Because the coefficients are function *values* at the inducing
+  points, re-fitting the kernel changes only the between-point behavior of
+  the interpolant, not the values it passes through.
+- `lengthscale=<value>`: fixed. The supplied hyperparameters are used
+  as-is and never touched by any solver.
 
 The LAML/GCV penalty is a spline-style second-derivative penalty on the
 inducing values — not the theoretical GP prior precision `K⁻¹`, whose
@@ -121,7 +131,9 @@ unreliable (see `penalty_matrix(::GPApproximator)` in approximators.jl).
 - `domain`: `(lo, hi)` range of the input variable
 - `n_inducing`: number of inducing points (like nknots for splines)
 - `kernel`: kernel type (default `:sqexp`)
-- `lengthscale`: kernel lengthscale (default: `domain_span / (n_inducing - 1)`)
+- `lengthscale`: kernel lengthscale. `nothing` (default) starts at
+  `domain_span / (n_inducing - 1)` and adapts during the fit; an explicit
+  value is fixed for the whole fit
 - `variance`: signal variance σ² (default: 1.0)
 - `initial`: optional initial function `x -> y`
 """
