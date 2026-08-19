@@ -203,7 +203,7 @@ ODINSolver
 
 ### RKHSSolver
 
-**Reproducing kernel Hilbert space estimation**: represents the unknown function as a kernel expansion and solves a penalized least-squares problem with an RKHS norm penalty (kernel ridge regression). Related in spirit to the RKHS gradient-matching literature (González et al. 2014), which kernelizes the state trajectory instead.
+**Trajectory-RKHS estimation** (González et al. 2014): the state trajectory is represented in a time-kernel RKHS so its derivative is analytic, and fitting alternates a linear Gauss–Newton solve for the trajectory coefficients (data + RKHS norm + linearized ODE-gradient term) with gradient steps on the unknown-function parameters. Supports partially observed systems; no ODE integration.
 
 ```@docs
 RKHSSolver
@@ -228,4 +228,4 @@ RKHSSolver
 | Identifiability analysis | [`ProfileLikelihoodSolver`](@ref) |
 | Derivative-free batch estimation | [`EnsembleKalmanSolver`](@ref) |
 | GP-weighted gradient matching | [`ODINSolver`](@ref) |
-| Kernel-based unknown functions | [`RKHSSolver`](@ref) |
+| Trajectory-in-RKHS gradient matching | [`RKHSSolver`](@ref) |

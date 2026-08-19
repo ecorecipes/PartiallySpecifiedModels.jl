@@ -2072,6 +2072,44 @@ using OrdinaryDiffEq
         @test sol_rk.convergence.method == :rkhs
         @test sol_rk.convergence.kernel == :rbf
         @test abs(sol_rk.unknown_functions[:f](3.0) - 1.5) < 0.35
+        # trajectory-RKHS: the fitted values are the RKHS trajectory, so
+        # they must track the data (not just echo a smoother)
+        @test sol_rk.data_loss < 0.5
+    end
+
+    @testset "RKHSSolver — partially observed oscillator" begin
+        # x1' = x2, x2' = -k(x1); only position observed. The Gauss–Newton
+        # B-step's Jacobian coupling must infer the velocity trajectory.
+        k_rkhs(x) = x
+        function osc_rk!(du, u, p, t)
+            du[1] = u[2]
+            du[2] = -p.k(u[1])
+        end
+        sol_true_rk = OrdinaryDiffEq.solve(
+            ODEProblem((du,u,p,t)->(du[1]=u[2]; du[2]=-k_rkhs(u[1])),
+                       [1.5, 0.0], (0.0, 8.0)), Tsit5(); saveat=0.25)
+        t_ork = collect(sol_true_rk.t)
+        data_ork = [sol_true_rk(t)[1] for t in t_ork] .+
+                   0.03 .* randn(Random.Xoshiro(7), length(t_ork))
+        prob_ork = PSMProblem(osc_rk!, [1.5, 0.0], (0.0, 8.0),
+            [BSplineApproximator(:k, (-2.0, 2.0), 7)];
+            data_times=t_ork, data_values=reshape(data_ork, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_ork = solve(prob_ork, RKHSSolver(maxiters=400, verbose=false))
+
+        errs = [abs(sol_ork.unknown_functions[:k](x) - k_rkhs(x))
+                for x in -1.4:0.2:1.4]
+        @test maximum(errs) < 0.15
+        @test sol_ork.data_loss < 0.5
+        # discrete-time problems are rejected (ẋ is undefined for maps)
+        prob_disc = PSMProblem((u, p, t) -> [p.k(u[1])], [1.0], (0.0, 5.0),
+            [BSplineApproximator(:k, (0.0, 5.0), 5)];
+            data_times=collect(0.0:1.0:5.0),
+            data_values=reshape(ones(6), :, 1), obs_to_state=[1],
+            known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian(), discrete=true)
+        @test_throws Exception solve(prob_disc, RKHSSolver())
     end
 
     @testset "ProfileLikelihoodSolver — logistic growth" begin

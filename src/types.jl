@@ -1643,35 +1643,34 @@ ODINSolver(; maxiters::Int=50,
 """
     RKHSSolver
 
-Reproducing kernel Hilbert space (RKHS) estimator for unknown functions.
-
-Represents the unknown function as f(x) = Σᵢ αᵢ K(x, xᵢ) where K is a
-kernel (default: squared-exponential) and xᵢ are representative points.
-Solves a penalised least-squares problem with an RKHS norm penalty
-‖f‖² = α' K α, yielding a kernel ridge regression-like estimator within
-the ODE fitting loop.
-
-Note this kernelizes the *unknown function* — a different design from the
-RKHS gradient-matching literature (González et al. 2014; Niu et al. 2016),
-which places the state *trajectory* x(t) in the RKHS. The penalty idea is
-shared; the estimator is not the cited papers' method.
+Trajectory-RKHS estimator (González et al. 2014): the *state trajectory*
+is placed in a time-kernel RKHS, `x_k(t) = m_k + Σᵢ b_{k,i} k(t, tᵢ)`
+with centers at the data times, so `ẋ_k(t)` is available analytically.
+The objective — data fit + RKHS norm `λ bᵀKb` + ODE-gradient match
+`ρ Σ(ẋ − f(x,θ))²` on a collocation grid — is minimized by alternating a
+*linear* solve for the trajectory coefficients (with `f` frozen at the
+previous iterate, Picard linearization) and Adam steps on the
+unknown-function parameters θ. Continuous-time problems only.
 
 # Fields
-- `kernel`: kernel type `:rbf`, `:matern32`, `:matern52` (default `:rbf`)
-- `lengthscale`: kernel lengthscale (default 1.0)
-- `lambda_rkhs`: RKHS norm penalty (default 1.0)
-- `n_repr_points`: number of representative points (default 20)
-- `maxiters`: optimisation iterations (default 1000)
-- `lr`: learning rate (default 0.01)
+- `kernel`: time-kernel type `:rbf`, `:matern32`, `:matern52` (default `:rbf`)
+- `lengthscale`: time-kernel lengthscale; ≤ 0 (default) auto-scales to
+  `time_span / 8`
+- `lambda_rkhs`: RKHS-norm penalty λ on the trajectory (default 0.01)
+- `lambda_ode`: weight ρ of the ODE-gradient term (default 1.0)
+- `n_repr_points`: size of the ODE collocation grid (default 30)
+- `maxiters`: outer alternations; 10 θ Adam steps each (default 200)
+- `lr`: θ learning rate (default 0.01)
 - `verbose`: print progress
 
 # References
-- Gonzalez et al. (2014), Pattern Recognition Letters
+- González et al. (2014), Pattern Recognition Letters
 """
 struct RKHSSolver
     kernel::Symbol
-    lengthscale::Float64      # ≤ 0 means auto-scale from domain
+    lengthscale::Float64      # ≤ 0 means auto-scale from the time span
     lambda_rkhs::Float64
+    lambda_ode::Float64
     n_repr_points::Int
     maxiters::Int
     lr::Float64
@@ -1679,9 +1678,11 @@ struct RKHSSolver
 end
 
 RKHSSolver(; kernel::Symbol=:rbf, lengthscale::Float64=-1.0,
-             lambda_rkhs::Float64=1.0, n_repr_points::Int=20,
-             maxiters::Int=1000, lr::Float64=0.01, verbose::Bool=false) =
-    RKHSSolver(kernel, lengthscale, lambda_rkhs, n_repr_points, maxiters, lr, verbose)
+             lambda_rkhs::Float64=0.01, lambda_ode::Float64=1.0,
+             n_repr_points::Int=30,
+             maxiters::Int=200, lr::Float64=0.01, verbose::Bool=false) =
+    RKHSSolver(kernel, lengthscale, lambda_rkhs, lambda_ode, n_repr_points,
+               maxiters, lr, verbose)
 
 # ─── Problem and solution types ────────────────────────────────────
 
