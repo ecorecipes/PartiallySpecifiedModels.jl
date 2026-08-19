@@ -1424,25 +1424,19 @@ using OrdinaryDiffEq
             obs_to_state=[1], known_params=NamedTuple(),
             likelihood=PartiallySpecifiedModels.Gaussian(), discrete=true)
 
-        # Test with BNGSolver (discrete)
+        # Accuracy on the discrete path for each solver (true r(5) = 0.25;
+        # all four recover it to ~0.002 on this seeded data)
         sol_bng_d = solve(prob_rick, BNGSolver(maxiters=500, verbose=false))
-        @test sol_bng_d isa PSMSolution
-        @test isfinite(sol_bng_d.data_loss)
+        @test abs(sol_bng_d.unknown_functions[:r](5.0) - 0.25) < 0.05
 
-        # Test with TwoStageSolver (discrete)
         sol_ts_d = solve(prob_rick, TwoStageSolver(maxiters=500, verbose=false))
-        @test sol_ts_d isa PSMSolution
-        @test isfinite(sol_ts_d.data_loss)
+        @test abs(sol_ts_d.unknown_functions[:r](5.0) - 0.25) < 0.05
 
-        # Test with DerivativeFreeSolver (discrete)
-        sol_df_d = solve(prob_rick, DerivativeFreeSolver(maxiters=2000, verbose=false))
-        @test sol_df_d isa PSMSolution
-        @test isfinite(sol_df_d.objective)
+        sol_df_d = solve(prob_rick, DerivativeFreeSolver(maxiters=4000, verbose=false))
+        @test abs(sol_df_d.unknown_functions[:r](5.0) - 0.25) < 0.05
 
-        # Test with GCVSolver (discrete)
         sol_gcv_d = solve(prob_rick, GCVSolver(maxiters=20, verbose=false))
-        @test sol_gcv_d isa PSMSolution
-        @test isfinite(sol_gcv_d.data_loss)
+        @test abs(sol_gcv_d.unknown_functions[:r](5.0) - 0.25) < 0.05
     end
 
     @testset "Kalman solvers reject discrete" begin

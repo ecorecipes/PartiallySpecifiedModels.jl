@@ -108,7 +108,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DerivativeFreeSolver)
             pen += dot(bk, S_list[l] * bk)
         end
 
-        data_loss + 0.5 * pen
+        data_loss + 0.5 * alg.penalty_weight * pen
     end
 
     # ── Choose optimizer ──

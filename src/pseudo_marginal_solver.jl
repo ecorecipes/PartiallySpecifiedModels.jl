@@ -29,8 +29,15 @@ function _pm_mvn_sample(μ::Vector{Float64}, Σ::Matrix{Float64}, rng)
     D = length(μ)
     base = maximum(diag(Σ))
     base <= 0 && return copy(μ)                      # degenerate (e.g. t=0)
-    F = cholesky(Symmetric(Σ + 1e-12 * max(base, 1.0) * I), check=false)
-    issuccess(F) ? μ .+ F.L * randn(rng, D) : copy(μ)
+    # Escalate jitter until the Cholesky succeeds: silently returning the
+    # mean would be a degenerate draw, breaking the FFBS estimator's
+    # unbiasedness in exactly the near-singular cases where it matters.
+    for jit in (1e-12, 1e-9, 1e-6)
+        F = cholesky(Symmetric(Σ + jit * max(base, 1.0) * I), check=false)
+        issuccess(F) && return μ .+ F.L * randn(rng, D)
+    end
+    F = cholesky(Symmetric(Σ + 1e-4 * max(base, 1.0) * I))
+    μ .+ F.L * randn(rng, D)
 end
 
 """
@@ -174,12 +181,34 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
     dtimes = Float64.(prob.data_times)
     u0 = Float64.(prob.u0)
 
+    # Likelihood estimator selected by alg.inner_method:
+    #   :ffbs   — unbiased FFBS Monte-Carlo average (pseudo-marginal MCMC
+    #             in the Andrieu & Roberts 2009 sense; the default)
+    #   :fenrir — deterministic Fenrir conditional evidence (Tronarp et al.
+    #             2022); the chain is then plain adaptive RWM on an
+    #             approximate likelihood
+    #   :dalton — deterministic DALTON data-adaptive likelihood (Wu & Lysy
+    #             2024); likewise plain RWM
+    alg.inner_method in (:ffbs, :fenrir, :dalton) ||
+        error("PseudoMarginalSolver: inner_method must be :ffbs, :fenrir, " *
+              "or :dalton (got :$(alg.inner_method))")
     function loglik_hat(beta)
         p = build_param_struct(prob, beta)
         rhs!(du, u, pu, t) = prob.dynamics!(du, u, p, t)
         try
-            _pm_loglik_hat(rhs!, u0, prob.tspan, alg.n_steps, alg.n_deriv, sigma,
-                           data, dtimes, prob.obs_to_state, obs_var, n_particles, rng)
+            if alg.inner_method == :fenrir
+                fenrir_loglik(rhs!, nothing, u0, prob.tspan, alg.n_steps,
+                              alg.n_deriv, sigma, data, dtimes,
+                              prob.obs_to_state, obs_var)
+            elseif alg.inner_method == :dalton
+                _dalton_loglik(rhs!, nothing, u0, prob.tspan, alg.n_steps,
+                               alg.n_deriv, sigma, data, dtimes,
+                               prob.obs_to_state, obs_var)
+            else
+                _pm_loglik_hat(rhs!, u0, prob.tspan, alg.n_steps, alg.n_deriv,
+                               sigma, data, dtimes, prob.obs_to_state,
+                               obs_var, n_particles, rng)
+            end
         catch e
             _is_program_error(e) && rethrow()
             -Inf

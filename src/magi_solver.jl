@@ -273,13 +273,29 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     # terms, silently distorting the posterior.
     obs_var = alg.obs_var
     if obs_var === nothing
+        # Gasser–Sroka–Jennen local-linear residual estimator: for each
+        # interior point, ε̂ᵢ = yᵢ − aᵢy₍ᵢ₋₁₎ − bᵢy₍ᵢ₊₁₎ with the linear-
+        # interpolation weights, σ̂² = Σ cᵢ²ε̂ᵢ²/(n−2), cᵢ² = 1/(aᵢ²+bᵢ²+1).
+        # Valid for NON-equispaced times (reduces to Var(Δ²y)/6 when
+        # equispaced, which the previous estimator assumed).
         ests = Float64[]
+        t_all = Float64.(prob.data_times)
         for j in 1:size(prob.data_values, 2)
             y = Float64.(prob.data_values[:, j])
-            y = y[.!isnan.(y)]
-            length(y) >= 4 || continue
-            d2 = diff(diff(y))
-            push!(ests, max(sum(abs2, d2) / (6 * length(d2)), 1e-10))
+            keep = .!isnan.(y)
+            yv = y[keep]; tv = t_all[keep]
+            n = length(yv)
+            n >= 4 || continue
+            acc = 0.0
+            for i in 2:(n - 1)
+                den = tv[i+1] - tv[i-1]
+                den > 0 || continue
+                a = (tv[i+1] - tv[i]) / den
+                b = (tv[i] - tv[i-1]) / den
+                ε = yv[i] - a * yv[i-1] - b * yv[i+1]
+                acc += ε^2 / (a^2 + b^2 + 1)
+            end
+            push!(ests, max(acc / (n - 2), 1e-10))
         end
         obs_var = isempty(ests) ? 0.01 : Statistics.mean(ests)
         verbose && println("MAGI: estimated obs_var = $(round(obs_var, sigdigits=3))")

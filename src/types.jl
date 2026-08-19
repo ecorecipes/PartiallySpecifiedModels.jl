@@ -960,19 +960,17 @@ struct MultipleShootingSolver
     n_intervals::Int
     maxiters_inner::Int
     maxiters_outer::Int
-    lr::Float64
     rho_init::Float64
     rho_max::Float64
     verbose::Bool
-    autodiff::Bool
 end
 
 MultipleShootingSolver(; n_intervals::Int=10, maxiters_inner::Int=100,
-                         maxiters_outer::Int=20, lr::Float64=0.01,
+                         maxiters_outer::Int=20,
                          rho_init::Float64=10.0, rho_max::Float64=1e6,
-                         verbose::Bool=false, autodiff::Bool=true) =
+                         verbose::Bool=false) =
     MultipleShootingSolver(n_intervals, maxiters_inner, maxiters_outer,
-                           lr, rho_init, rho_max, verbose, autodiff)
+                           rho_init, rho_max, verbose)
 
 """
     AdaptiveGradientMatching(; maxiters=200, verbose=false, gamma_init=1.0,
@@ -1252,8 +1250,11 @@ marginal likelihood p(Y|θ), then samples from the posterior p(θ|Y) via NUTS.
 - `obs_var`: observation noise variance (default 0.01)
 - `target_accept`: NUTS target acceptance rate (default 0.8)
 - `prior_scale`: prior standard deviation on parameters (default 1.0)
-- `inner_method`: reserved; currently ignored — the likelihood estimator
-  is always the unbiased FFBS Monte-Carlo average (see solve docstring)
+- `inner_method`: likelihood estimator — `:ffbs` (default; unbiased FFBS
+  Monte-Carlo average, giving genuine pseudo-marginal MCMC), `:fenrir`
+  (deterministic Fenrir evidence; the chain is then plain adaptive RWM on
+  an approximate likelihood), or `:dalton` (deterministic DALTON
+  data-adaptive likelihood, likewise plain RWM)
 - `verbose`: print progress
 """
 struct PseudoMarginalSolver
@@ -1275,7 +1276,7 @@ PseudoMarginalSolver(; n_samples::Int=1000, n_warmup::Int=500,
                        sigma::Union{Nothing, Vector{Float64}}=nothing,
                        obs_var::Union{Nothing, Float64}=nothing,
                        target_accept::Float64=0.8, prior_scale::Float64=1.0,
-                       inner_method::Symbol=:fenrir,
+                       inner_method::Symbol=:ffbs,
                        initial_params::Union{Nothing, Vector{Float64}}=nothing,
                        verbose::Bool=false) =
     PseudoMarginalSolver(n_samples, n_warmup, n_steps, n_deriv, sigma, obs_var,
@@ -1351,9 +1352,9 @@ TwoStageSolver(; n_basis_smooth::Int=20, lambda_smooth::Float64=1.0,
 
 Derivative-free optimization solver using NelderMead or particle swarm.
 
-The objective always includes the quadratic roughness penalty Σₖ βₖ'Sₖβₖ
-with unit weight (there is no smoothing-parameter selection here); for
-penalty-free fitting use `AdamSolver(penalty_weight=0)`.
+The objective includes the quadratic roughness penalty
+`penalty_weight · Σₖ βₖ'Sₖβₖ` (default weight 1.0; set `penalty_weight=0`
+for an unpenalized fit — there is no smoothing-parameter selection here).
 
 Useful as a robust fallback when gradient-based methods fail (non-smooth
 objectives, stiff dynamics, poor conditioning). Uses simulation-based
@@ -1371,13 +1372,16 @@ struct DerivativeFreeSolver
     maxiters::Int
     n_particles::Int
     loss::Symbol
+    penalty_weight::Float64
     verbose::Bool
 end
 
 DerivativeFreeSolver(; method::Symbol=:nelder_mead, maxiters::Int=10000,
                        n_particles::Int=20, loss::Symbol=:mse,
+                       penalty_weight::Float64=1.0,
                        verbose::Bool=false) =
-    DerivativeFreeSolver(method, maxiters, n_particles, loss, verbose)
+    DerivativeFreeSolver(method, maxiters, n_particles, loss, penalty_weight,
+                         verbose)
 
 # ─── Variational inference solver ──────────────────────────────────
 
