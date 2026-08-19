@@ -195,7 +195,7 @@ EnsembleKalmanSolver
 
 ### ODINSolver
 
-**ODIN-style gradient matching** (Wenk et al. 2020): weights the ODE mismatch by the GP's conditional derivative covariance (a Mahalanobis risk). This implementation is a one-shot variant with user-set GP hyperparameters.
+**ODE-informed regression** (ODIN; Wenk et al. 2020): GP hyperparameters are estimated per state by marginal likelihood, then states and unknown-function parameters are optimised *jointly* under a Mahalanobis risk that weights the ODE mismatch by the GP's conditional derivative covariance. Supports partially observed systems (unobserved states are identified through the ODE terms).
 
 ```@docs
 ODINSolver

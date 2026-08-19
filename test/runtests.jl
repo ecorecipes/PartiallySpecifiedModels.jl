@@ -2015,6 +2015,36 @@ using OrdinaryDiffEq
         @test haskey(sol_od.unknown_functions, :r)
         @test sol_od.convergence.method == :odin
         @test abs(sol_od.unknown_functions[:r](5.0) - 0.25) < 0.15
+        # GP hyperparameters are estimated per state by marginal likelihood
+        hp = sol_od.convergence.gp_hyperparams[1]
+        @test hp.ℓ > 0 && hp.σ² > 0 && hp.σn² > 0
+    end
+
+    @testset "ODINSolver — partially observed oscillator" begin
+        # x1' = x2, x2' = -k(x1); only position observed. The joint
+        # optimisation must infer the velocity through the ODE terms.
+        k_osc(x) = x
+        function osc_od!(du, u, p, t)
+            du[1] = u[2]
+            du[2] = -p.k(u[1])
+        end
+        sol_true = OrdinaryDiffEq.solve(
+            ODEProblem((du,u,p,t)->(du[1]=u[2]; du[2]=-k_osc(u[1])),
+                       [1.5, 0.0], (0.0, 8.0)), Tsit5(); saveat=0.25)
+        t_osc = collect(sol_true.t)
+        data_osc = [sol_true(t)[1] for t in t_osc] .+
+                   0.03 .* randn(Random.Xoshiro(7), length(t_osc))
+        uf_osc = BSplineApproximator(:k, (-2.0, 2.0), 7)
+        prob_osc = PSMProblem(osc_od!, [1.5, 0.0], (0.0, 8.0), [uf_osc];
+            data_times=t_osc, data_values=reshape(data_osc, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_osc = solve(prob_osc, ODINSolver(maxiters=60, verbose=false))
+
+        errs = [abs(sol_osc.unknown_functions[:k](x) - k_osc(x))
+                for x in -1.4:0.2:1.4]
+        @test maximum(errs) < 0.2
+        @test sol_osc.data_loss < 0.5   # states track the position data
     end
 
     @testset "RKHSSolver — exponential decay" begin

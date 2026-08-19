@@ -1589,23 +1589,30 @@ EnsembleKalmanSolver(; n_ensemble::Int=50, n_iterations::Int=30,
 """
     ODINSolver
 
-Gradient matching with the ODIN-style Mahalanobis risk (Wenk, Abbati
-et al. 2020): the ODE mismatch is weighted by the GP's conditional
-derivative covariance, so poorly-determined derivative directions carry
-less weight.
+ODE-informed regression (Wenk, Abbati et al. 2020). GP hyperparameters
+are first estimated per observed state by marginal likelihood, then the
+states `X` and the unknown-function parameters `θ` are optimised
+*jointly* against the ODIN risk
 
-**Scope**: this is a one-shot variant. The GP hyperparameters are set by
-the user (`gp_lengthscale`, `gp_variance`) and the states are held at the
-GP posterior mean; ODIN's defining *joint* optimisation over states, ODE
-parameters, and GP hyperparameters is not implemented. The adaptive
-weighting is therefore only as good as the supplied hyperparameters.
+    R(X, θ) = Σ_k [ ‖y_k − x_k‖²/σ_{n,k}² + x̃_kᵀ K_k⁻¹ x̃_k
+                    + (f_k(X,θ) − D_k x̃_k)ᵀ A_k⁻¹ (f_k(X,θ) − D_k x̃_k) ],
+
+where `x̃_k` is the centered state, `D_k = 'K K⁻¹` maps states to their GP
+conditional-mean derivative, and `A_k = ''K − 'K K⁻¹ 'Kᵀ + γI` is the GP
+conditional derivative covariance — so the ODE mismatch is trusted only
+in directions the GP actually determines. Unobserved states are included
+as free variables (GP prior + ODE terms, no data term), so partially
+observed systems are supported.
 
 # Fields
-- `maxiters`: outer EM iterations (default 50)
-- `gp_lengthscale`: initial RBF lengthscale (default 1.0)
-- `gp_variance`: initial signal variance (default 1.0)
-- `ode_weight`: weight for ODE mismatch penalty (default 10.0)
-- `lr`: learning rate for inner Adam loop (default 0.01)
+- `maxiters`: outer iterations; 20 Adam steps each (default 50)
+- `gp_lengthscale`, `gp_variance`: `nothing` (default) estimates the RBF
+  hyperparameters per state by GP marginal likelihood. Supplying BOTH
+  fixes them for all states (with noise assumed at `0.01 * gp_variance`);
+  supplying only one is an error
+- `ode_weight`: extra multiplier on the ODE-mismatch term (default 1.0 =
+  the natural Mahalanobis weighting of the paper)
+- `lr`: Adam learning rate (default 0.01)
 - `verbose`: print progress
 
 # References
@@ -1614,17 +1621,22 @@ weighting is therefore only as good as the supplied hyperparameters.
 """
 struct ODINSolver
     maxiters::Int
-    gp_lengthscale::Float64
-    gp_variance::Float64
+    gp_lengthscale::Union{Nothing, Float64}
+    gp_variance::Union{Nothing, Float64}
     ode_weight::Float64
     lr::Float64
     verbose::Bool
 end
 
-ODINSolver(; maxiters::Int=50, gp_lengthscale::Float64=1.0,
-             gp_variance::Float64=1.0, ode_weight::Float64=10.0,
+ODINSolver(; maxiters::Int=50,
+             gp_lengthscale::Union{Nothing, Real}=nothing,
+             gp_variance::Union{Nothing, Real}=nothing,
+             ode_weight::Float64=1.0,
              lr::Float64=0.01, verbose::Bool=false) =
-    ODINSolver(maxiters, gp_lengthscale, gp_variance, ode_weight, lr, verbose)
+    ODINSolver(maxiters,
+               gp_lengthscale === nothing ? nothing : Float64(gp_lengthscale),
+               gp_variance === nothing ? nothing : Float64(gp_variance),
+               ode_weight, lr, verbose)
 
 # ─── RKHS solver ───────────────────────────────────────────────────
 
