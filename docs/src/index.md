@@ -103,7 +103,7 @@ end
 | [`ProfileLikelihoodSolver`](@ref) | Profile likelihood identifiability/CIs | No | No | Simpson & Maclaren (2023) |
 | [`EnsembleKalmanSolver`](@ref) | Ensemble Kalman inversion | No | No | Iglesias et al. (2013) |
 | [`ODINSolver`](@ref) | ODIN-style Mahalanobis gradient matching | Yes | No | Wenk et al. (2020) |
-| [`RKHSSolver`](@ref) | RKHS/kernel ridge unknown-function estimation | Yes | No | González et al. (2014) |
+| [`RKHSSolver`](@ref) | Trajectory-in-RKHS gradient matching | Yes | No | González et al. (2014) |
 
 ### Approximators
 

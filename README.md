@@ -107,7 +107,7 @@ PartiallySpecifiedModels.jl provides 22 solvers spanning penalized likelihood, g
 | `ProfileLikelihoodSolver` | Profile likelihood identifiability/CIs | No | No | Simpson & Maclaren (2023) |
 | `EnsembleKalmanSolver` | Ensemble Kalman inversion | No | No | Iglesias et al. (2013) |
 | `ODINSolver` | ODIN-style Mahalanobis gradient matching | Yes | No | Wenk et al. (2020) |
-| `RKHSSolver` | RKHS/kernel ridge unknown-function estimation | Yes | No | González et al. (2014) |
+| `RKHSSolver` | Trajectory-in-RKHS gradient matching | Yes | No | González et al. (2014) |
 
 ## Approximators
 
@@ -193,7 +193,7 @@ The `vignettes/` directory contains 35 worked examples:
 | 32 | Profile Likelihood | Identifiability analysis and likelihood-ratio CIs |
 | 33 | Ensemble Kalman | Derivative-free estimation via ensemble Kalman inversion |
 | 34 | ODIN | ODE-informed Gaussian process regression |
-| 35 | RKHS | Reproducing kernel Hilbert space estimation |
+| 35 | RKHS | Trajectory-in-RKHS gradient matching |
 
 ## References
 

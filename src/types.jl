@@ -1178,39 +1178,56 @@ MagiSolver(; n_samples::Int=1000, n_warmup::Int=500, n_deriv::Int=3,
 """
     BNGSolver
 
-Gradient-matching solver in the style of Bonnaffé & Coulson (2023)'s
-neural gradient matching.
+Ensemble Bayesian gradient matching (Bonnaffé & Coulson 2023). Avoids
+ODE integration entirely: observed series are smoothed with GCV splines,
+and unknown-function parameters are fit by matching the smoothed
+derivatives under a variance-marginalized log-posterior
+`(n/2)log(1 + SSR/2) + (|β|/2)log(1 + Σ(β/prior_sd)²/2)` (the paper's
+"Bayesian regularisation": observation and prior variances are
+marginalized, not supplied).
 
-Two-step approach that avoids ODE integration entirely:
-1. Smooth observed time series to get interpolated states and derivatives
-2. Fit unknown functions by matching the smoothed derivatives
-
-**Scope**: this is a deterministic point-estimate implementation of the
-smooth-then-match loss. The *Bayesian* machinery of the cited paper —
-K_o × K_p ensembles of repeated fits, variance-marginalized posterior
-regularization, and the per-capita-growth-rate process model — is not
-implemented, so no uncertainty quantification is produced. For a
-Bayesian gradient-matching posterior use `MagiSolver` or `MCMCSolver`;
-for uncertainty on this solver's output use `bootstrap`.
+Uncertainty comes from a `k_obs × k_proc` fit ensemble: `k_obs`
+observation resamples (residual bootstrap of the smoother; the first is
+the original data) times `k_proc` restarts from perturbed
+initialisations. Reported unknown functions are ensemble means;
+`sol.convergence.ensemble_std[name]` gives the pointwise ensemble
+standard deviation.
 
 # Fields
-- `n_basis`: number of spline basis functions for data smoothing (default 20)
-- `maxiters`: maximum optimization iterations for step 2 (default 2000)
-- `lr`: learning rate for Adam optimizer (default 0.01)
-- `lambda_smooth`: smoothing penalty for data interpolation (default 1.0)
+- `k_obs`: observation-ensemble size (default 10)
+- `k_proc`: process fits per observation ensemble (default 3)
+- `prior_sd`: prior scale of the marginalized Gaussian parameter prior
+  (default 10.0)
+- `maxiters`: Adam iterations per ensemble member (default 2000)
+- `lr`: Adam learning rate (default 0.01)
+- `lambda_smooth`: extra smoothing penalty on approximator coefficients
+  (default 1.0)
+- `rng_seed`: seed for the bootstrap and restarts (default `nothing` =
+  non-reproducible)
 - `verbose`: print progress
+
+# References
+- Bonnaffé & Coulson (2023), "Fast fitting of neural ordinary
+  differential equations by Bayesian neural gradient matching to infer
+  ecological interactions from time-series data", Methods Ecol Evol 14
 """
 struct BNGSolver
-    n_basis::Int
+    k_obs::Int
+    k_proc::Int
+    prior_sd::Float64
     maxiters::Int
     lr::Float64
     lambda_smooth::Float64
+    rng_seed::Union{Nothing, Int}
     verbose::Bool
 end
 
-BNGSolver(; n_basis::Int=20, maxiters::Int=2000, lr::Float64=0.01,
-            lambda_smooth::Float64=1.0, verbose::Bool=false) =
-    BNGSolver(n_basis, maxiters, lr, lambda_smooth, verbose)
+BNGSolver(; k_obs::Int=10, k_proc::Int=3, prior_sd::Float64=10.0,
+            maxiters::Int=2000, lr::Float64=0.01,
+            lambda_smooth::Float64=1.0,
+            rng_seed::Union{Nothing, Int}=nothing, verbose::Bool=false) =
+    BNGSolver(k_obs, k_proc, prior_sd, maxiters, lr, lambda_smooth,
+              rng_seed, verbose)
 
 # ─── Dalton solver (Wu & Lysy 2024) ───────────────────────────────
 
@@ -1643,35 +1660,34 @@ ODINSolver(; maxiters::Int=50,
 """
     RKHSSolver
 
-Reproducing kernel Hilbert space (RKHS) estimator for unknown functions.
-
-Represents the unknown function as f(x) = Σᵢ αᵢ K(x, xᵢ) where K is a
-kernel (default: squared-exponential) and xᵢ are representative points.
-Solves a penalised least-squares problem with an RKHS norm penalty
-‖f‖² = α' K α, yielding a kernel ridge regression-like estimator within
-the ODE fitting loop.
-
-Note this kernelizes the *unknown function* — a different design from the
-RKHS gradient-matching literature (González et al. 2014; Niu et al. 2016),
-which places the state *trajectory* x(t) in the RKHS. The penalty idea is
-shared; the estimator is not the cited papers' method.
+Trajectory-RKHS estimator (González et al. 2014): the *state trajectory*
+is placed in a time-kernel RKHS, `x_k(t) = m_k + Σᵢ b_{k,i} k(t, tᵢ)`
+with centers at the data times, so `ẋ_k(t)` is available analytically.
+The objective — data fit + RKHS norm `λ bᵀKb` + ODE-gradient match
+`ρ Σ(ẋ − f(x,θ))²` on a collocation grid — is minimized by alternating a
+*linear* solve for the trajectory coefficients (with `f` frozen at the
+previous iterate, Picard linearization) and Adam steps on the
+unknown-function parameters θ. Continuous-time problems only.
 
 # Fields
-- `kernel`: kernel type `:rbf`, `:matern32`, `:matern52` (default `:rbf`)
-- `lengthscale`: kernel lengthscale (default 1.0)
-- `lambda_rkhs`: RKHS norm penalty (default 1.0)
-- `n_repr_points`: number of representative points (default 20)
-- `maxiters`: optimisation iterations (default 1000)
-- `lr`: learning rate (default 0.01)
+- `kernel`: time-kernel type `:rbf`, `:matern32`, `:matern52` (default `:rbf`)
+- `lengthscale`: time-kernel lengthscale; ≤ 0 (default) auto-scales to
+  `time_span / 8`
+- `lambda_rkhs`: RKHS-norm penalty λ on the trajectory (default 0.01)
+- `lambda_ode`: weight ρ of the ODE-gradient term (default 1.0)
+- `n_repr_points`: size of the ODE collocation grid (default 30)
+- `maxiters`: outer alternations; 10 θ Adam steps each (default 200)
+- `lr`: θ learning rate (default 0.01)
 - `verbose`: print progress
 
 # References
-- Gonzalez et al. (2014), Pattern Recognition Letters
+- González et al. (2014), Pattern Recognition Letters
 """
 struct RKHSSolver
     kernel::Symbol
-    lengthscale::Float64      # ≤ 0 means auto-scale from domain
+    lengthscale::Float64      # ≤ 0 means auto-scale from the time span
     lambda_rkhs::Float64
+    lambda_ode::Float64
     n_repr_points::Int
     maxiters::Int
     lr::Float64
@@ -1679,9 +1695,11 @@ struct RKHSSolver
 end
 
 RKHSSolver(; kernel::Symbol=:rbf, lengthscale::Float64=-1.0,
-             lambda_rkhs::Float64=1.0, n_repr_points::Int=20,
-             maxiters::Int=1000, lr::Float64=0.01, verbose::Bool=false) =
-    RKHSSolver(kernel, lengthscale, lambda_rkhs, n_repr_points, maxiters, lr, verbose)
+             lambda_rkhs::Float64=0.01, lambda_ode::Float64=1.0,
+             n_repr_points::Int=30,
+             maxiters::Int=200, lr::Float64=0.01, verbose::Bool=false) =
+    RKHSSolver(kernel, lengthscale, lambda_rkhs, lambda_ode, n_repr_points,
+               maxiters, lr, verbose)
 
 # ─── Problem and solution types ────────────────────────────────────
 

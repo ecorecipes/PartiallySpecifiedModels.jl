@@ -227,13 +227,12 @@ println("ODIN: data_loss=$(round(sol_odin.data_loss, digits=1)), ",
 
 ### 10. RKHSSolver
 
-Represents the unknown function in a reproducing kernel Hilbert space using RBF kernels at representative points. The RKHS norm $\|\!f\!\|^2_H = \alpha'K\alpha$ acts as the smoothing penalty, providing a non-parametric alternative to splines.
+Trajectory-RKHS estimation (González et al. 2014): the *state trajectory* is represented in a time-kernel RKHS so its derivative is analytic, and fitting alternates a linear Gauss–Newton solve for the trajectory coefficients with gradient steps on the unknown-function parameters. No ODE integration.
 
 ```{julia}
 #| echo: false
 t_rkhs = @elapsed sol_rkhs = solve(prob,
-    RKHSSolver(maxiters=500, n_repr_points=15, kernel=:rbf,
-               lengthscale=0.03, lambda_rkhs=1.0, lr=0.005, verbose=false))
+    RKHSSolver(maxiters=400, kernel=:rbf, verbose=false))
 println("RKHS: data_loss=$(round(sol_rkhs.data_loss, digits=1)), ",
         "time=$(round(t_rkhs, digits=1))s")
 ```

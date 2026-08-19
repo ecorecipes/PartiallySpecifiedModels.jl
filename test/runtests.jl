@@ -1170,13 +1170,24 @@ using OrdinaryDiffEq
             data_times=t_bng, data_values=reshape(data_bng, :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
             likelihood=PartiallySpecifiedModels.Gaussian())
-        sol_bng = solve(prob_bng, BNGSolver(maxiters=500, verbose=false))
+        sol_bng = solve(prob_bng, BNGSolver(maxiters=500, k_obs=4, k_proc=2,
+                                            rng_seed=7, verbose=false))
 
         @test sol_bng isa PSMSolution
         @test sol_bng.data_loss < 2.0   # noise floor ≈ 0.16 (16 pts × 0.1²)
         @test haskey(sol_bng.unknown_functions, :r)
         r_fitted = sol_bng.unknown_functions[:r]
         @test abs(r_fitted(5.0) - 0.25) < 0.12   # true r(5) = 0.5(1 − 5/10)
+        # Ensemble machinery: K_o × K_p members, posterior weights summing
+        # to 1, and a pointwise uncertainty band
+        @test sol_bng.convergence.n_ensemble == 8
+        @test length(sol_bng.convergence.member_losses) == 8
+        @test sum(sol_bng.convergence.member_weights) ≈ 1.0
+        @test sol_bng.convergence.ensemble_std[:r](5.0) >= 0.0
+        # Reproducibility under rng_seed
+        sol_bng2 = solve(prob_bng, BNGSolver(maxiters=500, k_obs=4, k_proc=2,
+                                             rng_seed=7, verbose=false))
+        @test sol_bng2.unknown_functions[:r](5.0) == r_fitted(5.0)
     end
 
     @testset "DaltonSolver — exponential decay" begin
@@ -2072,6 +2083,44 @@ using OrdinaryDiffEq
         @test sol_rk.convergence.method == :rkhs
         @test sol_rk.convergence.kernel == :rbf
         @test abs(sol_rk.unknown_functions[:f](3.0) - 1.5) < 0.35
+        # trajectory-RKHS: the fitted values are the RKHS trajectory, so
+        # they must track the data (not just echo a smoother)
+        @test sol_rk.data_loss < 0.5
+    end
+
+    @testset "RKHSSolver — partially observed oscillator" begin
+        # x1' = x2, x2' = -k(x1); only position observed. The Gauss–Newton
+        # B-step's Jacobian coupling must infer the velocity trajectory.
+        k_rkhs(x) = x
+        function osc_rk!(du, u, p, t)
+            du[1] = u[2]
+            du[2] = -p.k(u[1])
+        end
+        sol_true_rk = OrdinaryDiffEq.solve(
+            ODEProblem((du,u,p,t)->(du[1]=u[2]; du[2]=-k_rkhs(u[1])),
+                       [1.5, 0.0], (0.0, 8.0)), Tsit5(); saveat=0.25)
+        t_ork = collect(sol_true_rk.t)
+        data_ork = [sol_true_rk(t)[1] for t in t_ork] .+
+                   0.03 .* randn(Random.Xoshiro(7), length(t_ork))
+        prob_ork = PSMProblem(osc_rk!, [1.5, 0.0], (0.0, 8.0),
+            [BSplineApproximator(:k, (-2.0, 2.0), 7)];
+            data_times=t_ork, data_values=reshape(data_ork, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_ork = solve(prob_ork, RKHSSolver(maxiters=400, verbose=false))
+
+        errs = [abs(sol_ork.unknown_functions[:k](x) - k_rkhs(x))
+                for x in -1.4:0.2:1.4]
+        @test maximum(errs) < 0.15
+        @test sol_ork.data_loss < 0.5
+        # discrete-time problems are rejected (ẋ is undefined for maps)
+        prob_disc = PSMProblem((u, p, t) -> [p.k(u[1])], [1.0], (0.0, 5.0),
+            [BSplineApproximator(:k, (0.0, 5.0), 5)];
+            data_times=collect(0.0:1.0:5.0),
+            data_values=reshape(ones(6), :, 1), obs_to_state=[1],
+            known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian(), discrete=true)
+        @test_throws Exception solve(prob_disc, RKHSSolver())
     end
 
     @testset "ProfileLikelihoodSolver — logistic growth" begin

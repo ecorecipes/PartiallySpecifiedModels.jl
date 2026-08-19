@@ -118,7 +118,7 @@ include("ensemble_kalman_solver.jl")
 # ODIN solver (ODE-Informed regression, Wenk & Abbati 2020)
 include("odin_solver.jl")
 
-# RKHS solver (kernel-based unknown function estimation)
+# RKHS solver (trajectory-in-RKHS gradient matching)
 include("rkhs_solver.jl")
 
 # Profile range parameter optimization for SPDE
