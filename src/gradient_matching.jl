@@ -8,7 +8,7 @@
 # Key advantage: no ODE integration in the optimization loop, making it
 # far more robust for neural network approximators.
 #
-# Reference: Bonnaffé, Sheldon & Bhatt (2023), Methods in Ecology and Evolution
+# Reference: Bonnaffé & Coulson (2023), Methods in Ecology and Evolution
 
 using LinearAlgebra
 using Statistics

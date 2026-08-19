@@ -179,7 +179,7 @@ IntegralMatchingSolver
 
 ### ProfileLikelihoodSolver
 
-**Profile likelihood** for identifiability analysis and likelihood-ratio confidence intervals (Simpson & Maclaren 2023). Sweeps each parameter over a grid while re-optimizing the others with the LAML inner solver.
+nuisance coefficients are re-optimised at each grid point by a long Nelder–Mead run under the penalized objective at the fitted smoothing parameters (Gaussian likelihoods only; CI endpoints are interpolated between grid points)
 
 ```@docs
 ProfileLikelihoodSolver

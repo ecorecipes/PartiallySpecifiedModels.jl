@@ -149,7 +149,7 @@ optimization:
 
 ## Approach 4: Neural Network with Gradient Matching
 
-**Gradient matching** (Bonnaffé, Sheldon & Bhatt 2023) avoids ODE
+**Gradient matching** (Bonnaffé & Coulson 2023) avoids ODE
 integration entirely, making the optimization landscape much simpler:
 
 1.  **Smooth** the observed data with cubic splines to get $\hat{y}(t)$

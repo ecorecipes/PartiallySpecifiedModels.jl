@@ -312,7 +312,7 @@ reparameterization of Pya & Wood (2015).
 Combines the Matérn SPDE penalty (interpretable range and smoothness parameters)
 with shape constraints (monotonicity, positivity, convexity, etc.). Parameters
 are stored in unconstrained space (γ). During evaluation, mesh node values are
-computed as `β = Σ * softplus(γ)` where Σ is a constraint matrix, then
+computed as `β = Σ * d(γ)` (free level/slope components pass through linearly; the rest are softplus'd) where Σ is a constraint matrix, then
 interpolated with a cubic spline.
 
 **Note:** Shape constraints are enforced at mesh nodes. The cubic spline
@@ -456,7 +456,7 @@ B-spline approximator with a shape constraint enforced via the SCOP-spline
 reparameterization of Pya & Wood (2015).
 
 Parameters are stored in unconstrained space (γ). During evaluation, knot
-values are computed as `β = Σ * softplus(γ)` where Σ is a constraint matrix
+values are computed as `β = Σ * d(γ)` (free level/slope components pass through linearly; the rest are softplus'd) where Σ is a constraint matrix
 (cumulative sum for monotonicity, second-order cumsum for convexity, etc.).
 
 For zero-at-endpoint constraints, one knot value is fixed at 0 and
@@ -1504,7 +1504,8 @@ are re-optimised at each grid point by a long Nelder–Mead run,
 warm-started from the previous grid point. Gaussian likelihoods only.
 
 # Fields
-- `n_profile_points`: grid points per parameter (default 20)
+- `n_profile_points`: grid points per parameter (default 20); the exact
+  MLE value is inserted, so the evaluated grid may have one extra point
 - `ci_level`: confidence level for LR-based CI (default 0.95)
 - `param_indices`: which parameter indices to profile (default `nothing` = all)
 - `verbose`: print progress
