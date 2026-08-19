@@ -148,14 +148,18 @@ plot(plts..., layout=(nrows, ncols), size=(300*ncols, 250*nrows))
 
 For each parameter $\beta_j$:
 
-1.  Fix $\beta_j$ at a grid of values spanning
-    $\hat{\beta}_j \pm 3\hat{\sigma}_j$
-2.  At each grid point, optimise all other parameters $\beta_{-j}$
-    (warm-started from adjacent grid point)
-3.  Compute the profile likelihood ratio:
-    $\text{PLR}(\beta_j) = 2[L(\hat{\beta}) - L(\hat{\beta}_{-j}, \beta_j)]$
+1.  Fix $\beta_j$ at a grid of values centred on $\hat{\beta}_j$
+    (the exact MLE value is inserted into the grid)
+2.  At each grid point, optimise all other parameters $\beta_{-j}$ under
+    the *penalized* objective at the fitted smoothing parameters
+    $\hat{\lambda}$ (warm-started from the adjacent grid point)
+3.  Compute the fixed-smoothing profile likelihood ratio
+    $\text{PLR}(\beta_j) = [\text{PenSS}(\beta_j) - \text{PenSS}_{\min}]/\hat{\sigma}^2$
+    — the profile is conditional on $\hat{\lambda}$, because a penalized
+    spline is not identified through its raw residual sum of squares
 4.  The 95% CI is the set
-    $\{\beta_j : \text{PLR}(\beta_j) < \chi^2_{1, 0.95} = 3.841\}$
+    $\{\beta_j : \text{PLR}(\beta_j) < \chi^2_{1, 0.95} = 3.841\}$,
+    with endpoints interpolated between grid points
 
 This is more reliable than Wald-based CIs (which assume local quadratic
 curvature) because it captures the actual shape of the likelihood
