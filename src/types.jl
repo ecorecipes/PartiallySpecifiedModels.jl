@@ -1470,8 +1470,12 @@ For each unknown-function parameter βⱼ, sweeps βⱼ over a grid while
 optimising all other parameters (β₋ⱼ) at each grid point.  Returns the
 profile likelihood curve Lₚ(βⱼ) and a likelihood-ratio CI.
 
-Uses the LAML solver as the inner optimiser (warm-started from the
-previous grid point).
+The profile is taken through the penalized objective at the fitted
+smoothing parameters λ̂ (a penalized spline is not identified through its
+raw RSS); the statistic ΔPenSS/σ̂² is referenced against χ²₁, and CI
+endpoints are interpolated between grid points. Nuisance coefficients
+are re-optimised at each grid point by a long Nelder–Mead run,
+warm-started from the previous grid point. Gaussian likelihoods only.
 
 # Fields
 - `n_profile_points`: grid points per parameter (default 20)
