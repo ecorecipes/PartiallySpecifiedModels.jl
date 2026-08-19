@@ -91,7 +91,7 @@ PartiallySpecifiedModels.jl provides 22 solvers spanning penalized likelihood, g
 | `CollocationLAML` | Generalized profiling | No | No | Ramsay et al. (2007) |
 | `GradientMatching` | Smooth then match derivatives | Yes | No | — |
 | `TwoStageSolver` | Smooth then match (simple) | Yes | No | Varah (1982) |
-| `BNGSolver` | Bayesian neural gradient matching | Yes | No | Bonnaffé & Coulson (2023) |
+| `BNGSolver` | Ensemble Bayesian gradient matching | Yes | Yes | Bonnaffé & Coulson (2023) |
 | `AdaptiveGradientMatching` | GP product-of-experts | Yes | No | Macdonald & Husmeier (2015) |
 | `AdamSolver` | Adam through ODE (UDE-style) | No | No | Rackauckas et al. (2020) |
 | `MultipleShootingSolver` | Multiple shooting + Adam | No | No | Turan & Jäschke (2021) |

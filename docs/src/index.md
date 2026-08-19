@@ -87,7 +87,7 @@ end
 | [`CollocationLAML`](@ref) | Generalized profiling | No | No | Ramsay et al. (2007) |
 | [`GradientMatching`](@ref) | Smooth then match derivatives | Yes | No | — |
 | [`TwoStageSolver`](@ref) | Smooth then match (simple) | Yes | No | Varah (1982) |
-| [`BNGSolver`](@ref) | Bayesian neural gradient matching | Yes | No | Bonnaffé & Coulson (2023) |
+| [`BNGSolver`](@ref) | Ensemble Bayesian gradient matching | Yes | Yes | Bonnaffé & Coulson (2023) |
 | [`AdaptiveGradientMatching`](@ref) | GP product-of-experts | Yes | No | Macdonald & Husmeier (2015) |
 | [`AdamSolver`](@ref) | Adam through ODE (UDE-style) | No | No | Rackauckas et al. (2020) |
 | [`MultipleShootingSolver`](@ref) | Multiple shooting + Adam | No | No | Turan & Jäschke (2021) |

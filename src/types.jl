@@ -992,35 +992,51 @@ MultipleShootingSolver(; n_intervals::Int=10, maxiters_inner::Int=100,
 
 """
     AdaptiveGradientMatching(; maxiters=200, verbose=false, gamma_init=1.0,
-                               fit_gamma=true, kernel=:rbf)
+                               fit_gamma=true, kernel=:rbf, n_samples=0,
+                               n_chains=10, rng_seed=nothing)
 
 Adaptive Gradient Matching solver using the product-of-experts objective of
 Dondelinger et al. (2013). Gaussian processes smooth the data and supply
 gradient estimates with uncertainty; the ODE-predicted gradients are matched
 under the product-of-experts likelihood.
 
-**This is a MAP variant of the cited method**: GP hyperparameters are chosen
-by a marginal-likelihood grid search, the latent states are fixed at the GP
-posterior mean given the data, and (β, log γ) are optimized once by L-BFGS.
-The tempered population-MCMC sampler of Dondelinger et al./deGradInfer
-(which samples states, hyperparameters, and γ) is not implemented — no
-posterior samples are produced.
+Two modes:
 
-The loss function for each state k is:
+- **MAP (default, `n_samples=0`)**: GP hyperparameters from a
+  marginal-likelihood grid search, latent states fixed at the GP posterior
+  mean, and (β, log γ) optimized once by L-BFGS. Fast; no posterior samples.
+- **Population MCMC (`n_samples > 0`)**: the tempered population-MCMC
+  sampler of Dondelinger et al./deGradInfer. `n_chains` chains at
+  temperatures `t_c = ((c−1)/(C−1))⁵` jointly sample the latent states X,
+  the parameters β, and the mismatch variances γ by adaptive blockwise
+  random-walk Metropolis with exchange moves between adjacent chains; the
+  ODE-mismatch likelihood is raised to `t_c`, interpolating from pure GP
+  regression (t=0) to the fully coupled model (t=1). The cold chain
+  (t=1) provides the posterior: reported unknown functions use the
+  posterior-mean β, and `sol.convergence.beta_samples` /
+  `gamma_samples` hold the draws. GP kernel hyperparameters stay fixed
+  at their grid-search values (a documented simplification — the paper
+  also samples them). Continuous-time problems only.
+
+The (log-)likelihood term for each state k is:
     L_k = -0.5 (f_k - m_k)ᵀ (A_k + γ_k I)⁻¹ (f_k - m_k) - 0.5 log|A_k + γ_k I|
 
 where:
 - f_k = ODE-predicted gradients for state k
-- m_k = GP gradient mean = K*(K + σ²I)⁻¹x_k
+- m_k = GP gradient mean ('K K⁻¹ x_k, conditioned on the states)
 - A_k = GP gradient covariance = K** - K*(K + σ²I)⁻¹K*ᵀ
 - γ_k = mismatch parameter controlling ODE-GP coupling
 
 # Arguments
-- `maxiters::Int=200`: maximum L-BFGS iterations
+- `maxiters::Int=200`: maximum L-BFGS iterations (MAP mode); MCMC sweeps
+  are `2 n_samples` (half burn-in) in sampling mode
 - `verbose::Bool=false`: print iteration details
 - `gamma_init::Float64=1.0`: initial mismatch parameter (per state)
-- `fit_gamma::Bool=true`: optimize γ or keep fixed
-- `kernel::Symbol=:rbf`: GP kernel (:rbf, :matern32, :matern52)
+- `fit_gamma::Bool=true`: optimize γ or keep fixed (MAP mode)
+- `kernel::Symbol=:rbf`: GP kernel (:rbf, :matern32)
+- `n_samples::Int=0`: cold-chain posterior draws; 0 = MAP mode
+- `n_chains::Int=10`: number of tempered chains (sampling mode; ≥ 2)
+- `rng_seed`: seed for the sampler (default `nothing` = non-reproducible)
 """
 struct AdaptiveGradientMatching
     maxiters::Int
@@ -1028,12 +1044,18 @@ struct AdaptiveGradientMatching
     gamma_init::Float64
     fit_gamma::Bool
     kernel::Symbol
+    n_samples::Int
+    n_chains::Int
+    rng_seed::Union{Nothing, Int}
 end
 
 AdaptiveGradientMatching(; maxiters::Int=200, verbose::Bool=false,
                            gamma_init::Float64=1.0, fit_gamma::Bool=true,
-                           kernel::Symbol=:rbf) =
-    AdaptiveGradientMatching(maxiters, verbose, gamma_init, fit_gamma, kernel)
+                           kernel::Symbol=:rbf, n_samples::Int=0,
+                           n_chains::Int=10,
+                           rng_seed::Union{Nothing, Int}=nothing) =
+    AdaptiveGradientMatching(maxiters, verbose, gamma_init, fit_gamma, kernel,
+                             n_samples, n_chains, rng_seed)
 
 """
     RodeoSolver

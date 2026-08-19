@@ -519,6 +519,23 @@ using OrdinaryDiffEq
         @test haskey(sol.unknown_functions, :r)
         r_eval = sol.unknown_functions[:r]
         @test abs(r_eval(3.0) - true_r) < 0.15
+
+        # Population MCMC mode (Dondelinger et al. 2013): tempered chains
+        # jointly sample states, parameters, and mismatch variances
+        sol_pm = solve(prob, AdaptiveGradientMatching(n_samples=300,
+            n_chains=6, rng_seed=3, verbose=false))
+        @test sol_pm.convergence.sampler == :population_mcmc
+        @test size(sol_pm.convergence.beta_samples) == (300, 6)
+        @test size(sol_pm.convergence.gamma_samples, 1) == 300
+        @test length(sol_pm.convergence.temperatures) == 6
+        @test sol_pm.convergence.temperatures[end] == 1.0
+        @test abs(sol_pm.unknown_functions[:r](3.0) - true_r) < 0.15
+        @test_throws ArgumentError solve(prob,
+            AdaptiveGradientMatching(n_samples=100, n_chains=1))
+        # reproducible under rng_seed
+        sol_pm2 = solve(prob, AdaptiveGradientMatching(n_samples=300,
+            n_chains=6, rng_seed=3, verbose=false))
+        @test sol_pm2.unknown_functions[:r](3.0) == sol_pm.unknown_functions[:r](3.0)
     end
 
     @testset "Rodeo solver (B-spline)" begin

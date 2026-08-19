@@ -297,7 +297,7 @@ end
 println("True        r(2)=", round(r_true_decay(2.0), digits=4))
 ```
 
-TwoStage and BNG use the same derivative-matching objective, so their point estimates typically coincide; BNG adds a Bayesian interpretation. LAML integrates the ODE and selects smoothing via marginal likelihood, generally recovering the functional response more accurately when data are sparse or noisy.
+TwoStage and BNG match similar derivative targets, so their point estimates are typically close; BNG marginalizes the observation and prior variances and fits a bootstrap × restart ensemble, adding uncertainty quantification. LAML integrates the ODE and selects smoothing via marginal likelihood, generally recovering the functional response more accurately when data are sparse or noisy.
 
 ## When to Use Gradient Matching
 
