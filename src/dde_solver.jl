@@ -129,8 +129,9 @@ function adam_solve_dde(prob::PSMProblem, beta)
 
     DelayDiffEq.solve(dde_prob, dde_solver;
                       saveat=prob.data_times,
-                      abstol=1e-7, reltol=1e-7,
-                      maxiters=10_000)
+                      abstol=get(prob.ode_kwargs, :abstol, 1e-7),
+                      reltol=get(prob.ode_kwargs, :reltol, 1e-7),
+                      maxiters=get(prob.ode_kwargs, :maxiters, 10_000))
 end
 
 """
@@ -154,8 +155,9 @@ function adam_solve_dde_final(prob::PSMProblem, p_opt, u0)
 
     DelayDiffEq.solve(dde_prob, dde_solver;
                       saveat=prob.data_times,
-                      abstol=1e-7, reltol=1e-7,
-                      maxiters=10_000)
+                      abstol=get(prob.ode_kwargs, :abstol, 1e-7),
+                      reltol=get(prob.ode_kwargs, :reltol, 1e-7),
+                      maxiters=get(prob.ode_kwargs, :maxiters, 10_000))
 end
 
 # ─── DDEProblem constructor for PSMProblem ───────────────────────

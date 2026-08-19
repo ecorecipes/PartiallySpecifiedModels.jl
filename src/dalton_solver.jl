@@ -359,6 +359,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
         inplace=false
     )
     beta_opt = Optim.minimizer(result)
+    final_neg_loglik = Optim.minimum(result)
 
     if verbose
         @printf("  Converged: %s\n", Optim.converged(result))
@@ -432,6 +433,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
                 Optim.Options(iterations=alg.maxiters ÷ 2, g_tol=1e-6, f_reltol=1e-10, show_trace=false);
                 inplace=false)
             beta_opt = Optim.minimizer(result_re)
+            final_neg_loglik = Optim.minimum(result_re)
         end
         if verbose; @printf("  Final λ: %s\n", round.(smooth_lambdas, sigdigits=3)); end
     end
@@ -540,7 +542,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
 
     PSMSolution(
         params,
-        -Optim.minimum(result),           # objective (loglik)
+        -final_neg_loglik,                # objective (loglik) at returned β
         data_loss,
         edf,
         Float64.(smooth_lambdas),            # smoothing_params (Fellner-Schall)
@@ -551,7 +553,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
         (
             converged=Optim.converged(result),
             iterations=Optim.iterations(result),
-            neg_loglik=Optim.minimum(result),
+            neg_loglik=final_neg_loglik,
             method=:dalton,
             obs_var=obs_var,
             sigma=sigma,

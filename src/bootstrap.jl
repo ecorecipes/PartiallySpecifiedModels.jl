@@ -424,8 +424,10 @@ function _parametric_resample!(y::Matrix, fam::TruncatedNormal, fitted::Matrix,
 end
 
 # Fallback: use Gaussian residuals for unknown likelihood families
-function _parametric_resample!(y::Matrix, ::AbstractLikelihood, fitted::Matrix,
+function _parametric_resample!(y::Matrix, fam::AbstractLikelihood, fitted::Matrix,
                                σ_hat::Vector, n_t::Int, n_obs::Int, rng)
+    @warn "bootstrap: no parametric sampler for $(typeof(fam)); " *
+          "falling back to Gaussian residual sampling" maxlog=1
     for j in 1:n_obs, i in 1:n_t
         y[i, j] = fitted[i, j] + σ_hat[j] * randn(rng)
     end

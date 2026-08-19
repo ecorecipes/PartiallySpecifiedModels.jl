@@ -24,6 +24,10 @@ function _validate_problem(prob::PSMProblem, solver_name::String;
     n_obs = size(prob.data_values, 2)
 
     n_times == 0 && error("$solver_name: data_times is empty")
+    issorted(prob.data_times) ||
+        error("$solver_name: data_times must be sorted increasing (the " *
+              "Kalman-filter and profiling paths assume monotone " *
+              "observation indices)")
     size(prob.data_values, 1) != n_times &&
         error("$solver_name: data_values has $(size(prob.data_values, 1)) rows " *
               "but data_times has $n_times entries")
@@ -335,6 +339,7 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
         catch e
             _is_program_error(e) && rethrow()
             p_pert[j] = beta[j]
+            J[:, j] .= 0.0   # don't leak the previous iteration's column
             continue
         end
         p_pert[j] = beta[j]

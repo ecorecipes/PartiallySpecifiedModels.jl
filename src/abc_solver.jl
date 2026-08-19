@@ -240,17 +240,21 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
         mean_beta .+= weights[i] .* particles[i]
     end
 
-    # Fitted values from the best particle
+    # Fitted values and unknown functions from the SAME point estimate the
+    # solution reports (`params` = weighted posterior mean); mixing the
+    # posterior mean with best-particle functions returned inconsistent
+    # summaries.
     pred = try
-        simulate(prob, best_beta)
-    catch
+        simulate(prob, mean_beta)
+    catch e
+        _is_program_error(e) && rethrow()
         fill(NaN, size(prob.data_values))
     end
 
-    data_loss = sum((pred .- prob.data_values).^2) / length(prob.data_values)
+    # Sum of squares, matching the data_loss convention of the other solvers
+    data_loss = sum((pred .- prob.data_values).^2)
 
-    # Unknown-function evaluators (from best particle)
-    uf_evals = _abc_build_uf_dict(prob, best_beta)
+    uf_evals = _abc_build_uf_dict(prob, mean_beta)
 
     # ComponentArray of weighted posterior mean
     ca_entries = Pair{Symbol,Any}[]

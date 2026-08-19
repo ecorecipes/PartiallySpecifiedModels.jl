@@ -219,6 +219,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
         inplace=false
     )
     beta_opt = Optim.minimizer(result)
+    final_neg_loglik = Optim.minimum(result)
 
     if verbose
         println("  Converged: $(Optim.converged(result))")
@@ -317,6 +318,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
                               f_reltol=1e-10, show_trace=false);
                 inplace=false)
             beta_opt = Optim.minimizer(result_re)
+            final_neg_loglik = Optim.minimum(result_re)
         end
 
         if verbose
@@ -418,7 +420,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
 
     PSMSolution(
         params,                           # parameters
-        -Optim.minimum(result),           # objective (loglik)
+        -final_neg_loglik,                # objective (loglik) at returned β
         data_loss,                        # data_loss
         edf,                              # edf
         Float64.(smooth_lambdas),           # smoothing_params (Fellner-Schall)
@@ -429,7 +431,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
         (                                 # convergence
             converged=Optim.converged(result),
             iterations=Optim.iterations(result),
-            neg_loglik=Optim.minimum(result),
+            neg_loglik=final_neg_loglik,
             method=alg.method,
             obs_var=obs_var,
             sigma=sigma,

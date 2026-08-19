@@ -10,19 +10,6 @@
 #
 # Reference: standard Kalman filter, Rauch-Tung-Striebel smoother
 
-"""
-    kalman_predict(μ_past, Σ_past, Q, R)
-
-One prediction step: p(x_n | z_{0:n-1}) from p(x_{n-1} | z_{0:n-1}).
-
-Returns `(μ_pred, Σ_pred)`.
-"""
-function kalman_predict(μ_past::AbstractVector, Σ_past::AbstractMatrix,
-                        Q::AbstractMatrix, R::AbstractMatrix)
-    μ_pred = Q * μ_past
-    Σ_pred = Q * Σ_past * Q' + R
-    μ_pred, Σ_pred
-end
 
 """
     kalman_update(μ_pred, Σ_pred, z, d, W, V)
@@ -67,26 +54,6 @@ function kalman_forecast(μ_pred::AbstractVector, Σ_pred::AbstractMatrix,
     μ_fore, Σ_fore
 end
 
-"""
-    kalman_smooth_mv(μ_next, Σ_next, μ_filt, Σ_filt, μ_pred_next, Σ_pred_next, Q)
-
-One step of the RTS smoother (mean/variance).
-
-Computes p(x_n | z_{0:N}) from p(x_{n+1} | z_{0:N}) and filter estimates at time n.
-
-Returns `(μ_smooth, Σ_smooth)`.
-"""
-function kalman_smooth_mv(μ_next::AbstractVector, Σ_next::AbstractMatrix,
-                          μ_filt::AbstractVector, Σ_filt::AbstractMatrix,
-                          μ_pred_next::AbstractVector, Σ_pred_next::AbstractMatrix,
-                          Q::AbstractMatrix)
-    # Smoother gain: G = Σ_filt Q' Σ_pred_next^{-1}
-    G = Σ_filt * Q' / Σ_pred_next
-    μ_smooth = μ_filt + G * (μ_next - μ_pred_next)
-    Σ_smooth = Σ_filt + G * (Σ_next - Σ_pred_next) * G'
-    Σ_smooth = 0.5 * (Σ_smooth + Σ_smooth')
-    μ_smooth, Σ_smooth
-end
 
 """
     logpdf_mvn(x, μ, Σ)

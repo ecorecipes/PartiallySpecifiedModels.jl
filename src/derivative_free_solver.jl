@@ -67,7 +67,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::DerivativeFreeSolver)
         # Simulate model
         pred = try
             simulate(prob, beta)
-        catch
+        catch e
+            _is_program_error(e) && rethrow()
             return 1e20
         end
 

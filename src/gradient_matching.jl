@@ -373,7 +373,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
                     du .= eltype(β_eval)(1e6)
                 end
                 for k in 1:K
-                    loss_val += (dydt[i, k] - du[k])^2
+                    # w carries the observed-state mask (zeroed for
+                    # unobserved states whose targets are fabricated)
+                    wi = w[(k - 1) * n_match + i]
+                    loss_val += wi * (dydt[i, k] - du[k])^2
                 end
             end
             loss_val

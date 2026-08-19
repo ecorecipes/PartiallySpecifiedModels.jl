@@ -264,6 +264,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
             neg_grad = DiffResults.gradient(result)
             neg_grad
         catch e
+            _is_program_error(e) && rethrow()
             if verbose && iter <= 5
                 println("  iter $iter: gradient failed ($(typeof(e))), using zeros")
             end
@@ -329,8 +330,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     pred = try
         p = simulate(prob, mu_opt)
         Float64.(p)
-    catch
-        zeros(length(prob.data_times), size(prob.data_values, 2))
+    catch e
+        _is_program_error(e) && rethrow()
+        fill(NaN, length(prob.data_times), size(prob.data_values, 2))
     end
 
     n_t = length(prob.data_times)

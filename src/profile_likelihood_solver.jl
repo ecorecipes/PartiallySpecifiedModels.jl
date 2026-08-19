@@ -140,20 +140,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
             _is_program_error(e) && rethrow()
             return 1e10
         end
-        # Penalty at the FITTED smoothing parameters λ̂ (the profile is
-        # conditional on λ̂; a unit-λ penalty would profile a different
-        # criterion than the one the MLE minimizes)
+        # Penalty at the FITTED smoothing parameters λ̂, over exactly the
+        # penalized blocks LAML used (build_penalty_matrices skips
+        # unpenalized approximators, e.g. NeuralApproximator with
+        # penalty_weight=0, so lam_hat aligns with S_list_prof — indexing
+        # by raw approximator position mis-assigned λ̂ for mixed sets).
         if with_penalty
-            offset = 0
-            for (l, approx) in enumerate(prob.approximators)
-                np = nparams(approx)
-                pk = β_full[offset+1:offset+np]
-                offset += np
-                S = penalty_matrix(approx)
-                if S !== nothing
-                    lam_l = l <= length(lam_hat) ? lam_hat[l] : 1.0
-                    total_loss += lam_l * dot(pk, S * pk)
-                end
+            for k in eachindex(S_list_prof)
+                off = offs_prof[k]
+                nk = nks_prof[k]
+                pk = β_full[off+1:off+nk]
+                lam_l = k <= length(lam_hat) ? lam_hat[k] : 1.0
+                total_loss += lam_l * dot(pk, S_list_prof[k] * pk)
             end
         end
         total_loss
