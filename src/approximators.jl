@@ -190,6 +190,63 @@ function build_gp_evaluator(a::GPApproximator, params::AbstractVector)
     end
 end
 
+"""
+    _adapt_gp_hyperparams!(a::GPApproximator, beta_k) -> Bool
+
+Empirical-Bayes update of the kernel hyperparameters DURING a fit: choose
+(ℓ, σ²) maximizing the GP log marginal likelihood of the current inducing
+values `beta_k` (small fixed nugget), then rebuild `K`/`K_inv`. Called by
+the LAML/GCV loops when `a.adapt` (no user-supplied lengthscale). Returns
+whether the hyperparameters changed materially.
+"""
+function _adapt_gp_hyperparams!(a::GPApproximator, beta_k::AbstractVector)
+    a.adapt || return false
+    n = a.n_inducing
+    v = var(beta_k)
+    v > 1e-12 || return false          # flat function: nothing to adapt to
+    x = a.inducing_points
+    span = a.domain[2] - a.domain[1]
+    nug = 1e-6 * v
+
+    best_ll = -Inf
+    best_ℓ = a.lengthscale
+    best_σ² = a.variance
+    for frac in (0.08, 0.15, 0.25, 0.4, 0.6, 1.0), σm in (0.5, 1.0, 2.0)
+        ℓ_try = frac * span
+        σ²_try = σm * v
+        kf = _kernel_func(a.kernel, ℓ_try, σ²_try)
+        K = _build_kernel_matrix(kf, x)
+        F = cholesky(Symmetric(K + nug * I), check=false)
+        issuccess(F) || continue
+        α = F \ beta_k
+        ll = -0.5 * dot(beta_k, α) - sum(log, diag(F.U))
+        if ll > best_ll
+            best_ll = ll; best_ℓ = ℓ_try; best_σ² = σ²_try
+        end
+    end
+    isfinite(best_ll) || return false
+    changed = abs(log(best_ℓ / a.lengthscale)) > 0.05 ||
+              abs(log(best_σ² / max(a.variance, 1e-12))) > 0.05
+    changed || return false
+
+    a.lengthscale = best_ℓ
+    a.variance = best_σ²
+    kf = _kernel_func(a.kernel, best_ℓ, best_σ²)
+    K = _build_kernel_matrix(kf, x)
+    scale = max(maximum(abs, K), 1.0)
+    K_inv = nothing
+    for jit in (1e-8, 1e-6, 1e-4)
+        F = cholesky(Symmetric(K + jit * scale * I), check=false)
+        if issuccess(F)
+            K_inv = Matrix(inv(F)); break
+        end
+    end
+    K_inv === nothing && (K_inv = pinv(K + 1e-4 * scale * I))
+    a.K = K
+    a.K_inv = 0.5 * (K_inv + K_inv')
+    true
+end
+
 # ─── SPDE (Matérn) FEM matrices and evaluation ────────────────────
 
 """

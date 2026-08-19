@@ -2257,6 +2257,38 @@ using OrdinaryDiffEq
         @test maximum(abs.(g_ad .- g_fd)) < 1e-3 * max(maximum(abs.(g_fd)), 1.0)
     end
 
+    @testset "GP in-loop hyperparameter adaptation" begin
+        Random.seed!(4250)
+        rtrue_gp(x) = 0.3 + 0.15 * sin(3.0 * x)
+        function growth_gp!(du, u, p, t); du[1] = p.r(u[1]) * u[1]; end
+        pt = ODEProblem((du,u,p,t)->(du[1]=rtrue_gp(u[1])*u[1]), [0.8], (0.0, 6.0))
+        st = OrdinaryDiffEq.solve(pt, Tsit5(); saveat=0.25)
+        tt = collect(st.t)
+        dv = reshape([st(t)[1] for t in tt] .+
+                     0.02 .* randn(Random.Xoshiro(17), length(tt)), :, 1)
+        # adaptive (no user lengthscale): ℓ must move off the default and
+        # the in-data-range fit stay accurate
+        g_a = GPApproximator(:r, (0.5, 8.0), 12; initial=x->0.3)
+        ℓ0 = g_a.lengthscale
+        @test g_a.adapt
+        prob_a = PSMProblem(growth_gp!, [0.8], (0.0, 6.0), [g_a];
+            data_times=tt, data_values=dv, obs_to_state=[1],
+            known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+        sol_a = solve(prob_a, LAML(maxiters=60, verbose=false))
+        @test g_a.lengthscale != ℓ0                 # adaptation ran
+        errs = [abs(sol_a.unknown_functions[:r](x) - rtrue_gp(x))
+                for x in 1.0:0.25:3.5]              # data-informed range
+        @test maximum(errs) < 0.08
+        # user-fixed lengthscale: no adaptation, value untouched
+        g_f = GPApproximator(:r, (0.5, 8.0), 12; lengthscale=1.0, initial=x->0.3)
+        @test !g_f.adapt
+        prob_f = PSMProblem(growth_gp!, [0.8], (0.0, 6.0), [g_f];
+            data_times=tt, data_values=dv, obs_to_state=[1],
+            known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+        solve(prob_f, LAML(maxiters=30, verbose=false))
+        @test g_f.lengthscale == 1.0
+    end
+
     @testset "simulate and predict" begin
         function growth_sp!(du, u, p, t); du[1] = p.r(u[1]) * u[1]; end
         tt = collect(range(0.0, 3.0, length=10))

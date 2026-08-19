@@ -125,17 +125,23 @@ unreliable (see `penalty_matrix(::GPApproximator)` in approximators.jl).
 - `variance`: signal variance σ² (default: 1.0)
 - `initial`: optional initial function `x -> y`
 """
-struct GPApproximator <: AbstractApproximator
-    name::Symbol
-    domain::Tuple{Float64, Float64}
-    n_inducing::Int
-    inducing_points::Vector{Float64}
-    kernel::Symbol
+mutable struct GPApproximator <: AbstractApproximator
+    # Mutable so the fit loop can adapt (lengthscale, variance) — and the
+    # derived K/K_inv — as the fitted function evolves (empirical Bayes on
+    # the inducing values). `adapt` is set when the user did NOT supply a
+    # lengthscale explicitly; solvers only mutate when it is true.
+    # Bootstrap replicates deepcopy the approximators to avoid races.
+    const name::Symbol
+    const domain::Tuple{Float64, Float64}
+    const n_inducing::Int
+    const inducing_points::Vector{Float64}
+    const kernel::Symbol
     lengthscale::Float64
     variance::Float64
-    initial_func::Function
+    const initial_func::Function
     K::Matrix{Float64}        # kernel matrix at inducing points
-    K_inv::Matrix{Float64}    # inverse kernel matrix (penalty)
+    K_inv::Matrix{Float64}    # inverse kernel matrix
+    const adapt::Bool
 end
 
 function GPApproximator(name::Union{Symbol,String},
@@ -202,7 +208,7 @@ function GPApproximator(name::Union{Symbol,String},
     end
 
     GPApproximator(name_s, d, n_inducing, x_ind, kernel, ℓ, σ², init_func,
-                   K, K_inv)
+                   K, K_inv, lengthscale === nothing)
 end
 
 nparams(a::GPApproximator) = a.n_inducing

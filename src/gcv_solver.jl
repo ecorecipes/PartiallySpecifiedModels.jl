@@ -382,6 +382,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     gcv_val  = NaN
 
     for iter in 0:(maxiters - 1)
+        # Adapt GP kernel hyperparameters to the evolving fit
+        iter >= 2 && _adapt_gp_approximators!(prob, beta)
         # Re-evaluate model + Jacobian
         f_vec_new, _ = try; eval_model(beta); catch e
             if verbose; println("Iter $iter: simulation failed ($e)"); end
