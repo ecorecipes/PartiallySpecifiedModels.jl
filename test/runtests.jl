@@ -2037,7 +2037,9 @@ using OrdinaryDiffEq
         profiles = sol_pl.convergence.profiles
         @test haskey(profiles, 1)
         @test haskey(profiles, 2)
-        @test length(profiles[1].grid) == 10
+        # n_profile_points grid values plus the inserted exact-MLE point
+        # (equal when the MLE already coincides with a grid value)
+        @test 10 <= length(profiles[1].grid) <= 11
         @test length(profiles[1].ci) == 2
         # the fitted parameter sits inside its own profile CI (PLR = 0 there)
         @test profiles[1].ci[1] <= sol_pl.parameters[1] <= profiles[1].ci[2]
