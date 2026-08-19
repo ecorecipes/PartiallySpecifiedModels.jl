@@ -1427,19 +1427,20 @@ Likelihood-free inference using simulation-based rejection sampling with
 adaptive tolerance scheduling. Works for any simulator, including those
 where the likelihood is intractable.
 
-**Prior**: the prior over every coefficient is a *uniform box* of
-half-width `prior_scale` centered on the approximators' initial values —
-there is no smoothness structure (unlike the GMRF priors of `MCMCSolver`/
-`VariationalSolver`), so the reported posterior depends on the
-initialization and on `prior_scale`. Choose `prior_scale` generously and
-treat the output as approximate.
+**Prior** (`prior` keyword): `:smoothness` (default) is a Gaussian GMRF
+built from the approximators' roughness penalties, centered on their
+initial values with overall spread `prior_scale` — matching the prior
+structure of `MCMCSolver`/`VariationalSolver`, so wiggly coefficient
+vectors are a-priori discouraged. `:box` restores the legacy uniform box
+of half-width `prior_scale` (posterior then depends strongly on the
+initialization; treat as approximate).
 
 # Fields
 - `n_particles`: number of ABC particles (default 500)
 - `n_generations`: number of SMC generations (default 10)
 - `summary_fn`: summary statistic function, or `:auto` for MSE-based (default `:auto`)
-- `prior_scale`: half-width of the uniform box prior around the initial
-  coefficient values (default 2.0)
+- `prior`: `:smoothness` (default, GMRF) or `:box` (legacy uniform)
+- `prior_scale`: prior spread — GMRF scale, or box half-width (default 2.0)
 - `quantile_eps`: quantile for tolerance schedule (default 0.5)
 - `verbose`: print progress
 """
@@ -1447,6 +1448,7 @@ struct ABCSolver
     n_particles::Int
     n_generations::Int
     summary_fn::Union{Symbol, Function}
+    prior::Symbol
     prior_scale::Float64
     quantile_eps::Float64
     verbose::Bool
@@ -1454,9 +1456,11 @@ end
 
 ABCSolver(; n_particles::Int=500, n_generations::Int=10,
             summary_fn::Union{Symbol, Function}=:auto,
+            prior::Symbol=:smoothness,
             prior_scale::Float64=2.0, quantile_eps::Float64=0.5,
             verbose::Bool=false) =
-    ABCSolver(n_particles, n_generations, summary_fn, prior_scale, quantile_eps, verbose)
+    ABCSolver(n_particles, n_generations, summary_fn, prior, prior_scale,
+              quantile_eps, verbose)
 
 # ─── Integral matching solver (Dattner & Klaassen 2015) ────────────
 

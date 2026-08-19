@@ -1394,8 +1394,13 @@ using OrdinaryDiffEq
         @test isfinite(sol_abc.objective)
         @test haskey(sol_abc.unknown_functions, :f)
         # posterior-MEAN point estimate (consistent with sol.parameters);
-        # box-prior ABC is approximate — generous but nonvacuous bound
+        # default GMRF smoothness prior — generous but nonvacuous bound
         @test abs(sol_abc.unknown_functions[:f](3.0) - 1.5) < 0.6
+        # legacy box prior still available and accurate
+        sol_abc_box = solve(prob_abc, ABCSolver(n_particles=100,
+            n_generations=6, prior=:box, verbose=false))
+        @test abs(sol_abc_box.unknown_functions[:f](3.0) - 1.5) < 0.6
+        @test_throws ErrorException solve(prob_abc, ABCSolver(prior=:bogus))
     end
 
     # ─── Discrete-time tests for additional solvers ───────────────────
