@@ -69,6 +69,33 @@ function _gaussian_loglik(pred, data, weights, obs_noise_var)
 end
 
 """
+    _vi_loglik(fam, pred, data, weights, obs_noise_var)
+
+Observation log-likelihood dispatched on the likelihood family. Gaussian
+keeps the σ²-scaled quadratic form (`obs_noise_var` is the noise
+variance); every other family uses its own pointwise log-likelihood with
+`data_weights` multiplied in (`obs_noise_var` is ignored — dispersion
+parameters live in the family object).
+"""
+_vi_loglik(::Gaussian, pred, data, weights, obs_noise_var) =
+    _gaussian_loglik(pred, data, weights, obs_noise_var)
+
+function _vi_loglik(fam::AbstractLikelihood, pred, data, weights, obs_noise_var)
+    T = eltype(pred)
+    ll = zero(T)
+    n_t, n_obs = size(data)
+    for j in 1:n_obs
+        for i in 1:n_t
+            w = weights[i, j]
+            y = data[i, j]
+            (w > 0 && !isnan(y)) || continue
+            ll += w * loglik_pointwise(fam, y, pred[i, j])
+        end
+    end
+    ll
+end
+
+"""
     _kl_gaussian_penalized(mu, log_sigma, Λ, logdetΛ)
 
 Analytical KL(q ‖ p) where q = N(μ, diag(σ²)) and the prior p = N(0, Λ⁻¹)
@@ -129,8 +156,8 @@ function _compute_elbo(prob::PSMProblem, mu, log_sigma, Λ, logdetΛ,
             continue
         end
 
-        avg_ll += _gaussian_loglik(pred, prob.data_values, prob.data_weights,
-                                   obs_noise_var)
+        avg_ll += _vi_loglik(prob.likelihood, pred, prob.data_values,
+                             prob.data_weights, obs_noise_var)
         n_valid += 1
     end
 
@@ -153,6 +180,13 @@ Fit a partially specified model using mean-field variational inference.
 The posterior over unknown-function parameters is approximated by a
 diagonal Gaussian, optimised by maximising the evidence lower bound (ELBO).
 
+The ELBO's data term follows `prob.likelihood`: Gaussian data use the
+σ²-scaled quadratic form with `obs_noise_var` (user-supplied or
+estimated); Poisson, NegativeBinomial, TruncatedNormal, and
+CustomLikelihood use the family's pointwise log-likelihood with
+`data_weights` multiplied in and no Gaussian noise nuisance. Passing
+`obs_noise_var` with a non-Gaussian family errors.
+
 # Algorithm
 1. Initialise the variational mean μ from the model's initial parameters
    and set log-σ to a small value.
@@ -173,6 +207,13 @@ and variational parameters `μ`, `σ` in `sol.extras`.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     _validate_problem(prob, "VariationalSolver")
+    gaussian_obs = prob.likelihood isa Gaussian
+    if !gaussian_obs && alg.obs_noise_var !== nothing
+        error("VariationalSolver: obs_noise_var is the Gaussian " *
+              "observation-noise variance, but prob.likelihood is " *
+              "$(typeof(prob.likelihood)), which has no σ² parameter " *
+              "(dispersion parameters are fixed in the family object).")
+    end
     verbose = alg.verbose
 
     # Initialize variational parameters
@@ -181,8 +222,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     mu = copy(beta0)
     log_sigma = fill(-2.0, n_p)  # σ ≈ 0.135
 
-    # Observation noise variance: user-specified or estimated from data
-    obs_noise_var = if alg.obs_noise_var !== nothing
+    # Observation noise variance (Gaussian families only): user-specified
+    # or estimated from data. Non-Gaussian families carry their own
+    # dispersion, so the value is never read (see `_vi_loglik`).
+    obs_noise_var = if !gaussian_obs
+        1.0
+    elseif alg.obs_noise_var !== nothing
         alg.obs_noise_var
     else
         # Estimate from short-range variability in data (successive differences)
@@ -210,7 +255,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     if verbose
         println("VariationalSolver: $n_p params, $(alg.maxiters) max iters, " *
                 "lr=$(alg.lr), S=$(alg.n_elbo_samples)")
-        println("  prior_scale=$(alg.prior_scale), obs_noise_var=$(round(obs_noise_var, sigdigits=3))")
+        println("  prior_scale=$(alg.prior_scale)" *
+                (gaussian_obs ?
+                 ", obs_noise_var=$(round(obs_noise_var, sigdigits=3))" :
+                 ", likelihood=$(typeof(prob.likelihood))"))
     end
 
     # Prior precision Λ = roughness penalty (λS per smooth term) + broad
@@ -404,7 +452,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
         :final_elbo => best_elbo,
         :posterior_mean => copy(mu_opt),
         :posterior_std => copy(sigma_opt),
-        :obs_noise_var => obs_noise_var,
+        :obs_noise_var => gaussian_obs ? obs_noise_var : nothing,
         :n_iters => length(elbo_history),
     )
 

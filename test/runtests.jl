@@ -619,6 +619,166 @@ using StableRNGs
         @test abs(sol_magi.unknown_functions[:r](5.0) - 0.3) < 0.15
     end
 
+    # ─── Likelihood dispatch: solvers must honor prob.likelihood ──────
+
+    @testset "loglik_pointwise matches log_likelihood" begin
+        y = [0.0, 3.0, 7.0]
+        mu = [0.5, 2.5, 8.0]
+        w = [1.0, 0.5, 2.0]
+        for fam in (Gaussian(), Poisson(), NegativeBinomial(5.0),
+                    TruncatedNormal(lower=0.0, sigma=1.0),
+                    CustomLikelihood((yy, m) -> -abs(yy - m)))
+            ll_vec = PartiallySpecifiedModels.log_likelihood(fam, y, mu, w)
+            ll_pt = sum(w[i] * PartiallySpecifiedModels.loglik_pointwise(
+                            fam, y[i], mu[i]) for i in eachindex(y))
+            # identical accumulation term-for-term; only summation order differs
+            @test ll_pt ≈ ll_vec atol = 1e-10
+        end
+    end
+
+    @testset "MCMCSolver — Poisson likelihood" begin
+        # Exponential decay observed as Poisson counts: du/dt = -r(t)·u,
+        # r(t) ≡ 0.3, u0 = 200 so means run 200 → ~10 (informative counts).
+        rng_pmc = StableRNG(7)   # version-stable RNG for count draws
+        function exp_decay_pmc!(du, u, p, t)
+            du[1] = -p.r(t) * u[1]
+        end
+        times_pmc = collect(0.0:0.5:10.0)
+        mu_pmc = 200.0 .* exp.(-0.3 .* times_pmc)
+        function sample_poisson_pmc(μ)   # simple inversion sampler
+            μ = max(μ, 0.01); c = 0; s = 0.0
+            while true; s -= log(rand(rng_pmc)); s > μ && break; c += 1; end
+            Float64(c)
+        end
+        y_pmc = sample_poisson_pmc.(mu_pmc)
+
+        bs_pmc = BSplineApproximator(:r, (0.0, 10.0), 8; initial=0.15)
+        prob_pmc = PSMProblem(exp_decay_pmc!, [200.0], (0.0, 10.0), [bs_pmc];
+            data_times=times_pmc, data_values=reshape(y_pmc, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=Poisson(), solver=Tsit5())
+
+        sol_pmc = solve(prob_pmc, MCMCSolver(
+            n_samples=50, n_warmup=25, verbose=false))
+
+        # Poisson data sample NO Gaussian σ nuisance: 8 spline params only
+        # (the Gaussian MCMC test above sees 9 = 8 + log_σ)
+        @test size(sol_pmc.convergence, 2) == 8
+        @test isempty(sol_pmc.smoothing_params)
+        # Poisson counts at means 10–200 carry 7–30% relative noise; use the
+        # same 0.2 tolerance as the Gaussian MCMC recovery test above.
+        @test abs(sol_pmc.unknown_functions[:r](5.0) - 0.3) < 0.2
+
+        # obs_sigma is a Gaussian-only option: declaring it with Poisson
+        # data must error, not silently fit Gaussian
+        @test_throws ErrorException solve(prob_pmc,
+            MCMCSolver(n_samples=10, n_warmup=5, obs_sigma=0.1))
+    end
+
+    @testset "MagiSolver — likelihood guard, data_weights, sigma" begin
+        function exp_decay_mgw!(du, u, p, t)
+            du[1] = -p.r(t) * u[1]
+        end
+        times_mgw = collect(0.0:1.0:10.0)
+        data_mgw = reshape(exp.(-0.3 .* times_mgw), :, 1)
+        bs_mgw = BSplineApproximator(:r, (0.0, 10.0), 6; initial=0.15)
+
+        # (i) MAGI's manifold construction assumes Gaussian observations:
+        # a non-Gaussian likelihood is rejected at entry
+        prob_mgw_pois = PSMProblem(exp_decay_mgw!, [1.0], (0.0, 10.0), [bs_mgw];
+            data_times=times_mgw, data_values=data_mgw,
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=Poisson())
+        @test_throws ErrorException solve(prob_mgw_pois, MagiSolver(verbose=false))
+
+        # (ii)+(iii) weight-0 masking + explicit per-state sigma: corrupt one
+        # observation grossly (y=10 vs true 0.22) and mask it with weight 0.
+        # At σ=0.1 an UNMASKED outlier of this size would dominate the data
+        # term (~(10-0.22)²/0.02 ≈ 4800 vs ~O(1) for all clean points) and
+        # wreck the fit, so recovery to the clean-data tolerance demonstrates
+        # the mask is honored.
+        data_bad = copy(data_mgw); data_bad[6, 1] = 10.0
+        w_mask = ones(length(times_mgw), 1); w_mask[6, 1] = 0.0
+        prob_mgw_mask = PSMProblem(exp_decay_mgw!, [1.0], (0.0, 10.0), [bs_mgw];
+            data_times=times_mgw, data_values=data_bad, data_weights=w_mask,
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        Random.seed!(9182)   # NUTS draws from the global RNG
+        sol_mask = solve(prob_mgw_mask, MagiSolver(
+            n_samples=50, n_warmup=50, n_gridpoints=50,
+            sigma=[0.1], verbose=false))   # sigma path: SD 0.1 ≡ obs_var 0.01
+        # Weight-0 masking excludes the point from the data term, the GP
+        # hyperparameter fit, and the state initialization, so the corrupted
+        # point must not degrade recovery beyond the clean-data test's 0.15
+        @test abs(sol_mask.unknown_functions[:r](5.0) - 0.3) < 0.15
+
+        # (iv) option validation
+        @test_throws ErrorException solve(prob_mgw_mask,
+            MagiSolver(sigma=[0.1], obs_var=0.01))    # mutually exclusive
+        @test_throws ErrorException solve(prob_mgw_mask,
+            MagiSolver(sigma=[0.1, 0.1]))             # length ≠ n_vars
+    end
+
+    @testset "Poisson dispatch — MultipleShooting and DerivativeFree" begin
+        # Exponential growth observed as Poisson counts: du/dt = r(N)·N,
+        # r ≡ 0.3, u0 = 20 so means run 20 → ~90.
+        rng_msl = StableRNG(21)
+        true_r_msl = 0.3
+        function growth_msl!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+        end
+        t_msl = collect(range(0.0, 5.0, length=30))
+        mu_msl = 20.0 .* exp.(true_r_msl .* t_msl)
+        function sample_poisson_msl(μ)
+            μ = max(μ, 0.01); c = 0; s = 0.0
+            while true; s -= log(rand(rng_msl)); s > μ && break; c += 1; end
+            Float64(c)
+        end
+        y_msl = sample_poisson_msl.(mu_msl)
+
+        bs_msl = BSplineApproximator(:r, (10.0, 120.0), 6; initial=x -> 0.2)
+        prob_msl = PSMProblem(growth_msl!, [20.0], (0.0, 5.0), [bs_msl];
+            data_times=t_msl, data_values=reshape(y_msl, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=Poisson(), solver=Tsit5())
+
+        # MultipleShooting: loss=:auto routes Poisson data to the Poisson
+        # negative log-likelihood (previously silently fit Gaussian SSE).
+        # Counts carry 10–22% relative noise; 0.1 leaves headroom over the
+        # noiseless Gaussian MS test's 0.08 while still beating the 0.2
+        # initial guess.
+        sol_msl = solve(prob_msl, MultipleShootingSolver(
+            n_intervals=3, maxiters_inner=50, maxiters_outer=5,
+            rho_init=1.0, verbose=false))
+        @test abs(sol_msl.unknown_functions[:r](50.0) - true_r_msl) < 0.1
+
+        # NegativeBinomial has no MS loss: clear error, not silent Gaussian
+        prob_msl_nb = PSMProblem(growth_msl!, [20.0], (0.0, 5.0), [bs_msl];
+            data_times=t_msl, data_values=reshape(y_msl, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=NegativeBinomial(5.0), solver=Tsit5())
+        @test_throws ErrorException solve(prob_msl_nb, MultipleShootingSolver())
+
+        # penalty_weight > 0 smoke test (Gaussian data): finite objective
+        data_msg = reshape(exp.(true_r_msl .* t_msl), :, 1)
+        bs_msg = BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)
+        prob_msg = PSMProblem(growth_msl!, [1.0], (0.0, 5.0), [bs_msg];
+            data_times=t_msl, data_values=data_msg,
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian(), solver=Tsit5())
+        sol_msp = solve(prob_msg, MultipleShootingSolver(
+            n_intervals=3, maxiters_inner=20, maxiters_outer=2,
+            rho_init=1.0, penalty_weight=1e-3, verbose=false))
+        @test sol_msp isa PSMSolution
+        @test isfinite(sol_msp.objective)
+
+        # DerivativeFreeSolver: default loss=:auto now resolves to
+        # :likelihood for Poisson data (previously silently used :mse)
+        sol_dfp = solve(prob_msl,
+            DerivativeFreeSolver(maxiters=4000, verbose=false))
+        @test abs(sol_dfp.unknown_functions[:r](50.0) - true_r_msl) < 0.1
+    end
+
     # ─── Discrete-time model tests ─────────────────────────────────
 
     @testset "Discrete-time: Ricker model with LAML" begin

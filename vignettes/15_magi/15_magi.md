@@ -160,7 +160,7 @@ prob_sir = PSMProblem(sir!, [0.99, 0.01, 0.0], (0.0, 40.0), [uf_β];
 
 sol_sir = solve(prob_sir, MagiSolver(
     n_samples=150, n_warmup=150,
-    n_gridpoints=40, n_deriv=3,
+    n_gridpoints=40,
     obs_var=noise^2, preoptimize=true, verbose=false))
 ```
 
@@ -411,8 +411,7 @@ prob_lv = PSMProblem(lv!, [2.0, 1.0], (0.0, 30.0), [uf_g];
 
 sol_lv = solve(prob_lv, MagiSolver(
     n_samples=150, n_warmup=150,
-    n_gridpoints=40, n_deriv=3,
-    sigma=[1.0, 1.0],      # explicit sigma for both states
+    n_gridpoints=40,
     obs_var=0.0025, preoptimize=true, verbose=false))
 ```
 
