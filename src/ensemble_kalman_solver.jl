@@ -78,7 +78,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
                 ode_sol = OrdinaryDiffEq.solve(ode_prob, solver;
                             saveat=prob.data_times, prob.ode_kwargs...)
                 if ode_sol.retcode != :Success && ode_sol.retcode != SciMLBase.ReturnCode.Success
-                    return fill(1e6, n_data)
+                    return nothing
                 end
                 for i in 1:length(prob.data_times)
                     for j in 1:size(prob.data_values, 2)
@@ -87,8 +87,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
                     end
                 end
             end
-        catch
-            return fill(1e6, n_data)
+        catch e
+            _is_program_error(e) && rethrow()
+            return nothing
         end
 
         vec(pred)
@@ -108,33 +109,48 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
 
     # ── EKI iterations ───────────────────────────────────────────
     for iter in 1:n_iter
-        # Evaluate forward model for each particle
-        G = Matrix{Float64}(undef, n_data, J)
+        # Evaluate forward model for each particle; failures return nothing.
+        # (A 1e6 sentinel column would inflate the ensemble covariances by
+        # ~1e12 and drag the whole ensemble in a single update.)
+        Gcols = Vector{Union{Nothing, Vector{Float64}}}(undef, J)
         for j in 1:J
-            G[:, j] = forward_model(ensemble[:, j])
+            Gcols[j] = forward_model(ensemble[:, j])
         end
+        valid = findall(!isnothing, Gcols)
+        length(valid) >= 3 ||
+            error("EnsembleKalmanSolver: only $(length(valid)) of $J " *
+                  "particles produced a successful forward solve at " *
+                  "iteration $iter; the problem or the initial ensemble " *
+                  "spread is likely ill-posed")
+        G = reduce(hcat, (Gcols[j] for j in valid))
+        θv = ensemble[:, valid]
 
-        # Ensemble means
-        θ_mean = vec(mean(ensemble, dims=2))
+        # Ensemble statistics over the valid particles only
+        θ_mean = vec(mean(θv, dims=2))
         G_mean = vec(mean(G, dims=2))
-
-        # Ensemble anomalies
-        Δθ = ensemble .- θ_mean
+        Δθ = θv .- θ_mean
         ΔG = G .- G_mean
-
-        # Cross-covariance Cθg and auto-covariance Cgg
-        Cθg = (Δθ * ΔG') / (J - 1)
-        Cgg = (ΔG * ΔG') / (J - 1)
+        Jv = length(valid)
+        Cθg = (Δθ * ΔG') / max(Jv - 1, 1)
+        Cgg = (ΔG * ΔG') / max(Jv - 1, 1)
 
         # Kalman gain: K = Cθg * (Cgg + Γ)⁻¹
         # Use pseudo-inverse for numerical stability
         K = Cθg * pinv(Cgg + Γ)
 
-        # Update each particle
-        for j in 1:J
+        # Update valid particles with the perturbed-observation EKI step
+        for (k, j) in enumerate(valid)
             ξ = σ_obs .* randn(rng, n_data)
-            innovation = y_obs .+ ξ .- G[:, j]
+            innovation = y_obs .+ ξ .- G[:, k]
             ensemble[:, j] .+= K * innovation
+        end
+        # Resample failed particles from the updated valid ensemble with a
+        # small jitter, pulling them back into the feasible region.
+        θ_std = vec(std(ensemble[:, valid], dims=2)) .+ 1e-8
+        for j in 1:J
+            j in valid && continue
+            src = valid[rand(rng, 1:Jv)]
+            ensemble[:, j] .= ensemble[:, src] .+ 0.1 .* θ_std .* randn(rng, n_beta)
         end
 
         # Track ensemble spread
@@ -152,13 +168,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
     beta_final = vec(mean(ensemble, dims=2))
     ensemble_std = vec(std(ensemble, dims=2))
 
-    # Simulate at ensemble mean for fitted values
+    # Simulate at ensemble mean for fitted values (the mean of a converged
+    # ensemble should solve; if not, report NaN fitted values rather than
+    # fabricating numbers)
     pred_vec = forward_model(beta_final)
     n_times = length(prob.data_times)
     n_obs = size(prob.data_values, 2)
-    pred = reshape(pred_vec, n_times, n_obs)
+    pred = pred_vec === nothing ? fill(NaN, n_times, n_obs) :
+                                  reshape(pred_vec, n_times, n_obs)
 
-    data_loss = sum(abs2, prob.data_values .- pred)
+    data_loss = pred_vec === nothing ? Inf :
+                sum(abs2, prob.data_values .- pred)
 
     # Build UF evaluators
     uf_evals = Dict{Symbol, Any}()

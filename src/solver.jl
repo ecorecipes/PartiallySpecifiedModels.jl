@@ -24,6 +24,10 @@ function _validate_problem(prob::PSMProblem, solver_name::String;
     n_obs = size(prob.data_values, 2)
 
     n_times == 0 && error("$solver_name: data_times is empty")
+    issorted(prob.data_times) ||
+        error("$solver_name: data_times must be sorted increasing (the " *
+              "Kalman-filter and profiling paths assume monotone " *
+              "observation indices)")
     size(prob.data_values, 1) != n_times &&
         error("$solver_name: data_values has $(size(prob.data_values, 1)) rows " *
               "but data_times has $n_times entries")
@@ -123,6 +127,50 @@ function build_param_struct(prob::PSMProblem, beta::AbstractVector)
     merge(uf_nt, prob.known_params)
 end
 
+"""
+    _is_program_error(e)
+
+Classify an exception caught inside a solver objective. Programming
+errors (wrong method signature, out-of-bounds indexing, type bugs) must
+be rethrown so they surface immediately; only genuinely numerical
+failures (domain errors, singular factorizations, solver blow-ups) may
+be converted into a large-but-finite penalty for the optimizer.
+
+`InexactError` is special-cased: converting a NaN/Inf (e.g. inside
+DataInterpolations when a diverged trajectory reaches a spline) is a
+numerical failure the optimizer must survive, while converting a finite
+value (`Int(3.7)`) is a genuine bug.
+"""
+function _is_program_error(e::InexactError)
+    # Julia ≥ 1.12 stores the offending value as the last element of e.args;
+    # earlier versions expose it as e.val.
+    val = hasfield(InexactError, :val) ? e.val : e.args[end]
+    val isa Number && isfinite(val)
+end
+_is_program_error(e) = e isa Union{MethodError, BoundsError, UndefVarError,
+                                   TypeError, KeyError, DimensionMismatch,
+                                   UndefRefError}
+
+"""
+    _adapt_gp_approximators!(prob, beta) -> Bool
+
+Run the empirical-Bayes hyperparameter update for every `GPApproximator`
+with `adapt=true`, using its slice of the current coefficient vector.
+Returns whether any kernel changed (callers should re-evaluate the model).
+"""
+function _adapt_gp_approximators!(prob::PSMProblem, beta::AbstractVector)
+    off = 0
+    changed = false
+    for a in prob.approximators
+        np = nparams(a)
+        if a isa GPApproximator && a.adapt
+            changed |= _adapt_gp_hyperparams!(a, Float64.(beta[off+1:off+np]))
+        end
+        off += np
+    end
+    changed
+end
+
 # ─── Simulation ───────────────────────────────────────────────────
 
 """
@@ -178,6 +226,10 @@ function simulate_continuous(prob::PSMProblem, beta::AbstractVector)
     n_obs = length(prob.obs_to_state)
     pred = zeros(eltype(beta), n_times, n_obs)
 
+    length(sol.u) >= n_times ||
+        error("solve terminated after $(length(sol.u)) of $n_times save " *
+              "points (retcode $(sol.retcode)); cannot form predictions " *
+              "at all data times")
     for i in 1:n_times
         u_i = sol.u[i]
         for j in 1:n_obs
@@ -287,18 +339,27 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
     fp = zeros(n_data)
     fb = zeros(n_data)
 
+    # Absolute FD step floor. DDEfit's fully relative step (da = dam·|β|,
+    # floored at 1e-8·dam ≈ 1e-16 for β = 0) was safe there because Wood
+    # (2001, p.11) reuses the SAME integration time steps for the perturbed
+    # and unperturbed trajectories, so integrator error cancels in the
+    # difference; simulate() re-solves adaptively per perturbation, so a
+    # 1e-16 step measures pure solver noise. Tie the floor to the solver
+    # tolerance instead: differences must exceed integration error.
+    reltol_ode = Float64(get(prob.ode_kwargs, :reltol, 1e-8))
+    abs_floor = max(100.0 * reltol_ode, 1e-7)
+
     for j in 1:n_p
-        da = dam[j] * abs(beta[j])
-        if da < 1e-8 * dam[j]
-            da = 1e-8 * dam[j]
-        end
+        da = max(dam[j] * abs(beta[j]), abs_floor)
 
         # Forward perturbation
         p_pert[j] = beta[j] + da
         pred_fwd = try
             simulate(prob, p_pert)
-        catch
+        catch e
+            _is_program_error(e) && rethrow()
             p_pert[j] = beta[j]
+            J[:, j] .= 0.0   # don't leak the previous iteration's column
             continue
         end
         p_pert[j] = beta[j]
@@ -480,13 +541,28 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         W_sqrt = sqrt.(max.(w_irls, 1e-15))
         F_aug = vcat(Diagonal(W_sqrt) * J_mat, C)
         z_aug = vcat(W_sqrt .* z_pseudo, zeros(n_pen))
-        F_aug \ z_aug, B
+        # Truncated-SVD least squares. The FD Jacobian is trajectory-local:
+        # at a poor initialization (e.g. the x -> 0 default, where the
+        # trajectory sits at u0) most basis columns are numerically null,
+        # and a plain QR solve returns O(1e9) coefficients along those
+        # directions — a step no contraction can rescue. Zeroing components
+        # with σ < 1e-7·σ_max keeps the step inside the identified subspace;
+        # for well-conditioned systems the result matches backslash to 1e-7.
+        F = svd(F_aug)
+        σmax = F.S[1]
+        d = [σ > 1e-7 * σmax ? 1.0 / σ : 0.0 for σ in F.S]
+        a = F.V * (d .* (F.U' * z_aug))
+        a, B
     end
 
-    # Step contraction: backtracking line search with exponential step sizes
-    # Tries α = 1, 0.5, 0.25, ..., 2^(-15) ≈ 3e-5 to find a step that
-    # reduces the penalized objective. This handles highly nonlinear models
-    # where the full PCLS step overshoots badly.
+    # Step contraction: backtracking line search with exponential step sizes.
+    # Phase 1 tries α = 1, 0.5, ..., 2^(-15) and keeps the best (unchanged
+    # legacy behavior for sane steps). Phase 2 rescues EXPLOSIVE steps: when
+    # the trajectory-localized Jacobian is numerically rank-deficient (e.g.
+    # every coefficient at the x -> 0 default initialization), the PCLS
+    # solution can be O(1e9) along near-null directions and even 2^(-15) of
+    # it still blows up the ODE; continue halving with a first-improvement
+    # exit so the fit can escape instead of silently rejecting every step.
     function step_contract(a_old, a_new, B)
         f_old = penalized_objective(a_old, B)
         direction = a_new .- a_old
@@ -501,6 +577,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             if f_try < best_f
                 best_f = f_try
                 best_a = copy(a_try)
+            end
+        end
+        if best_f >= f_old
+            for k in 16:50
+                α = 2.0^(-k)
+                a_try = a_old .+ α .* direction
+                f_try = penalized_objective(a_try, B)
+                if f_try < f_old
+                    return a_try, f_try
+                end
             end
         end
         best_a, best_f
@@ -555,20 +641,34 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                 a1_pcls, B1 = pcls_step(J, z_pseudo, theta_new, w_gauss)
                 a1, f11 = step_contract(beta, a1_pcls, B1)
 
-                # Accept new θ only if it improves the Gaussian data fit
-                ss_a0 = sum((y_vec[i] - (try; first(eval_model(a0)); catch; f_vec; end)[i])^2 * w_vec[i] for i in 1:n_data)
-                ss_a1 = sum((y_vec[i] - (try; first(eval_model(a1)); catch; f_vec; end)[i])^2 * w_vec[i] for i in 1:n_data)
+                # Accept new θ only if it improves the Gaussian data fit.
+                # Evaluate each candidate's model ONCE (a full ODE solve) —
+                # the previous generator re-solved the ODE per data point.
+                f_a0 = try; first(eval_model(a0)); catch e
+                    _is_program_error(e) && rethrow(); f_vec; end
+                f_a1 = try; first(eval_model(a1)); catch e
+                    _is_program_error(e) && rethrow(); f_vec; end
+                ss_a0 = sum((y_vec[i] - f_a0[i])^2 * w_vec[i] for i in 1:n_data)
+                ss_a1 = sum((y_vec[i] - f_a1[i])^2 * w_vec[i] for i in 1:n_data)
 
                 if ss_a1 <= ss_a0
                     beta .= a1
                     gw_otheta .= theta_new
+                    f_vec .= f_a1
                 else
                     beta .= a0
+                    f_vec .= f_a0
                 end
             else
                 beta .= a0
+                f_new = try; first(eval_model(a0)); catch e
+                    _is_program_error(e) && rethrow(); f_vec; end
+                f_vec .= f_new
             end
 
+            # Convergence monitor uses the CURRENT step's fit (the old code
+            # scored f_vec from before the step — a one-iteration-stale
+            # objective).
             gw_ss = sum((y_vec[i] - f_vec[i])^2 * w_vec[i] for i in 1:n_data)
             gw_obj = 0.5 * (gw_ss + dot(beta, build_B(gw_otheta) * beta))
 
@@ -592,6 +692,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     prev_data_loss = Inf  # Track data loss for non-Gaussian convergence
 
     for iter in 0:(maxiters-1)
+        # Adapt GP kernel hyperparameters to the evolving fit (before the
+        # model evaluation so f/J/W below are consistent with the new kernel)
+        if iter >= alg.warmup
+            _adapt_gp_approximators!(prob, beta)
+        end
         # Re-evaluate model + Jacobian
         f_vec_new, _ = try; eval_model(beta); catch e
             if verbose; println("Iter $iter: simulation failed ($e)"); end
@@ -688,9 +793,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         # haven't been optimised yet and the objective may improve further.
         min_conv_iter = max(3, alg.warmup + 3)
         curr_data_loss = sum((y_vec[i] - f_vec[i])^2 * w_vec[i] for i in 1:n_data)
-        obj_stable = abs(curr_obj - prev_obj) < 1e-6 * max(abs(prev_obj), 1.0)
+        # alg.tol governs the penalized-objective test (as documented); the
+        # data-loss test uses a proportionally looser threshold.
+        obj_stable = abs(curr_obj - prev_obj) < alg.tol * max(abs(prev_obj), 1.0)
         dl_stable = prev_data_loss < Inf &&
-                    abs(curr_data_loss - prev_data_loss) < 1e-4 * max(prev_data_loss, 1.0)
+                    abs(curr_data_loss - prev_data_loss) <
+                        100 * alg.tol * max(prev_data_loss, 1.0)
         if iter >= min_conv_iter && obj_stable && dl_stable
             if verbose; println("Converged at iter $iter (objective stable)"); end
             break
@@ -708,7 +816,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         # doesn't restart from scratch.
         w_irls_for_laml = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
         if m > 0 && iter >= alg.warmup
-            s2cap = alg.sigma2_init !== nothing ? alg.sigma2_init : Inf
+            # sigma2_init caps the FS dispersion during early iterations to
+            # prevent runaway smoothing while the fit is still poor; as
+            # documented, the cap relaxes (×10 per iteration past warmup)
+            # so it cannot permanently bias λ downward.
+            s2cap = if alg.sigma2_init === nothing
+                Inf
+            else
+                alg.sigma2_init * 10.0^clamp(iter - alg.warmup, 0, 300)
+            end
             theta_new, _ = try
                 rho_init = log.(max.(theta, 1e-20))
                 estimate_smoothing_params(J, w_irls_for_laml, w_vec,

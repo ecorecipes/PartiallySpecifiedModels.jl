@@ -1,6 +1,6 @@
 # Ensemble Kalman Inversion: Derivative-Free Estimation
 Simon Frost
-2026-04-04
+2026-06-12
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -41,10 +41,6 @@ using Plots
 using Random
 Random.seed!(42)
 ```
-
-    Precompiling packages...
-      10687.3 ms  ✓ PartiallySpecifiedModels
-      1 dependency successfully precompiled in 28 seconds. 387 already precompiled.
 
     TaskLocalRNG()
 
@@ -134,7 +130,7 @@ println("\nTime: $(round(t_ek, digits=1))s")
       iter 45: misfit=9.573 spread=0.03525
       iter 50: misfit=9.57 spread=0.03483
 
-    Time: 3.9s
+    Time: 3.6s
 
 ### Recovered behavioural response
 

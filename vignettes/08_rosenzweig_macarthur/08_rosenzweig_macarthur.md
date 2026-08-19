@@ -1,6 +1,6 @@
 # Recovering Functional Responses: The Rosenzweig-MacArthur Model
 Simon Frost
-2026-04-03
+2026-06-12
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -152,68 +152,78 @@ prob = PSMProblem(consumer_resource!, u0, tspan, [approx_f];
     Iter 2: obj=1617.8, SS=3235.3, θ=[3.66e-5]
     Iter 3: obj=1239.78, SS=2479.42, θ=[3.66e-5]
     LAML init: ρ = [0.0]
-    LAML-FS iter 1: σ̂²=5.434e+01 λ = [0.000169]
-    LAML-FS iter 2: σ̂²=2.033e+01 λ = [0.01134]
-    LAML-FS iter 3: σ̂²=2.071e+01 λ = [0.003028]
-    LAML-FS iter 4: σ̂²=2.043e+01 λ = [0.005383]
-    LAML-FS iter 5: σ̂²=2.051e+01 λ = [0.004317]
-    LAML-FS iter 10: σ̂²=2.048e+01 λ = [0.004605]
-    LAML-FS iter 19: σ̂²=2.048e+01 λ = [0.004602]
+    LAML-FS iter 1: σ̂²=5.524e+01 λ = [0.0001718]
+    LAML-FS iter 2: σ̂²=2.067e+01 λ = [0.0115]
+    LAML-FS iter 3: σ̂²=2.106e+01 λ = [0.003056]
+    LAML-FS iter 4: σ̂²=2.077e+01 λ = [0.005454]
+    LAML-FS iter 5: σ̂²=2.085e+01 λ = [0.004365]
+    LAML-FS iter 10: σ̂²=2.082e+01 λ = [0.00466]
+    LAML-FS iter 19: σ̂²=2.082e+01 λ = [0.004657]
     LAML-FS converged at iteration 19
-    LAML-Newton iter 1: V=-1.861516e+02 |grad|=1.031e-07
-    Iter 4: obj=694.123, SS=1374.46, θ=[0.0046]
-    LAML init: ρ = [-5.381]
-    LAML-FS iter 1: σ̂²=1.138e+01 λ = [0.006745]
-    LAML-FS iter 2: σ̂²=1.143e+01 λ = [0.006091]
-    LAML-FS iter 3: σ̂²=1.142e+01 λ = [0.006263]
-    LAML-FS iter 4: σ̂²=1.142e+01 λ = [0.006216]
-    LAML-FS iter 5: σ̂²=1.142e+01 λ = [0.006229]
-    LAML-FS iter 10: σ̂²=1.142e+01 λ = [0.006226]
-    LAML-FS iter 11: σ̂²=1.142e+01 λ = [0.006226]
+    LAML-Newton iter 1: V=-1.871433e+02 |grad|=1.095e-07
+    Iter 4: obj=695.667, SS=1377.38, θ=[0.00466]
+    LAML init: ρ = [-5.369]
+    LAML-FS iter 1: σ̂²=1.159e+01 λ = [0.009123]
+    LAML-FS iter 2: σ̂²=1.171e+01 λ = [0.007775]
+    LAML-FS iter 3: σ̂²=1.167e+01 λ = [0.008102]
+    LAML-FS iter 4: σ̂²=1.168e+01 λ = [0.008018]
+    LAML-FS iter 5: σ̂²=1.168e+01 λ = [0.008039]
+    LAML-FS iter 10: σ̂²=1.168e+01 λ = [0.008035]
+    LAML-FS iter 11: σ̂²=1.168e+01 λ = [0.008035]
     LAML-FS converged at iteration 11
-    LAML-Newton iter 1: V=-1.533644e+02 |grad|=1.889e-07
-    LAML init: ρ = [-5.079]
-    LAML-FS iter 1: σ̂²=7.559e-01 λ = [0.02051]
-    LAML-FS iter 2: σ̂²=7.686e-01 λ = [0.0168]
-    LAML-FS iter 3: σ̂²=7.653e-01 λ = [0.0174]
-    LAML-FS iter 4: σ̂²=7.658e-01 λ = [0.01729]
-    LAML-FS iter 5: σ̂²=7.657e-01 λ = [0.01731]
-    LAML-FS iter 9: σ̂²=7.658e-01 λ = [0.01731]
+    LAML-Newton iter 1: V=-1.553358e+02 |grad|=1.860e-07
+    LAML init: ρ = [-4.824]
+    LAML-FS iter 1: σ̂²=1.858e-01 λ = [0.006569]
+    LAML-FS iter 2: σ̂²=1.848e-01 λ = [0.006815]
+    LAML-FS iter 3: σ̂²=1.850e-01 λ = [0.00677]
+    LAML-FS iter 4: σ̂²=1.850e-01 λ = [0.006778]
+    LAML-FS iter 5: σ̂²=1.850e-01 λ = [0.006777]
+    LAML-FS iter 9: σ̂²=1.850e-01 λ = [0.006777]
     LAML-FS converged at iteration 9
-    LAML-Newton iter 1: V=5.226687e+00 |grad|=2.124e-07
-    LAML init: ρ = [-4.057]
-    LAML-FS iter 1: σ̂²=2.157e-01 λ = [0.003966]
-    LAML-FS iter 2: σ̂²=1.990e-01 λ = [0.004602]
-    LAML-FS iter 3: σ̂²=1.998e-01 λ = [0.004526]
-    LAML-FS iter 4: σ̂²=1.997e-01 λ = [0.004535]
-    LAML-FS iter 5: σ̂²=1.997e-01 λ = [0.004534]
-    LAML-FS iter 8: σ̂²=1.997e-01 λ = [0.004534]
+    LAML-Newton iter 1: V=9.111228e+01 |grad|=6.265e-08
+    LAML init: ρ = [-4.994]
+    LAML-FS iter 1: σ̂²=1.434e-01 λ = [0.02345]
+    LAML-FS iter 2: σ̂²=1.462e-01 λ = [0.01892]
+    LAML-FS iter 3: σ̂²=1.455e-01 λ = [0.01959]
+    LAML-FS iter 4: σ̂²=1.456e-01 λ = [0.01948]
+    LAML-FS iter 5: σ̂²=1.456e-01 λ = [0.01949]
+    LAML-FS iter 9: σ̂²=1.456e-01 λ = [0.01949]
+    LAML-FS converged at iteration 9
+    LAML-Newton iter 1: V=1.039345e+02 |grad|=1.621e-07
+    LAML init: ρ = [-3.938]
+    LAML-FS iter 1: σ̂²=1.382e-01 λ = [0.02716]
+    LAML-FS iter 2: σ̂²=1.391e-01 λ = [0.02536]
+    LAML-FS iter 3: σ̂²=1.389e-01 λ = [0.02572]
+    LAML-FS iter 4: σ̂²=1.390e-01 λ = [0.02565]
+    LAML-FS iter 5: σ̂²=1.389e-01 λ = [0.02566]
+    LAML-FS iter 10: σ̂²=1.389e-01 λ = [0.02566]
+    LAML-FS converged at iteration 10
+    LAML-Newton iter 1: V=1.077743e+02 |grad|=6.392e-08
+    LAML init: ρ = [-3.663]
+    LAML-FS iter 1: σ̂²=1.389e-01 λ = [0.02741]
+    LAML-FS iter 2: σ̂²=1.391e-01 λ = [0.02707]
+    LAML-FS iter 3: σ̂²=1.391e-01 λ = [0.02713]
+    LAML-FS iter 4: σ̂²=1.391e-01 λ = [0.02712]
+    LAML-FS iter 5: σ̂²=1.391e-01 λ = [0.02712]
+    LAML-FS iter 8: σ̂²=1.391e-01 λ = [0.02712]
     LAML-FS converged at iteration 8
-    LAML-Newton iter 1: V=8.170798e+01 |grad|=5.564e-08
-    LAML init: ρ = [-5.396]
-    LAML-FS iter 1: σ̂²=1.451e-01 λ = [0.004381]
-    LAML-FS iter 2: σ̂²=1.450e-01 λ = [0.0044]
-    LAML-FS iter 3: σ̂²=1.450e-01 λ = [0.004397]
-    LAML-FS iter 4: σ̂²=1.450e-01 λ = [0.004398]
-    LAML-FS iter 5: σ̂²=1.450e-01 λ = [0.004398]
-    LAML-FS iter 6: σ̂²=1.450e-01 λ = [0.004398]
-    LAML-FS converged at iteration 6
-    LAML-Newton iter 1: V=9.779125e+01 |grad|=1.837e-07
-    LAML init: ρ = [-5.427]
-    LAML-FS iter 1: σ̂²=1.433e-01 λ = [0.004269]
-    LAML-FS iter 2: σ̂²=1.431e-01 λ = [0.004287]
-    LAML-FS iter 3: σ̂²=1.432e-01 λ = [0.004284]
-    LAML-FS iter 4: σ̂²=1.432e-01 λ = [0.004285]
-    LAML-FS iter 5: σ̂²=1.432e-01 λ = [0.004285]
-    LAML-FS iter 7: σ̂²=1.432e-01 λ = [0.004285]
-    LAML-FS converged at iteration 7
-    LAML-Newton iter 1: V=1.036693e+02 |grad|=7.093e-08
-    Converged at iter 9 (objective stable)
+    LAML-Newton iter 1: V=1.072311e+02 |grad|=1.595e-07
+    LAML init: ρ = [-3.607]
+    LAML-FS iter 1: σ̂²=1.389e-01 λ = [0.02918]
+    LAML-FS iter 2: σ̂²=1.391e-01 λ = [0.02884]
+    LAML-FS iter 3: σ̂²=1.391e-01 λ = [0.02889]
+    LAML-FS iter 4: σ̂²=1.391e-01 λ = [0.02889]
+    LAML-FS iter 5: σ̂²=1.391e-01 λ = [0.02889]
+    LAML-FS iter 8: σ̂²=1.391e-01 λ = [0.02889]
+    LAML-FS converged at iteration 8
+    LAML-Newton iter 1: V=1.075404e+02 |grad|=3.620e-08
+    Iter 10: obj=8.28868, SS=16.3438, θ=[0.0195]
+    Converged at iter 10 (no improvement)
 
-    Final: data_loss = 16.9074, penalty = 0.57347, EDF = 5.89
-    Final θ: [0.004398]
-    Data loss (SS): 16.91
-    EDF: 5.89
+    Final: data_loss = 16.3438, penalty = 0.233576, EDF = 4.67
+    Final θ: [0.01949]
+    Data loss (SS): 16.34
+    EDF: 4.67
 
 ### Fitted trajectories
 
@@ -329,7 +339,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](08_rosenzweig_macarthur_files/figure-commonmark/cell-10-output-1.svg)
 
-    Durbin-Watson: 1.295, 1.835
+    Durbin-Watson: 1.375, 1.83
 
 ## Phase Portrait
 

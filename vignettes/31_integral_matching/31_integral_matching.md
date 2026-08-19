@@ -1,6 +1,6 @@
 # Integral Matching: Noise-Robust Integration-Free Estimation
 Simon Frost
-2026-04-04
+2026-06-12
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -47,10 +47,6 @@ using Plots
 using Random
 Random.seed!(42)
 ```
-
-    Precompiling packages...
-      15021.7 ms  ✓ PartiallySpecifiedModels
-      1 dependency successfully precompiled in 32 seconds. 387 already precompiled.
 
     TaskLocalRNG()
 
@@ -185,8 +181,8 @@ println("IntegralMatching: loss=$(round(sol_im_lv.objective, sigdigits=4)), time
 println("GradientMatching: loss=$(round(sol_gm_lv.objective, sigdigits=4)), time=$(round(t_gm_lv, digits=1))s")
 ```
 
-    IntegralMatching: loss=172.6, time=2.2s
-    GradientMatching: loss=0.03535, time=1.3s
+    IntegralMatching: loss=172.6, time=2.3s
+    GradientMatching: loss=55.33, time=1.5s
 
 ``` julia
 H_grid = range(0.0, H_max, length=100)

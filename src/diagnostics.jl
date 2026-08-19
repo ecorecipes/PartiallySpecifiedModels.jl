@@ -125,8 +125,10 @@ function appraise(sol::PSMSolution; family::Union{Nothing, AbstractLikelihood}=n
 
     if family !== nothing && !(family isa Gaussian)
         r = deviance_residuals(family, y, mu)
-        # Standardize by estimated scale (median absolute deviance residual)
-        sc = median_abs(r)
+        # Robust scale: for N(0,1)-distributed residuals, median|r| ≈ 0.6745,
+        # so dividing by the raw median|r| inflates the standardized
+        # residuals ~1.48× against the N(0,1) QQ reference line.
+        sc = median_abs(r) / 0.6745
         if sc > 1e-10
             r_std = r ./ sc
         else
@@ -385,23 +387,3 @@ function _eval_approx_at(approx, p::Vector{Float64}, x::Real)
     error("confidence_band: unsupported approximator type $(typeof(approx))")
 end
 
-"""Piecewise linear basis vector for SPDE mesh."""
-function _piecewise_linear_basis(x::Real, mesh::Vector{Float64})
-    n = length(mesh)
-    b = zeros(n)
-    if x <= mesh[1]
-        b[1] = 1.0
-    elseif x >= mesh[end]
-        b[end] = 1.0
-    else
-        for i in 1:n-1
-            if mesh[i] <= x <= mesh[i+1]
-                t = (x - mesh[i]) / (mesh[i+1] - mesh[i])
-                b[i] = 1.0 - t
-                b[i+1] = t
-                break
-            end
-        end
-    end
-    b
-end

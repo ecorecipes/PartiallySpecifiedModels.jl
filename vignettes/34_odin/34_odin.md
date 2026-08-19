@@ -1,6 +1,6 @@
 # ODIN: ODE-Informed Gaussian Process Regression
 Simon Frost
-2026-04-04
+2026-08-19
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -16,11 +16,14 @@ Simon Frost
 ## Overview
 
 The **ODINSolver** implements ODE-Informed regression (Wenk & Abbati,
-2020) — a Gaussian process–based approach that alternates between GP
-smoothing and ODE parameter optimisation. Unlike simple gradient
-matching (which smooths data independently of the ODE), ODIN feeds the
-ODE residual back into the GP, creating tighter coupling between data
-smoothing and model structure.
+2020). GP hyperparameters are first estimated per observed state by
+marginal likelihood; then the states and the unknown-function parameters
+are optimised **jointly** under a risk that combines the data fit, a GP
+prior on the trajectory, and an ODE-gradient mismatch weighted by the
+GP’s conditional derivative covariance. Unlike simple gradient matching
+(which smooths data once, independently of the ODE), the trajectory can
+move away from the GP posterior mean when the ODE demands it, and
+unobserved states are inferred through the ODE terms.
 
 **When to use ODINSolver:**
 
@@ -37,7 +40,7 @@ smoothing and model structure.
 |----|:--:|:--:|:--:|
 | GradientMatching | Cubic spline | One-way (smooth → match) | No |
 | AdaptiveGradientMatching | GP + eigendecomp | Product-of-experts | No |
-| **ODINSolver** | GP + ODE penalty | Two-way (alternating) | No |
+| **ODINSolver** | GP prior on states | Joint (states + θ optimised together) | No |
 | MagiSolver | GP + manifold constraint | Full Bayesian | No |
 
 ## Setup
@@ -50,10 +53,6 @@ using Plots
 using Random
 Random.seed!(42)
 ```
-
-    Precompiling packages...
-      12762.1 ms  ✓ PartiallySpecifiedModels
-      1 dependency successfully precompiled in 38 seconds. 387 already precompiled.
 
     TaskLocalRNG()
 
@@ -115,28 +114,39 @@ prob = PSMProblem(sir!, u0, (0.0, 60.0), [approx_β];
     obs_to_state=[1, 2], known_params=(γ=0.25, N=1000.0), solver=Tsit5())
 
 t_odin = @elapsed sol_odin = solve(prob,
-    ODINSolver(maxiters=100, gp_lengthscale=10.0, gp_variance=100.0,
-               ode_weight=1.0, lr=0.01, verbose=true))
+    ODINSolver(maxiters=100, verbose=true))  # GP hyperparameters estimated per state
 println("\nTime: $(round(t_odin, digits=1))s")
 ```
 
     ODINSolver: 2 observed states, 61 time points
-      8 unknown-function parameters, 100 outer iterations
-      outer 1: loss=10678.0
-      outer 2: loss=10513.0
-      outer 3: loss=10513.0
-      outer 10: loss=10513.0
-      outer 20: loss=10513.0
-      outer 30: loss=10513.0
-      outer 40: loss=10513.0
-      outer 50: loss=10513.0
-      outer 60: loss=10513.0
-      outer 70: loss=10513.0
-      outer 80: loss=10513.0
-      outer 90: loss=10513.0
-      outer 100: loss=10513.0
+      GP hyperparams: σ²=52200.0 ℓ=18.0 σ_n²=52.2
+      GP hyperparams: σ²=867.0 ℓ=12.0 σ_n²=8.67
+      joint optimisation over 183 state values + 8 unknown-function parameters
+      step 1: risk=78398.0
+      step 2: risk=77975.0
+      step 3: risk=77802.0
+      step 100: risk=74477.0
+      step 200: risk=71679.0
+      step 300: risk=69099.0
+      step 400: risk=66736.0
+      step 500: risk=64591.0
+      step 600: risk=62663.0
+      step 700: risk=60950.0
+      step 800: risk=59445.0
+      step 900: risk=58141.0
+      step 1000: risk=57029.0
+      step 1100: risk=56097.0
+      step 1200: risk=55334.0
+      step 1300: risk=54726.0
+      step 1400: risk=54260.0
+      step 1500: risk=53918.0
+      step 1600: risk=53684.0
+      step 1700: risk=53539.0
+      step 1800: risk=53464.0
+      step 1900: risk=53435.0
+      step 2000: risk=53431.0
 
-    Time: 4.9s
+    Time: 9.2s
 
 ### Compare with Adaptive Gradient Matching and LAML
 
@@ -196,20 +206,23 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ## How It Works
 
-ODIN alternates between two steps:
+ODIN proceeds in two stages:
 
-1.  **GP step**: Fit an RBF Gaussian process to each observed state. The
-    GP posterior mean provides smooth state estimates $\hat{y}(t)$ and
-    derivatives $d\hat{y}/dt$.
-2.  **ODE step**: Optimise the unknown-function parameters $\beta$ to
-    minimise the ODE mismatch
-    $\sum_i \|d\hat{y}/dt(t_i) - f(\hat{y}(t_i), \beta)\|^2$.
+1.  **GP pre-training**: per observed state, the RBF hyperparameters
+    $(\sigma^2, \ell, \sigma_n^2)$ are estimated by maximising the GP
+    marginal likelihood. These fix the prior precision $K^{-1}$, the
+    derivative map $D = {}'K K^{-1}$, and the conditional derivative
+    covariance $A = {}''K - {}'K K^{-1} {}'K^\top + \gamma I$.
+2.  **Joint optimisation**: the states $X$ *and* the unknown-function
+    parameters $\theta$ are optimised together against the risk
+    $$R(X, \theta) = \sum_k \left[ \tfrac{1}{\sigma_{n,k}^2}\|y_k - x_k\|^2 + \tilde{x}_k^\top K_k^{-1} \tilde{x}_k + (f_k(X,\theta) - D_k \tilde{x}_k)^\top A_k^{-1} (f_k(X,\theta) - D_k \tilde{x}_k) \right].$$
 
-The key difference from simple gradient matching is that after the ODE
-step, the GP is **re-fitted** with the ODE residual informing the noise
-model — regions where the ODE is well-satisfied get tighter GP fits,
-creating a feedback loop that progressively refines both the smooth and
-the unknown function.
+The key difference from simple gradient matching is the Mahalanobis
+weighting $A^{-1}$ — the ODE mismatch is trusted only in directions
+where the GP actually determines the derivative — and that the states
+are free to move away from the GP posterior mean when the ODE demands
+it. Unobserved states enter as free variables identified through the ODE
+terms alone, so partially observed systems are supported.
 
 ## References
 

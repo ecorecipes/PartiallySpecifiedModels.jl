@@ -1,6 +1,6 @@
 # Fast Gradient Matching with BNGSolver
 Simon Frost
-2026-04-03
+2026-08-19
 
 - [Overview](#overview)
 - [Lotka-Volterra with Unknown
@@ -17,19 +17,25 @@ Simon Frost
 
 ## Overview
 
-The `BNGSolver` implements Bayesian Neural Gradient matching (Bonnaffé
-et al. 2023), a two-step approach that **avoids ODE integration
-entirely**:
+The `BNGSolver` implements ensemble Bayesian gradient matching (Bonnaffé
+& Coulson 2023), which **avoids ODE integration entirely**:
 
-1.  **Step 1 — Smooth**: Fit cubic splines to the observed time series
+1.  **Smooth**: Fit penalized (GCV) splines to the observed time series
     to obtain smoothed states ŷ(t) and their derivatives dŷ/dt.
-2.  **Step 2 — Match**: Optimize the unknown function parameters by
-    minimizing the mismatch between dŷ/dt and the ODE right-hand side
-    f(ŷ, θ, t).
+2.  **Match**: Optimize the unknown-function parameters by minimizing
+    the variance-marginalized log-posterior of the mismatch between
+    dŷ/dt and the ODE right-hand side — the paper’s “Bayesian
+    regularisation”, which needs no supplied noise variance.
+3.  **Ensemble**: Repeat over `k_obs` residual-bootstrap resamples of
+    the smoother × `k_proc` restarts from perturbed initialisations.
+    Reported unknown functions are posterior-weighted ensemble means,
+    and `sol.convergence.ensemble_std` gives pointwise uncertainty
+    bands.
 
 This makes BNG much faster than integration-based solvers (LAML, Adam)
 and more robust to poor initial parameter values, since no ODE solve is
-needed during training.
+needed during training — and unlike a single-fit gradient matcher, the
+ensemble quantifies uncertainty.
 
 ``` julia
 using PartiallySpecifiedModels
@@ -113,8 +119,12 @@ prob = PSMProblem(lv!, [50.0, 10.0], (0.0, 30.0), [uf];
     obs_to_state=[1, 2], known_params=NamedTuple(),
     likelihood=PartiallySpecifiedModels.Gaussian())
 
-sol_bng = solve(prob, BNGSolver(maxiters=3000, lr=0.01, verbose=false));
+sol_bng = solve(prob, BNGSolver(maxiters=3000, lr=0.01, rng_seed=1, verbose=false));
 ```
+
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
 
 ### Compare with AdamSolver
 
@@ -191,7 +201,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](17_bng_files/figure-commonmark/cell-10-output-1.svg)
 
-    Durbin-Watson: 0.564, 0.419
+    Durbin-Watson: 0.818, 0.893
 
 ## When to Use BNGSolver
 

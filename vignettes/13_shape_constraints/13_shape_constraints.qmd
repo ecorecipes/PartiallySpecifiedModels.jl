@@ -500,7 +500,7 @@ println("  Dec+Zero@K:      data_loss=$(round(sol_rick_dzr.data_loss, sigdigits=
 ```
 
 
-## Example 5: Lotka-Volterra — Simulated Data
+## Example 5: Rosenzweig-MacArthur — Simulated Data
 
 In predator-prey models, the key unknowns are typically the **functional
 response** f(H) (per-capita predation rate) and **numerical response** g(H)
@@ -889,4 +889,4 @@ The full set of shape constraints:
 - Pya, N. & Wood, S.N. (2015). Shape constrained additive models.
   *Statistics and Computing*, 25, 543–559.
 - Wood, S.N., Pya, N. & Säfken, B. (2016). Smoothing parameter and model
-  selection for general smooth models. *JASA*, 111, 1548–1563.
+  selection for general smooth models. *JASA*, 111, 1548–1575.

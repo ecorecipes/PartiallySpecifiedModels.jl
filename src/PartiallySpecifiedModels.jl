@@ -15,7 +15,7 @@ shape-constrained SPDE, neural network, Gaussian process, and COMONet).
 Uses Laplace Approximate Marginal Likelihood (LAML) for automatic smoothing
 parameter estimation, following:
 - Wood, Pya & Säfken (2016), JASA 111(516), 1548-1575
-- Wood & Fasiolo (2017), Statistics and Computing 27(3), 759-774
+- Wood & Fasiolo (2017), Biometrics 73(4), 1071-1081
 
 Supports Gaussian, Poisson, Negative Binomial, and custom likelihoods.
 """
@@ -71,7 +71,6 @@ include("adaptive_gradient_matching.jl")
 # Probabilistic ODE solver (rodeo)
 include("ibm_prior.jl")
 include("kalman.jl")
-include("interrogation.jl")
 include("probsolve.jl")
 include("rodeo_solver.jl")
 
@@ -119,7 +118,7 @@ include("ensemble_kalman_solver.jl")
 # ODIN solver (ODE-Informed regression, Wenk & Abbati 2020)
 include("odin_solver.jl")
 
-# RKHS solver (kernel-based unknown function estimation)
+# RKHS solver (trajectory-in-RKHS gradient matching)
 include("rkhs_solver.jl")
 
 # Profile range parameter optimization for SPDE

@@ -1,6 +1,6 @@
 # Bayesian Inference with PseudoMarginalSolver
 Simon Frost
-2026-04-02
+2026-06-12
 
 - [Overview](#overview)
 - [Logistic Growth Model](#logistic-growth-model)
@@ -18,18 +18,21 @@ Simon Frost
 ## Overview
 
 The `PseudoMarginalSolver` combines **probabilistic ODE solving** with
-**Bayesian MCMC inference**. It uses a probabilistic ODE solver
-(fenrir/DALTON) as an inner likelihood estimator within an outer
-NUTS/HMC sampling loop, yielding full posterior distributions over the
-unknown function parameters.
+**Bayesian MCMC inference**. It forms an *unbiased* Monte-Carlo estimate
+of the marginal likelihood — drawing complete state trajectories from
+the probabilistic solver’s Gauss–Markov posterior by
+forward-filter/backward-sampling (FFBS) and averaging the data
+likelihood over them — and uses it inside a random-walk Metropolis
+sampler. Because the estimator is unbiased and nonnegative, the chain
+targets the exact posterior (Andrieu & Roberts 2009).
 
 This differs from:
 
 - **MCMCSolver**: Uses deterministic ODE integration for the likelihood
 - **MagiSolver**: Uses Kalman-filtered Integrated Brownian Motion to
   marginalize states
-- **PseudoMarginalSolver**: Uses a probabilistic ODE solver for
-  approximate marginal likelihood, then samples with NUTS
+- **PseudoMarginalSolver**: Uses an unbiased Monte-Carlo (FFBS) estimate
+  of the marginal likelihood inside random-walk Metropolis
 
 ``` julia
 using PartiallySpecifiedModels
@@ -90,10 +93,9 @@ Figure 1: Simulated logistic growth data
 
 ### Fit with PseudoMarginalSolver
 
-We use the fenrir inner method for the probabilistic likelihood. Since
-the Kalman-filter-based likelihood requires good initialization, we
-first run LAML to get a point estimate and use it to warm-start the
-sampler.
+The Monte-Carlo likelihood estimate is noisy, so a good starting point
+helps the random-walk sampler mix; we first run LAML to get a point
+estimate and use it to warm-start the sampler.
 
 ``` julia
 uf = BSplineApproximator(:r, (0.0, 12.0), 6)
@@ -109,13 +111,10 @@ laml_init = Float64.(collect(sol_laml.parameters))
 
 sol_pm = solve(prob, PseudoMarginalSolver(
     n_samples=200, n_warmup=100,
-    n_steps=200, n_deriv=3,
-    inner_method=:fenrir,
+    n_steps=100, n_deriv=3,
     initial_params=laml_init,
     verbose=false));
 ```
-
-    [ Info: Found initial step size 0.0125
 
 ### Compare with MCMCSolver
 
@@ -159,9 +158,9 @@ Figure 4: Fitted population trajectories
 
 | Feature | MCMCSolver | MagiSolver | PseudoMarginalSolver |
 |----|----|----|----|
-| **Inner likelihood** | Deterministic ODE | Kalman marginal | Probabilistic ODE (fenrir/DALTON) |
-| **Outer sampler** | NUTS | NUTS | NUTS |
-| **State marginalization** | No (states from ODE) | Yes (Kalman filter) | Partial (IBM prior) |
+| **Inner likelihood** | Deterministic ODE | GP manifold constraint | Unbiased MC estimate (FFBS) |
+| **Outer sampler** | NUTS | NUTS | Random-walk Metropolis |
+| **State marginalization** | No (states from ODE) | No (states sampled) | Yes (MC-integrated over solver posterior) |
 | **Unobserved states** | Requires all observed | Handles naturally | Handles via IBM |
 | **ODE error** | Ignored | Modeled as noise | Modeled via IBM prior |
 | **Output** | MCMCChains | MCMCChains | MCMCChains |
@@ -205,7 +204,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](19_pseudo_marginal_files/figure-commonmark/cell-10-output-1.svg)
 
-    Durbin-Watson: 1.497
+    Durbin-Watson: 1.419
 
 ## Summary
 

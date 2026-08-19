@@ -25,15 +25,14 @@ one-sided differences at boundaries.
 """
 function build_diff_matrix(times::AbstractVector{Float64})
     T = length(times)
+    T >= 3 || error("build_diff_matrix: need at least 3 time points for " *
+                    "second-order differences, got $T")
     for i in 1:T-1
         times[i+1] <= times[i] && error("build_diff_matrix: times must be strictly increasing (duplicate at index $i)")
     end
     D = zeros(T, T)
 
-    # Forward difference at t_1 (second-order)
-    h1, h2 = times[2] - times[1], times[3] - times[1]
-    D[1, 1] = -(2*h1 + h2 - h1) / (h1 * (h2 - h1) + 1e-30)
-    # Use general 3-point forward formula
+    # Forward difference at t_1: general 3-point second-order formula
     dt1, dt2 = times[2] - times[1], times[3] - times[1]
     D[1, 1] = -(dt2 + dt1) / (dt1 * dt2)
     D[1, 2] = dt2 / (dt1 * (dt2 - dt1))
@@ -393,12 +392,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     for k in 1:K
         obs_idx = findfirst(j -> prob.obs_to_state[j] == k, 1:n_obs)
         if obs_idx !== nothing
-            raw = max.(prob.data_values[:, obs_idx], 0.01)
+            # Clamp initial states away from zero only when the data are
+            # themselves non-negative (a positivity-assuming model);
+            # unconditionally forcing ≥ 0.01 corrupted legitimately negative
+            # states (log-abundances, anomalies).
+            col = prob.data_values[:, obs_idx]
+            floor_k = all(>=(0.0), col) ? 0.01 : -Inf
+            raw = max.(col, floor_k)
             if prob.discrete && T_pts >= 4
                 itp = CubicSpline(raw, times;
                                   extrapolation=ExtrapolationType.Extension)
                 for i in 1:T_pts
-                    alpha[i, k] = max(itp(times[i]), 0.01)
+                    alpha[i, k] = max(itp(times[i]), floor_k)
                 end
             else
                 alpha[:, k] .= raw
@@ -455,6 +460,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     end
 
     # ─── Continuation loop ────────────────────────────────────────
+    edf_final = Float64(sum(uf_nk))   # updated by the Fellner–Schall step
     for (level, lambda_ode) in enumerate(lambda_ode_schedule)
         if verbose
             println("\n=== Continuation level $level: λ_ode = $(round(lambda_ode, sigdigits=4)) ===")
@@ -499,14 +505,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
             end
             prev_obj = curr_obj
 
-            # Gauss-Newton step: minimize ||r + J δ||² + δ'B δ
-            # Normal equations: (J'J + B) δ = -J'r → δ = -(J'J + B)⁻¹ J'r
-            # Update: params_new = params + δ (already negative from the -J'r)
+            # Gauss-Newton step for the penalized objective
+            #   f(p) = ||r(p)||² + p'B p,  ∇f = 2(J'r + B p),
+            # so the normal equations are (J'J + B) δ = -(J'r + B p).
+            # Omitting the B·p term makes δ nonzero at the true optimum
+            # (where J'r = -B p) and stalls the line search short of it.
             alpha_flat = vec(alpha)
             params_vec = vcat(alpha_flat, beta)
 
             JtJ = J_full' * J_full + B_full
-            neg_Jtr = -(J_full' * resid)  # Note: negative!
+            neg_Jtr = -(J_full' * resid .+ B_full * params_vec)
 
             delta = try
                 JtJ \ neg_Jtr
@@ -550,67 +558,69 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
             beta .= params_new[n_alpha+1:end]
         end
 
-        # Update smoothing parameters via LAML after convergence at this level
+        # ── Fellner–Schall smoothing-parameter update ────────────────
+        # Uses the genuine effective degrees of freedom
+        #   edf_k = tr(H⁻¹ (J'WJ)_kk),   H = J'WJ + S^θ,
+        # with J the Jacobian of the fitted values w.r.t. β (obtained by a
+        # finite-difference model simulation), σ̂² = RSS/(n − edf), and the
+        # update θ_k = σ̂² · edf_k / (β_kᵀ S_k β_k). This replaces the prior
+        # fabricated `edf_k = 0.5·(nk−2)` placeholder.
         if m > 0
-            # Build Jacobian of data residual w.r.t. beta only (for LAML)
-            # Approximate: use the ODE-constrained predictions
-            f_vec_data = zeros(T_pts * n_obs)
-            for j in 1:n_obs
-                sk = prob.obs_to_state[j]
-                for i in 1:T_pts
-                    f_vec_data[(j - 1) * T_pts + i] = alpha[i, sk]
+            ord(M) = Float64[M[i, j] for j in 1:n_obs for i in 1:T_pts]
+            μ_pred = try
+                simulate(prob, beta)
+            catch
+                nothing
+            end
+            if μ_pred !== nothing
+                y_vec2 = ord(prob.data_values)
+                w_vec2 = ord(prob.data_weights)
+                mu_base = ord(μ_pred)
+                n_data = length(y_vec2)
+                Jb = zeros(n_data, n_beta)
+                for b in 1:n_beta
+                    step = max(1e-6, abs(beta[b]) * 1e-6)
+                    bp = copy(beta); bp[b] += step
+                    pp = try; simulate(prob, bp); catch; μ_pred; end
+                    Jb[:, b] .= (ord(pp) .- mu_base) ./ step
                 end
-            end
-
-            # Compute Jacobian of fitted values w.r.t. beta via FD
-            J_beta = zeros(T_pts * n_obs, n_beta)
-            eps = 1e-5
-            for b in 1:n_beta
-                beta_p = copy(beta)
-                step = max(eps, abs(beta[b]) * eps)
-                beta_p[b] += step
-                # Re-solve the inner problem briefly with perturbed beta
-                # (Approximation: just evaluate ODE RHS change)
-                F0 = eval_ode_rhs(prob, times, alpha, beta)
-                F1 = eval_ode_rhs(prob, times, alpha, beta_p)
-                # dF/dbeta affects alpha through the ODE constraint
-                # For LAML, use a simple approximation: hold alpha fixed
-                # This underestimates the sensitivity but is computationally tractable
-                for j in 1:n_obs
-                    sk = prob.obs_to_state[j]
-                    J_beta[:, b] .= 0.0  # alpha doesn't change with beta in this approx
+                JWJ = Jb' * Diagonal(w_vec2) * Jb
+                S_full = zeros(n_beta, n_beta)
+                for l in 1:m
+                    idx = (uf_offsets[l]+1):(uf_offsets[l]+uf_nk[l])
+                    S_full[idx, idx] .+= theta[l] .* S_list[l]
                 end
-            end
-
-            # Simplified LAML: use data residuals and a rough Jacobian
-            # For the smoothing parameter estimation, the key quantities are:
-            # - beta'S beta (penalty magnitude)
-            # - edf (effective degrees of freedom)
-            # - sigma2 (residual variance)
-            # We can estimate these without a full Jacobian
-            data_ss = sum(w_vec .* (y_vec .- f_vec_data).^2)
-            sigma2_est = data_ss / (T_pts * n_obs)
-
-            if alg.sigma2_init !== nothing
-                sigma2_est = min(sigma2_est, alg.sigma2_init)
-            end
-
-            # Simple Fellner-Schall update for each smooth term
-            for l in 1:m
-                off = uf_offsets[l]
-                nk = uf_nk[l]
-                beta_k = beta[off+1:off+nk]
-                bSb = dot(beta_k, S_list[l] * beta_k)
-                rank_k = min(nk, nk - 2)  # Typical rank of second-derivative penalty
-                edf_k = max(rank_k * 0.5, 1.0)  # Conservative estimate
-                if bSb > 1e-30
-                    theta[l] = clamp(sigma2_est * edf_k / bSb, 1e-20, 1e20)
+                H = JWJ + S_full
+                maxd = maximum(abs.(diag(H)))
+                for i in 1:n_beta; H[i, i] += 1e-10 * (maxd + 1); end
+                H_inv = try; inv(cholesky(Symmetric(H))); catch; pinv(H); end
+                edf_total = clamp(tr(H_inv * JWJ), 1.0, Float64(n_beta))
+                sigma2_est = sum(w_vec2 .* (y_vec2 .- mu_base).^2) /
+                             max(n_data - edf_total, 1.0)
+                if alg.sigma2_init !== nothing
+                    sigma2_est = min(sigma2_est, alg.sigma2_init)
                 end
-            end
-
-            if verbose
-                println("  LAML update: σ²=$(round(sigma2_est, sigdigits=4)) " *
-                        "θ=$(round.(theta, sigdigits=3))")
+                edf_final = edf_total
+                for l in 1:m
+                    idx = (uf_offsets[l]+1):(uf_offsets[l]+uf_nk[l])
+                    beta_k = beta[idx]
+                    bSb = dot(beta_k, S_list[l] * beta_k)
+                    # Fellner–Schall numerator (Wood & Fasiolo 2017):
+                    #   rank(S_k) − θ_k·tr(H⁻¹S_k),
+                    # matching estimate_smoothing_params in laml.jl. Using the
+                    # hat-trace edf_k here instead would include the penalty
+                    # null space (rank + nullity − θtr(H⁻¹S)) and bias θ up.
+                    r_k = _rank_penalty(S_list[l])
+                    trHS = tr(H_inv[idx, idx] * S_list[l])
+                    fs_num = clamp(r_k - theta[l] * trHS, 0.01, Float64(uf_nk[l]))
+                    if bSb > 1e-30
+                        theta[l] = clamp(sigma2_est * fs_num / bSb, 1e-20, 1e20)
+                    end
+                end
+                if verbose
+                    println("  FS update: σ²=$(round(sigma2_est, sigdigits=4)) " *
+                            "edf=$(round(edf_total, sigdigits=3)) θ=$(round.(theta, sigdigits=3))")
+                end
             end
         end
     end
@@ -655,8 +665,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
         end
     end
 
-    # EDF approximation
-    edf = sum(uf_nk)  # Conservative: use full parameter count
+    # Effective degrees of freedom from the Fellner–Schall step.
+    edf = edf_final
 
     # Build parameter ComponentArray
     ca_entries = Pair{Symbol, Any}[]
@@ -668,8 +678,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     end
     params = ComponentArray(NamedTuple(ca_entries))
 
-    obj_val = data_loss + sum(theta[l] * dot(beta[uf_offsets[l]+1:uf_offsets[l]+uf_nk[l]],
-                  S_list[l] * beta[uf_offsets[l]+1:uf_offsets[l]+uf_nk[l]]) for l in 1:m)
+    obj_val = data_loss + sum((theta[l] * dot(beta[uf_offsets[l]+1:uf_offsets[l]+uf_nk[l]],
+                  S_list[l] * beta[uf_offsets[l]+1:uf_offsets[l]+uf_nk[l]]) for l in 1:m);
+                  init=0.0)   # m == 0 (all approximators unpenalized) is valid
 
     if verbose
         println("\nFinal: data_SS=$(round(data_loss, sigdigits=5)) " *

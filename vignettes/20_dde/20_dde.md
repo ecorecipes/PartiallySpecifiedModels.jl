@@ -1,6 +1,6 @@
 # Delay Differential Equations
 Simon Frost
-2026-04-03
+2026-06-12
 
 - [Overview](#overview)
 - [Example 1: Delayed Negative
@@ -239,7 +239,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](20_dde_files/figure-commonmark/cell-9-output-1.svg)
 
-    Durbin-Watson: 2.163
+    Durbin-Watson: 2.127
 
 > [!TIP]
 >

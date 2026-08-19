@@ -1,6 +1,6 @@
 # Fisheries Stock-Recruitment with Poisson Counts
 Simon Frost
-2026-04-02
+2026-06-12
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -198,7 +198,7 @@ println("Unconstrained — Data loss: $(round(sol_unc.data_loss, sigdigits=4)), 
     "EDF: $(round(sol_unc.edf, digits=1))")
 ```
 
-    Unconstrained — Data loss: 217900.0, EDF: 5.2
+    Unconstrained — Data loss: 218000.0, EDF: 5.1
 
 ## Shape-Constrained Fit
 
@@ -267,7 +267,7 @@ p_fit
 
     Stock-Recruitment Model — Comparison
     ────────────────────────────────────────────────────────────
-      Unconstrained:  data_loss=217900.0, EDF=5.2, cor(R̂,R)=0.996
+      Unconstrained:  data_loss=218000.0, EDF=5.1, cor(R̂,R)=0.996
       Inc+Concave:    data_loss=603100.0, EDF=2.2, cor(R̂,R)=0.953
 
 The shape constraint typically produces a smoother, more biologically

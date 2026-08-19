@@ -40,7 +40,7 @@ integration, providing a robust and computationally efficient estimator.
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
-    _validate_problem(prob, "IntegralMatchingSolver")
+    _validate_problem(prob, "IntegralMatchingSolver"; require_continuous=true)
     verbose = alg.verbose
 
     times = Float64.(prob.data_times)
@@ -54,13 +54,14 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
     y_smooth = zeros(n_times, n_vars)
     observed_states = Set{Int}()
 
+    # Penalized GCV smoother — an interpolating spline evaluated at its own
+    # knots returns the raw data (a no-op "smoothing" step).
     for j in 1:n_obs
         sk = prob.obs_to_state[j]
         push!(observed_states, sk)
-        itp = CubicSpline(prob.data_values[:, j], times;
-                          extrapolation=ExtrapolationType.Extension)
+        sval, _ = _smoothing_spline(times, Float64.(prob.data_values[:, j]))
         for i in 1:n_times
-            y_smooth[i, sk] = itp(times[i])
+            y_smooth[i, sk] = sval(times[i])
         end
     end
 
@@ -108,9 +109,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
     end
 
     lambda_smooth = alg.lambda_smooth
-    use_simpson = n_times >= 3
 
-    # Pre-compute time step widths for trapezoidal/Simpson quadrature
+    # Pre-compute time step widths for the composite trapezoidal quadrature
     dt = diff(times)
 
     function integral_loss(β_eval)
@@ -142,10 +142,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
             end
         end
 
-        # Loss: ||delta - I_cum||²
+        # Loss: ||delta - I_cum||² over OBSERVED states only (unobserved
+        # states hold a fabricated constant, so their delta ≡ 0 would push
+        # the unknown functions to zero the RHS along a fictitious path)
         loss_val = zero(T_el)
-        for k in 1:n_vars, i in 2:n_times
-            loss_val += (delta[i, k] - I_cum[i, k])^2
+        for k in 1:n_vars
+            k in observed_states || continue
+            for i in 2:n_times
+                loss_val += (delta[i, k] - I_cum[i, k])^2
+            end
         end
 
         # Smoothing penalty

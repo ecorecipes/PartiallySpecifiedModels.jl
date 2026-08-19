@@ -170,4 +170,4 @@ The basic workflow is:
 4. Call `solve(prob, LAML())`
 5. Access `sol.unknown_functions[:name]` for the fitted functions
 
-See the [Approximators](approximators.md) and [Solvers](solvers.md) pages for detailed documentation of all available options, or the [Vignettes](vignettes.md) page for 26 worked examples.
+See the [Approximators](approximators.md) and [Solvers](solvers.md) pages for detailed documentation of all available options, or the [Vignettes](vignettes.md) page for 35 worked examples.

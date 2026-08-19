@@ -64,6 +64,10 @@ function simulate_dde(prob::PSMProblem, beta::AbstractVector)
     n_obs = length(prob.obs_to_state)
     pred = zeros(eltype(beta), n_times, n_obs)
 
+    length(sol.u) >= n_times ||
+        error("solve terminated after $(length(sol.u)) of $n_times save " *
+              "points (retcode $(sol.retcode)); cannot form predictions " *
+              "at all data times")
     for i in 1:n_times
         u_i = sol.u[i]
         for j in 1:n_obs
@@ -125,8 +129,9 @@ function adam_solve_dde(prob::PSMProblem, beta)
 
     DelayDiffEq.solve(dde_prob, dde_solver;
                       saveat=prob.data_times,
-                      abstol=1e-7, reltol=1e-7,
-                      maxiters=10_000)
+                      abstol=get(prob.ode_kwargs, :abstol, 1e-7),
+                      reltol=get(prob.ode_kwargs, :reltol, 1e-7),
+                      maxiters=get(prob.ode_kwargs, :maxiters, 10_000))
 end
 
 """
@@ -150,8 +155,9 @@ function adam_solve_dde_final(prob::PSMProblem, p_opt, u0)
 
     DelayDiffEq.solve(dde_prob, dde_solver;
                       saveat=prob.data_times,
-                      abstol=1e-7, reltol=1e-7,
-                      maxiters=10_000)
+                      abstol=get(prob.ode_kwargs, :abstol, 1e-7),
+                      reltol=get(prob.ode_kwargs, :reltol, 1e-7),
+                      maxiters=get(prob.ode_kwargs, :maxiters, 10_000))
 end
 
 # ─── DDEProblem constructor for PSMProblem ───────────────────────
@@ -199,6 +205,19 @@ function PSMProblem(prob::SciMLBase.AbstractDDEProblem,
     else
         Float64[]
     end
+    # State-dependent lags cannot be represented in the PSM fitting path;
+    # dropping them silently would make simulate() treat the model as an
+    # ODE and fail far from the cause.
+    if hasproperty(prob, :dependent_lags) && prob.dependent_lags !== nothing &&
+       !isempty(prob.dependent_lags)
+        error("PSMProblem: DDEProblem has state-dependent lags " *
+              "(dependent_lags), which the PSM fitting path does not " *
+              "support; only constant_lags are handled.")
+    end
+    isempty(delays) &&
+        error("PSMProblem: DDEProblem has no constant_lags; pass the lags " *
+              "via constant_lags=[τ…] (a lag-free DDEProblem should be an " *
+              "ODEProblem).")
 
     # Extract history function
     history = prob.h

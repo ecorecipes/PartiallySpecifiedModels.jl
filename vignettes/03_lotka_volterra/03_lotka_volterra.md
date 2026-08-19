@@ -1,6 +1,6 @@
 # Lotka–Volterra Predator–Prey with Real Data
 Simon Frost
-2026-04-02
+2026-06-12
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -155,9 +155,9 @@ variance $\hat\sigma^2$, which in turn drives the Fellner–Schall
 smoothing parameter update. We use `sigma2_init` to cap $\hat\sigma^2$
 at a plausible observation-noise level, preventing this feedback loop:
 
-    Data loss (SS):  142820.0
-    EDF:             4.75
-    Smoothing λ:     [36.74, 196.5]
+    Data loss (SS):  148340.0
+    EDF:             9.3
+    Smoothing λ:     [0.256, 0.1044]
 
 The `sigma2_init=25.0` reflects a prior belief that observation noise
 has standard deviation $\sigma \approx 5$. As the fit improves and the
@@ -253,14 +253,14 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](03_lotka_volterra_files/figure-commonmark/cell-10-output-1.svg)
 
-    Durbin-Watson: 0.706, 0.469
+    Durbin-Watson: 0.684, 0.452
 
 Additional time-series diagnostics — the **Durbin–Watson statistic** (DW
 ≈ 2 for independent residuals, DW \< 2 for positive autocorrelation
 indicating oversmoothing) and the **empirical autocorrelation function
 (ACF)**:
 
-    Durbin–Watson: hare = 0.706  lynx = 0.469
+    Durbin–Watson: hare = 0.684  lynx = 0.452
 
 ``` julia
 resid = sol.data_values .- sol.fitted_values
@@ -300,10 +300,10 @@ appropriate than the linearization-based PSM approach.
 To illustrate the impact of the `sigma2_init` cap, we compare fits with
 different assumed noise levels:
 
-    σ²_init=auto: SS=142400.0  EDF=4.9  DW=[0.71, 0.47]
-    σ²_init=100.0: SS=143900.0  EDF=4.4  DW=[0.71, 0.45]
-    σ²_init=25.0: SS=142800.0  EDF=4.7  DW=[0.71, 0.47]
-    σ²_init=1.0: SS=144800.0  EDF=4.7  DW=[0.7, 0.46]
+    σ²_init=auto: SS=149100.0  EDF=19.1  DW=[0.68, 0.45]
+    σ²_init=100.0: SS=143500.0  EDF=4.0  DW=[0.71, 0.46]
+    σ²_init=25.0: SS=148300.0  EDF=9.3  DW=[0.68, 0.45]
+    σ²_init=1.0: SS=143200.0  EDF=4.4  DW=[0.71, 0.47]
 
 ## Collocation-Based Estimation
 
@@ -323,9 +323,9 @@ schedule increases $\lambda_{\text{ode}}$ from small (data-driven) to
 large (ODE-constrained), avoiding local minima.
 
     CollocationLAML:
-      Data loss (SS):  2364.5
-      EDF:             20.0
-      ODE compliance:  0.02735
+      Data loss (SS):  2450.6
+      EDF:             3.96
+      ODE compliance:  0.009632
 
 ### Comparison: LAML vs CollocationLAML
 
@@ -349,8 +349,8 @@ plot(p1c, p2c, layout=(2, 1), size=(700, 500))
 
 ### Residual Diagnostics (Collocation)
 
-    Durbin–Watson (collocation): hare = 1.857  lynx = 1.634
-    Durbin–Watson (LAML):        hare = 0.706  lynx = 0.469
+    Durbin–Watson (collocation): hare = 1.967  lynx = 1.656
+    Durbin–Watson (LAML):        hare = 0.684  lynx = 0.452
 
 ``` julia
 resid_coll = sol_coll.data_values .- sol_coll.fitted_values

@@ -220,7 +220,7 @@ handling the nonlinear dependence on network weights. This is equivalent to the
 
 ## Approach 4: Neural Network with Gradient Matching
 
-**Gradient matching** (Bonnaffé, Sheldon & Bhatt 2023) avoids ODE integration entirely, making the optimization landscape much simpler:
+**Gradient matching** (Bonnaffé & Coulson 2023) avoids ODE integration entirely, making the optimization landscape much simpler:
 
 1. **Smooth** the observed data with cubic splines to get $\hat{y}(t)$ and $d\hat{y}/dt$
 2. **Match** the ODE derivatives: minimize $\|d\hat{y}/dt - f(\hat{y}, p, t)\|^2$

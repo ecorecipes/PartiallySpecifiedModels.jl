@@ -99,12 +99,27 @@ end
     GPApproximator(name, domain, n_inducing; kernel=:sqexp, lengthscale=nothing,
                    variance=1.0, initial=nothing)
 
-Gaussian process approximator. Parameters are function values at uniformly
-spaced inducing points; the penalty matrix is the inverse kernel matrix K⁻¹,
-which corresponds to the GP prior `f ~ N(0, K/θ)`.
+Kernel-interpolation approximator. Parameters are function values at
+uniformly spaced inducing points, evaluated between points through the
+kernel weights `k(x,X)K⁻¹f_X` (the GP predictive-mean formula). Note this
+is a basis expansion, not full GP inference: no predictive variance is
+produced.
 
-This provides automatic smoothing via LAML (like B-splines) but with
-kernel-based correlation structure instead of polynomial smoothness.
+Kernel hyperparameters are handled two ways:
+- `lengthscale=nothing` (default): adaptive. During LAML (after `warmup`
+  iterations) and GCV fits, `(lengthscale, variance)` are re-estimated by
+  empirical Bayes — maximizing the GP marginal likelihood of the current
+  inducing values over a lengthscale × variance grid — and `K`/`K⁻¹` are
+  rebuilt. Because the coefficients are function *values* at the inducing
+  points, re-fitting the kernel changes only the between-point behavior of
+  the interpolant, not the values it passes through.
+- `lengthscale=<value>`: fixed. The supplied hyperparameters are used
+  as-is and never touched by any solver.
+
+The LAML/GCV penalty is a spline-style second-derivative penalty on the
+inducing values — not the theoretical GP prior precision `K⁻¹`, whose
+narrow eigenvalue spectrum makes smoothing-parameter estimation
+unreliable (see `penalty_matrix(::GPApproximator)` in approximators.jl).
 
 # Kernels
 - `:sqexp`  — Squared exponential: `k(r) = σ² exp(-r²/(2ℓ²))`
@@ -116,21 +131,29 @@ kernel-based correlation structure instead of polynomial smoothness.
 - `domain`: `(lo, hi)` range of the input variable
 - `n_inducing`: number of inducing points (like nknots for splines)
 - `kernel`: kernel type (default `:sqexp`)
-- `lengthscale`: kernel lengthscale (default: `domain_span / (n_inducing - 1)`)
+- `lengthscale`: kernel lengthscale. `nothing` (default) starts at
+  `domain_span / (n_inducing - 1)` and adapts during the fit; an explicit
+  value is fixed for the whole fit
 - `variance`: signal variance σ² (default: 1.0)
 - `initial`: optional initial function `x -> y`
 """
-struct GPApproximator <: AbstractApproximator
-    name::Symbol
-    domain::Tuple{Float64, Float64}
-    n_inducing::Int
-    inducing_points::Vector{Float64}
-    kernel::Symbol
+mutable struct GPApproximator <: AbstractApproximator
+    # Mutable so the fit loop can adapt (lengthscale, variance) — and the
+    # derived K/K_inv — as the fitted function evolves (empirical Bayes on
+    # the inducing values). `adapt` is set when the user did NOT supply a
+    # lengthscale explicitly; solvers only mutate when it is true.
+    # Bootstrap replicates deepcopy the approximators to avoid races.
+    const name::Symbol
+    const domain::Tuple{Float64, Float64}
+    const n_inducing::Int
+    const inducing_points::Vector{Float64}
+    const kernel::Symbol
     lengthscale::Float64
     variance::Float64
-    initial_func::Function
+    const initial_func::Function
     K::Matrix{Float64}        # kernel matrix at inducing points
-    K_inv::Matrix{Float64}    # inverse kernel matrix (penalty)
+    K_inv::Matrix{Float64}    # inverse kernel matrix
+    const adapt::Bool
 end
 
 function GPApproximator(name::Union{Symbol,String},
@@ -164,14 +187,28 @@ function GPApproximator(name::Union{Symbol,String},
     kfunc = _kernel_func(kernel, ℓ, σ²)
 
     # Inducing points uniformly spaced in domain
+    n_inducing >= 2 ||
+        throw(ArgumentError("GPApproximator needs n_inducing ≥ 2 (got $n_inducing)"))
     x_ind = collect(range(d[1], d[2], length=n_inducing))
 
     # Build kernel matrix
     K = _build_kernel_matrix(kfunc, x_ind)
 
-    # Invert with jitter for numerical stability
-    K_jitter = K + 1e-8 * I
-    K_inv = inv(K_jitter)
+    # Factor with scaled jitter. Squared-exponential Gram matrices are
+    # notoriously ill-conditioned as n_inducing grows; a fixed 1e-8 jitter
+    # plus explicit inv() produced large oscillatory weights K⁻¹f between
+    # inducing points. Scale the jitter to the kernel magnitude and escalate
+    # until the Cholesky succeeds.
+    scale = max(maximum(abs, K), 1.0)
+    K_inv = nothing
+    for jit in (1e-8, 1e-6, 1e-4)
+        F = cholesky(Symmetric(K + jit * scale * I), check=false)
+        if issuccess(F)
+            K_inv = Matrix(inv(F))
+            break
+        end
+    end
+    K_inv === nothing && (K_inv = pinv(K + 1e-4 * scale * I))
     K_inv = 0.5 * (K_inv + K_inv')  # symmetrize
 
     init_func = if initial === nothing
@@ -183,7 +220,7 @@ function GPApproximator(name::Union{Symbol,String},
     end
 
     GPApproximator(name_s, d, n_inducing, x_ind, kernel, ℓ, σ², init_func,
-                   K, K_inv)
+                   K, K_inv, lengthscale === nothing)
 end
 
 nparams(a::GPApproximator) = a.n_inducing
@@ -293,7 +330,7 @@ reparameterization of Pya & Wood (2015).
 Combines the Matérn SPDE penalty (interpretable range and smoothness parameters)
 with shape constraints (monotonicity, positivity, convexity, etc.). Parameters
 are stored in unconstrained space (γ). During evaluation, mesh node values are
-computed as `β = Σ * softplus(γ)` where Σ is a constraint matrix, then
+computed as `β = Σ * d(γ)` (free level/slope components pass through linearly; the rest are softplus'd) where Σ is a constraint matrix, then
 interpolated with a cubic spline.
 
 **Note:** Shape constraints are enforced at mesh nodes. The cubic spline
@@ -374,9 +411,14 @@ end
 
 function initial_params(a::ShapeConstrainedSPDEApproximator)
     beta_target = Float64[a.initial_func(x) for x in a.mesh_points]
-    ν = a.Sigma \ beta_target
-    ν = max.(ν, 0.01)
-    return [v > 20.0 ? v : log(exp(v) - 1.0) for v in ν]
+    d = a.Sigma \ beta_target
+    lin = _linear_param_indices(a.constraint)
+    # Free (linear) components pass through; nonnegative ones get a small
+    # positive floor (large floors visibly distorted flat initial functions
+    # into ramps) and are inverted through softplus.
+    return [i in lin ? d[i] :
+            (v = max(d[i], 1e-4); v > 20.0 ? v : log(exp(v) - 1.0))
+            for i in eachindex(d)]
 end
 
 # ─── Shape-constrained B-spline approximator ──────────────────────
@@ -408,7 +450,10 @@ Supported shape constraints for B-spline approximators.
 - `:inc_zero_right` — increasing with f(x_max) = 0
 - `:dec_zero_left`  — decreasing with f(x_min) = 0
 
-Note: `:increasing` already implies f(x) > 0 since softplus increments are positive.
+Note: following Pya & Wood (2015), the monotone and combined
+monotone/curvature constraints carry a *free* level parameter (β₁ = γ₁),
+so e.g. an `:increasing` function may cross zero; use `:positive` or
+`:dec_positive` when positivity itself is required.
 """
 const SHAPE_CONSTRAINTS = (
     :increasing, :decreasing, :convex, :concave,
@@ -429,7 +474,7 @@ B-spline approximator with a shape constraint enforced via the SCOP-spline
 reparameterization of Pya & Wood (2015).
 
 Parameters are stored in unconstrained space (γ). During evaluation, knot
-values are computed as `β = Σ * softplus(γ)` where Σ is a constraint matrix
+values are computed as `β = Σ * d(γ)` (free level/slope components pass through linearly; the rest are softplus'd) where Σ is a constraint matrix
 (cumulative sum for monotonicity, second-order cumsum for convexity, etc.).
 
 For zero-at-endpoint constraints, one knot value is fixed at 0 and
@@ -494,15 +539,25 @@ function nparams(a::ShapeConstrainedBSplineApproximator)
 end
 
 function initial_params(a::ShapeConstrainedBSplineApproximator)
-    xs = range(a.domain[1], a.domain[2], length=a.nknots)
-    beta_target = Float64[a.initial_func(x) for x in xs]
-    np = nparams(a)
-    # Solve Σ * ν = β_target for ν = softplus(γ) > 0
-    # For square Σ: direct solve; for rectangular (q × np): least-squares
-    ν = a.Sigma \ beta_target
-    ν = max.(ν, 0.01)
-    # softplus_inv(ν) = log(exp(ν) - 1) for ν > 0
-    return [v > 20.0 ? v : log(exp(v) - 1.0) for v in ν]
+    # Sample the target at the GREVILLE abscissae ξᵢ = mean of the 3
+    # interior knots supporting coefficient i (cubic B-splines): de Boor
+    # coefficients approximate function values at ξᵢ, not at a uniform
+    # domain grid — a uniform grid reproduced even a linear target with
+    # O(slope·spacing) error.
+    xk = _scam_knot_vector(a.domain, a.nknots)
+    xs = [(xk[i+1] + xk[i+2] + xk[i+3]) / 3 for i in 1:a.nknots]
+    beta_target = Float64[a.initial_func(clamp(x, a.domain[1], a.domain[2]))
+                          for x in xs]
+    # Solve Σ * d = β_target for the coefficient vector d.
+    # For square Σ: direct solve; for rectangular (q × np): least-squares.
+    d = a.Sigma \ beta_target
+    lin = _linear_param_indices(a.constraint)
+    # Linear (free) components pass through unchanged; nonnegative components
+    # get a small positive floor (a large floor turned flat initial functions
+    # into visible ramps) and are inverted through softplus.
+    return [i in lin ? d[i] :
+            (v = max(d[i], 1e-4); v > 20.0 ? v : log(exp(v) - 1.0))
+            for i in eachindex(d)]
 end
 
 # ─── COMONet shape-constrained neural network approximator ────────
@@ -515,20 +570,29 @@ architecturally using `exp(W)` weights and specialized activations.
 Constraints are guaranteed everywhere by construction — not just at
 knot points.
 
-**Monotonicity:**
-- `:increasing`    — f'(x) ≥ 0 (exp(W) weights + ReLU)
+Each constraint uses the architecture that makes it the network's actual
+function class (a positive-weight ReLU network is always convex, so it
+cannot serve as a general monotone or general positive class):
+
+**Monotonicity** (positive weights + saturating tanh hidden units — the
+class includes sigmoids and other monotone-nonconvex shapes):
+- `:increasing`    — f'(x) ≥ 0
 - `:decreasing`    — f'(x) ≤ 0 (negate input)
 
-**Curvature:**
-- `:convex`        — f''(x) ≥ 0 (exp(W) weights + ReLU)
-- `:concave`       — f''(x) ≤ 0 (-ReLU(-·))
+**Curvature only** (two-branch input-convex form g₁(x) + g₂(−x): convex
+and possibly non-monotone, e.g. U-shapes; twice the parameters):
+- `:convex`        — f''(x) ≥ 0
+- `:concave`       — f''(x) ≤ 0 (negated sum)
 
-**Combined:**
+**Monotone + curvature** (positive weights + ReLU/softplus or their
+negated concave forms):
 - `:inc_convex`    — increasing + convex
 - `:inc_concave`   — increasing + concave
 - `:dec_convex`    — decreasing + convex
 - `:dec_concave`   — decreasing + concave
-- `:positive`      — f(x) ≥ 0 (exp output)
+
+**Positivity** (unconstrained tanh MLP inside exp(·) — humps allowed):
+- `:positive`      — f(x) > 0
 """
 const COMONET_CONSTRAINTS = (
     :increasing, :decreasing,
@@ -582,6 +646,7 @@ struct COMONetApproximator <: AbstractApproximator
     constraint::Symbol
     penalty_weight::Float64
     activation::Symbol
+    rng_seed::Union{Nothing, Int}
 end
 
 function COMONetApproximator(name::Union{Symbol,String},
@@ -589,7 +654,8 @@ function COMONetApproximator(name::Union{Symbol,String},
                              hidden_sizes::Union{Tuple{Vararg{Int}}, Vector{Int}},
                              constraint::Symbol;
                              penalty_weight::Float64=0.01,
-                             activation::Symbol=:relu)
+                             activation::Symbol=:relu,
+                             rng_seed::Union{Nothing, Int}=nothing)
     name = Symbol(name)
     d = (Float64(domain[1]), Float64(domain[2]))
     constraint in COMONET_CONSTRAINTS || throw(ArgumentError(
@@ -598,43 +664,61 @@ function COMONetApproximator(name::Union{Symbol,String},
         "Unknown activation :$activation. Must be one of $COMONET_ACTIVATIONS"))
     hs = hidden_sizes isa Vector ? Tuple(hidden_sizes...) : hidden_sizes
     length(hs) >= 1 || throw(ArgumentError("Need at least 1 hidden layer"))
-    COMONetApproximator(name, d, hs, constraint, penalty_weight, activation)
+    COMONetApproximator(name, d, hs, constraint, penalty_weight, activation,
+                        rng_seed)
 end
 
-function nparams(a::COMONetApproximator)
-    # Count parameters: input→h1, h1→h2, ..., hL→1 (weights + biases)
+function _comonet_nparams_single(hidden_sizes)
     np = 0
     prev = 1  # single input (1D)
-    for h in a.hidden_sizes
+    for h in hidden_sizes
         np += prev * h + h  # W (prev×h) + b (h)
         prev = h
     end
-    np += prev + 1  # output layer: W (prev×1) + b (1)
-    return np
+    np + prev + 1  # output layer: W (prev×1) + b (1)
+end
+
+function nparams(a::COMONetApproximator)
+    n1 = _comonet_nparams_single(a.hidden_sizes)
+    # Two-branch input-convex constraints carry a pair of networks
+    a.constraint in (:convex, :concave) ? 2 * n1 : n1
 end
 
 function initial_params(a::COMONetApproximator)
+    rng = a.rng_seed === nothing ? Random.default_rng() :
+                                   Random.Xoshiro(a.rng_seed)
     np = nparams(a)
-    # Xavier-like initialization scaled for exp(W) transform
-    params = 0.1 .* randn(np)
+    # W̃ ≈ 0 corresponds to fan-in-scaled unit-gain weights exp(0)/fanin
+    # (see _comonet_branch), so a small-scale init starts near a tame,
+    # roughly linear network.
+    params = 0.1 .* randn(rng, np)
 
-    # For concave activations (min(0,z)), biases must be initialized negatively
-    # so that pre-activations z = exp(W)*x + b can be negative.
-    # With b≈0 and x∈[0,1], z>0 always, so min(0,z)=0 (dead neurons).
-    # Also set output bias positive since hidden outputs are ≤ 0.
-    use_concave = a.constraint in (:concave, :inc_concave, :dec_concave)
-    if use_concave
-        idx = 1
+    # Activation-aware bias initialization. ReLU branches only have
+    # gradient where their pre-activation is positive; with b ≈ 0 the
+    # units whose input is negated (x ↦ −x_norm ∈ [−1, 0]) start almost
+    # entirely dead and never recover under gradient descent.
+    _set_hidden_biases! = function (θ, lo_idx, bias_mean)
+        idx = lo_idx
         prev = 1
         for h in a.hidden_sizes
-            n_w = prev * h
-            idx += n_w  # skip weights
-            params[idx:idx+h-1] .= -1.0 .+ 0.1 .* randn(h)  # negative biases
+            idx += prev * h                      # skip weights
+            θ[idx:idx+h-1] .= bias_mean .+ 0.1 .* randn(rng, h)
             idx += h
             prev = h
         end
-        # Output bias: set positive to compensate for negative hidden outputs
-        params[end] = 1.0
+        idx + prev                                # start of output bias block
+    end
+    if a.constraint in (:inc_concave, :dec_concave)
+        # -relu(-z) needs z < 0 to be active: negative biases
+        _set_hidden_biases!(params, 1, -1.0)
+        params[end] = 1.0                         # output bias compensates
+    elseif a.constraint == :dec_convex
+        # relu on negated input (z = W(−x)+b ≤ b): positive biases
+        _set_hidden_biases!(params, 1, 1.0)
+    elseif a.constraint in (:convex, :concave)
+        # two-branch g₁(x) + g₂(−x): only the g₂ branch sees negated input
+        nh = length(params) ÷ 2
+        _set_hidden_biases!(params, nh + 1, 1.0)
     end
 
     return params
@@ -654,10 +738,10 @@ abstract type AbstractLikelihood end
 """Gaussian likelihood with identity link (unknown σ² profiled out in REML)."""
 struct Gaussian <: AbstractLikelihood end
 
-"""Poisson likelihood with log link."""
+"""Poisson likelihood, fitted on the response scale (identity link)."""
 struct Poisson <: AbstractLikelihood end
 
-"""Negative Binomial likelihood with log link."""
+"""Negative Binomial likelihood, fitted on the response scale (identity link)."""
 struct NegativeBinomial <: AbstractLikelihood
     theta::Float64  # overdispersion: Var = μ + μ²/θ
 end
@@ -698,7 +782,7 @@ end
 
 """
     LAML(; maxiters=100, tol=1e-6, verbose=false, initial_lambda=nothing,
-           warmup=0, sigma2_init=nothing)
+           warmup=3, sigma2_init=nothing)
 
 Laplace Approximate Marginal Likelihood algorithm.
 Equivalent to REML for Gaussian data.
@@ -709,10 +793,11 @@ Uses Fellner-Schall + Newton for smoothing parameter estimation.
 - `tol::Float64=1e-6`: convergence tolerance on penalized objective
 - `verbose::Bool=false`: print iteration diagnostics
 - `initial_lambda::Union{Nothing,Float64}=nothing`: initial smoothing parameter
-  for all terms.  Default (`nothing`) uses `θ = 1.0`, which gives moderate
-  initial smoothing.  For strongly nonlinear problems, a higher value
-  (e.g. `10.0`) combined with `warmup` helps the IRLS converge to a good
-  basin before LAML refinement.
+  for all terms.  Default (`nothing`) uses the data-driven `θ = 1/tr(S)` per
+  term (values below λ ≈ 4.5e-5 are floored there when LAML starts, to keep
+  the criterion away from its flat tiny-λ region).  For strongly nonlinear
+  problems, a higher value (e.g. `10.0`) combined with `warmup` helps the
+  IRLS converge to a good basin before LAML refinement.
 - `warmup::Int=3`: number of IRLS iterations to run with fixed smoothing before
   engaging LAML estimation.  Allows the coefficient estimates to stabilise
   before the smoothing parameters are adapted.  Increase for strongly
@@ -821,7 +906,8 @@ GradientMatching(; maxiters::Int=500, tol::Float64=1e-6, verbose::Bool=false,
     GradientMatching(maxiters, tol, verbose, sigma2_init, lr, refine_iters)
 
 """
-    AdamSolver(; maxiters=300, lr=0.01, verbose=false, loss=:mse, autodiff=true)
+    AdamSolver(; maxiters=300, lr=0.01, verbose=false, loss=:auto,
+                 penalty_weight=0.0, autodiff=true)
 
 Adam optimizer that trains unknown function parameters through ODE integration.
 
@@ -834,11 +920,21 @@ For B-splines and GPs: also supported, uses the standard evaluators.
 The loss function computes `solve(ODEProblem(...), solver)` at each step and
 compares with data. ForwardDiff computes exact gradients through the ODE solve.
 
+Unlike `LAML`/`GCVSolver`, this solver performs no automatic smoothing-parameter
+selection: with the default `penalty_weight = 0` the fit is *unpenalized*
+(spline coefficients are free). Set `penalty_weight > 0` to add the fixed
+quadratic roughness penalty `penalty_weight · Σₖ βₖ' Sₖ βₖ` to the loss.
+
 # Arguments
 - `maxiters::Int=300`: maximum Adam iterations
 - `lr::Float64=0.01`: learning rate (with cosine annealing)
 - `verbose::Bool=false`: print iteration details
-- `loss::Symbol=:mse`: loss function (:mse or :poisson)
+- `loss::Symbol=:auto`: loss function; `:auto` selects `:mse` for `Gaussian`
+  and `:poisson` for `Poisson` likelihoods (other families are not supported
+  by this solver — use `LAML`). Explicit `:mse`/`:poisson` override with a
+  warning on mismatch.
+- `penalty_weight::Float64=0.0`: fixed weight of the quadratic smoothing
+  penalty added to the loss (0 disables)
 - `autodiff::Bool=true`: use ForwardDiff (true) or finite differences (false)
 """
 struct AdamSolver
@@ -846,20 +942,22 @@ struct AdamSolver
     lr::Float64
     verbose::Bool
     loss::Symbol
+    penalty_weight::Float64
     autodiff::Bool
 end
 
 AdamSolver(; maxiters::Int=300, lr::Float64=0.01, verbose::Bool=false,
-             loss::Symbol=:mse, autodiff::Bool=true) =
-    AdamSolver(maxiters, lr, verbose, loss, autodiff)
+             loss::Symbol=:auto, penalty_weight::Float64=0.0,
+             autodiff::Bool=true) =
+    AdamSolver(maxiters, lr, verbose, loss, penalty_weight, autodiff)
 
 """
     MultipleShootingSolver(; n_intervals=10, maxiters_inner=100, maxiters_outer=20,
-                             lr=0.01, rho_init=1.0, rho_max=1e6, verbose=false)
+                             rho_init=10.0, rho_max=1e6, verbose=false)
 
 Multiple shooting solver for training neural differential equations, following
 Turan & Jäschke (2021). Partitions the time span into intervals with shooting
-variables at boundaries. Uses augmented Lagrangian to enforce continuity.
+variables at boundaries. Uses an augmented Lagrangian (L-BFGS inner subproblems) to enforce continuity.
 
 Advantages over single shooting (AdamSolver):
 - Better initial fits: shooting variables initialized from data
@@ -880,47 +978,65 @@ struct MultipleShootingSolver
     n_intervals::Int
     maxiters_inner::Int
     maxiters_outer::Int
-    lr::Float64
     rho_init::Float64
     rho_max::Float64
     verbose::Bool
-    autodiff::Bool
 end
 
 MultipleShootingSolver(; n_intervals::Int=10, maxiters_inner::Int=100,
-                         maxiters_outer::Int=20, lr::Float64=0.01,
+                         maxiters_outer::Int=20,
                          rho_init::Float64=10.0, rho_max::Float64=1e6,
-                         verbose::Bool=false, autodiff::Bool=true) =
+                         verbose::Bool=false) =
     MultipleShootingSolver(n_intervals, maxiters_inner, maxiters_outer,
-                           lr, rho_init, rho_max, verbose, autodiff)
+                           rho_init, rho_max, verbose)
 
 """
     AdaptiveGradientMatching(; maxiters=200, verbose=false, gamma_init=1.0,
-                               fit_gamma=true, kernel=:rbf)
+                               fit_gamma=true, kernel=:rbf, n_samples=0,
+                               n_chains=10, rng_seed=nothing)
 
-Adaptive Gradient Matching solver following Dondelinger et al. (2013) and the
-deGradInfer R package. Uses Gaussian processes to smooth data and compute
-gradient estimates with uncertainty, then matches ODE-predicted gradients
-using a "product of experts" formulation.
+Adaptive Gradient Matching solver using the product-of-experts objective of
+Dondelinger et al. (2013). Gaussian processes smooth the data and supply
+gradient estimates with uncertainty; the ODE-predicted gradients are matched
+under the product-of-experts likelihood.
 
-For partially specified models, the unknown function coefficients are optimized
-jointly with the mismatch parameter γ via L-BFGS.
+Two modes:
 
-The loss function for each state k is:
+- **MAP (default, `n_samples=0`)**: GP hyperparameters from a
+  marginal-likelihood grid search, latent states fixed at the GP posterior
+  mean, and (β, log γ) optimized once by L-BFGS. Fast; no posterior samples.
+- **Population MCMC (`n_samples > 0`)**: the tempered population-MCMC
+  sampler of Dondelinger et al./deGradInfer. `n_chains` chains at
+  temperatures `t_c = ((c−1)/(C−1))⁵` jointly sample the latent states X,
+  the parameters β, and the mismatch variances γ by adaptive blockwise
+  random-walk Metropolis with exchange moves between adjacent chains; the
+  ODE-mismatch likelihood is raised to `t_c`, interpolating from pure GP
+  regression (t=0) to the fully coupled model (t=1). The cold chain
+  (t=1) provides the posterior: reported unknown functions use the
+  posterior-mean β, and `sol.convergence.beta_samples` /
+  `gamma_samples` hold the draws. GP kernel hyperparameters stay fixed
+  at their grid-search values (a documented simplification — the paper
+  also samples them). Continuous-time problems only.
+
+The (log-)likelihood term for each state k is:
     L_k = -0.5 (f_k - m_k)ᵀ (A_k + γ_k I)⁻¹ (f_k - m_k) - 0.5 log|A_k + γ_k I|
 
 where:
 - f_k = ODE-predicted gradients for state k
-- m_k = GP gradient mean = K*(K + σ²I)⁻¹x_k
+- m_k = GP gradient mean ('K K⁻¹ x_k, conditioned on the states)
 - A_k = GP gradient covariance = K** - K*(K + σ²I)⁻¹K*ᵀ
 - γ_k = mismatch parameter controlling ODE-GP coupling
 
 # Arguments
-- `maxiters::Int=200`: maximum L-BFGS iterations
+- `maxiters::Int=200`: maximum L-BFGS iterations (MAP mode); MCMC sweeps
+  are `2 n_samples` (half burn-in) in sampling mode
 - `verbose::Bool=false`: print iteration details
 - `gamma_init::Float64=1.0`: initial mismatch parameter (per state)
-- `fit_gamma::Bool=true`: optimize γ or keep fixed
-- `kernel::Symbol=:rbf`: GP kernel (:rbf, :matern32, :matern52)
+- `fit_gamma::Bool=true`: optimize γ or keep fixed (MAP mode)
+- `kernel::Symbol=:rbf`: GP kernel (:rbf, :matern32)
+- `n_samples::Int=0`: cold-chain posterior draws; 0 = MAP mode
+- `n_chains::Int=10`: number of tempered chains (sampling mode; ≥ 2)
+- `rng_seed`: seed for the sampler (default `nothing` = non-reproducible)
 """
 struct AdaptiveGradientMatching
     maxiters::Int
@@ -928,12 +1044,18 @@ struct AdaptiveGradientMatching
     gamma_init::Float64
     fit_gamma::Bool
     kernel::Symbol
+    n_samples::Int
+    n_chains::Int
+    rng_seed::Union{Nothing, Int}
 end
 
 AdaptiveGradientMatching(; maxiters::Int=200, verbose::Bool=false,
                            gamma_init::Float64=1.0, fit_gamma::Bool=true,
-                           kernel::Symbol=:rbf) =
-    AdaptiveGradientMatching(maxiters, verbose, gamma_init, fit_gamma, kernel)
+                           kernel::Symbol=:rbf, n_samples::Int=0,
+                           n_chains::Int=10,
+                           rng_seed::Union{Nothing, Int}=nothing) =
+    AdaptiveGradientMatching(maxiters, verbose, gamma_init, fit_gamma, kernel,
+                             n_samples, n_chains, rng_seed)
 
 """
     RodeoSolver
@@ -1013,15 +1135,16 @@ MCMCSolver(; n_samples::Int=1000, n_warmup::Int=500, n_chains::Int=1,
 
 """
     MagiSolver(; n_samples=1000, n_warmup=500, n_deriv=3, n_gridpoints=200,
-                 sigma=nothing, obs_var=0.01, target_accept=0.8,
-                 prior_scale=1.0, verbose=false)
+                 sigma=nothing, obs_var=nothing, target_accept=0.8,
+                 prior_scale=1.0, preoptimize=true, verbose=false)
 
 Manifold-constrained Gaussian process inference (MAGI) for ODE systems.
 
-MAGI models each ODE state as integrated Brownian motion and uses a Kalman
-filter to evaluate the log-likelihood of the ODE constraint. States are
-marginalized out — only ODE parameters θ and unknown function parameters
-are sampled via NUTS/HMC.
+MAGI places a Matérn-3/2 Gaussian-process prior on each state and constrains
+the GP-implied derivative to the ODE vector field through the conditional
+derivative covariance `K* = ''K − 'K C⁻¹ ('K)ᵀ`. The state values on the
+discretization grid are sampled jointly with the unknown-function
+parameters θ via NUTS/HMC (the manifold-constrained posterior).
 
 **Key advantage**: Handles partially observed systems naturally (unobserved
 state components are inferred through the ODE constraint).
@@ -1031,12 +1154,19 @@ Returns an `MCMCChains.Chains` object with posterior samples.
 # Fields
 - `n_samples`: number of posterior samples after warmup
 - `n_warmup`: warmup/adaptation iterations
-- `n_deriv`: derivatives in IBM prior (2 or 3)
-- `n_gridpoints`: number of time discretization points for Kalman filter
-- `sigma`: IBM scale per state (auto-estimated if `nothing`)
-- `obs_var`: observation noise variance
+- `n_deriv`: retained for interface compatibility (the Matérn-3/2 GP prior
+  is once mean-square differentiable; this field is not used by the GP)
+- `n_gridpoints`: number of discretization grid points for the GP/manifold
+  constraint
+- `sigma`: GP marginal-variance scale per state (auto-estimated if `nothing`)
+- `obs_var`: observation noise variance; `nothing` (default) estimates it
+  from the data via the second-difference estimator Var(Δ²y) = 6σ²
+  (a fixed scale-blind default distorted the posterior whenever the
+  data's units differed from O(0.1))
 - `target_accept`: NUTS target acceptance rate
 - `prior_scale`: scale for Gaussian prior on parameters
+- `preoptimize`: run a short MAP pre-optimization to initialize the
+  sampler (default `true`)
 - `verbose`: print progress
 
 # References
@@ -1049,7 +1179,7 @@ struct MagiSolver
     n_deriv::Int
     n_gridpoints::Int
     sigma::Union{Nothing, Vector{Float64}}
-    obs_var::Float64
+    obs_var::Union{Nothing, Float64}
     target_accept::Float64
     prior_scale::Float64
     preoptimize::Bool
@@ -1059,7 +1189,7 @@ end
 MagiSolver(; n_samples::Int=1000, n_warmup::Int=500, n_deriv::Int=3,
              n_gridpoints::Int=200,
              sigma::Union{Nothing, Vector{Float64}}=nothing,
-             obs_var::Float64=0.01,
+             obs_var::Union{Nothing, Float64}=nothing,
              target_accept::Float64=0.8, prior_scale::Float64=1.0,
              preoptimize::Bool=true, verbose::Bool=false) =
     MagiSolver(n_samples, n_warmup, n_deriv, n_gridpoints, sigma, obs_var,
@@ -1070,30 +1200,56 @@ MagiSolver(; n_samples::Int=1000, n_warmup::Int=500, n_deriv::Int=3,
 """
     BNGSolver
 
-Bayesian Neural Gradient matching solver (Bonnaffé et al. 2023).
+Ensemble Bayesian gradient matching (Bonnaffé & Coulson 2023). Avoids
+ODE integration entirely: observed series are smoothed with GCV splines,
+and unknown-function parameters are fit by matching the smoothed
+derivatives under a variance-marginalized log-posterior
+`(n/2)log(1 + SSR/2) + (|β|/2)log(1 + Σ(β/prior_sd)²/2)` (the paper's
+"Bayesian regularisation": observation and prior variances are
+marginalized, not supplied).
 
-Two-step approach that avoids ODE integration entirely:
-1. Smooth observed time series to get interpolated states and derivatives
-2. Fit unknown functions by matching the smoothed derivatives
+Uncertainty comes from a `k_obs × k_proc` fit ensemble: `k_obs`
+observation resamples (residual bootstrap of the smoother; the first is
+the original data) times `k_proc` restarts from perturbed
+initialisations. Reported unknown functions are ensemble means;
+`sol.convergence.ensemble_std[name]` gives the pointwise ensemble
+standard deviation.
 
 # Fields
-- `n_basis`: number of spline basis functions for data smoothing (default 20)
-- `maxiters`: maximum optimization iterations for step 2 (default 2000)
-- `lr`: learning rate for Adam optimizer (default 0.01)
-- `lambda_smooth`: smoothing penalty for data interpolation (default 1.0)
+- `k_obs`: observation-ensemble size (default 10)
+- `k_proc`: process fits per observation ensemble (default 3)
+- `prior_sd`: prior scale of the marginalized Gaussian parameter prior
+  (default 10.0)
+- `maxiters`: Adam iterations per ensemble member (default 2000)
+- `lr`: Adam learning rate (default 0.01)
+- `lambda_smooth`: extra smoothing penalty on approximator coefficients
+  (default 1.0)
+- `rng_seed`: seed for the bootstrap and restarts (default `nothing` =
+  non-reproducible)
 - `verbose`: print progress
+
+# References
+- Bonnaffé & Coulson (2023), "Fast fitting of neural ordinary
+  differential equations by Bayesian neural gradient matching to infer
+  ecological interactions from time-series data", Methods Ecol Evol 14
 """
 struct BNGSolver
-    n_basis::Int
+    k_obs::Int
+    k_proc::Int
+    prior_sd::Float64
     maxiters::Int
     lr::Float64
     lambda_smooth::Float64
+    rng_seed::Union{Nothing, Int}
     verbose::Bool
 end
 
-BNGSolver(; n_basis::Int=20, maxiters::Int=2000, lr::Float64=0.01,
-            lambda_smooth::Float64=1.0, verbose::Bool=false) =
-    BNGSolver(n_basis, maxiters, lr, lambda_smooth, verbose)
+BNGSolver(; k_obs::Int=10, k_proc::Int=3, prior_sd::Float64=10.0,
+            maxiters::Int=2000, lr::Float64=0.01,
+            lambda_smooth::Float64=1.0,
+            rng_seed::Union{Nothing, Int}=nothing, verbose::Bool=false) =
+    BNGSolver(k_obs, k_proc, prior_sd, maxiters, lr, lambda_smooth,
+              rng_seed, verbose)
 
 # ─── Dalton solver (Wu & Lysy 2024) ───────────────────────────────
 
@@ -1139,9 +1295,8 @@ DaltonSolver(; n_steps::Int=200, n_deriv::Int=3,
 
 Pseudo-marginal MCMC using a probabilistic ODE solver for likelihood estimation.
 
-Uses a positive unbiased random estimator of an approximate probabilistic-ODE
-marginal likelihood, then samples from the corresponding approximate posterior
-via pseudo-marginal Metropolis-Hastings.
+Uses RODEO/fenrir as an inner solver to compute an unbiased estimate of the
+marginal likelihood p(Y|θ), then samples from the posterior p(θ|Y) via NUTS.
 
 # Fields
 - `n_samples`: number of posterior samples (default 1000)
@@ -1152,11 +1307,11 @@ via pseudo-marginal Metropolis-Hastings.
 - `obs_var`: observation noise variance (default 0.01)
 - `target_accept`: NUTS target acceptance rate (default 0.8)
 - `prior_scale`: prior standard deviation on parameters (default 1.0)
-- `inner_method`: inner approximate marginal likelihood `:fenrir`, `:basic`,
-  or `:dalton` (default `:fenrir`)
-- `n_particles`: number of unbiased likelihood replicates averaged per MH step
-- `proposal_scale`: random-walk proposal scale
-- `rng_seed`: optional RNG seed for reproducible pseudo-marginal randomness
+- `inner_method`: likelihood estimator — `:ffbs` (default; unbiased FFBS
+  Monte-Carlo average, giving genuine pseudo-marginal MCMC), `:fenrir`
+  (deterministic Fenrir evidence; the chain is then plain adaptive RWM on
+  an approximate likelihood), or `:dalton` (deterministic DALTON
+  data-adaptive likelihood, likewise plain RWM)
 - `verbose`: print progress
 """
 struct PseudoMarginalSolver
@@ -1169,17 +1324,8 @@ struct PseudoMarginalSolver
     target_accept::Float64
     prior_scale::Float64
     inner_method::Symbol
-    n_particles::Int
-    proposal_scale::Float64
     initial_params::Union{Nothing, Vector{Float64}}
-    rng_seed::Union{Nothing, Int}
     verbose::Bool
-end
-
-function _validate_pseudo_marginal_inner_method(inner_method::Symbol)
-    inner_method in (:fenrir, :basic, :dalton) ||
-        throw(ArgumentError("PseudoMarginalSolver inner_method must be :fenrir, :basic, or :dalton; got $(repr(inner_method))"))
-    inner_method
 end
 
 PseudoMarginalSolver(; n_samples::Int=1000, n_warmup::Int=500,
@@ -1187,17 +1333,12 @@ PseudoMarginalSolver(; n_samples::Int=1000, n_warmup::Int=500,
                        sigma::Union{Nothing, Vector{Float64}}=nothing,
                        obs_var::Union{Nothing, Float64}=nothing,
                        target_accept::Float64=0.8, prior_scale::Float64=1.0,
-                       inner_method::Symbol=:fenrir,
-                       n_particles::Int=8,
-                       proposal_scale::Float64=0.1,
+                       inner_method::Symbol=:ffbs,
                        initial_params::Union{Nothing, Vector{Float64}}=nothing,
-                       rng_seed::Union{Nothing, Int}=nothing,
                        verbose::Bool=false) =
     PseudoMarginalSolver(n_samples, n_warmup, n_steps, n_deriv, sigma, obs_var,
-                         target_accept, prior_scale,
-                         _validate_pseudo_marginal_inner_method(inner_method),
-                         n_particles, proposal_scale, initial_params, rng_seed,
-                         verbose)
+                          target_accept, prior_scale, inner_method,
+                          initial_params, verbose)
 
 # ─── GCV solver (Wood 2001 / ddefit504) ────────────────────────────
 
@@ -1268,12 +1409,16 @@ TwoStageSolver(; n_basis_smooth::Int=20, lambda_smooth::Float64=1.0,
 
 Derivative-free optimization solver using NelderMead or particle swarm.
 
+The objective includes the quadratic roughness penalty
+`penalty_weight · Σₖ βₖ'Sₖβₖ` (default weight 1.0; set `penalty_weight=0`
+for an unpenalized fit — there is no smoothing-parameter selection here).
+
 Useful as a robust fallback when gradient-based methods fail (non-smooth
 objectives, stiff dynamics, poor conditioning). Uses simulation-based
 loss without requiring autodiff through ODE solves.
 
 # Fields
-- `method`: optimization method — `:nelder_mead`, `:particle_swarm`, `:cmaes` (default `:nelder_mead`)
+- `method`: optimization method — `:nelder_mead` or `:particle_swarm` (default `:nelder_mead`)
 - `maxiters`: maximum function evaluations (default 10000)
 - `n_particles`: particle count for swarm methods (default 20)
 - `loss`: loss type `:mse` or `:likelihood` (default `:mse`)
@@ -1284,13 +1429,16 @@ struct DerivativeFreeSolver
     maxiters::Int
     n_particles::Int
     loss::Symbol
+    penalty_weight::Float64
     verbose::Bool
 end
 
 DerivativeFreeSolver(; method::Symbol=:nelder_mead, maxiters::Int=10000,
                        n_particles::Int=20, loss::Symbol=:mse,
+                       penalty_weight::Float64=1.0,
                        verbose::Bool=false) =
-    DerivativeFreeSolver(method, maxiters, n_particles, loss, verbose)
+    DerivativeFreeSolver(method, maxiters, n_particles, loss, penalty_weight,
+                         verbose)
 
 # ─── Variational inference solver ──────────────────────────────────
 
@@ -1336,11 +1484,20 @@ Likelihood-free inference using simulation-based rejection sampling with
 adaptive tolerance scheduling. Works for any simulator, including those
 where the likelihood is intractable.
 
+**Prior** (`prior` keyword): `:smoothness` (default) is a Gaussian GMRF
+built from the approximators' roughness penalties, centered on their
+initial values with overall spread `prior_scale` — matching the prior
+structure of `MCMCSolver`/`VariationalSolver`, so wiggly coefficient
+vectors are a-priori discouraged. `:box` restores the legacy uniform box
+of half-width `prior_scale` (posterior then depends strongly on the
+initialization; treat as approximate).
+
 # Fields
 - `n_particles`: number of ABC particles (default 500)
 - `n_generations`: number of SMC generations (default 10)
 - `summary_fn`: summary statistic function, or `:auto` for MSE-based (default `:auto`)
-- `prior_scale`: prior half-width on parameters (default 2.0)
+- `prior`: `:smoothness` (default, GMRF) or `:box` (legacy uniform)
+- `prior_scale`: prior spread — GMRF scale, or box half-width (default 2.0)
 - `quantile_eps`: quantile for tolerance schedule (default 0.5)
 - `verbose`: print progress
 """
@@ -1348,6 +1505,7 @@ struct ABCSolver
     n_particles::Int
     n_generations::Int
     summary_fn::Union{Symbol, Function}
+    prior::Symbol
     prior_scale::Float64
     quantile_eps::Float64
     verbose::Bool
@@ -1355,9 +1513,11 @@ end
 
 ABCSolver(; n_particles::Int=500, n_generations::Int=10,
             summary_fn::Union{Symbol, Function}=:auto,
+            prior::Symbol=:smoothness,
             prior_scale::Float64=2.0, quantile_eps::Float64=0.5,
             verbose::Bool=false) =
-    ABCSolver(n_particles, n_generations, summary_fn, prior_scale, quantile_eps, verbose)
+    ABCSolver(n_particles, n_generations, summary_fn, prior, prior_scale,
+              quantile_eps, verbose)
 
 # ─── Integral matching solver (Dattner & Klaassen 2015) ────────────
 
@@ -1401,11 +1561,16 @@ For each unknown-function parameter βⱼ, sweeps βⱼ over a grid while
 optimising all other parameters (β₋ⱼ) at each grid point.  Returns the
 profile likelihood curve Lₚ(βⱼ) and a likelihood-ratio CI.
 
-Uses the LAML solver as the inner optimiser (warm-started from the
-previous grid point).
+The profile is taken through the penalized objective at the fitted
+smoothing parameters λ̂ (a penalized spline is not identified through its
+raw RSS); the statistic ΔPenSS/σ̂² is referenced against χ²₁, and CI
+endpoints are interpolated between grid points. Nuisance coefficients
+are re-optimised at each grid point by a long Nelder–Mead run,
+warm-started from the previous grid point. Gaussian likelihoods only.
 
 # Fields
-- `n_profile_points`: grid points per parameter (default 20)
+- `n_profile_points`: grid points per parameter (default 20); the exact
+  MLE value is inserted, so the evaluated grid may have one extra point
 - `ci_level`: confidence level for LR-based CI (default 0.95)
 - `param_indices`: which parameter indices to profile (default `nothing` = all)
 - `verbose`: print progress
@@ -1463,22 +1628,30 @@ EnsembleKalmanSolver(; n_ensemble::Int=50, n_iterations::Int=30,
 """
     ODINSolver
 
-ODE-Informed regression (Wenk & Abbati 2020): GP smoothing with an
-ODE-informed mean function.
+ODE-informed regression (Wenk, Abbati et al. 2020). GP hyperparameters
+are first estimated per observed state by marginal likelihood, then the
+states `X` and the unknown-function parameters `θ` are optimised
+*jointly* against the ODIN risk
 
-Fits a Gaussian process to each state, then iterates between:
-1. GP hyper-parameter optimisation (marginal likelihood)
-2. ODE parameter optimisation (penalised ODE mismatch on GP mean)
+    R(X, θ) = Σ_k [ ‖y_k − x_k‖²/σ_{n,k}² + x̃_kᵀ K_k⁻¹ x̃_k
+                    + (f_k(X,θ) − D_k x̃_k)ᵀ A_k⁻¹ (f_k(X,θ) − D_k x̃_k) ],
 
-Tighter ODE coupling than AdaptiveGradientMatching because the ODE
-residual enters the GP's marginal likelihood directly.
+where `x̃_k` is the centered state, `D_k = 'K K⁻¹` maps states to their GP
+conditional-mean derivative, and `A_k = ''K − 'K K⁻¹ 'Kᵀ + γI` is the GP
+conditional derivative covariance — so the ODE mismatch is trusted only
+in directions the GP actually determines. Unobserved states are included
+as free variables (GP prior + ODE terms, no data term), so partially
+observed systems are supported.
 
 # Fields
-- `maxiters`: outer EM iterations (default 50)
-- `gp_lengthscale`: initial RBF lengthscale (default 1.0)
-- `gp_variance`: initial signal variance (default 1.0)
-- `ode_weight`: weight for ODE mismatch penalty (default 10.0)
-- `lr`: learning rate for inner Adam loop (default 0.01)
+- `maxiters`: outer iterations; 20 Adam steps each (default 50)
+- `gp_lengthscale`, `gp_variance`: `nothing` (default) estimates the RBF
+  hyperparameters per state by GP marginal likelihood. Supplying BOTH
+  fixes them for all states (with noise assumed at `0.01 * gp_variance`);
+  supplying only one is an error
+- `ode_weight`: extra multiplier on the ODE-mismatch term (default 1.0 =
+  the natural Mahalanobis weighting of the paper)
+- `lr`: Adam learning rate (default 0.01)
 - `verbose`: print progress
 
 # References
@@ -1487,47 +1660,56 @@ residual enters the GP's marginal likelihood directly.
 """
 struct ODINSolver
     maxiters::Int
-    gp_lengthscale::Float64
-    gp_variance::Float64
+    gp_lengthscale::Union{Nothing, Float64}
+    gp_variance::Union{Nothing, Float64}
     ode_weight::Float64
     lr::Float64
     verbose::Bool
 end
 
-ODINSolver(; maxiters::Int=50, gp_lengthscale::Float64=1.0,
-             gp_variance::Float64=1.0, ode_weight::Float64=10.0,
+ODINSolver(; maxiters::Int=50,
+             gp_lengthscale::Union{Nothing, Real}=nothing,
+             gp_variance::Union{Nothing, Real}=nothing,
+             ode_weight::Float64=1.0,
              lr::Float64=0.01, verbose::Bool=false) =
-    ODINSolver(maxiters, gp_lengthscale, gp_variance, ode_weight, lr, verbose)
+    ODINSolver(maxiters,
+               gp_lengthscale === nothing ? nothing : Float64(gp_lengthscale),
+               gp_variance === nothing ? nothing : Float64(gp_variance),
+               ode_weight, lr, verbose)
 
 # ─── RKHS solver ───────────────────────────────────────────────────
 
 """
     RKHSSolver
 
-Reproducing kernel Hilbert space (RKHS) estimator for unknown functions.
-
-Represents the unknown function as f(x) = Σᵢ αᵢ K(x, xᵢ) where K is a
-kernel (default: squared-exponential) and xᵢ are representative points.
-Solves a penalised least-squares problem with an RKHS norm penalty
-‖f‖² = α' K α, yielding a kernel ridge regression-like estimator within
-the ODE fitting loop.
+Trajectory-RKHS estimator (González et al. 2014): the *state trajectory*
+is placed in a time-kernel RKHS, `x_k(t) = m_k + Σᵢ b_{k,i} k(t, tᵢ)`
+with centers at the data times, so `ẋ_k(t)` is available analytically.
+The objective — data fit + RKHS norm `λ bᵀKb` + ODE-gradient match
+`ρ Σ(ẋ − f(x,θ))²` on a collocation grid — is minimized by alternating a
+*linear* solve for the trajectory coefficients (with `f` frozen at the
+previous iterate, Picard linearization) and Adam steps on the
+unknown-function parameters θ. Continuous-time problems only.
 
 # Fields
-- `kernel`: kernel type `:rbf`, `:matern32`, `:matern52` (default `:rbf`)
-- `lengthscale`: kernel lengthscale (default 1.0)
-- `lambda_rkhs`: RKHS norm penalty (default 1.0)
-- `n_repr_points`: number of representative points (default 20)
-- `maxiters`: optimisation iterations (default 1000)
-- `lr`: learning rate (default 0.01)
+- `kernel`: time-kernel type `:rbf`, `:matern32`, `:matern52` (default `:rbf`)
+- `lengthscale`: time-kernel lengthscale; ≤ 0 (default) auto-scales to
+  `time_span / 8`
+- `lambda_rkhs`: RKHS-norm penalty λ on the trajectory (default 0.01)
+- `lambda_ode`: weight ρ of the ODE-gradient term (default 1.0)
+- `n_repr_points`: size of the ODE collocation grid (default 30)
+- `maxiters`: outer alternations; 10 θ Adam steps each (default 200)
+- `lr`: θ learning rate (default 0.01)
 - `verbose`: print progress
 
 # References
-- Gonzalez et al. (2014), Pattern Recognition Letters
+- González et al. (2014), Pattern Recognition Letters
 """
 struct RKHSSolver
     kernel::Symbol
-    lengthscale::Float64      # ≤ 0 means auto-scale from domain
+    lengthscale::Float64      # ≤ 0 means auto-scale from the time span
     lambda_rkhs::Float64
+    lambda_ode::Float64
     n_repr_points::Int
     maxiters::Int
     lr::Float64
@@ -1535,9 +1717,11 @@ struct RKHSSolver
 end
 
 RKHSSolver(; kernel::Symbol=:rbf, lengthscale::Float64=-1.0,
-             lambda_rkhs::Float64=1.0, n_repr_points::Int=20,
-             maxiters::Int=1000, lr::Float64=0.01, verbose::Bool=false) =
-    RKHSSolver(kernel, lengthscale, lambda_rkhs, n_repr_points, maxiters, lr, verbose)
+             lambda_rkhs::Float64=0.01, lambda_ode::Float64=1.0,
+             n_repr_points::Int=30,
+             maxiters::Int=200, lr::Float64=0.01, verbose::Bool=false) =
+    RKHSSolver(kernel, lengthscale, lambda_rkhs, lambda_ode, n_repr_points,
+               maxiters, lr, verbose)
 
 # ─── Problem and solution types ────────────────────────────────────
 
@@ -1620,8 +1804,21 @@ function PSMProblem(dynamics!, u0, tspan,
                     solver_kwargs...)
     n_times = length(data_times)
     n_obs = size(data_values, 2)
-    @assert size(data_values, 1) == n_times "data_values rows must match data_times length"
-    @assert length(obs_to_state) == n_obs
+    size(data_values, 1) == n_times ||
+        throw(ArgumentError("data_values has $(size(data_values, 1)) rows " *
+                            "but data_times has $n_times entries"))
+    length(obs_to_state) == n_obs ||
+        throw(ArgumentError("obs_to_state has $(length(obs_to_state)) " *
+                            "entries but data_values has $n_obs columns"))
+    # A known parameter sharing a name with an approximator would silently
+    # SHADOW the fitted function in the merged parameter NamedTuple
+    # (later entries win in merge), producing baffling non-fits.
+    for approx in approximators
+        haskey(known_params, approx.name) &&
+            throw(ArgumentError("known_params has an entry :$(approx.name) " *
+                                "that collides with an approximator of the " *
+                                "same name; rename one of them"))
+    end
 
     w = if data_weights === nothing
         ones(Float64, n_times, n_obs)

@@ -17,7 +17,7 @@ function _variational_simulate(prob::PSMProblem, beta)
     p = build_autodiff_param_struct(prob, beta)
 
     if prob.discrete
-        return adam_simulate_discrete(prob, p)
+        return adam_simulate_discrete(prob, p, T)
     end
 
     u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
@@ -52,37 +52,55 @@ function _variational_simulate(prob::PSMProblem, beta)
 end
 
 """
-    _kl_gaussian(mu, log_sigma, prior_scale)
+    _gaussian_loglik(pred, data, weights, obs_noise_var)
 
-Analytical KL divergence: KL(q || p) where q = N(μ, σ²), p = N(0, τ²).
-`log_sigma` contains log(σ_i), `prior_scale` = τ.
-
-    KL = Σ_i [log(τ/σ_i) + (σ_i² + μ_i²)/(2τ²) - 1/2]
+Gaussian log-likelihood: -0.5 Σ w_ij (pred_ij - data_ij)² / σ²_obs.
 """
-function _kl_gaussian(mu, log_sigma, prior_scale)
-    T = promote_type(eltype(mu), eltype(log_sigma))
-    τ = T(prior_scale)
-    τ² = τ * τ
-    log_τ = log(τ)
-    kl = zero(T)
-    for i in eachindex(mu)
-        σ_i = exp(log_sigma[i])
-        kl += log_τ - log_sigma[i] + (σ_i^2 + mu[i]^2) / (2 * τ²) - T(0.5)
+function _gaussian_loglik(pred, data, weights, obs_noise_var)
+    T = eltype(pred)
+    ll = zero(T)
+    n_t, n_obs = size(data)
+    for j in 1:n_obs
+        for i in 1:n_t
+            ll -= weights[i, j] * (pred[i, j] - data[i, j])^2 / (2 * obs_noise_var)
+        end
     end
-    kl
+    ll
 end
 
 """
-    _compute_elbo(prob, mu, log_sigma, prior_scale, epsilons, obs_noise_var)
+    _kl_gaussian_penalized(mu, log_sigma, Λ, logdetΛ)
 
-Compute the ELBO using the reparameterization trick.
+Analytical KL(q ‖ p) where q = N(μ, diag(σ²)) and the prior p = N(0, Λ⁻¹)
+has precision Λ. The prior precision is the roughness-penalty GMRF prior
+`λS` (plus a broad ridge on the null space), so — unlike an isotropic
+N(0, τ²) prior — the ELBO actually contains the smoothing penalty `μᵀΛμ`
+that defines a partially specified model.
 
-    ELBO = (1/S) Σ_s log p(Y|θ_s) - KL(q||p)
-    θ_s = μ + exp(log_σ) ⊙ ε_s
-
-`epsilons` is a matrix of size (n_params, n_samples).
+    KL = ½[ tr(Λ Σ_q) + μᵀΛμ − k − log|Λ| − log|Σ_q| ]
 """
-function _compute_elbo(prob::PSMProblem, mu, log_sigma, prior_scale,
+function _kl_gaussian_penalized(mu, log_sigma, Λ, logdetΛ)
+    T = promote_type(eltype(mu), eltype(log_sigma))
+    k = length(mu)
+    dΛ = diag(Λ)
+    tr_term = zero(T); quad_part = Λ * mu
+    for i in 1:k
+        tr_term += dΛ[i] * exp(2 * log_sigma[i])
+    end
+    quad = dot(mu, quad_part)
+    logdetΣq = 2 * sum(log_sigma)
+    T(0.5) * (tr_term + quad - k - T(logdetΛ) - logdetΣq)
+end
+
+"""
+    _compute_elbo(prob, mu, log_sigma, Λ, logdetΛ, epsilons, obs_noise_var)
+
+Compute the ELBO using the reparameterization trick, with the
+penalty-induced Gaussian prior (precision `Λ`).
+
+    ELBO = (1/S) Σ_s log p(Y|θ_s) - KL(q||p),   θ_s = μ + exp(log_σ) ⊙ ε_s
+"""
+function _compute_elbo(prob::PSMProblem, mu, log_sigma, Λ, logdetΛ,
                        epsilons, obs_noise_var)
     T = promote_type(eltype(mu), eltype(log_sigma))
     n_samples = size(epsilons, 2)
@@ -96,19 +114,23 @@ function _compute_elbo(prob::PSMProblem, mu, log_sigma, prior_scale,
 
         pred = try
             _variational_simulate(prob, theta_s)
-        catch
+        catch e
+            _is_program_error(e) && rethrow()
             nothing
         end
 
         if pred === nothing
+            # A failed simulation is a draw of effectively zero likelihood.
+            # Averaging only over the successes would bias the ELBO toward
+            # the non-failing region and hide infeasible posterior mass, so
+            # count the failure with a large finite log-likelihood penalty.
+            avg_ll += T(-1e8)
+            n_valid += 1
             continue
         end
 
-        avg_ll += observation_loglikelihood(prob.likelihood,
-                                            prob.data_values,
-                                            pred,
-                                            prob.data_weights;
-                                            sigma2=obs_noise_var)
+        avg_ll += _gaussian_loglik(pred, prob.data_values, prob.data_weights,
+                                   obs_noise_var)
         n_valid += 1
     end
 
@@ -117,7 +139,7 @@ function _compute_elbo(prob::PSMProblem, mu, log_sigma, prior_scale,
     end
     avg_ll /= n_valid
 
-    kl = _kl_gaussian(mu, log_sigma, prior_scale)
+    kl = _kl_gaussian_penalized(mu, log_sigma, Λ, logdetΛ)
 
     avg_ll - kl
 end
@@ -139,7 +161,7 @@ diagonal Gaussian, optimised by maximising the evidence lower bound (ELBO).
 3. Estimate the ELBO gradient via the reparametrisation trick and update
    (μ, log σ) with Adam.
 4. Return the posterior mean as point estimate and the variational
-   parameters in `sol.convergence`.
+   parameters in `sol.extras`.
 
 # References
 - Blei, Kucukelbir & McAuliffe (2017), "Variational Inference: A Review
@@ -147,7 +169,7 @@ diagonal Gaussian, optimised by maximising the evidence lower bound (ELBO).
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, unknown functions,
-and variational parameters `μ`, `σ` in `sol.convergence`.
+and variational parameters `μ`, `σ` in `sol.extras`.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     _validate_problem(prob, "VariationalSolver")
@@ -160,9 +182,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     log_sigma = fill(-2.0, n_p)  # σ ≈ 0.135
 
     # Observation noise variance: user-specified or estimated from data
-    obs_noise_var = if prob.likelihood isa Gaussian && alg.obs_noise_var !== nothing
+    obs_noise_var = if alg.obs_noise_var !== nothing
         alg.obs_noise_var
-    elseif prob.likelihood isa Gaussian
+    else
         # Estimate from short-range variability in data (successive differences)
         # This is more robust than the data range heuristic
         n_t = size(prob.data_values, 1)
@@ -183,16 +205,27 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
             data_range = maximum(prob.data_values) - minimum(prob.data_values)
             max((0.05 * data_range)^2, 1e-6)
         end
-    else
-        nothing
     end
 
     if verbose
         println("VariationalSolver: $n_p params, $(alg.maxiters) max iters, " *
                 "lr=$(alg.lr), S=$(alg.n_elbo_samples)")
-        obs_msg = obs_noise_var === nothing ? "n/a" : string(round(obs_noise_var, sigdigits=3))
-        println("  prior_scale=$(alg.prior_scale), obs_noise_var=$obs_msg")
+        println("  prior_scale=$(alg.prior_scale), obs_noise_var=$(round(obs_noise_var, sigdigits=3))")
     end
+
+    # Prior precision Λ = roughness penalty (λS per smooth term) + broad
+    # ridge on the null space.  This is what carries the smoothing penalty
+    # into the ELBO (an isotropic prior would drop it entirely).
+    Λ = zeros(n_p, n_p)
+    ridge = 1.0 / (100.0 * alg.prior_scale)
+    for i in 1:n_p; Λ[i, i] += ridge; end
+    let (pens, offs, _) = _build_penalty_info(prob)
+        for (k, S) in enumerate(pens)
+            npk = size(S, 1); idx = (offs[k]+1):(offs[k]+npk)
+            Λ[idx, idx] .+= (1.0 / alg.prior_scale) .* S
+        end
+    end
+    logdetΛ = logdet(cholesky(Symmetric(Λ)))
 
     # Concatenated variational parameters: φ = [μ; log_σ]
     n_phi = 2 * n_p
@@ -218,7 +251,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
         function neg_elbo(phi_vec)
             mu_v = phi_vec[1:n_p]
             ls_v = phi_vec[n_p+1:end]
-            -_compute_elbo(prob, mu_v, ls_v, alg.prior_scale, epsilons,
+            -_compute_elbo(prob, mu_v, ls_v, Λ, logdetΛ, epsilons,
                            obs_noise_var)
         end
 
@@ -231,6 +264,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
             neg_grad = DiffResults.gradient(result)
             neg_grad
         catch e
+            _is_program_error(e) && rethrow()
             if verbose && iter <= 5
                 println("  iter $iter: gradient failed ($(typeof(e))), using zeros")
             end
@@ -296,8 +330,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     pred = try
         p = simulate(prob, mu_opt)
         Float64.(p)
-    catch
-        zeros(length(prob.data_times), size(prob.data_values, 2))
+    catch e
+        _is_program_error(e) && rethrow()
+        fill(NaN, length(prob.data_times), size(prob.data_values, 2))
     end
 
     n_t = length(prob.data_times)

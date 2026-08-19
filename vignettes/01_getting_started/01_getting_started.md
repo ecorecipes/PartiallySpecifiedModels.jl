@@ -1,12 +1,12 @@
 # Getting Started with PartiallySpecifiedModels.jl
 Simon Frost
-2026-04-02
+2026-06-12
 
 - [Overview](#overview)
 - [Vignette Guide](#vignette-guide)
 - [Setup](#setup)
-- [A Simple Example: Exponential
-  Growth](#a-simple-example-exponential-growth)
+- [A Simple Example: Logistic
+  Growth](#a-simple-example-logistic-growth)
   - [Generate synthetic data](#generate-synthetic-data)
   - [Define the PSM](#define-the-psm)
   - [Choose an approximator](#choose-an-approximator)
@@ -37,25 +37,26 @@ This vignette introduces the basic workflow of
 4.  Solve with `LAML()` (Laplace Approximate Marginal Likelihood)
 5.  Inspect the fitted solution
 
-We start with the simplest possible example: exponential growth with an
+We start with the simplest possible example: logistic growth with an
 unknown per-capita growth rate.
 
 ## Vignette Guide
 
-This package includes 29 vignettes organized by topic:
+This package includes 35 vignettes organized by topic:
 
 | Topic | Vignettes |
 |----|----|
 | **Getting started** | 01 (this), 02 (likelihoods) |
-| **Ecological models** | 03 (Lotka-Volterra), 04 (copepod), 08 (consumer-resource), 10 (chemostat), 27 (blowfly DDE), 28 (fisheries) |
+| **Ecological models** | 03 (Lotka-Volterra), 04 (copepod), 08 (consumer-resource), 10 (chemostat), 27 (predator-prey functional response), 28 (fisheries) |
 | **Approximator types** | 05 (B-spline, GP, neural), 26 (SPDE) |
-| **Solver comparison** | 06 (all solvers), 09 (gradient matching) |
+| **Solver comparison** | 06 (all solvers), 09 (gradient matching), 17 (BNG), 21 (GCV vs LAML), 22 (two-stage, redirect to 09), 23 (derivative-free), 31 (integral matching), 33 (ensemble Kalman), 34 (ODIN), 35 (RKHS) |
 | **Shape constraints** | 13 (B-spline constraints), 16 (COMONet) |
 | **Bayesian inference** | 14 (MCMC), 15 (MAGI), 19 (pseudo-marginal), 24 (variational), 25 (ABC) |
-| **Uncertainty** | 07 (probabilistic ODE), 29 (bootstrap CIs) |
+| **Uncertainty** | 07 (probabilistic ODE), 18 (DALTON), 29 (bootstrap CIs), 32 (profile likelihood) |
+| **Model selection** | 30 (marginal likelihood) |
 | **Count data** | 02 (likelihoods), 11 (epidemiological), 28 (fisheries) |
 | **Discrete time** | 12 (Ricker, Beverton-Holt), 28 (fisheries) |
-| **Delay equations** | 20 (DDE basics), 27 (blowfly) |
+| **Delay equations** | 20 (DDE basics) |
 | **Diagnostics** | All vignettes include `appraise()` diagnostic plots |
 
 ## Setup
@@ -69,14 +70,9 @@ using Random
 Random.seed!(42)
 ```
 
-    Precompiling packages...
-        PartiallySpecifiedModels Being precompiled by another process (pid: 36853, pidfile: /Users/username/.julia/compiled/v1.12/PartiallySpecifiedModels/tWtwA_lLwID.ji.pidfile)
-      21655.7 ms  ✓ PartiallySpecifiedModels
-      1 dependency successfully precompiled in 50 seconds. 387 already precompiled.
-
     TaskLocalRNG()
 
-## A Simple Example: Exponential Growth
+## A Simple Example: Logistic Growth
 
 Consider a population $N(t)$ growing according to
 
@@ -177,9 +173,9 @@ The `LAML()` algorithm estimates the spline coefficients and the
 smoothing parameter $\lambda$ simultaneously. For Gaussian data, LAML is
 equivalent to **Restricted Maximum Likelihood (REML)**.
 
-    Data loss (SS): 2.38
-    EDF:            4.95
-    Smoothing λ:    [0.01933]
+    Data loss (SS): 2.46
+    EDF:            4.02
+    Smoothing λ:    [0.1941]
 
 ### Inspect the solution
 
@@ -190,7 +186,7 @@ diagnostics:
 # Plot fitted trajectory
 plot(data_times, true_N, label="True", lw=2, color=:black, ls=:dash,
      xlabel="Time", ylabel="Population N",
-     title="PSM fit: exponential growth with unknown r(N)")
+     title="PSM fit: logistic growth with unknown r(N)")
 scatter!(data_times, observed_N, label="Observed", ms=4, alpha=0.6)
 plot!(data_times, sol.fitted_values[:, 1], label="PSM fit", lw=2, color=:red)
 ```
@@ -264,8 +260,9 @@ $\lambda$ to balance fit and smoothness:
 - **Small $\lambda$**: less smoothing, higher EDF, more flexible
 - **Large $\lambda$**: more smoothing, lower EDF, smoother curves
 
-For our example, the EDF should be close to 2 (since the true $r(N)$ is
-linear).
+For our example, the true $r(N)$ is linear, so an EDF near 2 would be
+ideal; the fit above reports an EDF of about 4, reflecting the extra
+flexibility LAML retains to accommodate the observation noise.
 
 ## Diagnostic Plots
 
@@ -307,7 +304,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](01_getting_started_files/figure-commonmark/cell-10-output-1.svg)
 
-    Durbin-Watson: 1.804
+    Durbin-Watson: 1.751
 
 ## Summary
 

@@ -4,7 +4,7 @@
 #   Wood, Pya & Säfken (2016) "Smoothing parameter and model selection
 #   for general smooth models", JASA 111(516), 1548-1575.
 #   Wood & Fasiolo (2017) "A generalized Fellner-Schall method for smoothing
-#   parameter optimization", Statistics and Computing 27(3), 759-774.
+#   parameter optimization", Biometrics 73(4), 1071-1081.
 #
 # For Gaussian data with unknown σ², this is equivalent to profiled REML:
 #   V_REML(ρ) = -(n-Mp)/2 log(σ̂²) + ½ log|S^λ|_+ - ½ log|H| + const
@@ -28,10 +28,13 @@ function _variance_function(fam::TruncatedNormal, mu)
     σ^2 * max(1.0 - λξ * (ξ + λξ), 0.01)
 end
 function _variance_function(fam::CustomLikelihood, mu)
-    # V(μ) = 1/(-∂²ℓ/∂μ²)
+    # V(μ) ≈ 1/(-∂²ℓ/∂μ²) evaluated at y = μ. Evaluating the curvature at
+    # the mean recovers the exact variance function for exponential-family
+    # kernels (e.g. Poisson: -∂²ℓ|_{y=μ} = 1/μ ⇒ V = μ); the old fixed
+    # y = 0 gave y-dependent curvatures a wrong or degenerate answer.
     neg_d2l = -ForwardDiff.derivative(
-        μ -> ForwardDiff.derivative(μ2 -> fam.loglik_scalar(0.0, μ2), μ), mu)
-    max(1.0 / max(neg_d2l, 1e-20), 1e-10)
+        μ -> ForwardDiff.derivative(μ2 -> fam.loglik_scalar(mu, μ2), μ), mu)
+    clamp(1.0 / max(neg_d2l, 1e-20), 1e-10, 1e10)
 end
 
 # ─── Penalty matrix assembly ──────────────────────────────────────
@@ -88,7 +91,17 @@ function laml_objective(family::AbstractLikelihood,
 
     pen = dot(beta, S_lambda * beta)
 
-    log_det_S_plus = _log_det_plus(S_lambda)
+    # Exact for non-overlapping penalty blocks (one block per approximator):
+    #   log|S_λ|₊ = Σ_k [ r_k·ρ_k + log|S_k|₊ ].
+    # Eigen-decomposing the COMBINED S_λ with a relative tolerance let the
+    # effective rank drop when λ's across blocks differed by ≳1e10,
+    # de-synchronizing the objective from the fixed-rank gradient exactly
+    # where the Newton line search explores.
+    log_det_S_plus = 0.0
+    for l in eachindex(S_list)
+        log_det_S_plus += _rank_penalty(S_list[l]) * rho[l] +
+                          _log_det_plus(S_list[l])
+    end
     log_det_H = _log_det_pd(H)
 
     # Number of unpenalized parameters
@@ -97,8 +110,12 @@ function laml_objective(family::AbstractLikelihood,
 
     if family isa Gaussian
         RSS = sum(w_data[i] * (y[i] - mu[i])^2 for i in 1:n)
-        sigma2 = max((RSS + pen) / n, 1e-30)
         n_eff = n - Mp
+        # Profiled REML scale uses the restricted dof (n − Mp), NOT n. Using
+        # /n (the ML scale) leaves the analytic gradient inconsistent with V
+        # by a factor (n−Mp)/n on the penalty term and biases toward
+        # undersmoothing. (Wood 2011, "Fast stable REML".)
+        sigma2 = max((RSS + pen) / max(n_eff, 1), 1e-30)
         V = -0.5 * n_eff * log(sigma2) + 0.5 * log_det_S_plus - 0.5 * log_det_H
     else
         ll = log_likelihood(family, y, mu, w_data)
@@ -239,14 +256,13 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
     n = length(y)
 
     # Initialize ρ.  Fellner-Schall can converge to under-smoothing local
-    # minima when started from very negative ρ (tiny λ).  Reset to ρ=0
-    # (λ=1) when the initial values are all very small, providing a
-    # moderate starting point.
+    # minima when started from very negative ρ (tiny λ). Clamp to a floor
+    # of ρ = −10 (λ ≈ 4.5e-5) rather than resetting to ρ = 0: the old reset
+    # silently replaced any deliberately small initial λ — including the
+    # data-driven default λ = 1/tr(S) — with λ = 1, discarding the caller's
+    # initialization entirely.
     if rho_init !== nothing
-        rho = clamp.(rho_init, RHO_MIN, RHO_MAX)
-        if all(r -> r < -10.0, rho)
-            rho .= 0.0
-        end
+        rho = clamp.(rho_init, max(RHO_MIN, -10.0), RHO_MAX)
     else
         rho = zeros(m)
     end
@@ -263,13 +279,24 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
     n_fs = min(maxiter, 30)
     lambda = exp.(rho)
 
+    # Working-model quantities for the coupled FS iteration: each λ update
+    # is followed by a re-solve of the working-model coefficients
+    # β̂(λ) = (J'WJ + S_λ)⁻¹ J'Wz (Wood & Fasiolo 2017 alternate FS and β̂
+    # updates; iterating λ to a fixed point against a FROZEN β̂ solves a
+    # different — frozen-β — criterion and can drift far from REML).
+    z_work = y .- mu .+ J * beta
+    JWJ = J' * Diagonal(W_irls) * J
+    JWz = J' * (W_irls .* z_work)
+    beta_fs = copy(beta)
+
     for fs_iter in 1:n_fs
         lambda_old = copy(lambda)
 
         S_lambda = build_S_lambda(S_list, offsets, nknots_list, log.(lambda), n_p)
-        JWJ = J' * Diagonal(W_irls) * J
         H = JWJ + S_lambda
         H_inv = _safe_inv(H)
+        # β̂ at the CURRENT λ (working model)
+        beta_fs = H_inv * JWz
 
         # Profiled scale for Gaussian; Pearson dispersion for non-Gaussian.
         # For non-Gaussian families with identity link, IRLS weights (1/V(μ))
@@ -278,9 +305,10 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
         # Fellner-Schall update well-calibrated (Wood & Fasiolo 2017).
         # When sigma2_max is finite, cap to prevent oversmoothing.
         sigma2 = if family isa Gaussian
-            RSS = sum(w_data[i] * (y[i] - mu[i])^2 for i in 1:n)
-            pen = dot(beta, S_lambda * beta)
-            profiled = max((RSS + pen) / n, 1e-30)
+            r_work = z_work .- J * beta_fs
+            RSS = sum(w_data[i] * r_work[i]^2 for i in 1:n)
+            pen = dot(beta_fs, S_lambda * beta_fs)
+            profiled = max((RSS + pen) / max(n - Mp, 1), 1e-30)   # REML scale
             min(profiled, sigma2_max)
         else
             pearson = sum(w_data[i] * (y[i] - mu[i])^2 /
@@ -294,7 +322,7 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
         for k in 1:m
             nk = nknots_list[k]
             off = offsets[k]
-            beta_k = @view beta[off+1:off+nk]
+            beta_k = @view beta_fs[off+1:off+nk]
             bSb = dot(beta_k, S_list[k] * beta_k)
 
             # τ_k = λ_k tr(H⁻¹ S_k)
@@ -344,16 +372,19 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
     n_newton = family isa Gaussian ? max(0, maxiter - n_fs) : 0
 
     for iter in 1:min(n_newton, 20)
-        V, H, S_lambda, sigma2 = laml_objective(family, beta, J, W_irls, w_data, y, mu,
+        # Evaluate at the working-model optimum β̂(λ) from the FS phase —
+        # not the stale outer-loop β. (Within Newton the β̂ is held fixed:
+        # a small approximation, polished by the outer IRLS re-linearization.)
+        V, H, S_lambda, sigma2 = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu,
                                                  S_list, offsets, nknots_list, rho, n_p)
         if !isfinite(V)
             if verbose; println("LAML-Newton: non-finite V, stopping"); end
             break
         end
 
-        grad = laml_gradient(family, beta, S_list, offsets,
+        grad = laml_gradient(family, beta_fs, S_list, offsets,
                              nknots_list, rho, n_p, H, sigma2)
-        hess = laml_hessian(family, beta, S_list, offsets,
+        hess = laml_hessian(family, beta_fs, S_list, offsets,
                             nknots_list, rho, n_p, H, sigma2)
 
         if verbose
@@ -387,7 +418,7 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
         step = 1.0
         rho_new = clamp.(rho .+ step .* delta, RHO_MIN, RHO_MAX)
         V_new = try
-            v, _, _, _ = laml_objective(family, beta, J, W_irls, w_data, y, mu,
+            v, _, _, _ = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu,
                                          S_list, offsets, nknots_list, rho_new, n_p)
             v
         catch; -Inf end
@@ -397,7 +428,7 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
             step *= 0.5
             rho_new = clamp.(rho .+ step .* delta, RHO_MIN, RHO_MAX)
             V_new = try
-                v, _, _, _ = laml_objective(family, beta, J, W_irls, w_data, y, mu,
+                v, _, _, _ = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu,
                                              S_list, offsets, nknots_list, rho_new, n_p)
                 v
             catch; -Inf end

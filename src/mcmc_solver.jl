@@ -29,12 +29,23 @@ end
 
 function LogDensityProblems.dimension(ld::PSMLogDensity)
     d = ld.n_params
-    if ld.obs_sigma === nothing && ld.prob.likelihood isa Gaussian; d += 1; end
+    if ld.obs_sigma === nothing; d += 1; end
     if ld.sample_smoothing; d += ld.n_smooths; end
     d
 end
 
 function LogDensityProblems.logdensity(ld::PSMLogDensity, theta)
+    try
+        return _psm_logdensity(ld, theta)
+    catch e
+        # A numerical failure inside the user dynamics should reject the
+        # proposal, not abort the whole chain.
+        _is_program_error(e) && rethrow()
+        return eltype(theta)(-1e20)
+    end
+end
+
+function _psm_logdensity(ld::PSMLogDensity, theta)
     prob = ld.prob
     T = eltype(theta)
 
@@ -42,15 +53,13 @@ function LogDensityProblems.logdensity(ld::PSMLogDensity, theta)
     idx = ld.n_params
     beta = theta[1:idx]
 
-    estimate_sigma = ld.obs_sigma === nothing && prob.likelihood isa Gaussian
-
-    if estimate_sigma
+    if ld.obs_sigma === nothing
         idx += 1
         log_sigma = theta[idx]
         sigma2 = exp(2 * log_sigma)
     else
         log_sigma = nothing
-        sigma2 = ld.obs_sigma === nothing ? nothing : T(ld.obs_sigma^2)
+        sigma2 = T(ld.obs_sigma^2)
     end
 
     if ld.sample_smoothing && ld.n_smooths > 0
@@ -63,7 +72,7 @@ function LogDensityProblems.logdensity(ld::PSMLogDensity, theta)
     p = build_autodiff_param_struct(prob, beta)
 
     if prob.discrete
-        pred = adam_simulate_discrete(prob, p)
+        pred = adam_simulate_discrete(prob, p, T)
     else
         u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
         u0_T = T.(u0)
@@ -83,42 +92,56 @@ function LogDensityProblems.logdensity(ld::PSMLogDensity, theta)
         n_obs = size(prob.data_values, 2)
     end
 
+    # Gaussian log-likelihood (accumulate as scalar to preserve Dual type).
+    # The normalizer counts only weight-carrying finite observations: a
+    # zero weight encodes a masked/missing point, and counting it in n_data
+    # biases the estimated σ² low; NaN data are skipped consistently.
     n_t = size(prob.data_values, 1)
     n_obs = size(prob.data_values, 2)
-    pred_mat = if prob.discrete
-        pred
-    else
-        pred_tmp = zeros(T, n_t, n_obs)
-        for j in 1:n_obs, i in 1:n_t
-            pred_tmp[i, j] = i <= length(sol.t) ? sol[prob.obs_to_state[j], i] : T(0)
+    ll = zero(T)
+    n_eff = 0
+    for j in 1:n_obs
+        for i in 1:n_t
+            w = prob.data_weights[i, j]
+            y = prob.data_values[i, j]
+            (w > 0 && !isnan(y)) || continue
+            n_eff += 1
+            pred_ij = if prob.discrete
+                pred[i, j]
+            else
+                i <= length(sol.t) ? sol[prob.obs_to_state[j], i] : T(0)
+            end
+            ll -= T(0.5) * w * (pred_ij - T(y))^2 / sigma2
         end
-        pred_tmp
     end
-    ll = observation_loglikelihood(prob.likelihood,
-                                   T.(prob.data_values),
-                                   pred_mat,
-                                   T.(prob.data_weights);
-                                   sigma2=sigma2)
+    ll -= T(0.5) * n_eff * log(T(2π) * sigma2)
 
-    # --- Log-prior: penalty matrices + broad prior ---
+    # --- Log-prior: penalty (Gaussian GMRF prior) + broad prior ---
+    # The roughness penalty is the prior precision λS/σ²; the prior is
+    # p(β|λ,σ²) ∝ (λ/σ²)^{rank(S)/2} exp(−(λ/2σ²) βᵀSβ).  The σ² coupling
+    # (data and penalty share the scale) and the (λ/σ²) normalizer are both
+    # required for the hierarchical λ/σ² posterior to be valid.
     lp = zero(T)
     for (k, S) in enumerate(ld.penalty_matrices)
         np = size(S, 1)
         off = ld.param_offsets[k]
         beta_k = beta[off+1:off+np]
-        # Use sampled λ if available, otherwise fixed prior_scale
         lambda_k = if log_lambdas !== nothing
             exp(log_lambdas[k])
         else
             T(1.0) / T(ld.prior_scale)
         end
-        lp -= T(0.5) * lambda_k * dot(beta_k, S * beta_k)
+        rk = _rank_penalty(S)
+        lp += T(0.5) * rk * (log(lambda_k) - log(sigma2)) -
+              T(0.5) * lambda_k / sigma2 * dot(beta_k, S * beta_k)
     end
 
     # Broad Gaussian prior on all params
     lp -= T(0.5) * sum(beta .^ 2) / T(100.0 * ld.prior_scale)
 
-    # Jeffrey's prior on sigma via log transform
+    # Sampling s = log σ with a FLAT prior on σ: the +log σ term is the
+    # log-transform Jacobian |dσ/ds| = σ. (A Jeffreys prior p(σ) ∝ 1/σ
+    # would contribute no term in log-σ space.)
     if log_sigma !== nothing
         lp += log_sigma
     end
@@ -201,7 +224,7 @@ over the unknown-function parameters.
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, unknown functions,
-and the full MCMC chain in `sol.convergence`.
+and the full MCMC chain in `sol.extras[:chain]`.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     _validate_problem(prob, "MCMCSolver")
@@ -234,7 +257,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
                        alg.obs_sigma, alg.sample_smoothing, n_smooths,
                        log_lambda_init)
 
-    estimate_sigma = alg.obs_sigma === nothing && prob.likelihood isa Gaussian
+    estimate_sigma = alg.obs_sigma === nothing
     D = LogDensityProblems.dimension(ld)
 
     # Initial point: beta0 + optional log_sigma + optional log_lambda
@@ -260,34 +283,46 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     # Set up NUTS sampler with target acceptance rate
     nuts = NUTS(alg.target_accept)
 
-    # Run sampler using AbstractMCMC interface (handles adaptation internally)
+    # Run sampler via AbstractMCMC. n_adapts must equal n_warmup: without it
+    # AdvancedHMC adapts for only min(N/10, 1000) steps, so the retained
+    # draws could include iterations taken while step size and mass matrix
+    # were still adapting (not valid posterior samples).
     # Suppress AdvancedHMC "Verbosity toggle: max_iters" warnings
-    chain_raw = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
-        AbstractMCMC.sample(
-            ld_ad, nuts, alg.n_warmup + alg.n_samples;
-            initial_params=theta0,
-            progress=verbose, verbose=false)
+    n_ch = max(alg.n_chains, 1)
+    all_samples = zeros(alg.n_samples, D, n_ch)
+    for c in 1:n_ch
+        # Overdisperse the later chains' starts slightly so R̂-style
+        # diagnostics on the returned Chains object are meaningful.
+        θ0c = c == 1 ? theta0 : theta0 .+ 0.1 .* randn(length(theta0))
+        chain_raw = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+            AbstractMCMC.sample(
+                ld_ad, nuts, alg.n_warmup + alg.n_samples;
+                n_adapts=alg.n_warmup,
+                initial_params=θ0c,
+                progress=verbose, verbose=false)
+        end
+        # Extract samples (drop warmup)
+        start_idx = alg.n_warmup + 1
+        for (idx, i) in enumerate(start_idx:length(chain_raw))
+            all_samples[idx, :, c] .= chain_raw[i].z.θ
+        end
     end
+    # Pool chains for point estimates
+    sample_matrix = reshape(permutedims(all_samples, (1, 3, 2)),
+                            alg.n_samples * n_ch, D)
 
-    # Extract samples as matrix (drop warmup)
-    n_total = length(chain_raw)
-    start_idx = alg.n_warmup + 1
-    sample_matrix = zeros(alg.n_samples, D)
-    for (idx, i) in enumerate(start_idx:n_total)
-        sample_matrix[idx, :] .= chain_raw[i].z.θ
-    end
-
-    # Build MCMCChains.Chains object
+    # Build MCMCChains.Chains object (iterations × params × chains)
     pnames = _param_names(prob, estimate_sigma;
                           sample_smoothing=alg.sample_smoothing)
-    chain = MCMCChains.Chains(sample_matrix, pnames)
+    chain = MCMCChains.Chains(all_samples, pnames)
 
     if verbose
-        println("  Chain size: $(size(sample_matrix))")
+        println("  Chain size: $(size(all_samples))")
     end
 
-    # MAP estimate = sample with highest log-posterior
-    logp_values = [LogDensityProblems.logdensity(ld, sample_matrix[i, :]) for i in 1:alg.n_samples]
+    # MAP estimate = pooled sample with highest log-posterior
+    logp_values = [LogDensityProblems.logdensity(ld, sample_matrix[i, :])
+                   for i in 1:size(sample_matrix, 1)]
     map_idx = argmax(logp_values)
     map_theta = sample_matrix[map_idx, :]
     map_beta = map_theta[1:n_beta]
@@ -300,7 +335,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
 
     if prob.discrete
         p_ad = build_autodiff_param_struct(prob, map_beta)
-        pred = Float64.(adam_simulate_discrete(prob, p_ad))
+        pred = Float64.(adam_simulate_discrete(prob, p_ad, Float64))
     else
         u0 = prob.u0 isa Function ? prob.u0(p_opt) : prob.u0
         ode_prob = ODEProblem((du, u, params, t) -> prob.dynamics!(du, u, p_opt, t),
@@ -368,8 +403,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     end
     ca = ComponentArray(NamedTuple(ca_entries))
 
-    sigma_map = estimate_sigma ? exp(map_theta[end]) : alg.obs_sigma
-    smoothing = sigma_map === nothing ? Float64[] : [sigma_map]
+    # Layout is [β; log σ; log λ...]: with sample_smoothing the LAST entry
+    # is a smoothing parameter, so index log σ by position, not by end.
+    sigma_map = estimate_sigma ? exp(map_theta[n_beta + 1]) : alg.obs_sigma
+    smoothing = [sigma_map]
 
     PSMSolution(ca, -logp_values[map_idx], data_loss, Float64(n_beta),
                 smoothing, pred, prob.data_values, collect(prob.data_times),

@@ -100,28 +100,36 @@ function optimize_gp_hyperparams(times::Vector{Float64}, y::Vector{Float64},
     best_σn² = 0.01 * y_var
     best_nll = Inf
 
-    # Grid search over lengthscales and noise levels
+    # Grid search over lengthscale, signal variance, and noise level
+    # (all three are optimized against the marginal likelihood; σ² was
+    # previously pinned at var(y) despite the docstring saying otherwise)
+    kernel in (:rbf, :matern32) ||
+        error("AdaptiveGradientMatching: kernel must be :rbf or " *
+              ":matern32 (got :$(kernel)); :matern52 is not implemented")
     for ℓ_frac in [0.05, 0.1, 0.15, 0.2, 0.3, 0.5]
         ℓ_try = time_span * ℓ_frac
-        for σn_frac in [1e-4, 1e-3, 1e-2, 5e-2, 0.1]
-            σn²_try = σn_frac * y_var
-            K, _, _ = if kernel == :matern32
-                matern32_kernel_with_derivs(times, y_var, ℓ_try)
-            else
-                rbf_kernel_with_derivs(times, y_var, ℓ_try)
-            end
-            Ky = K + σn²_try * I(n)
-            try
-                C = cholesky(Symmetric(Ky))
-                α = C \ y
-                nll = 0.5 * dot(y, α) + 0.5 * logdet(C) + 0.5 * n * log(2π)
-                if nll < best_nll
-                    best_nll = nll
-                    best_σ² = y_var
-                    best_ℓ = ℓ_try
-                    best_σn² = σn²_try
+        for σ_mult in [0.5, 1.0, 2.0]
+            σ²_try = σ_mult * y_var
+            for σn_frac in [1e-4, 1e-3, 1e-2, 5e-2, 0.1]
+                σn²_try = σn_frac * y_var
+                K, _, _ = if kernel == :matern32
+                    matern32_kernel_with_derivs(times, σ²_try, ℓ_try)
+                else
+                    rbf_kernel_with_derivs(times, σ²_try, ℓ_try)
                 end
-            catch
+                Ky = K + σn²_try * I(n)
+                try
+                    C = cholesky(Symmetric(Ky))
+                    α = C \ y
+                    nll = 0.5 * dot(y, α) + 0.5 * logdet(C) + 0.5 * n * log(2π)
+                    if nll < best_nll
+                        best_nll = nll
+                        best_σ² = σ²_try
+                        best_ℓ = ℓ_try
+                        best_σn² = σn²_try
+                    end
+                catch
+                end
             end
         end
     end
@@ -185,8 +193,9 @@ end
 """
 Compute the product-of-experts gradient matching loss.
 
-For each state k:
+For each state k (with a Gamma prior on the mismatch variance γ_k):
   L_k = -0.5 (f_k - m_k)ᵀ (A_k + γ_k I)⁻¹ (f_k - m_k) - 0.5 log|A_k + γ_k I|
+        + log γ_k - γ_k/scale_k
 
 Total loss = -Σ_k L_k  (negative because we minimize)
 """
@@ -237,6 +246,16 @@ function agm_loss(prob::PSMProblem, beta::AbstractVector,
         log_det = sum(log.(shifted_eig))
 
         ll_k = -T(0.5) * quad_form - T(0.5) * log_det
+
+        # Weakly-informative Gamma(shape=2, rate=1/scale) prior on the
+        # gradient-mismatch variance γ_k (Dondelinger et al. 2013;
+        # Calderhead et al. 2009 place a Gamma prior on γ precisely to keep
+        # it away from the degenerate γ→0 limit, where the GP-derivative
+        # constraint becomes infinitely tight and overfits). The scale is set
+        # to the mean eigenvalue of A_k, the natural variance scale, so the
+        # prior is uninformative relative to the data term.
+        γ_scale = max(sum(λ_A) / length(λ_A), T(1e-6))
+        ll_k += log(gamma[k]) - gamma[k] / T(γ_scale)
         total_loss -= ll_k
     end
 
@@ -271,6 +290,345 @@ function agm_loss(prob::PSMProblem, beta::AbstractVector,
     total_loss
 end
 
+# ─── Population MCMC (Dondelinger et al. 2013) ───────────────────
+#
+# Tempered chains at t_c = ((c−1)/(C−1))^5 jointly sample the latent
+# states X, the parameters β, and the mismatch variances γ. The ODE
+# product-of-experts likelihood is raised to t_c, so chain 1 is pure GP
+# regression and chain C is the fully coupled model; exchange moves let
+# information flow across the ladder. GP kernel hyperparameters are held
+# fixed at their marginal-likelihood grid-search values.
+
+function _agm_population_mcmc(prob::PSMProblem, alg::AdaptiveGradientMatching)
+    prob.discrete && error("AdaptiveGradientMatching: population MCMC " *
+                           "(n_samples > 0) requires a continuous-time problem")
+    any(a -> a isa NeuralApproximator, prob.approximators) &&
+        error("AdaptiveGradientMatching population MCMC does not support " *
+              "NeuralApproximator; use the MAP mode or AdamSolver.")
+    alg.n_chains >= 2 ||
+        throw(ArgumentError("AdaptiveGradientMatching: population MCMC needs " *
+                            "n_chains ≥ 2 (got $(alg.n_chains))"))
+    verbose = alg.verbose
+    times = Float64.(prob.data_times)
+    T_pts = length(times)
+    K_states = length(prob.u0)
+    n_obs = size(prob.data_values, 2)
+    u0_vec = Float64.(prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)
+    rng = alg.rng_seed === nothing ? Random.Xoshiro(rand(UInt32)) :
+          Random.Xoshiro(alg.rng_seed)
+    obs_of_state = Dict{Int, Vector{Int}}()
+    for j in 1:n_obs
+        push!(get!(obs_of_state, prob.obs_to_state[j], Int[]), j)
+    end
+
+    # ── Fixed GP structure per state ─────────────────────────────
+    m_center = zeros(K_states)
+    P = Vector{Matrix{Float64}}(undef, K_states)      # prior precision K⁻¹
+    Lp = Vector{Matrix{Float64}}(undef, K_states)     # chol(K).L for proposals
+    D = Vector{Matrix{Float64}}(undef, K_states)      # 'K K⁻¹
+    A_vals = Vector{Vector{Float64}}(undef, K_states)
+    A_vecs = Vector{Matrix{Float64}}(undef, K_states)
+    sigma_n2 = fill(NaN, K_states)
+    gp_hyperparams = fill((0.0, 0.0, 0.0), K_states)
+    x_init = zeros(T_pts, K_states)
+
+    function mcmc_state_matrices(σ²::Float64, ℓ::Float64)
+        K, Kstar, Kstarstar = alg.kernel == :matern32 ?
+            matern32_kernel_with_derivs(times, σ², ℓ) :
+            rbf_kernel_with_derivs(times, σ², ℓ)
+        jitter = 1e-6 * σ²
+        C = cholesky(Symmetric(K + jitter * I))
+        Pk = Matrix(inv(C))
+        Dk = Kstar * Pk
+        A = Kstarstar - Kstar * (C \ Kstar') 
+        E = eigen(Symmetric(0.5 * (A + A')))
+        Pk, Matrix(C.L), Dk, max.(E.values, 1e-10), E.vectors
+    end
+
+    obs_states = sort(collect(keys(obs_of_state)))
+    for sk in obs_states
+        y = Float64.(prob.data_values[:, obs_of_state[sk][1]])
+        σ², ℓ, σn² = optimize_gp_hyperparams(times, y .- mean(y), alg.kernel;
+                                             verbose=verbose)
+        gp_hyperparams[sk] = (σ², ℓ, σn²)
+        sigma_n2[sk] = σn²
+        m_center[sk] = mean(y)
+        P[sk], Lp[sk], D[sk], A_vals[sk], A_vecs[sk] = mcmc_state_matrices(σ², ℓ)
+        # Initialise at the GP posterior mean
+        K, _, _ = alg.kernel == :matern32 ?
+            matern32_kernel_with_derivs(times, σ², ℓ) :
+            rbf_kernel_with_derivs(times, σ², ℓ)
+        x_init[:, sk] = m_center[sk] .+
+                        K * (cholesky(Symmetric(K + σn² * I)) \ (y .- m_center[sk]))
+    end
+    ℓ_bar = mean(gp_hyperparams[sk][2] for sk in obs_states)
+    σ²_bar = mean(gp_hyperparams[sk][1] for sk in obs_states)
+    for k in 1:K_states
+        haskey(obs_of_state, k) && continue
+        gp_hyperparams[k] = (σ²_bar, ℓ_bar, 0.0)
+        m_center[k] = u0_vec[k]
+        P[k], Lp[k], D[k], A_vals[k], A_vecs[k] = mcmc_state_matrices(σ²_bar, ℓ_bar)
+        x_init[:, k] .= u0_vec[k]
+    end
+    γ_scale = [max(mean(A_vals[k]), 1e-6) for k in 1:K_states]
+
+    # ── β structure ──────────────────────────────────────────────
+    beta0 = Float64[]
+    for approx in prob.approximators
+        append!(beta0, initial_params(approx))
+    end
+    n_beta = length(beta0)
+    S_blocks = Tuple{UnitRange{Int}, Matrix{Float64}}[]
+    let offset = 0
+        for approx in prob.approximators
+            np = nparams(approx)
+            S = penalty_matrix(approx)
+            S !== nothing && push!(S_blocks, (offset+1:offset+np, Matrix{Float64}(S)))
+            offset += np
+        end
+    end
+
+    # Match the MAP path's smoothing scale (0.01 × mean mismatch variance)
+    p_init = build_param_struct(prob, beta0)
+    du_init = zeros(K_states)
+    mm_var = zeros(K_states)
+    for k in 1:K_states
+        resids = zeros(T_pts)
+        for i in 1:T_pts
+            prob.dynamics!(du_init, x_init[i, :], p_init, times[i])
+            resids[i] = du_init[k] - dot(D[k][i, :], x_init[:, k] .- m_center[k])
+        end
+        mm_var[k] = max(var(resids), 1e-4)
+    end
+    smoothing_lambda = 0.01 * mean(mm_var)
+    lg0 = log.(max.(0.1 .* alg.gamma_init .* mm_var, 1e-8))
+
+    # ── Log-density pieces ───────────────────────────────────────
+    # ODE product-of-experts term (untempered; also drives exchange moves).
+    # A proposal where the dynamics throw gets ode = −Inf; note t_c·(−Inf)
+    # is NaN for the t=0 chain, and NaN comparisons reject — so every chain
+    # (including t=0) is implicitly restricted to the ODE-evaluable support,
+    # consistently across the ladder, which keeps exchange moves valid.
+    function ode_loglik(X, beta, lg)
+        p = build_param_struct(prob, beta)
+        du = zeros(K_states)
+        F = zeros(T_pts, K_states)
+        for i in 1:T_pts
+            try
+                prob.dynamics!(du, X[i, :], p, times[i])
+            catch
+                return -Inf
+            end
+            F[i, :] .= du
+        end
+        ll = 0.0
+        for k in 1:K_states
+            γ = exp(lg[k])
+            r = F[:, k] .- D[k] * (X[:, k] .- m_center[k])
+            Vt_r = A_vecs[k]' * r
+            shifted = A_vals[k] .+ γ
+            ll += -0.5 * sum(abs2.(Vt_r) ./ shifted) - 0.5 * sum(log.(shifted))
+        end
+        isfinite(ll) ? ll : -Inf
+    end
+
+    # Data + GP prior + γ prior (in log space, incl. Jacobian) + β smoothing.
+    # Conventions (shared with the MAP path): with several data columns per
+    # state, hyperparameters/σn²/init come from the first column while all
+    # columns enter the data term; prob.data_weights are not applied here.
+    function base_logp(X, beta, lg)
+        lp = 0.0
+        for k in 1:K_states
+            xc = X[:, k] .- m_center[k]
+            lp -= 0.5 * dot(xc, P[k] * xc)
+            if haskey(obs_of_state, k)
+                for j in obs_of_state[k]
+                    lp -= 0.5 / sigma_n2[k] *
+                          sum(abs2, prob.data_values[:, j] .- X[:, k])
+                end
+            end
+            # Gamma(2, scale) prior on γ, sampled as lg = log γ:
+            # log p(γ) + log|dγ/dlg| = 2 lg − exp(lg)/scale (+ const)
+            lp += 2 * lg[k] - exp(lg[k]) / γ_scale[k]
+        end
+        for (idx, S) in S_blocks
+            bk = @view beta[idx]
+            lp -= smoothing_lambda * dot(bk, S * bk)
+        end
+        lp
+    end
+
+    # ── Chains ───────────────────────────────────────────────────
+    C = alg.n_chains
+    temps = [((c - 1) / (C - 1))^5 for c in 1:C]
+    X_ch = [copy(x_init) for _ in 1:C]
+    beta_ch = [copy(beta0) for _ in 1:C]
+    lg_ch = [copy(lg0) for _ in 1:C]
+    ode_ch = [ode_loglik(X_ch[c], beta_ch[c], lg_ch[c]) for c in 1:C]
+    base_ch = [base_logp(X_ch[c], beta_ch[c], lg_ch[c]) for c in 1:C]
+    isfinite(base_ch[C] + ode_ch[C]) ||
+        error("AdaptiveGradientMatching: the target density is not finite at " *
+              "the initial state — the dynamics return non-finite values on " *
+              "the GP-smoothed trajectory. Check the dynamics/approximator " *
+              "domains.")
+    # Adaptive step sizes per chain: states (per state), β, log γ
+    sx = [fill(0.05, K_states) for _ in 1:C]
+    sb = fill(0.05, C)
+    sg = fill(0.3, C)
+    acc = zeros(4); tot = zeros(4)                 # X, β, γ, swap
+
+    n_sweeps = 2 * alg.n_samples                   # first half is burn-in
+    burnin = alg.n_samples
+    beta_samples = Matrix{Float64}(undef, alg.n_samples, n_beta)
+    gamma_samples = Matrix{Float64}(undef, alg.n_samples, K_states)
+    X_mean = zeros(T_pts, K_states)
+
+    if verbose
+        println("AGM population MCMC: $C chains, $n_sweeps sweeps " *
+                "($(burnin) burn-in), $n_beta β, $K_states states")
+    end
+
+    for sweep in 1:n_sweeps
+        adapting = sweep <= burnin
+        for c in 1:C
+            t_c = temps[c]
+            # X blocks: GP-correlated proposal per state
+            for k in 1:K_states
+                Xp = copy(X_ch[c])
+                Xp[:, k] .+= sx[c][k] .* (Lp[k] * randn(rng, T_pts))
+                ode_p = ode_loglik(Xp, beta_ch[c], lg_ch[c])
+                base_p = base_logp(Xp, beta_ch[c], lg_ch[c])
+                if log(rand(rng)) < (base_p + t_c * ode_p) -
+                                    (base_ch[c] + t_c * ode_ch[c])
+                    X_ch[c] = Xp; ode_ch[c] = ode_p; base_ch[c] = base_p
+                    c == C && (acc[1] += 1)
+                    adapting && (sx[c][k] *= exp(0.05))
+                else
+                    adapting && (sx[c][k] *= exp(-0.0167))
+                end
+                c == C && (tot[1] += 1)
+            end
+            # β block
+            bp = beta_ch[c] .+ sb[c] .* randn(rng, n_beta)
+            ode_p = ode_loglik(X_ch[c], bp, lg_ch[c])
+            base_p = base_logp(X_ch[c], bp, lg_ch[c])
+            if log(rand(rng)) < (base_p + t_c * ode_p) -
+                                (base_ch[c] + t_c * ode_ch[c])
+                beta_ch[c] = bp; ode_ch[c] = ode_p; base_ch[c] = base_p
+                c == C && (acc[2] += 1)
+                adapting && (sb[c] *= exp(0.05))
+            else
+                adapting && (sb[c] *= exp(-0.0167))
+            end
+            c == C && (tot[2] += 1)
+            # log γ block
+            lgp = lg_ch[c] .+ sg[c] .* randn(rng, K_states)
+            ode_p = ode_loglik(X_ch[c], beta_ch[c], lgp)
+            base_p = base_logp(X_ch[c], beta_ch[c], lgp)
+            if log(rand(rng)) < (base_p + t_c * ode_p) -
+                                (base_ch[c] + t_c * ode_ch[c])
+                lg_ch[c] = lgp; ode_ch[c] = ode_p; base_ch[c] = base_p
+                c == C && (acc[3] += 1)
+                adapting && (sg[c] *= exp(0.05))
+            else
+                adapting && (sg[c] *= exp(-0.0167))
+            end
+            c == C && (tot[3] += 1)
+        end
+        # Exchange move between a random adjacent pair (the untempered ODE
+        # term is the only tempered piece, so it alone enters the swap ratio)
+        c = rand(rng, 1:(C - 1))
+        Δ = (temps[c] - temps[c + 1]) * (ode_ch[c + 1] - ode_ch[c])
+        tot[4] += 1
+        if log(rand(rng)) < Δ
+            acc[4] += 1
+            X_ch[c], X_ch[c + 1] = X_ch[c + 1], X_ch[c]
+            beta_ch[c], beta_ch[c + 1] = beta_ch[c + 1], beta_ch[c]
+            lg_ch[c], lg_ch[c + 1] = lg_ch[c + 1], lg_ch[c]
+            ode_ch[c], ode_ch[c + 1] = ode_ch[c + 1], ode_ch[c]
+            base_ch[c], base_ch[c + 1] = base_ch[c + 1], base_ch[c]
+        end
+        if sweep > burnin
+            s_idx = sweep - burnin
+            beta_samples[s_idx, :] = beta_ch[C]
+            gamma_samples[s_idx, :] = exp.(lg_ch[C])
+            X_mean .+= X_ch[C]
+        end
+        if verbose && sweep % max(1, n_sweeps ÷ 10) == 0
+            println("  sweep $sweep/$n_sweeps  cold-chain logp=" *
+                    "$(round(base_ch[C] + ode_ch[C], sigdigits=6))")
+        end
+    end
+    X_mean ./= alg.n_samples
+    beta_mean = vec(mean(beta_samples, dims=1))
+    gamma_mean = vec(mean(gamma_samples, dims=1))
+
+    if verbose
+        println("  acceptance: X=$(round(acc[1]/tot[1], digits=2)) " *
+                "β=$(round(acc[2]/tot[2], digits=2)) " *
+                "γ=$(round(acc[3]/tot[3], digits=2)) " *
+                "swap=$(round(acc[4]/tot[4], digits=2))")
+    end
+
+    # ── Build solution from the cold chain ───────────────────────
+    pred = zeros(T_pts, n_obs)
+    for j in 1:n_obs
+        pred[:, j] .= X_mean[:, prob.obs_to_state[j]]
+    end
+    data_loss = 0.0
+    for j in 1:n_obs, i in 1:T_pts
+        data_loss += prob.data_weights[i, j] *
+                     (prob.data_values[i, j] - pred[i, j])^2
+    end
+
+    uf_evals = Dict{Symbol, Any}()
+    offset = 0
+    for approx in prob.approximators
+        np = nparams(approx)
+        params_k = beta_mean[offset+1:offset+np]
+        offset += np
+        if approx isa BSplineApproximator
+            knots_x = collect(range(approx.domain[1], approx.domain[2],
+                                    length=approx.nknots))
+            uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
+        elseif approx isa GPApproximator
+            uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
+        elseif approx isa ShapeConstrainedBSplineApproximator
+            uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
+        elseif approx isa COMONetApproximator
+            uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
+        elseif approx isa SPDEApproximator
+            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
+        elseif approx isa ShapeConstrainedSPDEApproximator
+            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
+        end
+    end
+
+    ca_entries = Pair{Symbol, Any}[]
+    offset = 0
+    for approx in prob.approximators
+        np = nparams(approx)
+        push!(ca_entries, approx.name => beta_mean[offset+1:offset+np])
+        offset += np
+    end
+    params = ComponentArray(NamedTuple(ca_entries))
+
+    PSMSolution(params, -(base_ch[C] + ode_ch[C]), data_loss,
+                Float64(n_beta), gamma_mean,
+                Float64.(pred), Float64.(prob.data_values),
+                Float64.(prob.data_times), uf_evals,
+                (method=:adaptive_gradient_matching,
+                 sampler=:population_mcmc,
+                 gp_hyperparams=gp_hyperparams,
+                 gamma=gamma_mean,
+                 beta_samples=beta_samples,
+                 gamma_samples=gamma_samples,
+                 n_chains=C,
+                 temperatures=temps,
+                 accept_rates=(x=acc[1]/max(tot[1],1), beta=acc[2]/max(tot[2],1),
+                               gamma=acc[3]/max(tot[3],1), swap=acc[4]/max(tot[4],1))))
+end
+
 # ─── Main solver ─────────────────────────────────────────────────
 
 """
@@ -290,6 +648,10 @@ joint posterior, avoiding explicit numerical integration.
    likelihood with respect to the combined model.
 4. Optionally re-estimate GP hyperparameters (γ) to adapt the state prior.
 
+With `n_samples > 0` the MAP fit is replaced by the paper's tempered
+population-MCMC sampler over states, parameters, and mismatch variances
+(see the `AdaptiveGradientMatching` docstring).
+
 # References
 - Dondelinger et al. (2013), "ODE parameter inference using adaptive
   gradient matching with Gaussian processes", AISTATS.
@@ -299,6 +661,7 @@ joint posterior, avoiding explicit numerical integration.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     _validate_problem(prob, "AdaptiveGradientMatching")
+    alg.n_samples > 0 && return _agm_population_mcmc(prob, alg)
     verbose = alg.verbose
     times = Float64.(prob.data_times)
     T_pts = length(times)
@@ -317,7 +680,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     grad_means = zeros(T_pts, K_states)
     grad_covs = Vector{Matrix{Float64}}(undef, K_states)
 
-    gp_hyperparams = Vector{Tuple{Float64,Float64,Float64}}(undef, K_states)
+    # Initialize so unobserved states report zeros rather than undef garbage
+    gp_hyperparams = fill((0.0, 0.0, 0.0), K_states)
 
     if prob.discrete
         # For discrete models: GP-smooth the states, and use forward-shifted
@@ -360,7 +724,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     # For unobserved states, initialize from u0 (constant)
     for k in 1:K_states
         if !isassigned(grad_covs, k)
-            x_smooth[:, k] .= prob.u0[k]
+            x_smooth[:, k] .= (prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)[k]
             grad_means[:, k] .= 0.0
             grad_covs[k] = Matrix(1e6 * I(T_pts))  # Large uncertainty
         end
@@ -404,7 +768,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     end
 
     # Initialize gamma from mismatch variance (start tight, let optimizer loosen)
-    gamma_init_vals = mismatch_var .* 0.1
+    # gamma_init scales the data-driven default (0.1·Var of the GP-implied
+    # derivative mismatch); the field was previously accepted but ignored.
+    gamma_init_vals = 0.1 .* alg.gamma_init .* mismatch_var
     log_gamma = log.(gamma_init_vals)
     n_gamma = alg.fit_gamma ? K_states : 0
 

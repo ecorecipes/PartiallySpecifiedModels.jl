@@ -1,6 +1,6 @@
 # Integration-Free Inference with Gradient Matching
 Simon Frost
-2026-04-02
+2026-08-19
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -48,7 +48,7 @@ ODE integration entirely by:
   adaptive mismatch parameters and smoothing penalties
 - **`TwoStageSolver`** — smooth-then-differentiate baseline (penalized
   least squares)
-- **`BNGSolver`** — Bayesian Numerical Gradient matching (Bayesian
+- **`BNGSolver`** — Bayesian neural gradient matching (Bayesian
   interpretation of the two-stage idea)
 
 This vignette compares these integration-free methods against standard
@@ -106,12 +106,12 @@ prob = PSMProblem(sir!, u0, tspan, [approx_β];
 
     Method               | Time (s) | Data Loss
     -------------------------------------------------------
-    GradientMatching     | 4.14     | 0.0
-    AGM                  | 5.68     | 1184.4
-    LAML                 | 6.2      | 1754.0
-    CollocationLAML      | 1.62     | 1210.1
-    AdamSolver           | 4.31     | 1365.0
-    RodeoSolver          | 4.49     | 1342.4
+    GradientMatching     | 3.16     | 1023.4
+    AGM                  | 5.82     | 1167.2
+    LAML                 | 5.41     | 1344.8
+    CollocationLAML      | 1.67     | 771.1
+    AdamSolver           | 3.75     | 1365.0
+    RodeoSolver          | 12.55    | 1505.9
 
 ### Compare recovered β(prevalence)
 
@@ -175,9 +175,9 @@ for fitted trajectories.
 ### Inspecting AGM diagnostics
 
     AGM convergence info:
-      GP hyperparams: [(52268.25281995996, 18.0, 52.26825281995996), (864.7704326939464, 12.0, 8.647704326939465), (3.078267445e-314, 3.14e-321, NaN)]
-      Gamma (mismatch): [5.3415, 6.4351, 5.3671]
-      Derivative loss: 11416.7432
+      GP hyperparams: [(104536.50563991992, 18.0, 52.26825281995996), (1729.5408653878928, 12.0, 8.647704326939465), (0.0, 0.0, 0.0)]
+      Gamma (mismatch): [4.0473, 3.1278, 32757.1883]
+      Derivative loss: 11427.0288
 
 ## Example 2: Logistic Growth — A Clean Demonstration
 
@@ -261,7 +261,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](09_gradient_matching_files/figure-commonmark/cell-9-output-1.svg)
 
-    Durbin-Watson: 1.588, 1.903
+    Durbin-Watson: 1.603, 1.962
 
 ## Two-Stage Smooth-Then-Differentiate
 
@@ -311,16 +311,17 @@ plot!(u_grid_d, [sol_laml_d.unknown_functions[:r](x) for x in u_grid_d], label="
 
 ![](09_gradient_matching_files/figure-commonmark/cell-12-output-1.svg)
 
-    TwoStage    loss=0.0  r(2)=0.9528
-    BNG         loss=1.4316  r(2)=0.9528
-    LAML        loss=0.3408  r(2)=1.0301
+    TwoStage    loss=0.2547  r(2)=0.9541
+    BNG         loss=0.7976  r(2)=0.9998
+    LAML        loss=0.3444  r(2)=1.0232
     True        r(2)=1.0
 
-TwoStage and BNG use the same derivative-matching objective, so their
-point estimates typically coincide; BNG adds a Bayesian interpretation.
-LAML integrates the ODE and selects smoothing via marginal likelihood,
-generally recovering the functional response more accurately when data
-are sparse or noisy.
+TwoStage and BNG match similar derivative targets, so their point
+estimates are typically close; BNG marginalizes the observation and
+prior variances and fits a bootstrap × restart ensemble, adding
+uncertainty quantification. LAML integrates the ODE and selects
+smoothing via marginal likelihood, generally recovering the functional
+response more accurately when data are sparse or noisy.
 
 ## When to Use Gradient Matching
 
@@ -328,15 +329,19 @@ are sparse or noisy.
 
 - **No ODE integration** — avoids numerical instability, stiffness
   issues, and solver failures
-- **Fast** — typically the quickest methods in the package
+- **Fast optimization loop** — no ODE solves during fitting, though as
+  the timing table above shows, total runtime is not always lower than
+  the fastest integration-based solvers
 - **No sensitivity equations** — simpler computational graph
 
 ### Limitations
 
 - **Relies on good derivative estimates** from the data — needs
   sufficient, well-spaced observations
-- **No formal data loss** — GradientMatching reports `data_loss ≈ 0`
-  because it doesn’t directly fit to data
+- **Indirect data fit** — the optimization matches derivatives of the
+  smoothed data rather than the data themselves; the reported
+  `data_loss` is computed afterwards by integrating the ODE at the
+  fitted parameters and comparing to the observations
 - **May not generalise** for prediction — the fitted parameters work for
   the observed time window but extrapolation may be poor
 

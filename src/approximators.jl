@@ -14,7 +14,10 @@
 Evaluate a cubic spline interpolant at point `x`.
 """
 function evaluate_bspline(knots_x::AbstractVector, knots_y::AbstractVector, x::Real)
-    itp = CubicSpline(knots_y, knots_x; extrapolation=ExtrapolationType.Extension)
+    # Linear extrapolation: continuing the boundary CUBIC outside the domain
+    # grows without bound and can destabilize the ODE solve whenever a state
+    # wanders past the fitted range mid-integration.
+    itp = CubicSpline(knots_y, knots_x; extrapolation=ExtrapolationType.Linear)
     return itp(x)
 end
 
@@ -24,7 +27,9 @@ end
 Build a callable cubic spline evaluator (caches the interpolation object).
 """
 function build_bspline_evaluator(knots_x::AbstractVector, knots_y::AbstractVector)
-    CubicSpline(knots_y, knots_x; extrapolation=ExtrapolationType.Extension)
+    # Linear (slope-preserving) extrapolation outside the fitted domain —
+    # see evaluate_bspline.
+    CubicSpline(knots_y, knots_x; extrapolation=ExtrapolationType.Linear)
 end
 
 """
@@ -164,10 +169,82 @@ function build_gp_evaluator(a::GPApproximator, params::AbstractVector)
     kfunc = _kernel_func(a.kernel, a.lengthscale, a.variance)
     weights = a.K_inv * params  # precompute α = K⁻¹ f
     x_ind = a.inducing_points
+    raw = xv -> sum(kfunc(xv, x_ind[j]) * weights[j] for j in eachindex(x_ind))
+    # Outside the inducing-point range the kernel decays and the predictive
+    # mean reverts to 0 REGARDLESS of the fitted level — an ODE excursion
+    # past the domain saw f ≈ 0. Extrapolate linearly from the boundary
+    # value and slope instead (consistent with the spline evaluators).
+    lo, hi = extrema(x_ind)
+    h = (hi - lo) * 1e-6
+    f_lo = raw(lo);  s_lo = (raw(lo + h) - f_lo) / h
+    f_hi = raw(hi);  s_hi = (f_hi - raw(hi - h)) / h
     x -> begin
-        xv = Float64(x isa AbstractArray ? x[1] : x)
-        sum(kfunc(xv, x_ind[j]) * weights[j] for j in eachindex(x_ind))
+        xv = x isa AbstractArray ? x[1] : x   # keep Duals intact
+        if xv < lo
+            f_lo + s_lo * (xv - lo)
+        elseif xv > hi
+            f_hi + s_hi * (xv - hi)
+        else
+            raw(xv)
+        end
     end
+end
+
+"""
+    _adapt_gp_hyperparams!(a::GPApproximator, beta_k) -> Bool
+
+Empirical-Bayes update of the kernel hyperparameters DURING a fit: choose
+(ℓ, σ²) maximizing the GP log marginal likelihood of the current inducing
+values `beta_k` (small fixed nugget), then rebuild `K`/`K_inv`. Called by
+the LAML/GCV loops when `a.adapt` (no user-supplied lengthscale). Returns
+whether the hyperparameters changed materially.
+"""
+function _adapt_gp_hyperparams!(a::GPApproximator, beta_k::AbstractVector)
+    a.adapt || return false
+    n = a.n_inducing
+    v = var(beta_k)
+    v > 1e-12 || return false          # flat function: nothing to adapt to
+    x = a.inducing_points
+    span = a.domain[2] - a.domain[1]
+    nug = 1e-6 * v
+
+    best_ll = -Inf
+    best_ℓ = a.lengthscale
+    best_σ² = a.variance
+    for frac in (0.08, 0.15, 0.25, 0.4, 0.6, 1.0), σm in (0.5, 1.0, 2.0)
+        ℓ_try = frac * span
+        σ²_try = σm * v
+        kf = _kernel_func(a.kernel, ℓ_try, σ²_try)
+        K = _build_kernel_matrix(kf, x)
+        F = cholesky(Symmetric(K + nug * I), check=false)
+        issuccess(F) || continue
+        α = F \ beta_k
+        ll = -0.5 * dot(beta_k, α) - sum(log, diag(F.U))
+        if ll > best_ll
+            best_ll = ll; best_ℓ = ℓ_try; best_σ² = σ²_try
+        end
+    end
+    isfinite(best_ll) || return false
+    changed = abs(log(best_ℓ / a.lengthscale)) > 0.05 ||
+              abs(log(best_σ² / max(a.variance, 1e-12))) > 0.05
+    changed || return false
+
+    a.lengthscale = best_ℓ
+    a.variance = best_σ²
+    kf = _kernel_func(a.kernel, best_ℓ, best_σ²)
+    K = _build_kernel_matrix(kf, x)
+    scale = max(maximum(abs, K), 1.0)
+    K_inv = nothing
+    for jit in (1e-8, 1e-6, 1e-4)
+        F = cholesky(Symmetric(K + jit * scale * I), check=false)
+        if issuccess(F)
+            K_inv = Matrix(inv(F)); break
+        end
+    end
+    K_inv === nothing && (K_inv = pinv(K + 1e-4 * scale * I))
+    a.K = K
+    a.K_inv = 0.5 * (K_inv + K_inv')
+    true
 end
 
 # ─── SPDE (Matérn) FEM matrices and evaluation ────────────────────
@@ -262,7 +339,7 @@ Build a callable cubic spline evaluator for the SPDE mesh node values.
 Uses cubic spline interpolation for smooth ODE-compatible evaluation.
 """
 function build_spde_evaluator(mesh_x::AbstractVector, params::AbstractVector)
-    CubicSpline(params, mesh_x; extrapolation=ExtrapolationType.Extension)
+    CubicSpline(params, mesh_x; extrapolation=ExtrapolationType.Linear)
 end
 
 # ─── Shape-constrained SPDE: evaluator and penalty ────────────────
@@ -273,26 +350,33 @@ end
 Build a callable evaluator from unconstrained parameters γ.
 
 Applies the SCOP-spline reparameterization: mesh node values are computed
-as `β = Σ * softplus(γ)`, then interpolated with a cubic spline.
+as `β = Σ · _apply_constraint_transform(γ)` (free components linear, the
+rest softplus'd), then interpolated with a cubic spline.
 Shape constraints are enforced at mesh nodes; the cubic spline interpolation
 between nodes may slightly overshoot.
 """
 function build_constrained_spde_evaluator(a::ShapeConstrainedSPDEApproximator,
                                           gamma::AbstractVector)
-    ν = [_softplus(g) for g in gamma]
-    mesh_values = a.Sigma * ν
-    CubicSpline(mesh_values, a.mesh_points; extrapolation=ExtrapolationType.Extension)
+    mesh_values = gamma_to_mesh_values(a, gamma)
+    # Linear extrapolation also preserves the boundary monotonicity of the
+    # constrained fit, which the boundary cubic could invert just outside
+    # the domain.
+    CubicSpline(mesh_values, a.mesh_points; extrapolation=ExtrapolationType.Linear)
 end
 
 """
     gamma_to_mesh_values(a::ShapeConstrainedSPDEApproximator, gamma)
 
-Transform unconstrained parameters γ to mesh node values β = Σ * softplus(γ).
+Transform unconstrained parameters γ to mesh node values β = Σ * d, where
+`d` passes the free (linear) components through unchanged and applies
+`softplus` to the rest — the same `_apply_constraint_transform` used by the
+B-spline path. (The old softplus-everything version silently destroyed the
+free intercept/slope of `:convex`/`:concave`, degenerating them to
+increasing-convex-positive.)
 """
 function gamma_to_mesh_values(a::ShapeConstrainedSPDEApproximator,
                               gamma::AbstractVector)
-    ν = [_softplus(g) for g in gamma]
-    a.Sigma * ν
+    a.Sigma * _apply_constraint_transform(a.constraint, gamma)
 end
 
 """
@@ -331,13 +415,18 @@ end
 # ─── Shape-constrained B-spline: Sigma matrices and evaluation ────
 
 """Softplus function: log(1 + exp(x)), numerically stable."""
-_softplus(x::Real) = x > 20.0 ? Float64(x) : log1p(exp(x))
+# Type-generic and Dual-safe: for large x, softplus(x) = x + log1p(exp(-x))
+# is exact and avoids the old Float64(x) cast that broke ForwardDiff.
+_softplus(x::Real) = x > 20.0 ? x + log1p(exp(-x)) : log1p(exp(x))
 
 """
     _build_sigma_matrix(constraint, nknots) -> Matrix{Float64}
 
-Build the Σ constraint matrix that maps positive coefficients ν = softplus(γ)
-to knot values β = Σ * ν satisfying the given shape constraint.
+Build the Σ constraint matrix mapping the transformed coefficient vector
+`d = _apply_constraint_transform(constraint, γ)` — free (linear) components
+pass through, the rest are softplus'd nonnegative — to B-spline coefficients
+β = Σ * d satisfying the given shape constraint. Monotone and combined
+constraints carry a free level d₁ = γ₁ per Pya & Wood (2015) Table 1.
 
 For most constraints, Σ is q × q (square). For zero-at-endpoint constraints,
 Σ is q × (q-1) since one knot value is fixed at 0.
@@ -361,46 +450,82 @@ function _build_sigma_matrix(constraint::Symbol, q::Int)
             end
         end
     elseif constraint == :convex
-        # Second differences increasing: β_j = j*ν₁ + Σ_{k=2}^{j} (j-k+1)*νₖ
+        # Convex (NOT necessarily monotone): free intercept β₁ and free
+        # initial slope, with NONNEGATIVE second differences Δ²β_j ≥ 0.
+        # β_i = d₁ + (i-1)·d₂ + Σ_{k=3}^{i} (i-k+1)·d_k, where d₁=γ₁ and
+        # d₂=γ₂ are unconstrained (see `_linear_param_indices`) and
+        # d_k=softplus(γ_k) ≥ 0 for k≥3 are the second differences.
+        # This admits U-shaped (decreasing-then-increasing) functions, which
+        # the previous parameterization (identical to :inc_convex) could not.
         Sig = zeros(q, q)
         for i in 1:q
-            Sig[i, 1] = Float64(i)
+            Sig[i, 1] = 1.0          # intercept (free)
+            Sig[i, 2] = Float64(i - 1)  # linear ramp (free slope)
         end
-        for j in 2:q, i in j:q
-            Sig[i, j] = Float64(i - j + 1)
+        for k in 3:q, i in k:q
+            Sig[i, k] = Float64(i - k + 1)
         end
     elseif constraint == :concave
-        # Second differences decreasing: negate off-diagonal of convex
+        # Concave (NOT necessarily monotone): free intercept and slope with
+        # NONPOSITIVE second differences. Same construction as :convex with
+        # the curvature columns negated; admits ∩-shaped functions.
         Sig = zeros(q, q)
         for i in 1:q
-            Sig[i, 1] = Float64(i)
+            Sig[i, 1] = 1.0
+            Sig[i, 2] = Float64(i - 1)
         end
-        for j in 2:q, i in j:q
-            Sig[i, j] = -Float64(i - j + 1)
+        for k in 3:q, i in k:q
+            Sig[i, k] = -Float64(i - k + 1)
         end
     elseif constraint == :inc_convex
-        # Monotone increasing + convex: cumsum of cumsums
+        # Monotone increasing + convex, Pya & Wood (2015) Table 1: free level
+        # β₁ = γ₁ (first column of ones), increments cumulate the nonnegative
+        # ν's so Δβᵢ = Σ_{k≤i+1} νₖ grows: βᵢ = γ₁ + Σ_{k=2}^{i} (i-k+1)νₖ.
+        # (The old ramp first column forced β ≥ 0 and tied level to slope,
+        # making e.g. f ≈ 5 + 0.01x unrepresentable.)
         Sig = zeros(q, q)
-        for j in 1:q, i in j:q
-            Sig[i, j] = Float64(i - j + 1)
+        for i in 1:q
+            Sig[i, 1] = 1.0
+        end
+        for k in 2:q, i in k:q
+            Sig[i, k] = Float64(i - k + 1)
         end
     elseif constraint == :inc_concave
-        # Monotone increasing + concave
+        # Monotone increasing + concave: free level β₁ = γ₁; increments
+        # δᵢ = Σ_{k≥i+1} νₖ are nonnegative and decreasing:
+        # βᵢ = γ₁ + Σ_{k=2}^{q} min(k-1, i-1)·νₖ.
+        # NOTE: this is Pya & Wood Table 1's matrix with the ν-indices
+        # reversed (they use min(i-1, q-j+1)); the spanned cone is identical
+        # and Σ remains invertible, but the slope-like parameter is ν_q here
+        # rather than ν₂ (see _penalty_skip_indices).
         Sig = zeros(q, q)
-        for j in 1:q, i in 1:q
-            Sig[i, j] = Float64(min(i, q - j + 1))
+        for i in 1:q
+            Sig[i, 1] = 1.0
+        end
+        for k in 2:q, i in 1:q
+            Sig[i, k] = Float64(min(k - 1, i - 1))
         end
     elseif constraint == :dec_convex
-        # Monotone decreasing + convex: negate inc_concave
+        # Monotone decreasing + convex: free level, increments
+        # δᵢ = -Σ_{k≥i+1} νₖ ≤ 0 rising toward 0 (convex).
+        # (The old all-negative Σ forced β ≤ 0 everywhere: a positive
+        # declining rate like 1/x was unrepresentable.)
         Sig = zeros(q, q)
-        for j in 1:q, i in 1:q
-            Sig[i, j] = -Float64(min(i, q - j + 1))
+        for i in 1:q
+            Sig[i, 1] = 1.0
+        end
+        for k in 2:q, i in 1:q
+            Sig[i, k] = -Float64(min(k - 1, i - 1))
         end
     elseif constraint == :dec_concave
-        # Monotone decreasing + concave: negate inc_convex
+        # Monotone decreasing + concave: free level, increasingly negative
+        # increments: βᵢ = γ₁ - Σ_{k=2}^{i} (i-k+1)νₖ.
         Sig = zeros(q, q)
-        for j in 1:q, i in j:q
-            Sig[i, j] = -Float64(i - j + 1)
+        for i in 1:q
+            Sig[i, 1] = 1.0
+        end
+        for k in 2:q, i in k:q
+            Sig[i, k] = -Float64(i - k + 1)
         end
     elseif constraint == :positive
         # Identity: β_j = softplus(γ_j) directly — all knot values positive
@@ -452,15 +577,42 @@ function _build_sigma_matrix(constraint::Symbol, q::Int)
 end
 
 """
+    _linear_param_indices(constraint) -> Tuple
+
+Indices of the γ components that enter the reparameterization *linearly*
+(unconstrained), as opposed to through `softplus` (nonnegative). For most
+constraints this is empty (every component is nonnegative). For `:convex`
+and `:concave` the first two components are the free intercept and slope,
+so only the remaining components (the second differences) are nonnegative.
+"""
+_linear_param_indices(constraint::Symbol) =
+    constraint in (:convex, :concave)               ? (1, 2) :
+    constraint in (:increasing, :decreasing,
+                   :inc_convex, :inc_concave,
+                   :dec_convex, :dec_concave)       ? (1,)   : ()
+
+"""
+    _apply_constraint_transform(constraint, gamma) -> Vector
+
+Map γ to the nonnegative/linear coefficient vector `d` that `Σ` multiplies:
+`d[i] = γ[i]` for the linear indices, `softplus(γ[i])` otherwise.
+"""
+function _apply_constraint_transform(constraint::Symbol, gamma::AbstractVector)
+    lin = _linear_param_indices(constraint)
+    [i in lin ? gamma[i] : _softplus(gamma[i]) for i in eachindex(gamma)]
+end
+
+"""
     gamma_to_knot_values(a::ShapeConstrainedBSplineApproximator, gamma)
 
-Transform unconstrained parameters γ to B-spline coefficients β = Σ * softplus(γ).
+Transform unconstrained parameters γ to B-spline coefficients β = Σ * d,
+where `d` applies `softplus` to the nonnegative components and the identity
+to the free (linear) components — see [`_apply_constraint_transform`](@ref).
 These are de Boor control point values, not interpolation knot values.
 """
 function gamma_to_knot_values(a::ShapeConstrainedBSplineApproximator,
                               gamma::AbstractVector)
-    ν = [_softplus(g) for g in gamma]
-    a.Sigma * ν
+    a.Sigma * _apply_constraint_transform(a.constraint, gamma)
 end
 
 """
@@ -475,25 +627,28 @@ This is the standard Cox-de Boor recursion for B-splines of given `order`
 function _bspline_basis_vector(x::Real, knots::AbstractVector, order::Int)
     nk = length(knots)
     n_basis = nk - order
+    # Buffers take the evaluation point's type so ForwardDiff Duals propagate
+    # (stiff ODE solvers with autodiff Jacobians evaluate splines at Dual x).
+    T = float(typeof(x))
 
     # Order 1: piecewise constant
-    b = zeros(nk - 1)
+    b = zeros(T, nk - 1)
     for j in 1:(nk - 1)
         if j == nk - 1
-            b[j] = (knots[j] <= x <= knots[j + 1]) ? 1.0 : 0.0
+            b[j] = (knots[j] <= x <= knots[j + 1]) ? one(T) : zero(T)
         else
-            b[j] = (knots[j] <= x < knots[j + 1]) ? 1.0 : 0.0
+            b[j] = (knots[j] <= x < knots[j + 1]) ? one(T) : zero(T)
         end
     end
 
     # Recursion for higher orders
     for p in 2:order
-        b_new = zeros(nk - p)
+        b_new = zeros(T, nk - p)
         for j in 1:(nk - p)
             d1 = knots[j + p - 1] - knots[j]
             d2 = knots[j + p] - knots[j + 1]
-            t1 = d1 > 0 ? (x - knots[j]) / d1 * b[j] : 0.0
-            t2 = d2 > 0 ? (knots[j + p] - x) / d2 * b[j + 1] : 0.0
+            t1 = d1 > 0 ? (x - knots[j]) / d1 * b[j] : zero(T)
+            t2 = d2 > 0 ? (knots[j + p] - x) / d2 * b[j + 1] : zero(T)
             b_new[j] = t1 + t2
         end
         b = b_new
@@ -533,10 +688,12 @@ Build a callable evaluator from unconstrained parameters γ using proper
 B-spline basis evaluation.
 
 Uses the SCOP-spline approach (Pya & Wood 2015): the constrained coefficients
-β = Σ * softplus(γ) are B-spline basis coefficients, and the function is
-evaluated as f(x) = Σⱼ βⱼ Bⱼ(x). The convex hull property of B-splines
-guarantees that shape constraints (monotonicity, convexity, positivity)
-hold everywhere on the domain, not just at knot points.
+β = Σ · _apply_constraint_transform(γ) are B-spline basis coefficients, and
+the function is evaluated as f(x) = Σⱼ βⱼ Bⱼ(x). The convex hull property of
+B-splines guarantees that shape constraints (monotonicity, convexity,
+positivity) hold everywhere on the domain, not just at knot points. For
+zero-at-endpoint constraints the spline is centered by subtracting its
+boundary value, pinning f(endpoint) = 0 exactly.
 """
 function build_constrained_bspline_evaluator(a::ShapeConstrainedBSplineApproximator,
                                              gamma::AbstractVector)
@@ -562,35 +719,66 @@ function build_constrained_bspline_evaluator(a::ShapeConstrainedBSplineApproxima
     f_ll = dot(B_ll, beta)
     f_ul = dot(B_ul, beta)
 
-    # Return a callable that evaluates the B-spline at any point
+    # Zero-at-endpoint constraints: zeroing one B-spline COEFFICIENT does not
+    # zero the function VALUE at the boundary (three basis functions are
+    # active there, weights 1/6, 4/6, 1/6). Center the spline by subtracting
+    # its boundary value — a constant shift that is linear in β, preserves
+    # monotonicity/curvature exactly, and pins f(endpoint) = 0.
+    offset = if a.constraint in (:inc_zero_left, :dec_zero_left)
+        f_ll
+    elseif a.constraint in (:inc_zero_right, :dec_zero_right)
+        f_ul
+    else
+        zero(f_ll)
+    end
+
+    # Return a callable that evaluates the (centered) B-spline at any point
     function evaluator(x::Real)
         if x < ll
             # Linear extrapolation below domain
-            return f_ll + slope_lo * (x - ll)
+            return f_ll - offset + slope_lo * (x - ll)
         elseif x > ul
             # Linear extrapolation above domain
-            return f_ul + slope_hi * (x - ul)
+            return f_ul - offset + slope_hi * (x - ul)
         else
             B = _bspline_basis_vector(x, xk, spline_order)
-            return dot(B, beta)
+            return dot(B, beta) - offset
         end
     end
     return evaluator
 end
 
 """
-    penalty_matrix(a::ShapeConstrainedBSplineApproximator)
+    _penalty_skip_indices(constraint, np) -> Tuple
 
-First-order difference penalty on unconstrained parameters (size np × np).
-This penalizes roughness while the Sigma reparameterization enforces shape.
+Indices excluded from the first-difference penalty chain, following
+Pya & Wood (2015). The free level (γ₁) is always excluded; constraints
+involving curvature also exclude their slope-like parameter, so the λ→∞
+limit is an arbitrary member of the constraint's polynomial null family
+(free level + free slope + constant curvature) rather than a family with
+slope tied to curvature. For the reversed parameterizations
+(`:inc_concave`/`:dec_convex`, where increments cumulate from the right)
+the slope-like parameter is the LAST component, not the second.
 """
+_penalty_skip_indices(constraint::Symbol, np::Int) =
+    constraint in (:convex, :concave, :inc_convex, :dec_concave) ? (1, 2)  :
+    constraint in (:inc_concave, :dec_convex)                    ? (1, np) :
+    constraint in (:increasing, :decreasing)                     ? (1,)    : ()
+
 function penalty_matrix(a::ShapeConstrainedBSplineApproximator)
     np = nparams(a)
-    # First-order difference penalty: D'D where D is (np-1) × np
-    D = zeros(np - 1, np)
-    for i in 1:(np - 1)
-        D[i, i]   = -1.0
-        D[i, i+1] =  1.0
+    # First-order difference penalty over the curvature-carrying components
+    # only, per Pya & Wood (2015): their D starts the differences from β̃₂
+    # for monotone smooths and from β̃₃ for curvature-constrained smooths.
+    # Free level/slope components live in the penalty null space — shrinking
+    # them with λ would bias the function's level, not its wiggliness.
+    skip = _penalty_skip_indices(a.constraint, np)
+    idxs = [i for i in 1:np if !(i in skip)]
+    n_c = length(idxs)
+    D = zeros(max(n_c - 1, 0), np)
+    for r in 1:(n_c - 1)
+        D[r, idxs[r]]   = -1.0
+        D[r, idxs[r+1]] =  1.0
     end
     D' * D
 end
@@ -600,26 +788,42 @@ end
 # COMONet: shape-constrained neural network evaluator
 # ═══════════════════════════════════════════════════════════════════════
 #
-# COMONet guarantees shape constraints architecturally:
-#   - Monotone increasing: all weights W > 0 (via exp(W̃)) + non-decreasing activation
-#   - Convex: positive weights + ReLU (convex, non-decreasing) composition
-#   - Concave: negate the convex network: f(x) = -g(x) where g is convex
-#   - Decreasing: negate input: f(x) = g(-x) where g is increasing
+# COMONet guarantees shape constraints architecturally. The architecture
+# is chosen PER CONSTRAINT CLASS so that each advertised constraint is the
+# network's actual function class (positive weights composed with a convex
+# nondecreasing activation are always convex — so a ReLU network cannot be
+# "monotone but not convex", and a single positive-weight branch cannot be
+# "convex but not monotone"):
+#   - Pure monotone (:increasing/:decreasing): exp(W̃)/fanin weights + tanh
+#     hidden units. tanh is nondecreasing but saturating (neither convex
+#     nor concave), so the class is all monotone shapes — including
+#     sigmoids and Holling type-II/III responses.
+#   - Curvature-and-monotone (:inc_convex, :inc_concave, :dec_convex,
+#     :dec_concave): positive weights + ReLU/softplus (or their negated
+#     concave forms); decreasing variants negate the input.
+#   - Curvature only (:convex/:concave): two-branch input-convex form
+#     g₁(x) + g₂(−x) with both branches positive-weight convex-increasing
+#     nets — the sum is convex and may be non-monotone (U-shapes);
+#     :concave negates the sum.
+#   - :positive: an UNCONSTRAINED tanh MLP with exp output — positivity
+#     comes from exp alone, so humps are representable.
 #
-# Parameters are stored unconstrained (W̃, b); at evaluation time we apply
-# exp(W̃) to get positive weights.
+# Positive weights are exp(W̃)/fanin: the fan-in scaling makes W̃ = 0 a
+# unit-gain network, so the L2 penalty on W̃ shrinks toward a tame function
+# (raw exp(W̃) weights ≈ 1 amplify the signal by ∏ layer widths, and
+# penalizing W̃ → 0 pushed toward that amplifier — backwards for smoothing).
 
 """
-    _comonet_unpack(a::COMONetApproximator, theta)
+    _comonet_unpack_single(hidden_sizes, theta)
 
-Unpack flat parameter vector into (weights, biases) pairs per layer.
-Returns vector of (W_matrix, b_vector) tuples.
+Unpack a flat parameter vector into (weights, biases) pairs per layer for
+one network (input 1 → hidden_sizes… → 1).
 """
-function _comonet_unpack(a::COMONetApproximator, theta::AbstractVector{T}) where T
+function _comonet_unpack_single(hidden_sizes, theta::AbstractVector{T}) where T
     layers = Tuple{Matrix{T}, Vector{T}}[]
     idx = 1
     prev = 1  # input dimension
-    for h in a.hidden_sizes
+    for h in hidden_sizes
         n_w = prev * h
         W = reshape(theta[idx:idx+n_w-1], h, prev)
         idx += n_w
@@ -638,69 +842,98 @@ function _comonet_unpack(a::COMONetApproximator, theta::AbstractVector{T}) where
 end
 
 """
-    _comonet_forward(layers, x_norm, constraint, activation)
+    _comonet_unpack(a::COMONetApproximator, theta)
 
-Forward pass through COMONet. `x_norm` is normalized to [0,1].
-All hidden layers use exp(W̃) for positive weights + activation function.
-Output layer uses exp(W̃) + identity (no activation).
-
-Activations:
-- `:relu`: ReLU / min(0,·) — piecewise linear (C⁰), exact theoretical match
-- `:softplus`: softplus / -softplus(-·) — smooth (C∞), same guarantees
-
-Constraint-specific input/output transforms:
-- `:decreasing` / `:dec_*`: negate input
-- `:concave` / `:inc_concave` / `:dec_concave`: concave-branch activation
-- `:positive`: apply exp to output
+Unpack the parameter vector: one network for most constraints, a pair of
+branch networks (θ split in half) for the two-branch `:convex`/`:concave`.
 """
-function _comonet_forward(layers, x_norm, constraint::Symbol, activation::Symbol=:relu)
-    # Input transform for decreasing constraints
-    x = if constraint in (:decreasing, :dec_convex, :dec_concave)
-        -x_norm
-    else
-        x_norm
+function _comonet_unpack(a::COMONetApproximator, theta::AbstractVector)
+    if a.constraint in (:convex, :concave)
+        nh = length(theta) ÷ 2
+        return (_comonet_unpack_single(a.hidden_sizes, theta[1:nh]),
+                _comonet_unpack_single(a.hidden_sizes, theta[nh+1:end]))
     end
+    _comonet_unpack_single(a.hidden_sizes, theta)
+end
 
-    # Use concave-branch activation?
-    use_concave = constraint in (:concave, :inc_concave, :dec_concave)
-
-    # Forward pass through hidden layers — use promote_type for ForwardDiff compatibility
+"""
+Positive-weight branch: exp(W̃)/fanin weights, ReLU/softplus (or negated
+concave) hidden activations, linear output. Convex-nondecreasing (or
+concave-nondecreasing) by construction.
+"""
+function _comonet_branch(layers, x, use_concave::Bool, activation::Symbol)
     h = [x]
     n_layers = length(layers)
     for (i, (W_tilde, b)) in enumerate(layers)
-        W_pos = exp.(W_tilde)  # guaranteed positive weights
+        W_pos = exp.(W_tilde) ./ size(W_tilde, 2)   # positive, fan-in scaled
         z = W_pos * h .+ b
         if i < n_layers
-            # Hidden layer activation
             if activation == :softplus
-                if use_concave
-                    # -softplus(-z): smooth, concave, non-decreasing, ≤ 0
-                    h = [-_softplus(-zi) for zi in z]
-                else
-                    # softplus(z): smooth, convex, non-decreasing, ≥ 0
-                    h = [_softplus(zi) for zi in z]
-                end
+                h = use_concave ? [-_softplus(-zi) for zi in z] :
+                                  [_softplus(zi) for zi in z]
             else  # :relu (default)
-                if use_concave
-                    h = [-max(zero(eltype(z)), -zi) for zi in z]
-                else
-                    h = [max(zero(eltype(z)), zi) for zi in z]
-                end
+                h = use_concave ? [-max(zero(eltype(z)), -zi) for zi in z] :
+                                  [max(zero(eltype(z)), zi) for zi in z]
             end
         else
-            # Output layer: linear (no activation)
-            h = z
+            h = z   # linear output
         end
     end
+    h[1]
+end
 
-    out = h[1]  # scalar output
-
-    # Output transform
-    if constraint == :positive
-        return exp(out)
-    else
-        return out
+"""
+Positive-weight monotone net: exp(W̃)/fanin weights with tanh hidden units.
+Monotone nondecreasing (positive weights + nondecreasing activation) but
+NOT constrained in curvature — tanh saturates, so sigmoids and other
+monotone-nonconvex shapes are representable.
+"""
+function _comonet_monotone(layers, x)
+    h = [x]
+    n_layers = length(layers)
+    for (i, (W_tilde, b)) in enumerate(layers)
+        W_pos = exp.(W_tilde) ./ size(W_tilde, 2)
+        z = W_pos * h .+ b
+        h = i < n_layers ? [tanh(zi) for zi in z] : z
     end
+    h[1]
+end
+
+"""
+Unconstrained tanh MLP (raw weights): used inside `exp(·)` for `:positive`,
+where positivity comes from the output transform alone.
+"""
+function _comonet_raw_mlp(layers, x)
+    h = [x]
+    n_layers = length(layers)
+    for (i, (W, b)) in enumerate(layers)
+        z = W * h .+ b
+        h = i < n_layers ? [tanh(zi) for zi in z] : z
+    end
+    h[1]
+end
+
+function _comonet_forward(layers, x_norm, constraint::Symbol, activation::Symbol=:relu)
+    if constraint in (:convex, :concave)
+        # Two-branch input-convex construction: g₁(x) + g₂(−x), both convex
+        # nondecreasing ⇒ sum convex, possibly non-monotone (U-shapes).
+        l1, l2 = layers
+        s = _comonet_branch(l1, x_norm, false, activation) +
+            _comonet_branch(l2, -x_norm, false, activation)
+        return constraint == :convex ? s : -s
+    elseif constraint == :positive
+        return exp(_comonet_raw_mlp(layers, x_norm))
+    end
+
+    # Input transform for decreasing constraints
+    x = constraint in (:decreasing, :dec_convex, :dec_concave) ? -x_norm : x_norm
+
+    if constraint in (:increasing, :decreasing)
+        return _comonet_monotone(layers, x)
+    end
+
+    use_concave = constraint in (:inc_concave, :dec_concave)
+    _comonet_branch(layers, x, use_concave, activation)
 end
 
 """

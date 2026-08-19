@@ -1,346 +1,374 @@
-# ─── RKHS solver (Reproducing Kernel Hilbert Space) ────────────────
+# ─── RKHS solver (trajectory in a reproducing kernel Hilbert space) ─
 #
-# Represents the unknown function as f(x) = Σᵢ αᵢ K(x, xᵢ) where K is
-# a kernel and xᵢ are representative points.  Solves a penalised
-# least-squares problem with RKHS norm penalty ‖f‖²_H = α' K α.
+# González et al. (2014): the state trajectory is placed in a
+# time-kernel RKHS, x_k(t) = m_k + Σᵢ b_{k,i} k(t, tᵢ), so its
+# derivative ẋ_k(t) = Σᵢ b_{k,i} k̇(t, tᵢ) is available analytically.
+# Estimation alternates a joint LINEAR Gauss–Newton solve for all
+# states' trajectory coefficients B (data fit + RKHS norm + ODE-gradient
+# term with f linearized around the previous trajectory) with gradient
+# steps on the unknown-function parameters θ.
 #
-# The approach is kernel ridge regression embedded in an ODE fitting loop:
-#   Stage 1 — Smooth states with cubic splines → ŷ(t), dŷ/dt
-#   Stage 2 — Fit kernel weights α by gradient-matching + RKHS penalty
-#
-# Reference: Gonzalez et al. (2014), Pattern Recognition Letters
+# Reference: González et al. (2014), Pattern Recognition Letters —
+#            "Reproducing kernel Hilbert space based estimation of
+#             systems of ordinary differential equations"
 #            Schölkopf & Smola (2002), Learning with Kernels
 
-using LinearAlgebra: dot, norm, Symmetric
+using LinearAlgebra: dot, norm, Symmetric, cholesky, I
 
 """
     solve(prob::PSMProblem, alg::RKHSSolver)
 
-Fit a partially specified model using an RKHS representation for the
-unknown functions.
+Fit a partially specified model with the state trajectory represented in
+a time-kernel RKHS (González et al. 2014).
 
-Instead of B-spline basis expansions, represents each unknown function
-as a weighted sum of kernel evaluations at representative points:
-f(x) = Σᵢ αᵢ K(x, xᵢ).  The RKHS norm ‖f‖² = α'Kα serves as the
-smoothing penalty (analogous to β'Sβ for splines).
+Each state is expanded over the data times, `x_k(t) = m_k + Σᵢ b_{k,i}
+k(t, tᵢ)`, giving the analytic derivative `ẋ_k(t) = Σᵢ b_{k,i} k̇(t, tᵢ)`.
+The objective
 
-# Algorithm
-1. Smooth observed data with cubic splines.
-2. Place n_repr_points representative points across each UF's domain.
-3. Build kernel matrix K and derivative-matching loss.
-4. Optimise kernel weights α using Adam with RKHS penalty.
+    J(B, θ) = Σ_k [ ‖y_k − x_k(t_data)‖² + λ b_kᵀ K b_k ]
+              + ρ Σ_k Σ_g (ẋ_k(t_g) − f_k(x(t_g), θ))² + θᵀSθ
+
+(data fit + RKHS norm + ODE-gradient match on a collocation grid +
+approximator smoothing penalty) is minimized by alternating:
+
+1. **B-step** — one Gauss–Newton step on ALL states' coefficients
+   jointly: `f` is linearized around the previous trajectory using the
+   grid Jacobian `∂f/∂x`, making every equation's mismatch linear in
+   every state's coefficients, and the joint normal equations (size
+   `n_times · n_vars`) are solved directly. The Jacobian coupling is what
+   identifies unobserved states.
+2. **θ-step** — Adam on the ODE-gradient mismatch with the trajectory
+   fixed.
+
+Unobserved states have no data term (`w_k = 0`) and are identified
+through the ODE term alone. All approximator types are supported.
 
 # Returns
-`PSMSolution` with kernel-based unknown function evaluators.
+`PSMSolution`: `params` are the approximator coefficients θ, the fitted
+values are the RKHS trajectory at the data times.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
-    _validate_problem(prob, "RKHSSolver")
+    _validate_problem(prob, "RKHSSolver"; require_continuous=true)
     verbose = alg.verbose
 
     times = Float64.(prob.data_times)
     n_times = length(times)
-    n_vars = length(prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)
+    u0_vec = Float64.(prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)
+    n_vars = length(u0_vec)
     n_obs = size(prob.data_values, 2)
-
-    # ── Stage 1: Smooth data ─────────────────────────────────────
-    if verbose; println("RKHSSolver Stage 1: Smoothing data..."); end
-
-    y_smooth = zeros(n_times, n_vars)
-    dydt = zeros(n_times, n_vars)
-    observed_states = Set{Int}()
-
-    if prob.discrete
-        for j in 1:n_obs
-            sk = prob.obs_to_state[j]
-            push!(observed_states, sk)
-            itp = CubicSpline(prob.data_values[:, j], times;
-                              extrapolation=ExtrapolationType.Extension)
-            for i in 1:n_times
-                y_smooth[i, sk] = itp(times[i])
-            end
-        end
-        for k in 1:n_vars
-            for i in 1:(n_times - 1)
-                dydt[i, k] = y_smooth[i + 1, k]
-            end
-            dydt[n_times, k] = y_smooth[n_times, k]
-        end
-    else
-        for j in 1:n_obs
-            sk = prob.obs_to_state[j]
-            push!(observed_states, sk)
-            itp = CubicSpline(prob.data_values[:, j], times;
-                              extrapolation=ExtrapolationType.Extension)
-            for i in 1:n_times
-                y_smooth[i, sk] = itp(times[i])
-                dydt[i, sk] = DataInterpolations.derivative(itp, times[i])
-            end
-        end
+    obs_of_state = Dict{Int, Vector{Int}}()
+    for j in 1:n_obs
+        push!(get!(obs_of_state, prob.obs_to_state[j], Int[]), j)
     end
 
-    for k in 1:n_vars
-        if k ∉ observed_states
-            u0_k = Float64(prob.u0 isa Function ? prob.u0(prob.known_params)[k] :
-                           prob.u0[k])
-            y_smooth[:, k] .= u0_k
-        end
-    end
-
-    n_match = prob.discrete ? n_times - 1 : n_times
-
-    # ── Stage 2: Build kernel representations ────────────────────
-    if verbose; println("RKHSSolver Stage 2: Building kernel representations..."); end
-
-    # Kernel function — auto-scale lengthscale from domain if ≤ 0
+    # ── Time kernel and its derivative ∂k/∂t₁ ────────────────────────
     ℓ = alg.lengthscale
     if ℓ <= 0.0
-        # Compute domain span from first approximator with a domain
-        domain_span = 1.0
-        for approx in prob.approximators
-            if approx isa BSplineApproximator
-                domain_span = approx.domain[2] - approx.domain[1]
-                break
-            elseif approx isa GPApproximator
-                domain_span = maximum(approx.inducing_points) - minimum(approx.inducing_points)
-                break
-            elseif approx isa SPDEApproximator
-                domain_span = maximum(approx.mesh_points) - minimum(approx.mesh_points)
-                break
-            end
-        end
-        ℓ = domain_span / 3.0   # ~3 effective kernel widths across domain
-        if verbose; println("  Auto lengthscale: ℓ=$(round(ℓ, sigdigits=3)) (domain span=$(round(domain_span, sigdigits=3)))"); end
+        ℓ = (times[end] - times[1]) / 8.0
+        if verbose; println("RKHSSolver: auto time-kernel lengthscale ℓ=$(round(ℓ, sigdigits=3))"); end
     end
-    kernel_fn = if alg.kernel == :rbf
-        (x1, x2) -> exp(-0.5 * (x1 - x2)^2 / ℓ^2)
+    kernel_fn, dkernel_fn = if alg.kernel == :rbf
+        ((t1, t2) -> exp(-0.5 * (t1 - t2)^2 / ℓ^2),
+         (t1, t2) -> -(t1 - t2) / ℓ^2 * exp(-0.5 * (t1 - t2)^2 / ℓ^2))
     elseif alg.kernel == :matern32
-        (x1, x2) -> begin
-            r = abs(x1 - x2) / ℓ
-            (1 + sqrt(3) * r) * exp(-sqrt(3) * r)
-        end
+        ((t1, t2) -> begin
+             r = abs(t1 - t2) / ℓ
+             (1 + sqrt(3) * r) * exp(-sqrt(3) * r)
+         end,
+         (t1, t2) -> -3 * (t1 - t2) / ℓ^2 * exp(-sqrt(3) * abs(t1 - t2) / ℓ))
     elseif alg.kernel == :matern52
-        (x1, x2) -> begin
-            r = abs(x1 - x2) / ℓ
-            (1 + sqrt(5) * r + 5/3 * r^2) * exp(-sqrt(5) * r)
-        end
+        ((t1, t2) -> begin
+             r = abs(t1 - t2) / ℓ
+             (1 + sqrt(5) * r + 5/3 * r^2) * exp(-sqrt(5) * r)
+         end,
+         (t1, t2) -> begin
+             r = abs(t1 - t2) / ℓ
+             -5/3 * (t1 - t2) / ℓ^2 * (1 + sqrt(5) * r) * exp(-sqrt(5) * r)
+         end)
     else
         error("Unknown kernel: $(alg.kernel). Use :rbf, :matern32, or :matern52.")
     end
 
-    # For each approximator, build representative points and kernel matrix
-    n_repr = alg.n_repr_points
-    repr_info = []
+    # Expansion centers = data times; ODE collocation grid across the data
+    # window (n_repr_points controls its resolution).
+    centers = times
+    m = n_times
+    n_g = max(alg.n_repr_points, 2)
+    t_grid = collect(range(times[1], times[end], length=n_g))
 
-    total_alpha = 0
-    for approx in prob.approximators
-        if approx isa BSplineApproximator || approx isa GPApproximator ||
-           approx isa SPDEApproximator
-            domain = if approx isa BSplineApproximator
-                approx.domain
-            elseif approx isa GPApproximator
-                (minimum(approx.inducing_points), maximum(approx.inducing_points))
-            else
-                (minimum(approx.mesh_points), maximum(approx.mesh_points))
-            end
-            x_repr = collect(range(domain[1], domain[2], length=n_repr))
-            K_repr = Matrix{Float64}(undef, n_repr, n_repr)
-            for i in 1:n_repr, j in 1:n_repr
-                K_repr[i, j] = kernel_fn(x_repr[i], x_repr[j])
-            end
-            K_repr .+= 1e-6 * Matrix{Float64}(I, n_repr, n_repr)  # jitter
-            push!(repr_info, (name=approx.name, x_repr=x_repr, K_repr=K_repr,
-                              domain=domain, n_alpha=n_repr))
-            total_alpha += n_repr
+    K_cc = [kernel_fn(centers[i], centers[j]) for i in 1:m, j in 1:m]
+    Φd = K_cc                                     # kernel at data times × centers
+    Φg = [kernel_fn(t_grid[i], centers[j]) for i in 1:n_g, j in 1:m]
+    dΦg = [dkernel_fn(t_grid[i], centers[j]) for i in 1:n_g, j in 1:m]
+
+    λ = alg.lambda_rkhs
+    ρ = alg.lambda_ode
+    A_data = Φd' * Φd
+    # 1e-8 jitter regularizes the solves; full_objective tracks the exact
+    # λ bᵀKb, so tracked J and minimized J differ by a negligible 1e-8‖b‖².
+    A_pen = Symmetric(K_cc + 1e-8 * I)
+    # The ODE weight is ramped in over the first fifth of the iterations:
+    # starting data-dominant prevents the Picard alternation from locking
+    # onto the degenerate flat-trajectory fixed point before the coupling
+    # between observed and unobserved states has taken hold.
+    n_ramp = max(1, alg.maxiters ÷ 5)
+
+    # ── Centers m_k and initial trajectory (kernel ridge on the data) ──
+    m_center = zeros(n_vars)
+    B = zeros(m, n_vars)                          # trajectory coefficients
+    for k in 1:n_vars
+        if haskey(obs_of_state, k)
+            m_center[k] = mean(prob.data_values[:, obs_of_state[k]])  # pooled over replicate columns
+            y_k = prob.data_values[:, obs_of_state[k][1]]
+            B[:, k] = Symmetric(A_data + λ * A_pen) \ (Φd' * (y_k .- m_center[k]))
         else
-            # For neural/other approximators, fall back to nparams
-            np = nparams(approx)
-            push!(repr_info, (name=approx.name, x_repr=nothing, K_repr=nothing,
-                              domain=nothing, n_alpha=np, approx=approx))
-            total_alpha += np
+            m_center[k] = u0_vec[k]               # flat at IC; ODE term moves it
         end
     end
 
-    # Initialise kernel weights from approximator initial values
-    alpha = zeros(total_alpha)
-    off = 0
-    for (ri, info) in enumerate(repr_info)
-        np = info.n_alpha
-        if info.K_repr !== nothing
-            # Use the approximator's initial_params to get target values
-            approx = prob.approximators[ri]
-            ip = initial_params(approx)
-            init_val = sum(ip) / length(ip)  # mean initial value
-            f_target = fill(init_val, np)
-            alpha[off+1:off+np] = info.K_repr \ f_target
+    # ── Initialise unknown-function parameters θ ─────────────────────
+    beta = Float64[]
+    for approx in prob.approximators
+        if approx isa NeuralApproximator
+            spec = mlp_spec_from_lux(approx.model)
+            rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) :
+                  Random.default_rng()
+            append!(beta, init_mlp_params(spec, rng))
+        else
+            append!(beta, initial_params(approx))
         end
-        off += np
     end
-    n_alpha = total_alpha
+    n_beta = length(beta)
 
     if verbose
-        println("  $n_alpha kernel weights, $(alg.maxiters) iterations, λ=$(alg.lambda_rkhs)")
+        println("RKHSSolver: $m centers/state × $n_vars states, $n_beta θ, " *
+                "grid $n_g, λ=$λ ρ=$ρ")
     end
 
-    lambda_rkhs = alg.lambda_rkhs
+    # Trajectory and derivative on the collocation grid for given B
+    X_g(Bmat) = (Φg * Bmat) .+ m_center'
+    dX_g(Bmat) = dΦg * Bmat
 
-    # Kernel evaluator: given weights α and repr points, evaluate at x
-    function kernel_evaluate(x, x_repr, alpha_k)
-        val = 0.0
-        for i in eachindex(x_repr)
-            val += alpha_k[i] * kernel_fn(x, x_repr[i])
-        end
-        val
-    end
-
-    # Only include observed states in gradient-matching loss
-    obs_states = sort(unique(prob.obs_to_state))
-
-    # ── Loss function ────────────────────────────────────────────
-    function rkhs_loss(α_eval)
-        T_el = eltype(α_eval)
-
-        # Build callable unknown functions from kernel weights
-        uf_entries = Pair{Symbol, Any}[]
-        off = 0
-        for (ri, info) in enumerate(repr_info)
-            np = info.n_alpha
-            ak = α_eval[off+1:off+np]
-            off += np
-
-            if info.x_repr !== nothing
-                let xr = info.x_repr, a = ak
-                    push!(uf_entries, info.name => (x -> begin
-                        val = zero(T_el)
-                        for i in eachindex(xr)
-                            val += a[i] * kernel_fn(x, xr[i])
-                        end
-                        val
-                    end))
-                end
-            end
-        end
-
-        p = merge(NamedTuple(uf_entries), prob.known_params)
+    # RHS of the ODE at the grid, along the given trajectory
+    function rhs_on_grid(Xg, β_eval)
+        T_el = eltype(β_eval)
+        p = build_autodiff_param_struct(prob, β_eval)
         du = zeros(T_el, n_vars)
-        loss = zero(T_el)
-
-        for i in 1:n_match
-            u = T_el.(y_smooth[i, :])
+        F = Matrix{T_el}(undef, n_g, n_vars)
+        for i in 1:n_g
+            u = Vector{T_el}(@view Xg[i, :])
             try
-                prob.dynamics!(du, u, p, times[i])
+                prob.dynamics!(du, u, p, t_grid[i])
             catch
                 du .= T_el(1e6)
             end
-            for k in obs_states
-                loss += (dydt[i, k] - du[k])^2
+            F[i, :] .= du
+        end
+        F
+    end
+
+    # θ objective: ODE mismatch on the grid + smoothing penalty
+    function theta_loss(β_eval, Xg, dXg, ρ_use=ρ)
+        T_el = eltype(β_eval)
+        F = rhs_on_grid(Xg, β_eval)
+        loss = zero(T_el)
+        for k in 1:n_vars
+            for i in 1:n_g
+                loss += ρ_use * (dXg[i, k] - F[i, k])^2
             end
         end
-
-        # RKHS norm penalty: α' K α for each kernel UF
-        off = 0
-        for info in repr_info
-            np = info.n_alpha
-            ak = α_eval[off+1:off+np]
-            off += np
-            if info.K_repr !== nothing
-                loss += lambda_rkhs * dot(ak, info.K_repr * ak)
-            end
+        offset = 0
+        for approx in prob.approximators
+            np = nparams(approx)
+            pk = @view β_eval[offset+1:offset+np]
+            offset += np
+            S = penalty_matrix(approx)
+            S !== nothing && (loss += dot(pk, S * pk))
         end
-
         loss
     end
 
-    # ── Adam optimisation ────────────────────────────────────────
+    # Full objective J(B, θ) for convergence tracking
+    function full_objective(Bmat, β_eval)
+        J = 0.0
+        for k in 1:n_vars
+            if haskey(obs_of_state, k)
+                xk = Φd * Bmat[:, k] .+ m_center[k]
+                for j in obs_of_state[k]
+                    J += sum(abs2, prob.data_values[:, j] .- xk)
+                end
+            end
+            J += λ * dot(Bmat[:, k], K_cc * Bmat[:, k])
+        end
+        J + theta_loss(β_eval, X_g(Bmat), dX_g(Bmat))
+    end
+
+    # ── Alternating optimisation ─────────────────────────────────────
+    n_inner = 10                                  # θ Adam steps per outer iter
     lr = alg.lr
     β1_adam, β2_adam, eps_adam = 0.9, 0.999, 1e-8
-    m_adam = zeros(n_alpha)
-    v_adam = zeros(n_alpha)
-    best_alpha = copy(alpha)
-    best_loss = Inf
-    loss_window = fill(Inf, 30)
+    m_adam = zeros(n_beta); v_adam = zeros(n_beta)
+    adam_t = 0
+    result = DiffResults.MutableDiffResult(0.0, (zeros(n_beta),))
+
+    # Grid Jacobians G[i,:,:] = ∂f/∂x at the current trajectory, needed so
+    # the B-step sees every equation's dependence on every state (without
+    # them, a state entering only OTHER equations' right-hand sides — e.g.
+    # an unobserved velocity in x1' = x2 — would never be pulled by the
+    # ODE terms and the alternation locks onto a degenerate trajectory).
+    function grid_jacobians(Xg, p_now)
+        G = Array{Float64, 3}(undef, n_g, n_vars, n_vars)
+        du_buf = zeros(n_vars)
+        for i in 1:n_g
+            u_i = Vector{Float64}(@view Xg[i, :])
+            Ji = try
+                ForwardDiff.jacobian((du, u) -> prob.dynamics!(du, u, p_now, t_grid[i]),
+                                     du_buf, u_i)
+            catch
+                zeros(n_vars, n_vars)
+            end
+            G[i, :, :] = Ji
+        end
+        G
+    end
+
+    J_prev = Inf
     final_iter = alg.maxiters
-
+    converged = false
+    n_B = m * n_vars
     for iter in 1:alg.maxiters
-        result = DiffResults.MutableDiffResult(0.0, (zeros(n_alpha),))
-        ForwardDiff.gradient!(result, rkhs_loss, alpha)
-        loss_val = DiffResults.value(result)
-        grad = DiffResults.gradient(result)
-
-        if loss_val < best_loss
-            best_loss = loss_val
-            best_alpha .= alpha
-        end
-        loss_window[mod1(iter, 30)] = loss_val
-
-        lr_t = lr * 0.5 * (1 + cos(π * iter / alg.maxiters))
-
-        m_adam .= β1_adam .* m_adam .+ (1 - β1_adam) .* grad
-        v_adam .= β2_adam .* v_adam .+ (1 - β2_adam) .* grad.^2
-        m_hat = m_adam ./ (1 - β1_adam^iter)
-        v_hat = v_adam ./ (1 - β2_adam^iter)
-        alpha .-= lr_t .* m_hat ./ (sqrt.(v_hat) .+ eps_adam)
-
-        if verbose && (iter <= 5 || iter % 50 == 0 || iter == alg.maxiters)
-            println("  iter $iter: loss=$(round(loss_val, sigdigits=5)) " *
-                    "lr=$(round(lr_t, sigdigits=3))")
-        end
-
-        if iter > 60
-            recent_min = minimum(loss_window)
-            recent_max = maximum(loss_window)
-            if (recent_max - recent_min) / max(abs(recent_min), 1.0) < 1e-6
-                if verbose; println("  Converged at iter $iter"); end
-                final_iter = iter
-                break
+        ρ_eff = ρ * min(1.0, iter / n_ramp)^2
+        # B-step: one Gauss–Newton step on the trajectory coefficients.
+        # Linearize f around the previous trajectory,
+        #   f_k(x) ≈ F_prev_k + Σⱼ G_kj ∘ (Φg bⱼ − Φg bⱼ_prev),
+        # so each equation's mismatch ẋ_k − f_k is linear in ALL states'
+        # coefficients, and solve the joint normal equations (size m·n_vars).
+        Xg_prev = X_g(B)
+        p_float = build_autodiff_param_struct(prob, beta)
+        F_prev = rhs_on_grid(Xg_prev, beta)
+        G = grid_jacobians(Xg_prev, p_float)
+        H = zeros(n_B, n_B)
+        rhs = zeros(n_B)
+        blk(j) = ((j-1)*m + 1):(j*m)
+        for j in 1:n_vars
+            w_j = haskey(obs_of_state, j) ? Float64(length(obs_of_state[j])) : 0.0
+            H[blk(j), blk(j)] .+= w_j .* A_data .+ λ .* A_pen
+            if w_j > 0
+                for jc in obs_of_state[j]
+                    rhs[blk(j)] .+= Φd' * (prob.data_values[:, jc] .- m_center[j])
+                end
             end
         end
+        for k in 1:n_vars
+            # c_k: linearization constant of eq k
+            c_k = copy(F_prev[:, k])
+            for j in 1:n_vars
+                c_k .-= G[:, k, j] .* (Φg * B[:, j])
+            end
+            Ms = Vector{Matrix{Float64}}(undef, n_vars)
+            for j in 1:n_vars
+                Mkj = -(G[:, k, j] .* Φg)
+                j == k && (Mkj .+= dΦg)
+                Ms[j] = Mkj
+            end
+            for j1 in 1:n_vars, j2 in 1:n_vars
+                H[blk(j1), blk(j2)] .+= ρ_eff .* (Ms[j1]' * Ms[j2])
+            end
+            for j in 1:n_vars
+                rhs[blk(j)] .+= ρ_eff .* (Ms[j]' * c_k)
+            end
+        end
+        B_new = reshape(Symmetric(H + 1e-10 * I) \ rhs, m, n_vars)
+        B .= 0.5 .* B .+ 0.5 .* B_new      # damped step for stability
+
+        # θ-step: Adam on the ODE mismatch with the trajectory fixed
+        Xg_now = X_g(B); dXg_now = dX_g(B)
+        loss_fixed = β -> theta_loss(β, Xg_now, dXg_now, ρ_eff)
+        for _ in 1:n_inner
+            adam_t += 1
+            ForwardDiff.gradient!(result, loss_fixed, beta)
+            grad = DiffResults.gradient(result)
+            m_adam .= β1_adam .* m_adam .+ (1 - β1_adam) .* grad
+            v_adam .= β2_adam .* v_adam .+ (1 - β2_adam) .* grad .^ 2
+            m_hat = m_adam ./ (1 - β1_adam^adam_t)
+            v_hat = v_adam ./ (1 - β2_adam^adam_t)
+            beta .-= lr .* m_hat ./ (sqrt.(v_hat) .+ eps_adam)
+        end
+
+        J = full_objective(B, beta)
+        if verbose && (iter <= 3 || iter % 25 == 0)
+            println("  iter $iter: J=$(round(J, sigdigits=6))")
+        end
+        if iter > n_ramp &&
+           isfinite(J_prev) && abs(J_prev - J) / max(abs(J_prev), 1e-12) < 1e-9
+            converged = true
+            final_iter = iter
+            if verbose; println("  Converged at iter $iter"); end
+            break
+        end
+        J_prev = J
     end
-    alpha .= best_alpha
+    J_final = full_objective(B, beta)
 
-    if verbose; println("  Best loss: $(round(best_loss, sigdigits=5))"); end
-
-    # ── Build solution ───────────────────────────────────────────
+    # ── Build solution ───────────────────────────────────────────────
     pred = zeros(n_times, n_obs)
     for j in 1:n_obs
         sk = prob.obs_to_state[j]
-        pred[:, j] .= y_smooth[:, sk]
+        pred[:, j] = Φd * B[:, sk] .+ m_center[sk]
     end
-
     data_loss = sum(abs2, prob.data_values .- pred)
 
     uf_evals = Dict{Symbol, Any}()
-    off = 0
-    for info in repr_info
-        np = info.n_alpha
-        ak = alpha[off+1:off+np]
-        off += np
-        if info.x_repr !== nothing
-            let xr = copy(info.x_repr), a = copy(ak), kf = kernel_fn
-                uf_evals[info.name] = x -> begin
-                    val = 0.0
-                    for i in eachindex(xr)
-                        val += a[i] * kf(Float64(x isa AbstractArray ? x[1] : x), xr[i])
+    offset = 0
+    for approx in prob.approximators
+        np = nparams(approx)
+        params_k = beta[offset+1:offset+np]
+        offset += np
+        if approx isa BSplineApproximator
+            knots_x = collect(range(approx.domain[1], approx.domain[2],
+                                    length=approx.nknots))
+            uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
+        elseif approx isa NeuralApproximator
+            spec = mlp_spec_from_lux(approx.model)
+            lo = approx.domain === nothing ? nothing : approx.domain[1]
+            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
+            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
+                uf_evals[approx.name] = x -> begin
+                    xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
+                        (Float64(x isa AbstractArray ? x[1] : x) - lo_) / span_
+                    else
+                        Float64(x isa AbstractArray ? x[1] : x)
                     end
-                    val
+                    mlp_evaluate(s, pk, xn)
                 end
             end
+        elseif approx isa GPApproximator
+            uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
+        elseif approx isa ShapeConstrainedBSplineApproximator
+            uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
+        elseif approx isa COMONetApproximator
+            uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
+        elseif approx isa SPDEApproximator
+            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
+        elseif approx isa ShapeConstrainedSPDEApproximator
+            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
         end
     end
 
     ca_entries = Pair{Symbol, Any}[]
-    off = 0
-    for info in repr_info
-        np = info.n_alpha
-        push!(ca_entries, info.name => alpha[off+1:off+np])
-        off += np
+    offset = 0
+    for approx in prob.approximators
+        np = nparams(approx)
+        push!(ca_entries, approx.name => beta[offset+1:offset+np])
+        offset += np
     end
     params = ComponentArray(NamedTuple(ca_entries))
 
-    edf = Float64(n_alpha)
+    edf = Float64(n_beta)   # number of θ parameters (trajectory dof excluded)
 
-    PSMSolution(params, best_loss, data_loss, edf, Float64[lambda_rkhs],
+    PSMSolution(params, J_final, data_loss, edf, Float64[λ, ρ],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (converged=true, iterations=final_iter, method=:rkhs,
+                (converged=converged, iterations=final_iter, method=:rkhs,
                  kernel=alg.kernel, lengthscale=ℓ))
 end

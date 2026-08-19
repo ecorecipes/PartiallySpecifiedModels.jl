@@ -22,7 +22,13 @@ function _normcdf(x::Real)
                t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
         1.0 - _normpdf(x) * poly
     else
-        1.0 - _normcdf(-x)
+        # Compute the small tail DIRECTLY: 1 − Φ(−x) cancels catastrophically
+        # below x ≈ −7.5 (Φ underflows against 1), which inflated the
+        # TruncatedNormal information ~300× in the far tail.
+        t = 1.0 / (1.0 - 0.2316419 * x)
+        poly = t * (0.319381530 + t * (-0.356563782 +
+               t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+        _normpdf(x) * poly
     end
 end
 
@@ -36,12 +42,38 @@ function _normlogcdf(x::Real)
     end
 end
 
+# ─── log Γ (Lanczos; avoids a SpecialFunctions dependency) ──────────
+
+"""Log-gamma via the Lanczos approximation (g=7), accurate to ~1e-13 for x>0."""
+function _loggamma(x::Real)
+    g = 7.0
+    c = (0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+         771.32342877765313, -176.61502916214059, 12.507343278686905,
+         -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7)
+    if x < 0.5
+        return log(π / abs(sin(π * x))) - _loggamma(1 - x)
+    end
+    x -= 1
+    a = c[1]
+    t = x + g + 0.5
+    for i in 2:9
+        a += c[i] / (x + (i - 1))
+    end
+    0.5 * log(2π) + (x + 0.5) * log(t) - t + log(a)
+end
+
 # ─── Log-likelihood functions ───────────────────────────────────────
 
 """
     log_likelihood(fam, y, mu, w)
 
 Total weighted log-likelihood: Σ_i w_i ℓ(y_i, μ_i).
+
+Poisson, NegativeBinomial, and TruncatedNormal include their full
+normalizing constants and are mutually comparable (e.g. for AIC). The
+**Gaussian** value is the kernel −½Σw(y−μ)² only — σ² is profiled out
+elsewhere, so the −(n/2)log(2πσ²) term is omitted and Gaussian values are
+NOT comparable across families.
 """
 function log_likelihood(::Gaussian, y::AbstractVector,
                         mu::AbstractVector, w::AbstractVector)
@@ -57,7 +89,8 @@ function log_likelihood(::Poisson, y::AbstractVector,
     ll = 0.0
     for i in eachindex(y)
         mu_i = max(mu[i], 1e-10)
-        ll += w[i] * (y[i] > 0 ? y[i] * log(mu_i) - mu_i : -mu_i)
+        kern = y[i] > 0 ? y[i] * log(mu_i) - mu_i : -mu_i
+        ll += w[i] * (kern - _loggamma(y[i] + 1))   # − log(y!)
     end
     ll
 end
@@ -65,10 +98,13 @@ end
 function log_likelihood(fam::NegativeBinomial, y::AbstractVector,
                         mu::AbstractVector, w::AbstractVector)
     θ = fam.theta
+    lgθ = _loggamma(θ)
     ll = 0.0
     for i in eachindex(y)
         mu_i = max(mu[i], 1e-10)
-        ll += w[i] * (y[i] * log(mu_i / (mu_i + θ)) + θ * log(θ / (mu_i + θ)))
+        kern = y[i] * log(mu_i / (mu_i + θ)) + θ * log(θ / (mu_i + θ))
+        norm = _loggamma(y[i] + θ) - lgθ - _loggamma(y[i] + 1)
+        ll += w[i] * (kern + norm)
     end
     ll
 end
@@ -136,10 +172,12 @@ end
 
 function irls_weights(fam::TruncatedNormal, y::AbstractVector,
                       mu::AbstractVector, w::AbstractVector)
-    # For TruncatedNormal(a, σ), the Fisher information is:
-    #   I(μ) = (1/σ²)(1 + ξ·λ(ξ) - λ(ξ)²)
-    # where ξ = (μ-a)/σ, λ(ξ) = φ(ξ)/Φ(ξ) (inverse Mills ratio).
-    # Working weight: W̃ = w × I(μ) = w × (-∂²ℓ/∂μ²)
+    # For TruncatedNormal(a, σ), the observed (= Fisher) information is:
+    #   I(μ) = (1/σ²)(1 - ξ·λ(ξ) - λ(ξ)²)
+    # where ξ = (μ-a)/σ, λ(ξ) = φ(ξ)/Φ(ξ) (inverse Mills ratio), from
+    # -∂²ℓ/∂μ² = (1 + λ'(ξ))/σ² with λ'(ξ) = -ξλ - λ².
+    # Analytically I(μ) ∈ (0, 1/σ²); the floor guards roundoff at ξ ≪ 0.
+    # Working weight: W̃ = w × I(μ)
     σ = fam.sigma
     a = fam.lower
     wt = similar(w)
@@ -147,7 +185,7 @@ function irls_weights(fam::TruncatedNormal, y::AbstractVector,
         ξ = (mu[i] - a) / σ
         Φξ = max(_normcdf(ξ), 1e-15)
         λξ = _normpdf(ξ) / Φξ          # inverse Mills ratio
-        info = (1.0 + ξ * λξ - λξ^2) / σ^2
+        info = (1.0 - ξ * λξ - λξ^2) / σ^2
         wt[i] = w[i] * max(info, 1e-10)
     end
     wt
@@ -168,90 +206,3 @@ function irls_weights(fam::CustomLikelihood, y::AbstractVector,
     wt
 end
 
-# ─── IRLS pseudo-data ──────────────────────────────────────────────
-
-"""
-    irls_pseudodata(fam, y, mu, w)
-
-Compute IRLS working response z̃_i for each observation.
-For Gaussian (identity link): z̃ = y.
-For log-link families: z̃ = log(μ) + (y - μ)/μ.
-"""
-function irls_pseudodata(::Gaussian, y::AbstractVector,
-                         mu::AbstractVector, w::AbstractVector)
-    copy(y)
-end
-
-function irls_pseudodata(::Poisson, y::AbstractVector,
-                         mu::AbstractVector, w::AbstractVector)
-    z = similar(y)
-    for i in eachindex(y)
-        mu_i = max(mu[i], 1e-10)
-        z[i] = log(mu_i) + (y[i] - mu_i) / mu_i
-    end
-    z
-end
-
-# ─── Observation-loglik helpers for solver backends ─────────────────
-
-"""
-    observation_loglikelihood(fam, y, mu, w; sigma2=nothing)
-
-Evaluate the weighted observation log-likelihood for matrix-valued predictions.
-For `Gaussian`, callers must provide the observation variance `sigma2`.
-"""
-function observation_loglikelihood(fam::AbstractLikelihood,
-                                   y::AbstractMatrix,
-                                   mu::AbstractMatrix,
-                                   w::AbstractMatrix;
-                                   sigma2=nothing)
-    log_likelihood(fam, vec(y), vec(mu), vec(w))
-end
-
-function observation_loglikelihood(::Gaussian,
-                                   y::AbstractMatrix,
-                                   mu::AbstractMatrix,
-                                   w::AbstractMatrix;
-                                   sigma2)
-    sigma2 === nothing && throw(ArgumentError("Gaussian likelihood requires sigma2"))
-    T = promote_type(eltype(y), eltype(mu), eltype(w), typeof(sigma2))
-    ll = zero(T)
-    log_norm = -T(0.5) * log(T(2π) * T(sigma2))
-    for j in axes(y, 2), i in axes(y, 1)
-        ll += T(w[i, j]) * (log_norm - T(0.5) * (mu[i, j] - y[i, j])^2 / T(sigma2))
-    end
-    ll
-end
-
-function irls_pseudodata(fam::NegativeBinomial, y::AbstractVector,
-                         mu::AbstractVector, w::AbstractVector)
-    z = similar(y)
-    for i in eachindex(y)
-        mu_i = max(mu[i], 1e-10)
-        z[i] = log(mu_i) + (y[i] - mu_i) / mu_i
-    end
-    z
-end
-
-function irls_pseudodata(fam::TruncatedNormal, y::AbstractVector,
-                         mu::AbstractVector, w::AbstractVector)
-    # Identity link: z = y (same as Gaussian)
-    copy(y)
-end
-
-function irls_pseudodata(fam::CustomLikelihood, y::AbstractVector,
-                         mu::AbstractVector, w::AbstractVector)
-    # Numerical: z_i = η_i + (y_i - μ_i) / (∂μ/∂η)
-    # For identity link, this reduces to y
-    z = similar(y)
-    for i in eachindex(y)
-        yi = y[i]
-        dl = ForwardDiff.derivative(μ -> fam.loglik_scalar(yi, μ), mu[i])
-        neg_d2l = -ForwardDiff.derivative(
-            μ -> ForwardDiff.derivative(μ2 -> fam.loglik_scalar(yi, μ2), μ),
-            mu[i]
-        )
-        z[i] = mu[i] + dl / max(neg_d2l, 1e-10)
-    end
-    z
-end

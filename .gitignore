@@ -12,3 +12,4 @@ vignettes/*_files/
 *.jl.mem
 Manifest.toml
 proofs/
+.claude/worktrees/

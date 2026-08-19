@@ -1,6 +1,6 @@
 # Two-Stage Smooth-Then-Differentiate
 Simon Frost
-2026-04-02
+2026-06-12
 
 - [Note](#note)
 

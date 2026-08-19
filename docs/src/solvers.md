@@ -1,6 +1,6 @@
 # Solvers
 
-PartiallySpecifiedModels.jl provides 17 solvers for fitting partially specified models. Solvers are passed as the second argument to `solve`:
+PartiallySpecifiedModels.jl provides 22 solvers for fitting partially specified models. Solvers are passed as the second argument to `solve`:
 
 ```@example solvers
 using PartiallySpecifiedModels # hide
@@ -59,7 +59,7 @@ GradientMatching
 
 ### TwoStageSolver
 
-The simplest gradient matching approach: smooth the data with splines, differentiate, then regress the unknown functions on the derivatives. A useful baseline for comparison.
+The simplest gradient matching approach (Varah 1982): smooth the data with splines, differentiate, then regress the unknown functions on the derivatives. A useful baseline for comparison.
 
 ```@docs
 TwoStageSolver
@@ -67,7 +67,7 @@ TwoStageSolver
 
 ### AdaptiveGradientMatching
 
-GP-based gradient matching using a **product-of-experts** formulation. Iteratively refines the GP fit and the parameter estimates. More robust than simple gradient matching.
+GP-based gradient matching using the **product-of-experts** formulation of Dondelinger et al. (2013). Default mode is a fast MAP fit; with `n_samples > 0` it runs the paper's tempered **population MCMC**, jointly sampling latent states, parameters, and mismatch variances across a temperature ladder with exchange moves, returning cold-chain posterior draws in `convergence.beta_samples`.
 
 ```@docs
 AdaptiveGradientMatching
@@ -75,7 +75,7 @@ AdaptiveGradientMatching
 
 ### BNGSolver
 
-**Bayesian Neural Gradient matching**. Uses neural networks for gradient matching with Bayesian regularization. Fast and suitable for complex dynamics.
+**Ensemble Bayesian gradient matching** (Bonnaffé & Coulson 2023). Smooth-then-match under a variance-marginalized log-posterior, repeated over `k_obs` residual-bootstrap resamples × `k_proc` restarts; unknown functions are posterior-weighted ensemble means with pointwise uncertainty in `convergence.ensemble_std`. Fast (no ODE integration) and suitable for complex dynamics.
 
 ```@docs
 BNGSolver
@@ -111,7 +111,7 @@ DerivativeFreeSolver
 
 ### RodeoSolver
 
-**Probabilistic ODE solver** based on Kalman filtering/smoothing. Provides uncertainty estimates from the numerical integration itself, not just from parameter uncertainty.
+**Probabilistic ODE solver** based on Kalman filtering/smoothing (Wu & Lysy 2024; the `:fenrir` likelihood variant follows Tronarp et al. 2022). Provides uncertainty estimates from the numerical integration itself, not just from parameter uncertainty.
 
 ```@docs
 RodeoSolver
@@ -145,7 +145,7 @@ MagiSolver
 
 ### PseudoMarginalSolver
 
-Combines **probabilistic ODE solving** with Bayesian MCMC via pseudo-marginal methods. The ODE solver uncertainty is marginalized out, providing fully Bayesian inference that accounts for numerical error.
+**Pseudo-marginal MCMC** (Andrieu & Roberts 2009): a Metropolis-Hastings sampler that targets the exact posterior using an unbiased likelihood estimate, here computed with a probabilistic ODE solver so that numerical integration error is accounted for.
 
 ```@docs
 PseudoMarginalSolver
@@ -167,6 +167,48 @@ VariationalSolver
 ABCSolver
 ```
 
+## Additional Solvers
+
+### IntegralMatchingSolver
+
+**Integral matching** (Dattner & Klaassen 2015): integrates both sides of the ODE and matches smoothed trajectory increments against the cumulative integral of the right-hand side. Integration-free and more noise-robust than derivative matching.
+
+```@docs
+IntegralMatchingSolver
+```
+
+### ProfileLikelihoodSolver
+
+nuisance coefficients are re-optimised at each grid point by a long Nelder–Mead run under the penalized objective at the fitted smoothing parameters (Gaussian likelihoods only; CI endpoints are interpolated between grid points)
+
+```@docs
+ProfileLikelihoodSolver
+```
+
+### EnsembleKalmanSolver
+
+**Ensemble Kalman Inversion** (Iglesias et al. 2013): propagates an ensemble of parameter particles through the forward model and updates them with the Kalman gain. Derivative-free batch estimation.
+
+```@docs
+EnsembleKalmanSolver
+```
+
+### ODINSolver
+
+**ODE-informed regression** (ODIN; Wenk et al. 2020): GP hyperparameters are estimated per state by marginal likelihood, then states and unknown-function parameters are optimised *jointly* under a Mahalanobis risk that weights the ODE mismatch by the GP's conditional derivative covariance. Supports partially observed systems (unobserved states are identified through the ODE terms).
+
+```@docs
+ODINSolver
+```
+
+### RKHSSolver
+
+**Trajectory-RKHS estimation** (González et al. 2014): the state trajectory is represented in a time-kernel RKHS so its derivative is analytic, and fitting alternates a linear Gauss–Newton solve for the trajectory coefficients (data + RKHS norm + linearized ODE-gradient term) with gradient steps on the unknown-function parameters. Supports partially observed systems; no ODE integration.
+
+```@docs
+RKHSSolver
+```
+
 ## Choosing a Solver
 
 | Use case | Recommended solver |
@@ -182,3 +224,8 @@ ABCSolver
 | Fast approximate Bayesian | [`VariationalSolver`](@ref) |
 | Intractable likelihood | [`ABCSolver`](@ref) |
 | Probabilistic numerics | [`RodeoSolver`](@ref) or [`DaltonSolver`](@ref) |
+| Noisy data, integration-free | [`IntegralMatchingSolver`](@ref) |
+| Identifiability analysis | [`ProfileLikelihoodSolver`](@ref) |
+| Derivative-free batch estimation | [`EnsembleKalmanSolver`](@ref) |
+| GP-weighted gradient matching | [`ODINSolver`](@ref) |
+| Trajectory-in-RKHS gradient matching | [`RKHSSolver`](@ref) |

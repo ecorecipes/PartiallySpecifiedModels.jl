@@ -1,6 +1,6 @@
 # Copepod Stage-Structured Population Model
 Simon Frost
-2026-04-02
+2026-06-12
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -168,10 +168,10 @@ prob = PSMProblem(copepod!, compute_u0, (0.0, 90.0),
 
     PSMProblem{typeof(copepod!), typeof(compute_u0), Gaussian, BS3{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(copepod!, compute_u0, (0.0, 90.0), BSplineApproximator[BSplineApproximator(:R, (0.0, 90.0), 15, var"#2#3"()), BSplineApproximator(:mu_j, (0.0, 90.0), 15, var"#5#6"()), BSplineApproximator(:mu_a, (0.0, 90.0), 15, var"#8#9"())], [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0], [2853.9353 0.0 … 6893.1885 7983.0894; 10981.5 5793.3442 … 0.0 1473.7781; … ; 0.0 0.0 … 5107.6265 0.0; 1660.5525 15433.848 … 12018.808 0.0], [1.0 1.0 … 1.0 1.0; 1.0 1.0 … 1.0 1.0; … ; 1.0 1.0 … 1.0 1.0; 1.0 1.0 … 1.0 1.0], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], NamedTuple(), Gaussian(), BS3{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(:maxiters => 10000, :reltol => 1.0e-6, :abstol => 1.0e-6), false, Float64[], nothing)
 
-    Data loss (SS):  1.7816e+09
-    Penalized obj:   1.0261e+09
-    EDF:             20.51
-    Smoothing λ:     [357.2, 1.1e6, 944100.0]
+    Data loss (SS):  1.7882e+09
+    Penalized obj:   1.0352e+09
+    EDF:             20.18
+    Smoothing λ:     [395.8, 1.224e6, 1.062e6]
 
 ## Results
 
@@ -257,7 +257,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](04_copepod_files/figure-commonmark/cell-12-output-1.svg)
 
-    Durbin-Watson: 1.978, 1.876, 1.134, 1.957, 1.548, 2.681, 1.922, 2.385, 1.567, 1.097, 1.943
+    Durbin-Watson: 1.983, 1.895, 1.086, 1.97, 1.548, 2.684, 1.92, 2.383, 1.567, 1.101, 1.944
 
 ## Discussion
 

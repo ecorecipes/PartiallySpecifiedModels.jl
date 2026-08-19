@@ -8,7 +8,7 @@
 # Key advantage: no ODE integration in the optimization loop, making it
 # far more robust for neural network approximators.
 #
-# Reference: Bonnaffé, Sheldon & Bhatt (2023), Methods in Ecology and Evolution
+# Reference: Bonnaffé & Coulson (2023), Methods in Ecology and Evolution
 
 using LinearAlgebra
 using Statistics
@@ -16,11 +16,69 @@ using Statistics
 # ─── Step 1: Data smoothing ──────────────────────────────────────
 
 """
-Smooth observed data using cubic splines and compute time derivatives.
+    _smoothing_spline(t, y) -> (value, derivative)
+
+Fit a penalized cubic regression spline (P-spline: cubic B-spline basis +
+second-order difference penalty) to `(t, y)` with the smoothing parameter
+chosen by Generalized Cross-Validation, and return callables for the fitted
+value and its first derivative.
+
+This is a genuine SMOOTHER (it does not interpolate the noisy data), which
+is what gradient matching requires: differentiating an interpolant amplifies
+observation noise, whereas the penalized fit suppresses it (Wood 2001;
+Varah 1982). Shared by the gradient-matching, two-stage, and BNG solvers.
+"""
+function _smoothing_spline(t::AbstractVector{Float64}, y::AbstractVector{Float64})
+    n = length(t)
+    a, b = minimum(t), maximum(t)
+    if b <= a || n < 4
+        ȳ = sum(y) / max(n, 1)
+        return (x -> ȳ), (x -> 0.0)
+    end
+    q = clamp(n - 2, 4, 15)                     # number of B-spline coefficients
+    knots = _scam_knot_vector((a, b), q)
+    B = zeros(n, q)
+    for i in 1:n
+        B[i, :] = _bspline_basis_vector(t[i], knots, 4)
+    end
+    # Second-order difference penalty D'D.
+    D = zeros(q - 2, q)
+    for i in 1:(q - 2)
+        D[i, i] = 1.0; D[i, i+1] = -2.0; D[i, i+2] = 1.0
+    end
+    P = D' * D
+    BtB = B' * B; Bty = B' * y
+    best_gcv = Inf; β = BtB \ Bty
+    for logλ in range(-6.0, 6.0, length=40)
+        λ = 10.0^logλ
+        F = cholesky(Symmetric(BtB + λ * P + 1e-10 * I), check=false)
+        issuccess(F) || continue
+        βλ = F \ Bty
+        resid = y - B * βλ
+        trH = tr(B * (F \ B'))
+        denom = (n - trH)^2
+        gcv = denom > 1e-8 ? n * sum(abs2, resid) / denom : Inf
+        if gcv < best_gcv
+            best_gcv = gcv; β = βλ
+        end
+    end
+    h = (b - a) * 1e-6
+    value = x -> dot(_bspline_basis_vector(clamp(Float64(x), a, b), knots, 4), β)
+    deriv = x -> begin
+        xc = clamp(Float64(x), a + h, b - h)
+        (dot(_bspline_basis_vector(xc + h, knots, 4), β) -
+         dot(_bspline_basis_vector(xc - h, knots, 4), β)) / (2h)
+    end
+    value, deriv
+end
+
+"""
+Smooth observed data with a penalized (GCV) smoothing spline and compute
+time derivatives — see [`_smoothing_spline`](@ref).
 
 Returns:
 - `y_smooth`: smoothed state values (n_times × K)
-- `dydt`: time derivatives from spline (n_times × K)
+- `dydt`: time derivatives from the smoother (n_times × K)
 """
 function smooth_and_differentiate(times::Vector{Float64},
                                   data::Matrix{Float64},
@@ -33,11 +91,10 @@ function smooth_and_differentiate(times::Vector{Float64},
 
     for j in 1:n_obs
         sk = obs_to_state[j]
-        itp = CubicSpline(data[:, j], times;
-                          extrapolation=ExtrapolationType.Extension)
+        val, der = _smoothing_spline(times, data[:, j])
         for i in 1:T
-            y_smooth[i, sk] = itp(times[i])
-            dydt[i, sk] = DataInterpolations.derivative(itp, times[i])
+            y_smooth[i, sk] = val(times[i])
+            dydt[i, sk] = der(times[i])
         end
     end
 
@@ -152,19 +209,14 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
         # For discrete models, smooth data first (just like continuous) then
         # use smoothed next-state values as matching targets.
         # Without smoothing, noisy data→noisy targets produces poor recovery.
-        y_raw = zeros(T_pts, K)
-        for j in 1:n_obs
-            sk = prob.obs_to_state[j]
-            y_raw[:, sk] .= prob.data_values[:, j]
-        end
-        # Smooth each observed state with a cubic spline
+        # (An interpolating spline evaluated at its own knots returns the raw
+        # data — a no-op; use the genuine penalized GCV smoother.)
         y_smooth = zeros(T_pts, K)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
-            itp = CubicSpline(prob.data_values[:, j], times;
-                              extrapolation=ExtrapolationType.Extension)
+            sval, _ = _smoothing_spline(times, Float64.(prob.data_values[:, j]))
             for i in 1:T_pts
-                y_smooth[i, sk] = itp(times[i])
+                y_smooth[i, sk] = sval(times[i])
             end
         end
         # Target: smoothed next-state value u[t+1] = f(u[t], p, t)
@@ -212,6 +264,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
                 idx = (k - 1) * n_match + i
                 w[idx] = 1.0 / scale_k^2
             end
+        end
+    end
+    # Unobserved states carry fabricated targets (constant state, zero
+    # derivative); including them would push the unknown functions to zero
+    # the RHS along a fictitious trajectory. Zero their weights so both the
+    # loss and the Gauss-Newton residuals ignore them.
+    obs_set = Set(prob.obs_to_state)
+    for k in 1:K
+        k in obs_set && continue
+        for i in 1:n_match
+            w[(k - 1) * n_match + i] = 0.0
         end
     end
 
@@ -310,7 +373,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
                     du .= eltype(β_eval)(1e6)
                 end
                 for k in 1:K
-                    loss_val += (dydt[i, k] - du[k])^2
+                    # w carries the observed-state mask (zeroed for
+                    # unobserved states whose targets are fabricated)
+                    wi = w[(k - 1) * n_match + i]
+                    loss_val += wi * (dydt[i, k] - du[k])^2
                 end
             end
             loss_val
