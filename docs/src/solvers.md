@@ -75,7 +75,7 @@ AdaptiveGradientMatching
 
 ### BNGSolver
 
-**Bayesian Neural Gradient matching**. Uses neural networks for gradient matching with Bayesian regularization. Fast and suitable for complex dynamics.
+**Ensemble Bayesian gradient matching** (Bonnaffé & Coulson 2023). Smooth-then-match under a variance-marginalized log-posterior, repeated over `k_obs` residual-bootstrap resamples × `k_proc` restarts; unknown functions are posterior-weighted ensemble means with pointwise uncertainty in `convergence.ensemble_std`. Fast (no ODE integration) and suitable for complex dynamics.
 
 ```@docs
 BNGSolver
