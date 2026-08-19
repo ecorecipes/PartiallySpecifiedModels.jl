@@ -128,6 +128,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
 
     # Initialize per-term smoothing parameters
     n_smooth = length(smooth_mats)
+    edf_total = NaN
     smooth_lambdas = fill(0.1 / max(obs_var, 1e-6), n_smooth)
 
     # Optimization: maximize loglikelihood w.r.t. beta
@@ -296,14 +297,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
                 for i in 1:n_beta; H_hat[i,i] += 1e-12*maxd; end
                 H_inv = try; inv(cholesky(Symmetric(H_hat))); catch; pinv(H_hat); end
 
-                # EDF for this term
                 idx_k = (off+1):(off+np_k)
-                edf_k = tr(H_inv[idx_k, idx_k] * JWJ[idx_k, idx_k])
-                edf_k = clamp(edf_k, 0.01, np_k - 0.01)
-
-                # Fellner-Schall: λ_new = σ̂² * edf / (β'Sβ)
-                λ_new = σ²_hat * edf_k / bSb
-                smooth_lambdas[k] = clamp(λ_new, exp(RHO_MIN), exp(RHO_MAX))
+                # Fellner–Schall numerator (Wood & Fasiolo 2017):
+                #   rank(S_k) − λ_k·tr(H⁻¹S_k)
+                # (the hat-trace edf_k includes the penalty null space and
+                # biased λ upward — same fix as collocation/laml).
+                r_k = _rank_penalty(S)
+                trHS = tr(H_inv[idx_k, idx_k] * S)
+                fs_num = clamp(r_k - smooth_lambdas[k] * trHS, 0.01, Float64(np_k))
+                smooth_lambdas[k] = clamp(σ²_hat * fs_num / bSb,
+                                          exp(RHO_MIN), exp(RHO_MAX))
+                # Real total EDF at the current λ (reported in the solution)
+                edf_total = clamp(tr(H_inv * JWJ), 1.0, Float64(n_beta))
             end
 
             if verbose
@@ -393,7 +398,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
         end
     end
 
-    edf = Float64(n_beta)
+    # Real EDF when smoothing ran (tr(H⁻¹J'WJ) at the final λ);
+    # the raw parameter count is correct only for the unpenalized case.
+    edf = isnan(edf_total) ? Float64(n_beta) : edf_total
     ca_entries = Pair{Symbol, Any}[]
     offset = 0
     for approx in prob.approximators

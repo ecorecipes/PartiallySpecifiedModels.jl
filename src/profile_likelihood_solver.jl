@@ -105,8 +105,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
     # (correct for any 0 < ci_level < 1, not just the three tabulated ones).
     chi2_threshold = _chisq1_quantile(alg.ci_level)
 
-    # Number of scalar observations (for the Gaussian profile-likelihood ratio).
-    n_obs = length(prob.data_times) * size(prob.data_values, 2)
+    # Effective number of scalar observations: only weight-carrying finite
+    # cells enter both the objective and the σ̂² denominator.
+    n_obs = count(i -> prob.data_weights[i] > 0 && !isnan(prob.data_values[i]),
+                  eachindex(prob.data_values))
 
     profiles = Dict{Int, NamedTuple}()
 
@@ -133,7 +135,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
             pred = simulate(prob, β_full)
             for i in 1:length(prob.data_times)
                 for j in 1:size(prob.data_values, 2)
-                    total_loss += (prob.data_values[i, j] - pred[i, j])^2
+                    w = prob.data_weights[i, j]
+                    y = prob.data_values[i, j]
+                    (w > 0 && !isnan(y)) || continue
+                    total_loss += w * (y - pred[i, j])^2
                 end
             end
         catch e

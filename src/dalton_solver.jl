@@ -262,6 +262,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
     end
 
     n_smooth = length(smooth_mats)
+    edf_total = NaN
     smooth_lambdas = fill(0.1 / max(obs_var, 1e-6), n_smooth)
 
     # ── Objective: negative DALTON log-likelihood + penalty ──
@@ -422,8 +423,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
                 for i in 1:n_beta; H_hat[i,i] += 1e-12*maxd; end
                 H_inv = try; inv(cholesky(Symmetric(H_hat))); catch; pinv(H_hat); end
                 idx_k = (off+1):(off+np_k)
-                edf_k = clamp(tr(H_inv[idx_k, idx_k] * JWJ[idx_k, idx_k]), 0.01, np_k - 0.01)
-                smooth_lambdas[k] = clamp(σ²_hat * edf_k / bSb, exp(RHO_MIN), exp(RHO_MAX))
+                # FS numerator rank(S_k) − λ_k·tr(H⁻¹S_k) (Wood & Fasiolo);
+                # the hat-trace form included the penalty null space.
+                r_k = _rank_penalty(S)
+                trHS = tr(H_inv[idx_k, idx_k] * S)
+                fs_num = clamp(r_k - smooth_lambdas[k] * trHS, 0.01, Float64(np_k))
+                smooth_lambdas[k] = clamp(σ²_hat * fs_num / bSb, exp(RHO_MIN), exp(RHO_MAX))
+                edf_total = clamp(tr(H_inv * JWJ), 1.0, Float64(n_beta))
             end
 
             if verbose; @printf("  FS cycle %d: λ = %s\n", fs_cycle, round.(smooth_lambdas, sigdigits=3)); end
@@ -515,7 +521,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
     end
 
     # Package parameters as ComponentArray
-    edf = Float64(n_beta)
+    edf = isnan(edf_total) ? Float64(n_beta) : edf_total
     ca_entries = Pair{Symbol, Any}[]
     offset = 0
     for approx in prob.approximators
