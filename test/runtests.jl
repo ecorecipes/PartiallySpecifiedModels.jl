@@ -1170,13 +1170,24 @@ using OrdinaryDiffEq
             data_times=t_bng, data_values=reshape(data_bng, :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
             likelihood=PartiallySpecifiedModels.Gaussian())
-        sol_bng = solve(prob_bng, BNGSolver(maxiters=500, verbose=false))
+        sol_bng = solve(prob_bng, BNGSolver(maxiters=500, k_obs=4, k_proc=2,
+                                            rng_seed=7, verbose=false))
 
         @test sol_bng isa PSMSolution
         @test sol_bng.data_loss < 2.0   # noise floor ≈ 0.16 (16 pts × 0.1²)
         @test haskey(sol_bng.unknown_functions, :r)
         r_fitted = sol_bng.unknown_functions[:r]
         @test abs(r_fitted(5.0) - 0.25) < 0.12   # true r(5) = 0.5(1 − 5/10)
+        # Ensemble machinery: K_o × K_p members, posterior weights summing
+        # to 1, and a pointwise uncertainty band
+        @test sol_bng.convergence.n_ensemble == 8
+        @test length(sol_bng.convergence.member_losses) == 8
+        @test sum(sol_bng.convergence.member_weights) ≈ 1.0
+        @test sol_bng.convergence.ensemble_std[:r](5.0) >= 0.0
+        # Reproducibility under rng_seed
+        sol_bng2 = solve(prob_bng, BNGSolver(maxiters=500, k_obs=4, k_proc=2,
+                                             rng_seed=7, verbose=false))
+        @test sol_bng2.unknown_functions[:r](5.0) == r_fitted(5.0)
     end
 
     @testset "DaltonSolver — exponential decay" begin

@@ -3,10 +3,10 @@
 # González et al. (2014): the state trajectory is placed in a
 # time-kernel RKHS, x_k(t) = m_k + Σᵢ b_{k,i} k(t, tᵢ), so its
 # derivative ẋ_k(t) = Σᵢ b_{k,i} k̇(t, tᵢ) is available analytically.
-# Estimation alternates a LINEAR solve for the trajectory coefficients
-# B (data fit + RKHS norm + ODE-gradient term, with f evaluated at the
-# previous iterate — Picard linearization) with gradient steps on the
-# unknown-function parameters θ.
+# Estimation alternates a joint LINEAR Gauss–Newton solve for all
+# states' trajectory coefficients B (data fit + RKHS norm + ODE-gradient
+# term with f linearized around the previous trajectory) with gradient
+# steps on the unknown-function parameters θ.
 #
 # Reference: González et al. (2014), Pattern Recognition Letters —
 #            "Reproducing kernel Hilbert space based estimation of
@@ -31,9 +31,12 @@ The objective
 (data fit + RKHS norm + ODE-gradient match on a collocation grid +
 approximator smoothing penalty) is minimized by alternating:
 
-1. **B-step** — with `f` frozen at the previous trajectory (Picard
-   linearization), each `b_k` solves the linear system
-   `(w_k ΦᵀΦ + λK + ρ Φ̇ᵀΦ̇) b_k = w_k Φᵀ(y_k − m_k) + ρ Φ̇ᵀ f_k`.
+1. **B-step** — one Gauss–Newton step on ALL states' coefficients
+   jointly: `f` is linearized around the previous trajectory using the
+   grid Jacobian `∂f/∂x`, making every equation's mismatch linear in
+   every state's coefficients, and the joint normal equations (size
+   `n_times · n_vars`) are solved directly. The Jacobian coupling is what
+   identifies unobserved states.
 2. **θ-step** — Adam on the ODE-gradient mismatch with the trajectory
    fixed.
 
@@ -101,8 +104,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
     λ = alg.lambda_rkhs
     ρ = alg.lambda_ode
     A_data = Φd' * Φd
+    # 1e-8 jitter regularizes the solves; full_objective tracks the exact
+    # λ bᵀKb, so tracked J and minimized J differ by a negligible 1e-8‖b‖².
     A_pen = Symmetric(K_cc + 1e-8 * I)
-    A_ode = dΦg' * dΦg
     # The ODE weight is ramped in over the first fifth of the iterations:
     # starting data-dominant prevents the Picard alternation from locking
     # onto the degenerate flat-trajectory fixed point before the coupling
@@ -114,8 +118,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
     B = zeros(m, n_vars)                          # trajectory coefficients
     for k in 1:n_vars
         if haskey(obs_of_state, k)
+            m_center[k] = mean(prob.data_values[:, obs_of_state[k]])  # pooled over replicate columns
             y_k = prob.data_values[:, obs_of_state[k][1]]
-            m_center[k] = mean(y_k)
             B[:, k] = Symmetric(A_data + λ * A_pen) \ (Φd' * (y_k .- m_center[k]))
         else
             m_center[k] = u0_vec[k]               # flat at IC; ODE term moves it
@@ -212,7 +216,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
     # them, a state entering only OTHER equations' right-hand sides — e.g.
     # an unobserved velocity in x1' = x2 — would never be pulled by the
     # ODE terms and the alternation locks onto a degenerate trajectory).
-    p_float = build_autodiff_param_struct(prob, beta)
     function grid_jacobians(Xg, p_now)
         G = Array{Float64, 3}(undef, n_g, n_vars, n_vars)
         du_buf = zeros(n_vars)
@@ -256,7 +259,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
                 end
             end
         end
-        Mkj = Matrix{Float64}(undef, n_g, m)
         for k in 1:n_vars
             # c_k: linearization constant of eq k
             c_k = copy(F_prev[:, k])
@@ -267,7 +269,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
             for j in 1:n_vars
                 Mkj = -(G[:, k, j] .* Φg)
                 j == k && (Mkj .+= dΦg)
-                Ms[j] = copy(Mkj)
+                Ms[j] = Mkj
             end
             for j1 in 1:n_vars, j2 in 1:n_vars
                 H[blk(j1), blk(j2)] .+= ρ_eff .* (Ms[j1]' * Ms[j2])
@@ -362,7 +364,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
     end
     params = ComponentArray(NamedTuple(ca_entries))
 
-    edf = Float64(n_beta)
+    edf = Float64(n_beta)   # number of θ parameters (trajectory dof excluded)
 
     PSMSolution(params, J_final, data_loss, edf, Float64[λ, ρ],
                 Float64.(pred), Float64.(prob.data_values),

@@ -21,9 +21,9 @@ The **RKHSSolver** implements the trajectory-RKHS method of González et al. (20
 
 **When to use RKHSSolver:**
 
-- You want a kernel-based alternative to splines with automatic smoothness via the RKHS norm
-- Your unknown function is very smooth (RBF kernel) or has limited differentiability (Matérn kernel)
-- You want a nonparametric approach without explicit knot/basis placement
+- You want gradient matching with an analytic (not numerically estimated) trajectory derivative
+- Your system is partially observed — the Jacobian-coupled trajectory solve infers unobserved states
+- You want to avoid ODE integration entirely
 
 **Comparison with other nonparametric approaches:**
 
@@ -91,7 +91,7 @@ plot!(sol_rm.t, [sol_rm.u[i][2] for i in 1:length(sol_rm.t)],
 
 ### Fit with RKHS (RBF kernel)
 
-The RBF (Gaussian) kernel produces infinitely smooth functions. The **lengthscale** is automatically set from the domain width when not specified (default behaviour).
+The RBF (Gaussian) time kernel produces infinitely smooth trajectories. The **lengthscale** is automatically set to `time_span / 8` when not specified (default behaviour).
 
 ```{julia}
 approx_f = BSplineApproximator(:f, (0.0, 50.0), 8; initial=x -> x / 55.0)
@@ -160,10 +160,10 @@ println("  TwoStage:    $(round(mae_ts, digits=4))")
 
 ## Kernel Comparison
 
-The choice of kernel determines the smoothness properties of the estimated function:
+The time kernel determines the smoothness of the fitted *trajectory* (the unknown function's smoothness is set by its approximator, identical in both fits):
 
-- **RBF (Gaussian) kernel**: $k(x, x') = \exp(-\|x - x'\|^2 / 2\ell^2)$ — infinitely differentiable functions; very smooth estimates
-- **Matérn-5/2 kernel**: $k(x, x') = (1 + \sqrt{5}r/\ell + 5r^2/3\ell^2) \exp(-\sqrt{5}r/\ell)$ — twice-differentiable functions; allows slightly more local variation
+- **RBF (Gaussian) kernel**: $k(t, t') = \exp(-(t - t')^2 / 2\ell^2)$ — infinitely differentiable trajectories
+- **Matérn-5/2 kernel**: $k(t, t') = (1 + \sqrt{5}r/\ell + 5r^2/3\ell^2) \exp(-\sqrt{5}r/\ell)$, $r = |t - t'|$ — twice-differentiable trajectories; allows more local variation
 
 ```{julia}
 plot(H_grid, [sol_rbf.unknown_functions[:f](H) for H in H_grid],

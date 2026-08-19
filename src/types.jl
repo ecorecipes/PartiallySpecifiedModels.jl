@@ -1178,39 +1178,56 @@ MagiSolver(; n_samples::Int=1000, n_warmup::Int=500, n_deriv::Int=3,
 """
     BNGSolver
 
-Gradient-matching solver in the style of Bonnaffé & Coulson (2023)'s
-neural gradient matching.
+Ensemble Bayesian gradient matching (Bonnaffé & Coulson 2023). Avoids
+ODE integration entirely: observed series are smoothed with GCV splines,
+and unknown-function parameters are fit by matching the smoothed
+derivatives under a variance-marginalized log-posterior
+`(n/2)log(1 + SSR/2) + (|β|/2)log(1 + Σ(β/prior_sd)²/2)` (the paper's
+"Bayesian regularisation": observation and prior variances are
+marginalized, not supplied).
 
-Two-step approach that avoids ODE integration entirely:
-1. Smooth observed time series to get interpolated states and derivatives
-2. Fit unknown functions by matching the smoothed derivatives
-
-**Scope**: this is a deterministic point-estimate implementation of the
-smooth-then-match loss. The *Bayesian* machinery of the cited paper —
-K_o × K_p ensembles of repeated fits, variance-marginalized posterior
-regularization, and the per-capita-growth-rate process model — is not
-implemented, so no uncertainty quantification is produced. For a
-Bayesian gradient-matching posterior use `MagiSolver` or `MCMCSolver`;
-for uncertainty on this solver's output use `bootstrap`.
+Uncertainty comes from a `k_obs × k_proc` fit ensemble: `k_obs`
+observation resamples (residual bootstrap of the smoother; the first is
+the original data) times `k_proc` restarts from perturbed
+initialisations. Reported unknown functions are ensemble means;
+`sol.convergence.ensemble_std[name]` gives the pointwise ensemble
+standard deviation.
 
 # Fields
-- `n_basis`: number of spline basis functions for data smoothing (default 20)
-- `maxiters`: maximum optimization iterations for step 2 (default 2000)
-- `lr`: learning rate for Adam optimizer (default 0.01)
-- `lambda_smooth`: smoothing penalty for data interpolation (default 1.0)
+- `k_obs`: observation-ensemble size (default 10)
+- `k_proc`: process fits per observation ensemble (default 3)
+- `prior_sd`: prior scale of the marginalized Gaussian parameter prior
+  (default 10.0)
+- `maxiters`: Adam iterations per ensemble member (default 2000)
+- `lr`: Adam learning rate (default 0.01)
+- `lambda_smooth`: extra smoothing penalty on approximator coefficients
+  (default 1.0)
+- `rng_seed`: seed for the bootstrap and restarts (default `nothing` =
+  non-reproducible)
 - `verbose`: print progress
+
+# References
+- Bonnaffé & Coulson (2023), "Fast fitting of neural ordinary
+  differential equations by Bayesian neural gradient matching to infer
+  ecological interactions from time-series data", Methods Ecol Evol 14
 """
 struct BNGSolver
-    n_basis::Int
+    k_obs::Int
+    k_proc::Int
+    prior_sd::Float64
     maxiters::Int
     lr::Float64
     lambda_smooth::Float64
+    rng_seed::Union{Nothing, Int}
     verbose::Bool
 end
 
-BNGSolver(; n_basis::Int=20, maxiters::Int=2000, lr::Float64=0.01,
-            lambda_smooth::Float64=1.0, verbose::Bool=false) =
-    BNGSolver(n_basis, maxiters, lr, lambda_smooth, verbose)
+BNGSolver(; k_obs::Int=10, k_proc::Int=3, prior_sd::Float64=10.0,
+            maxiters::Int=2000, lr::Float64=0.01,
+            lambda_smooth::Float64=1.0,
+            rng_seed::Union{Nothing, Int}=nothing, verbose::Bool=false) =
+    BNGSolver(k_obs, k_proc, prior_sd, maxiters, lr, lambda_smooth,
+              rng_seed, verbose)
 
 # ─── Dalton solver (Wu & Lysy 2024) ───────────────────────────────
 
