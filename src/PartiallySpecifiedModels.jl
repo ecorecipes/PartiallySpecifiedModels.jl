@@ -71,7 +71,6 @@ include("adaptive_gradient_matching.jl")
 # Probabilistic ODE solver (rodeo)
 include("ibm_prior.jl")
 include("kalman.jl")
-include("interrogation.jl")
 include("probsolve.jl")
 include("rodeo_solver.jl")
 

@@ -179,7 +179,7 @@ function build_gp_evaluator(a::GPApproximator, params::AbstractVector)
     f_lo = raw(lo);  s_lo = (raw(lo + h) - f_lo) / h
     f_hi = raw(hi);  s_hi = (f_hi - raw(hi - h)) / h
     x -> begin
-        xv = Float64(x isa AbstractArray ? x[1] : x)
+        xv = x isa AbstractArray ? x[1] : x   # keep Duals intact
         if xv < lo
             f_lo + s_lo * (xv - lo)
         elseif xv > hi

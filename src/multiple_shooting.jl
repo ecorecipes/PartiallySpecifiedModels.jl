@@ -13,6 +13,7 @@
 # where h(θ, s) = [x⁽ⁱ⁾_f - s_{i+1}] are the shooting gap constraints.
 
 using LinearAlgebra: norm, dot
+using ForwardDiff
 
 # ─── Interval management ─────────────────────────────────────────
 
@@ -96,7 +97,30 @@ Compute the multiple shooting loss:
 Parameters z = [θ; vec(shooting_vars)] where θ are the model parameters
 and shooting_vars are the state values at interior boundaries.
 """
+# Value AND derivative finiteness: Optim's HagerZhang line search asserts
+# isfinite(phi) && isfinite(dphi), and a Dual can carry a finite value with
+# Inf/NaN partials (e.g. squared huge-but-finite states).
+_all_finite(x::Real) = isfinite(x)
+_all_finite(x::ForwardDiff.Dual) =
+    isfinite(ForwardDiff.value(x)) && all(isfinite, ForwardDiff.partials(x))
+
 function ms_loss(prob::PSMProblem, z, n_theta::Int, K::Int,
+                 boundaries::Vector{Float64}, intervals::Vector{Vector{Int}},
+                 lagrange_mult::Matrix{Float64}, rho::Float64)
+    try
+        return _ms_loss_inner(prob, z, n_theta, K, boundaries, intervals,
+                              lagrange_mult, rho)
+    catch e
+        # A blow-up region can throw from inside the spline evaluators
+        # (NaN Dual state reaching DataInterpolations) before the
+        # integrator can abort with a retcode; the exception would
+        # otherwise escape Optim.optimize and kill the whole solve.
+        _is_program_error(e) && rethrow()
+        return eltype(z)(1e10)
+    end
+end
+
+function _ms_loss_inner(prob::PSMProblem, z, n_theta::Int, K::Int,
                  boundaries::Vector{Float64}, intervals::Vector{Vector{Int}},
                  lagrange_mult::Matrix{Float64}, rho::Float64)
     n_intervals = length(intervals)
@@ -127,11 +151,13 @@ function ms_loss(prob::PSMProblem, z, n_theta::Int, K::Int,
         t_lo = boundaries[k]
         t_hi = boundaries[k + 1]
 
-        # Data times in this interval
+        # Data times in this interval. An interval with NO data still
+        # carries its continuity constraint: skipping it entirely removed
+        # those shooting gaps from the training objective while the outer
+        # multiplier update kept measuring them, escalating ρ forever
+        # without effect (common since segments start at tspan[1], which
+        # can precede the first observation by several intervals).
         idx = intervals[k]
-        if isempty(idx)
-            continue
-        end
         local_times = prob.data_times[idx]
 
         if prob.discrete
@@ -152,7 +178,7 @@ function ms_loss(prob::PSMProblem, z, n_theta::Int, K::Int,
                 # Guard map blow-up: a NaN/Inf state would otherwise reach
                 # the spline evaluators (which cannot bracket a NaN knot
                 # position) deep inside the AD-driven line search.
-                all(isfinite, u) || return T(1e10)
+                all(_all_finite, u) || return T(1e10)
                 t_now = all_steps[si + 1]
                 time_states[t_now] = copy(u)
             end
@@ -229,7 +255,8 @@ function ms_loss(prob::PSMProblem, z, n_theta::Int, K::Int,
         end
     end
 
-    data_loss + lagrangian_term + constraint_violation
+    total = data_loss + lagrangian_term + constraint_violation
+    _all_finite(total) ? total : T(1e10)
 end
 
 # ─── Main solver ─────────────────────────────────────────────────
@@ -442,8 +469,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
         ode_prob = ODEProblem(ode_fn, Float64.(u0), prob.tspan, p_opt)
         sol_ode = OrdinaryDiffEq.solve(ode_prob, prob.ode_solver;
                                        saveat=prob.data_times,
-                                       abstol=1e-7, reltol=1e-7,
-                                       maxiters=10000)
+                                       abstol=get(prob.ode_kwargs, :abstol, 1e-7),
+                                       reltol=get(prob.ode_kwargs, :reltol, 1e-7),
+                                       maxiters=get(prob.ode_kwargs, :maxiters, 10000))
+        (sol_ode.retcode == SciMLBase.ReturnCode.Success ||
+         sol_ode.retcode == :Success) && length(sol_ode.u) >= T_pts ||
+            error("final ODE solve at the fitted parameters failed " *
+                  "(retcode $(sol_ode.retcode))")
 
         pred = zeros(T_pts, n_obs)
         for j in 1:n_obs

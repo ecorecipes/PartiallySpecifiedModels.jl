@@ -1353,12 +1353,13 @@ using OrdinaryDiffEq
             data_times=t_abc, data_values=reshape(max.(data_abc, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
             likelihood=PartiallySpecifiedModels.Gaussian())
-        sol_abc = solve(prob_abc, ABCSolver(n_particles=50, n_generations=3, verbose=false))
+        sol_abc = solve(prob_abc, ABCSolver(n_particles=100, n_generations=6, verbose=false))
 
         @test sol_abc isa PSMSolution
         @test isfinite(sol_abc.objective)
         @test haskey(sol_abc.unknown_functions, :f)
-        # box-prior ABC with 3 generations: generous, but nonvacuous
+        # posterior-MEAN point estimate (consistent with sol.parameters);
+        # box-prior ABC is approximate — generous but nonvacuous bound
         @test abs(sol_abc.unknown_functions[:f](3.0) - 1.5) < 0.6
     end
 

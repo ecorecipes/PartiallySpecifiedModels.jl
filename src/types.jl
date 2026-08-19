@@ -169,6 +169,8 @@ function GPApproximator(name::Union{Symbol,String},
     kfunc = _kernel_func(kernel, ℓ, σ²)
 
     # Inducing points uniformly spaced in domain
+    n_inducing >= 2 ||
+        throw(ArgumentError("GPApproximator needs n_inducing ≥ 2 (got $n_inducing)"))
     x_ind = collect(range(d[1], d[2], length=n_inducing))
 
     # Build kernel matrix
@@ -519,8 +521,15 @@ function nparams(a::ShapeConstrainedBSplineApproximator)
 end
 
 function initial_params(a::ShapeConstrainedBSplineApproximator)
-    xs = range(a.domain[1], a.domain[2], length=a.nknots)
-    beta_target = Float64[a.initial_func(x) for x in xs]
+    # Sample the target at the GREVILLE abscissae ξᵢ = mean of the 3
+    # interior knots supporting coefficient i (cubic B-splines): de Boor
+    # coefficients approximate function values at ξᵢ, not at a uniform
+    # domain grid — a uniform grid reproduced even a linear target with
+    # O(slope·spacing) error.
+    xk = _scam_knot_vector(a.domain, a.nknots)
+    xs = [(xk[i+1] + xk[i+2] + xk[i+3]) / 3 for i in 1:a.nknots]
+    beta_target = Float64[a.initial_func(clamp(x, a.domain[1], a.domain[2]))
+                          for x in xs]
     # Solve Σ * d = β_target for the coefficient vector d.
     # For square Σ: direct solve; for rectangular (q × np): least-squares.
     d = a.Sigma \ beta_target
@@ -666,20 +675,32 @@ function initial_params(a::COMONetApproximator)
     # roughly linear network.
     params = 0.1 .* randn(rng, np)
 
-    # For the single-branch concave activations (-relu(-z)), biases must
-    # start negative so pre-activations can be negative (else min(0,z)=0:
-    # dead neurons); the output bias compensates.
-    if a.constraint in (:inc_concave, :dec_concave)
-        idx = 1
+    # Activation-aware bias initialization. ReLU branches only have
+    # gradient where their pre-activation is positive; with b ≈ 0 the
+    # units whose input is negated (x ↦ −x_norm ∈ [−1, 0]) start almost
+    # entirely dead and never recover under gradient descent.
+    _set_hidden_biases! = function (θ, lo_idx, bias_mean)
+        idx = lo_idx
         prev = 1
         for h in a.hidden_sizes
-            n_w = prev * h
-            idx += n_w  # skip weights
-            params[idx:idx+h-1] .= -1.0 .+ 0.1 .* randn(rng, h)
+            idx += prev * h                      # skip weights
+            θ[idx:idx+h-1] .= bias_mean .+ 0.1 .* randn(rng, h)
             idx += h
             prev = h
         end
-        params[end] = 1.0
+        idx + prev                                # start of output bias block
+    end
+    if a.constraint in (:inc_concave, :dec_concave)
+        # -relu(-z) needs z < 0 to be active: negative biases
+        _set_hidden_biases!(params, 1, -1.0)
+        params[end] = 1.0                         # output bias compensates
+    elseif a.constraint == :dec_convex
+        # relu on negated input (z = W(−x)+b ≤ b): positive biases
+        _set_hidden_biases!(params, 1, 1.0)
+    elseif a.constraint in (:convex, :concave)
+        # two-branch g₁(x) + g₂(−x): only the g₂ branch sees negated input
+        nh = length(params) ÷ 2
+        _set_hidden_biases!(params, nh + 1, 1.0)
     end
 
     return params
@@ -914,11 +935,11 @@ AdamSolver(; maxiters::Int=300, lr::Float64=0.01, verbose::Bool=false,
 
 """
     MultipleShootingSolver(; n_intervals=10, maxiters_inner=100, maxiters_outer=20,
-                             lr=0.01, rho_init=1.0, rho_max=1e6, verbose=false)
+                             rho_init=10.0, rho_max=1e6, verbose=false)
 
 Multiple shooting solver for training neural differential equations, following
 Turan & Jäschke (2021). Partitions the time span into intervals with shooting
-variables at boundaries. Uses augmented Lagrangian to enforce continuity.
+variables at boundaries. Uses an augmented Lagrangian (L-BFGS inner subproblems) to enforce continuity.
 
 Advantages over single shooting (AdamSolver):
 - Better initial fits: shooting variables initialized from data
@@ -1231,7 +1252,8 @@ marginal likelihood p(Y|θ), then samples from the posterior p(θ|Y) via NUTS.
 - `obs_var`: observation noise variance (default 0.01)
 - `target_accept`: NUTS target acceptance rate (default 0.8)
 - `prior_scale`: prior standard deviation on parameters (default 1.0)
-- `inner_method`: inner likelihood method `:fenrir` or `:dalton` (default `:fenrir`)
+- `inner_method`: reserved; currently ignored — the likelihood estimator
+  is always the unbiased FFBS Monte-Carlo average (see solve docstring)
 - `verbose`: print progress
 """
 struct PseudoMarginalSolver
@@ -1328,6 +1350,10 @@ TwoStageSolver(; n_basis_smooth::Int=20, lambda_smooth::Float64=1.0,
     DerivativeFreeSolver
 
 Derivative-free optimization solver using NelderMead or particle swarm.
+
+The objective always includes the quadratic roughness penalty Σₖ βₖ'Sₖβₖ
+with unit weight (there is no smoothing-parameter selection here); for
+penalty-free fitting use `AdamSolver(penalty_weight=0)`.
 
 Useful as a robust fallback when gradient-based methods fail (non-smooth
 objectives, stiff dynamics, poor conditioning). Uses simulation-based

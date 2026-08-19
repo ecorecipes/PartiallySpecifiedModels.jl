@@ -32,7 +32,7 @@ the previous uniform-weight mismatch and ad-hoc noise heuristic.
 unknown functions.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
-    _validate_problem(prob, "ODINSolver")
+    _validate_problem(prob, "ODINSolver"; require_continuous=true)
     verbose = alg.verbose
 
     times = Float64.(prob.data_times)

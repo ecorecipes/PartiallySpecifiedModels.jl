@@ -442,7 +442,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
         beta .= beta_new
 
         # Check convergence
-        if iter >= 3 && abs(curr_obj - prev_obj) < 1e-6 * max(abs(prev_obj), 1.0)
+        if iter >= 3 && abs(curr_obj - prev_obj) < alg.tol * max(abs(prev_obj), 1.0)
             if verbose; println("Converged at iter $iter (objective stable)"); end
             break
         end

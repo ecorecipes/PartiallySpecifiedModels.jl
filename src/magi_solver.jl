@@ -253,7 +253,7 @@ NUTS.
 function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     _validate_problem(prob, "MagiSolver"; require_continuous=true)
     verbose = alg.verbose
-    n_vars = length(prob.u0 isa Function ? prob.u0((;)) : prob.u0)
+    n_vars = length(prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)
 
     t0, tf = prob.tspan
     grid_times = collect(range(t0, tf, length=alg.n_gridpoints))
@@ -293,7 +293,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     μ = Vector{Vector{Float64}}(undef, n_vars)
     Xinit = zeros(n_grid, n_vars)
 
-    u0v = Float64.(prob.u0 isa Function ? prob.u0((;)) : prob.u0)
+    u0v = Float64.(prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)
     for d in 1:n_vars
         # observation column mapping to this state, if any
         ocol = findfirst(j -> prob.obs_to_state[j] == d, 1:size(prob.data_values, 2))

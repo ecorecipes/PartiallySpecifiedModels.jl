@@ -35,6 +35,17 @@ function LogDensityProblems.dimension(ld::PSMLogDensity)
 end
 
 function LogDensityProblems.logdensity(ld::PSMLogDensity, theta)
+    try
+        return _psm_logdensity(ld, theta)
+    catch e
+        # A numerical failure inside the user dynamics should reject the
+        # proposal, not abort the whole chain.
+        _is_program_error(e) && rethrow()
+        return eltype(theta)(-1e20)
+    end
+end
+
+function _psm_logdensity(ld::PSMLogDensity, theta)
     prob = ld.prob
     T = eltype(theta)
 
@@ -392,7 +403,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     end
     ca = ComponentArray(NamedTuple(ca_entries))
 
-    sigma_map = estimate_sigma ? exp(map_theta[end]) : alg.obs_sigma
+    # Layout is [β; log σ; log λ...]: with sample_smoothing the LAST entry
+    # is a smoothing parameter, so index log σ by position, not by end.
+    sigma_map = estimate_sigma ? exp(map_theta[n_beta + 1]) : alg.obs_sigma
     smoothing = [sigma_map]
 
     PSMSolution(ca, -logp_values[map_idx], data_loss, Float64(n_beta),

@@ -270,23 +270,33 @@ function adam_loss_mse(prob::PSMProblem, beta, penalty_w::Float64=0.0)
                 loss += prob.data_weights[i, j] * (pred[i, j] - prob.data_values[i, j])^2
             end
         end
-        return loss + adam_penalty(prob, beta, penalty_w)
+        total = loss + adam_penalty(prob, beta, penalty_w)
+        return _all_finite(total) ? total : T(1e10)
     end
 
     u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
     u0_T = T.(u0)
 
     # Dispatch to DDE or ODE solve
-    sol = if !isempty(prob.delays)
-        adam_solve_dde(prob, beta)
-    else
-        ode_fn = ODEFunction{true, SciMLBase.FullSpecialize}((du, u, params, t) -> prob.dynamics!(du, u, params, t))
-        ode_prob = ODEProblem(ode_fn, u0_T, prob.tspan, p)
-        OrdinaryDiffEq.solve(ode_prob, prob.ode_solver;
-                             saveat=prob.data_times,
-                             abstol=get(prob.ode_kwargs, :abstol, 1e-7),
-                             reltol=get(prob.ode_kwargs, :reltol, 1e-7),
-                             maxiters=get(prob.ode_kwargs, :maxiters, 10000))
+    sol = try
+        if !isempty(prob.delays)
+            adam_solve_dde(prob, beta)
+        else
+            ode_fn = ODEFunction{true, SciMLBase.FullSpecialize}((du, u, params, t) -> prob.dynamics!(du, u, params, t))
+            ode_prob = ODEProblem(ode_fn, u0_T, prob.tspan, p)
+            OrdinaryDiffEq.solve(ode_prob, prob.ode_solver;
+                                 saveat=prob.data_times,
+                                 abstol=get(prob.ode_kwargs, :abstol, 1e-7),
+                                 reltol=get(prob.ode_kwargs, :reltol, 1e-7),
+                                 maxiters=get(prob.ode_kwargs, :maxiters, 10000))
+        end
+    catch e
+        # Blow-up regions can throw from inside spline evaluators (NaN Dual
+        # state reaching DataInterpolations) before the integrator aborts
+        # with a retcode; convert to the failure sentinel instead of
+        # crashing the optimization.
+        _is_program_error(e) && rethrow()
+        return T(1e10)
     end
 
     if sol.retcode != :Success && sol.retcode != SciMLBase.ReturnCode.Success
@@ -304,7 +314,8 @@ function adam_loss_mse(prob::PSMProblem, beta, penalty_w::Float64=0.0)
             loss += prob.data_weights[i, j] * (pred - obs)^2
         end
     end
-    loss + adam_penalty(prob, beta, penalty_w)
+    total = loss + adam_penalty(prob, beta, penalty_w)
+    _all_finite(total) ? total : T(1e10)
 end
 
 function adam_loss_poisson(prob::PSMProblem, beta, penalty_w::Float64=0.0)
@@ -323,23 +334,33 @@ function adam_loss_poisson(prob::PSMProblem, beta, penalty_w::Float64=0.0)
                 loss -= prob.data_weights[i, j] * (y * log(mu) - mu)
             end
         end
-        return loss + adam_penalty(prob, beta, penalty_w)
+        total = loss + adam_penalty(prob, beta, penalty_w)
+        return _all_finite(total) ? total : T(1e10)
     end
 
     u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
     u0_T = T.(u0)
 
     # Dispatch to DDE or ODE solve
-    sol = if !isempty(prob.delays)
-        adam_solve_dde(prob, beta)
-    else
-        ode_fn = ODEFunction{true, SciMLBase.FullSpecialize}((du, u, params, t) -> prob.dynamics!(du, u, params, t))
-        ode_prob = ODEProblem(ode_fn, u0_T, prob.tspan, p)
-        OrdinaryDiffEq.solve(ode_prob, prob.ode_solver;
-                             saveat=prob.data_times,
-                             abstol=get(prob.ode_kwargs, :abstol, 1e-7),
-                             reltol=get(prob.ode_kwargs, :reltol, 1e-7),
-                             maxiters=get(prob.ode_kwargs, :maxiters, 10000))
+    sol = try
+        if !isempty(prob.delays)
+            adam_solve_dde(prob, beta)
+        else
+            ode_fn = ODEFunction{true, SciMLBase.FullSpecialize}((du, u, params, t) -> prob.dynamics!(du, u, params, t))
+            ode_prob = ODEProblem(ode_fn, u0_T, prob.tspan, p)
+            OrdinaryDiffEq.solve(ode_prob, prob.ode_solver;
+                                 saveat=prob.data_times,
+                                 abstol=get(prob.ode_kwargs, :abstol, 1e-7),
+                                 reltol=get(prob.ode_kwargs, :reltol, 1e-7),
+                                 maxiters=get(prob.ode_kwargs, :maxiters, 10000))
+        end
+    catch e
+        # Blow-up regions can throw from inside spline evaluators (NaN Dual
+        # state reaching DataInterpolations) before the integrator aborts
+        # with a retcode; convert to the failure sentinel instead of
+        # crashing the optimization.
+        _is_program_error(e) && rethrow()
+        return T(1e10)
     end
 
     if sol.retcode != :Success && sol.retcode != SciMLBase.ReturnCode.Success
@@ -357,7 +378,8 @@ function adam_loss_poisson(prob::PSMProblem, beta, penalty_w::Float64=0.0)
             loss -= prob.data_weights[i, j] * (y * log(mu) - mu)
         end
     end
-    loss + adam_penalty(prob, beta, penalty_w)
+    total = loss + adam_penalty(prob, beta, penalty_w)
+    _all_finite(total) ? total : T(1e10)
 end
 
 # ─── Main Adam solver ────────────────────────────────────────────
@@ -434,7 +456,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
 
     if verbose
         println("AdamSolver: $(n_beta) params, $(alg.maxiters) max iters, lr=$(alg.lr)")
-        println("  Loss: $(alg.loss), autodiff: $(alg.autodiff)")
+        println("  Loss: $(loss_sym) (from $(alg.loss)), autodiff: $(alg.autodiff)")
     end
 
     # Adam state
@@ -529,8 +551,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
                               Float64.(u0), prob.tspan)
         sol_ode = OrdinaryDiffEq.solve(ode_prob, prob.ode_solver;
                                        saveat=prob.data_times,
-                                       abstol=1e-7, reltol=1e-7,
-                                       maxiters=10000)
+                                       abstol=get(prob.ode_kwargs, :abstol, 1e-7),
+                                       reltol=get(prob.ode_kwargs, :reltol, 1e-7),
+                                       maxiters=get(prob.ode_kwargs, :maxiters, 10000))
+        (sol_ode.retcode == SciMLBase.ReturnCode.Success ||
+         sol_ode.retcode == :Success) && length(sol_ode.u) >= T_pts ||
+            error("final ODE solve at the fitted parameters failed " *
+                  "(retcode $(sol_ode.retcode))")
 
         pred = zeros(T_pts, n_obs)
         for j in 1:n_obs

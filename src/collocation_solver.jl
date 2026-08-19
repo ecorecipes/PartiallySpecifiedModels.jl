@@ -678,8 +678,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     end
     params = ComponentArray(NamedTuple(ca_entries))
 
-    obj_val = data_loss + sum(theta[l] * dot(beta[uf_offsets[l]+1:uf_offsets[l]+uf_nk[l]],
-                  S_list[l] * beta[uf_offsets[l]+1:uf_offsets[l]+uf_nk[l]]) for l in 1:m)
+    obj_val = data_loss + sum((theta[l] * dot(beta[uf_offsets[l]+1:uf_offsets[l]+uf_nk[l]],
+                  S_list[l] * beta[uf_offsets[l]+1:uf_offsets[l]+uf_nk[l]]) for l in 1:m);
+                  init=0.0)   # m == 0 (all approximators unpenalized) is valid
 
     if verbose
         println("\nFinal: data_SS=$(round(data_loss, sigdigits=5)) " *

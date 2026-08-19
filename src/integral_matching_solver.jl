@@ -40,7 +40,7 @@ integration, providing a robust and computationally efficient estimator.
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
-    _validate_problem(prob, "IntegralMatchingSolver")
+    _validate_problem(prob, "IntegralMatchingSolver"; require_continuous=true)
     verbose = alg.verbose
 
     times = Float64.(prob.data_times)

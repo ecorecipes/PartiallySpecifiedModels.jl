@@ -384,7 +384,7 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
 
         grad = laml_gradient(family, beta_fs, S_list, offsets,
                              nknots_list, rho, n_p, H, sigma2)
-        hess = laml_hessian(family, beta, S_list, offsets,
+        hess = laml_hessian(family, beta_fs, S_list, offsets,
                             nknots_list, rho, n_p, H, sigma2)
 
         if verbose

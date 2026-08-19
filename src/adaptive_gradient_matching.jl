@@ -109,7 +109,10 @@ function optimize_gp_hyperparams(times::Vector{Float64}, y::Vector{Float64},
             σ²_try = σ_mult * y_var
             for σn_frac in [1e-4, 1e-3, 1e-2, 5e-2, 0.1]
                 σn²_try = σn_frac * y_var
-                K, _, _ = if kernel == :matern32
+                kernel in (:rbf, :matern32) ||
+                error("AdaptiveGradientMatching: kernel must be :rbf or " *
+                      ":matern32 (got :$(kernel)); :matern52 is not implemented")
+            K, _, _ = if kernel == :matern32
                     matern32_kernel_with_derivs(times, σ²_try, ℓ_try)
                 else
                     rbf_kernel_with_derivs(times, σ²_try, ℓ_try)
@@ -333,7 +336,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     grad_means = zeros(T_pts, K_states)
     grad_covs = Vector{Matrix{Float64}}(undef, K_states)
 
-    gp_hyperparams = Vector{Tuple{Float64,Float64,Float64}}(undef, K_states)
+    # Initialize so unobserved states report zeros rather than undef garbage
+    gp_hyperparams = fill((0.0, 0.0, 0.0), K_states)
 
     if prob.discrete
         # For discrete models: GP-smooth the states, and use forward-shifted
@@ -376,7 +380,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     # For unobserved states, initialize from u0 (constant)
     for k in 1:K_states
         if !isassigned(grad_covs, k)
-            x_smooth[:, k] .= prob.u0[k]
+            x_smooth[:, k] .= (prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)[k]
             grad_means[:, k] .= 0.0
             grad_covs[k] = Matrix(1e6 * I(T_pts))  # Large uncertainty
         end
@@ -420,7 +424,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     end
 
     # Initialize gamma from mismatch variance (start tight, let optimizer loosen)
-    gamma_init_vals = mismatch_var .* 0.1
+    # gamma_init scales the data-driven default (0.1·Var of the GP-implied
+    # derivative mismatch); the field was previously accepted but ignored.
+    gamma_init_vals = 0.1 .* alg.gamma_init .* mismatch_var
     log_gamma = log.(gamma_init_vals)
     n_gamma = alg.fit_gamma ? K_states : 0
 
