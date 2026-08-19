@@ -19,15 +19,14 @@ julia:
 
 When fitting a partially specified model, point estimates of the unknown function and fitted trajectories are rarely sufficient — we also need **uncertainty quantification**. Bootstrap confidence intervals provide a distribution-free (or distribution-aware) approach to estimating the variability of both the fitted trajectories and the recovered unknown functions.
 
-`PartiallySpecifiedModels.jl` implements three bootstrap methods:
+`PartiallySpecifiedModels.jl` implements two bootstrap methods:
 
 | Method | Description | Assumptions |
 |--------|-------------|-------------|
 | `:parametric` | Simulate new data from the fitted likelihood (e.g., $N(\hat\mu, \hat\sigma)$ or $\text{Pois}(\hat\mu)$) | Correct likelihood family |
-| `:nonparametric` | Resample residuals with replacement per state | Exchangeable residuals |
-| `:case` | Resample entire observation rows with replacement | Weakest assumptions |
+| `:nonparametric` | Resample residuals with replacement per state (Gaussian likelihood only) | Exchangeable residuals |
 
-This vignette demonstrates all three methods on an SIR epidemic model with a nonparametric force of infection, compares the resulting confidence intervals, and shows how the parametric bootstrap adapts to non-Gaussian likelihoods.
+This vignette demonstrates both methods on an SIR epidemic model with a nonparametric force of infection, compares the resulting confidence intervals, and shows how the parametric bootstrap adapts to non-Gaussian likelihoods.
 
 ## Setup
 
@@ -252,9 +251,9 @@ println("Nonparametric bootstrap: $(bs_nonparam.n_success) / 50 replicates succe
 ## Section 4: Case Bootstrap
 
 ::: {.callout-warning}
-## Case bootstrap is not recommended for ODE models
+## Case bootstrap has been removed
 
-The **case bootstrap** resamples entire observation rows with replacement. For time series data from ODE models, this scrambles the temporal structure — a resampled dataset might place the peak observation at an early time point. This produces unreliable CIs and high failure rates. Case resampling is designed for cross-sectional (i.i.d.) data, not time-ordered dynamical systems.
+The **case bootstrap** resamples entire observation rows with replacement. For time series data from ODE models, this scrambles the temporal structure — a resampled dataset might place the peak observation at an early time point. This produces unreliable CIs and high failure rates. Case resampling is designed for cross-sectional (i.i.d.) data, not time-ordered dynamical systems. For this reason `method=:case` has been removed from the package (requesting it raises an error).
 
 For ODE-based PSMs, use **parametric** or **nonparametric** bootstrap instead.
 :::
@@ -489,7 +488,7 @@ A Durbin-Watson statistic near 2 indicates no strong autocorrelation in the resi
 | Quick exploratory analysis | `:parametric` with `nboot=50` |
 
 ::: {.callout-note}
-The `:case` bootstrap (resampling entire rows) is available but **not recommended** for ODE/DDE models because it scrambles the temporal structure of the data.
+The `:case` bootstrap (resampling entire rows) has been **removed** because it scrambles the temporal structure of ODE/DDE data; the `:nonparametric` method requires a Gaussian likelihood.
 :::
 
 ### Tips
@@ -497,4 +496,4 @@ The `:case` bootstrap (resampling entire rows) is available but **not recommende
 - **Start with `nboot=50–100`** to check the method works, then increase to 200+ for publication-quality CIs.
 - **Check `bs.n_success`**: if many replicates fail (< 80% success), the model may be unstable. Try increasing `maxiters` or simplifying the approximator (fewer knots).
 - **Set `rng=Random.Xoshiro(seed)`** for reproducibility.
-- The parametric bootstrap is the default for good reason: it is fast, well-calibrated, and adapts to the likelihood family. Use nonparametric or case bootstrap when you have reason to doubt the error model.
+- The parametric bootstrap is the default for good reason: it is fast, well-calibrated, and adapts to the likelihood family. Use the nonparametric bootstrap when you have reason to doubt the error model (Gaussian likelihood only).

@@ -27,8 +27,8 @@ Simon Frost
   - [Fitting: unconstrained vs
     dec_zero_right](#fitting-unconstrained-vs-dec_zero_right-1)
   - [Results](#results-3)
-- [Example 5: Lotka-Volterra — Simulated
-  Data](#example-5-lotka-volterra--simulated-data)
+- [Example 5: Rosenzweig-MacArthur — Simulated
+  Data](#example-5-rosenzweig-macarthur--simulated-data)
   - [Data generation](#data-generation-4)
   - [Fitting with increasing
     constraint](#fitting-with-increasing-constraint)
@@ -622,7 +622,7 @@ p4b
       Decreasing:      data_loss=320.3, EDF=4.2, cor=0.995
       Dec+Zero@K:      data_loss=505.7, EDF=3.4, cor=0.945
 
-## Example 5: Lotka-Volterra — Simulated Data
+## Example 5: Rosenzweig-MacArthur — Simulated Data
 
 In predator-prey models, the key unknowns are typically the **functional
 response** f(H) (per-capita predation rate) and **numerical response**
@@ -1017,4 +1017,4 @@ The full set of shape constraints:
 - Pya, N. & Wood, S.N. (2015). Shape constrained additive models.
   *Statistics and Computing*, 25, 543–559.
 - Wood, S.N., Pya, N. & Säfken, B. (2016). Smoothing parameter and model
-  selection for general smooth models. *JASA*, 111, 1548–1563.
+  selection for general smooth models. *JASA*, 111, 1548–1575.

@@ -13,7 +13,7 @@ PartiallySpecifiedModels.jl provides a unified interface for specifying and fitt
 - **Basis function approximators** (B-splines, shape-constrained splines, Gaussian processes): fewer parameters, automatic smoothing via LAML/GCV, interpretable, and easy to constrain (monotonicity, convexity, positivity).
 - **Neural network approximators** (Lux.jl networks, COMONet): more flexible for high-dimensional or complex functional forms, compatible with gradient-based UDE-style training.
 
-The package supports 17 fitting algorithms, 7 approximator types, 4 likelihood families, and 14 shape constraint types.
+The package supports 22 fitting algorithms, 7 approximator types, 5 likelihood families, and 14 shape constraint types.
 
 ## Installation
 
@@ -85,20 +85,25 @@ end
 | [`LAML`](@ref) | Penalized IRLS + LAML smoothing | No | No | Wood et al. (2016) |
 | [`GCVSolver`](@ref) | Penalized IRLS + GCV smoothing | No | No | Wood (2001) |
 | [`CollocationLAML`](@ref) | Generalized profiling | No | No | Ramsay et al. (2007) |
-| [`GradientMatching`](@ref) | Smooth then match derivatives | Yes | No | Calderhead et al. (2009) |
-| [`TwoStageSolver`](@ref) | Smooth then match (simple) | Yes | No | Wood (2001) |
-| [`BNGSolver`](@ref) | Bayesian neural gradient matching | Yes | No | Bonnaffé et al. (2023) |
+| [`GradientMatching`](@ref) | Smooth then match derivatives | Yes | No | — |
+| [`TwoStageSolver`](@ref) | Smooth then match (simple) | Yes | No | Varah (1982) |
+| [`BNGSolver`](@ref) | Bayesian neural gradient matching | Yes | No | Bonnaffé & Coulson (2023) |
 | [`AdaptiveGradientMatching`](@ref) | GP product-of-experts | Yes | No | Macdonald & Husmeier (2015) |
 | [`AdamSolver`](@ref) | Adam through ODE (UDE-style) | No | No | Rackauckas et al. (2020) |
 | [`MultipleShootingSolver`](@ref) | Multiple shooting + Adam | No | No | Turan & Jäschke (2021) |
 | [`DerivativeFreeSolver`](@ref) | NelderMead / Particle Swarm | No | No | — |
-| [`RodeoSolver`](@ref) | Probabilistic ODE (Kalman) | No | No | Tronarp et al. (2022) |
+| [`RodeoSolver`](@ref) | Probabilistic ODE (Kalman) | No | No | Wu & Lysy (2024); Tronarp et al. (2022) for `:fenrir` |
 | [`DaltonSolver`](@ref) | Data-adaptive Kalman likelihood | No | No | Wu & Lysy (2024) |
 | [`MCMCSolver`](@ref) | HMC/NUTS posterior sampling | No | Yes | — |
 | [`MagiSolver`](@ref) | Manifold-constrained GP inference | No | Yes | Yang et al. (2021) |
-| [`PseudoMarginalSolver`](@ref) | Probabilistic ODE + NUTS | No | Yes | Chkrebtii et al. (2016) |
+| [`PseudoMarginalSolver`](@ref) | Pseudo-marginal MCMC (probabilistic ODE likelihood) | No | Yes | Andrieu & Roberts (2009) |
 | [`VariationalSolver`](@ref) | Mean-field variational inference | No | Yes | — |
 | [`ABCSolver`](@ref) | ABC-SMC (likelihood-free) | No | Yes | — |
+| [`IntegralMatchingSolver`](@ref) | Integral matching (smooth, then match integrals) | Yes | No | Dattner & Klaassen (2015) |
+| [`ProfileLikelihoodSolver`](@ref) | Profile likelihood identifiability/CIs | No | No | Simpson & Maclaren (2023) |
+| [`EnsembleKalmanSolver`](@ref) | Ensemble Kalman inversion | No | No | Iglesias et al. (2013) |
+| [`ODINSolver`](@ref) | ODIN-style Mahalanobis gradient matching | Yes | No | Wenk et al. (2020) |
+| [`RKHSSolver`](@ref) | RKHS/kernel ridge unknown-function estimation | Yes | No | González et al. (2014) |
 
 ### Approximators
 
@@ -115,8 +120,9 @@ end
 ### Likelihoods
 
 - [`Gaussian`](@ref) — Gaussian errors with identity link (default)
-- [`Poisson`](@ref) — Count data with log link
-- [`NegativeBinomial`](@ref) — Overdispersed counts with estimated dispersion
+- [`Poisson`](@ref) — Count data, fitted on the response scale (identity link)
+- [`NegativeBinomial`](@ref) — Overdispersed counts with fixed dispersion θ, identity link
+- [`TruncatedNormal`](@ref) — Continuous data bounded below (e.g. non-negative densities)
 - [`CustomLikelihood`](@ref) — User-defined likelihood
 
-See the [Getting Started](getting_started.md) guide for a detailed tutorial, or browse the [Solvers](solvers.md) and [Approximators](approximators.md) pages for full documentation. The [Vignettes](vignettes.md) page has 26 worked examples covering every solver and approximator.
+See the [Getting Started](getting_started.md) guide for a detailed tutorial, or browse the [Solvers](solvers.md) and [Approximators](approximators.md) pages for full documentation. The [Vignettes](vignettes.md) page has 35 worked examples covering every solver and approximator.

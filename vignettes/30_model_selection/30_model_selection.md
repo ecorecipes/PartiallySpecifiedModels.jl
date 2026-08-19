@@ -54,13 +54,19 @@ principled criterion for answering all three questions. LAML integrates
 out the unknown function coefficients via a Laplace approximation to the
 marginal likelihood:
 
-$$\text{LAML}(\lambda) = -\frac{n}{2}\log(2\pi\hat\sigma^2) + \frac{1}{2}\log|\mathbf{S}_\lambda| - \frac{1}{2}\log|\mathbf{H}| - \frac{1}{2\hat\sigma^2}\|\mathbf{y} - \hat{\mathbf{y}}\|^2$$
+$$\mathcal{V}(\lambda) = \ell(\hat{\boldsymbol\beta}) - \tfrac{1}{2}\hat{\boldsymbol\beta}'\mathbf{S}_\lambda\hat{\boldsymbol\beta} + \tfrac{1}{2}\log|\mathbf{S}_\lambda|_+ - \tfrac{1}{2}\log|\mathbf{H}| + \tfrac{M_p}{2}\log(2\pi)$$
 
 where $\mathbf{S}_\lambda$ is the penalty matrix scaled by the smoothing
-parameter $\lambda$, $\mathbf{H}$ is the Hessian of the penalized
-log-likelihood, and $\hat\sigma^2$ is the estimated dispersion. Lower
-(more negative) LAML values indicate a better model — analogous to AIC
-or BIC, but with proper accounting for the smoothing penalty.
+parameter $\lambda$, $|\cdot|_+$ denotes the pseudo-determinant (the
+product of the positive eigenvalues, since $\mathbf{S}_\lambda$ is rank
+deficient), $\mathbf{H}$ is the Hessian of the penalized
+log-likelihood, and $M_p$ is the penalty null-space dimension. For
+Gaussian data with unknown $\sigma^2$ this reduces to profiled REML.
+The criterion is maximized internally when selecting $\lambda$. Note
+that the `sol.objective` field recorded below is not this marginal
+likelihood but the final penalized objective
+$\tfrac{1}{2}(\|\mathbf{y}-\hat{\mathbf{y}}\|^2 + \hat{\boldsymbol\beta}'\mathbf{S}_\lambda\hat{\boldsymbol\beta})$,
+for which lower values indicate a better penalized fit.
 
 This vignette demonstrates LAML-based model selection on two example
 systems: logistic growth and Lotka–Volterra predator–prey.
@@ -164,9 +170,14 @@ end
 
 ### LAML vs number of knots
 
-The LAML curve is characteristically U-shaped: underfitting (too few
-knots) yields poor data fit, while overfitting (too many knots) incurs a
-complexity penalty.
+In principle the criterion balances underfitting (too few knots) against
+overfitting (too many knots). In practice the curve below is not a clean
+U shape: most knot counts reach similar objective values (roughly
+0.8–2.3), while the 6- and 10-knot fits converged to poor local optima
+(data SS of 27.8 and 19.2, versus ≈1.4–4.2 for the others), which
+dominates their criterion values. This is a useful reminder to inspect
+the individual fits — not just the selection criterion — before
+comparing models.
 
 ``` julia
 laml_vals = [r.laml for r in knot_results]

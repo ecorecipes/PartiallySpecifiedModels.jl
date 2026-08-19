@@ -374,6 +374,11 @@ for H in [0.5, 1.0, 2.0, 3.0, 4.0]
 end
 ```
 
+Note that in this partially observed example the posterior misses the
+true functional response — the medians sit well above the truth at low
+prey density and the wide credible intervals reflect weak
+identifiability when the predator state is never observed.
+
 ### Trace Plots
 
 ```{julia}
@@ -396,7 +401,7 @@ p_tr_lv
 |---------|-----------|-----------|
 | **ODE solver per step** | No (GP manifold constraint) | Yes (full ODE solve) |
 | **States sampled?** | Yes (jointly with parameters) | No (determined by the ODE) |
-| **Partially observed** | Natural support | Requires all states |
+| **Partially observed** | Natural support (unobserved states sampled) | Supported via `obs_to_state` (unobserved states come from the ODE solve) |
 | **Speed per iteration** | Matrix ops (scales with grid size) | Slower (ODE integration) |
 | **Accuracy** | Approximate (GP manifold) | Exact (ODE solve) |
 | **Output** | `MCMCChains.Chains` | `MCMCChains.Chains` |

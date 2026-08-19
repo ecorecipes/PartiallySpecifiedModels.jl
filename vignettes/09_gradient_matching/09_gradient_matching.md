@@ -48,7 +48,7 @@ ODE integration entirely by:
   adaptive mismatch parameters and smoothing penalties
 - **`TwoStageSolver`** — smooth-then-differentiate baseline (penalized
   least squares)
-- **`BNGSolver`** — Bayesian Numerical Gradient matching (Bayesian
+- **`BNGSolver`** — Bayesian neural gradient matching (Bayesian
   interpretation of the two-stage idea)
 
 This vignette compares these integration-free methods against standard
@@ -328,15 +328,20 @@ are sparse or noisy.
 
 - **No ODE integration** — avoids numerical instability, stiffness
   issues, and solver failures
-- **Fast** — typically the quickest methods in the package
+- **Fast optimization loop** — no ODE solves during fitting, though as
+  the timing table above shows, total runtime is not always lower than
+  the fastest integration-based solvers
 - **No sensitivity equations** — simpler computational graph
 
 ### Limitations
 
 - **Relies on good derivative estimates** from the data — needs
   sufficient, well-spaced observations
-- **No formal data loss** — GradientMatching reports `data_loss ≈ 0`
-  because it doesn’t directly fit to data
+- **Indirect data fit** — the optimization matches derivatives of the
+  smoothed data rather than the data themselves; the `data_loss`
+  reported (e.g. 1023.4 in the table above) is computed afterwards by
+  integrating the ODE at the fitted parameters and comparing to the
+  observations
 - **May not generalise** for prediction — the fitted parameters work for
   the observed time window but extrapolation may be poor
 

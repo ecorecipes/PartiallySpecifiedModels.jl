@@ -15,7 +15,7 @@ shape-constrained SPDE, neural network, Gaussian process, and COMONet).
 Uses Laplace Approximate Marginal Likelihood (LAML) for automatic smoothing
 parameter estimation, following:
 - Wood, Pya & Säfken (2016), JASA 111(516), 1548-1575
-- Wood & Fasiolo (2017), Statistics and Computing 27(3), 759-774
+- Wood & Fasiolo (2017), Biometrics 73(4), 1071-1081
 
 Supports Gaussian, Poisson, Negative Binomial, and custom likelihoods.
 """
