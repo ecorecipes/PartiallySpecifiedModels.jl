@@ -86,10 +86,38 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
         alg.summary_fn
     end
 
-    # ── prior: Uniform(beta0 ± prior_scale) ──────────────────────────
+    # ── prior over coefficients ──────────────────────────────────────
+    # :smoothness (default): β ~ N(β₀, prior_scale²·(S̄ + εI)⁻¹), where S̄
+    # is the block-diagonal roughness structure with each block scaled to
+    # unit mean diagonal — the ABC analogue of the GMRF priors used by
+    # MCMCSolver/VariationalSolver. :box: legacy Uniform(β₀ ± prior_scale).
+    alg.prior in (:smoothness, :box) ||
+        error("ABCSolver: prior must be :smoothness or :box (got :$(alg.prior))")
     prior_lo = beta0 .- alg.prior_scale
     prior_hi = beta0 .+ alg.prior_scale
-    prior_volume = prod(prior_hi .- prior_lo)
+    local prior_sample, prior_logpdf, in_support
+    if alg.prior == :smoothness
+        penalties, offsets, _ = _build_penalty_info(prob)
+        # Unit ridge: smooth (penalty-null) directions get sd exactly
+        # prior_scale, rough directions less — comparable overall spread to
+        # the legacy box, with smoothness preference on top.
+        P = Matrix{Float64}(1.0I, n_p, n_p)
+        for (k, S) in enumerate(penalties)
+            np_k = size(S, 1); off = offsets[k]
+            sc = max(tr(S) / np_k, 1e-12)              # unit mean diagonal
+            P[off+1:off+np_k, off+1:off+np_k] .+= S ./ sc
+        end
+        P ./= alg.prior_scale^2
+        Lp = cholesky(Symmetric(P)).L
+        prior_sample = () -> beta0 .+ (Lp' \ randn(n_p))
+        prior_logpdf = β -> (d = β .- beta0; -0.5 * dot(d, P * d))
+        in_support   = β -> true
+    else
+        prior_volume = prod(prior_hi .- prior_lo)
+        prior_sample = () -> prior_lo .+ (prior_hi .- prior_lo) .* rand(n_p)
+        prior_logpdf = β -> (prior_volume > 0 ? -log(prior_volume) : 0.0)
+        in_support   = β -> !(any(β .< prior_lo) || any(β .> prior_hi))
+    end
 
     # ── generation 0: sample from prior, accept all ──────────────────
     particles = Vector{Vector{Float64}}(undef, N)
@@ -97,7 +125,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
     weights   = fill(1.0 / N, N)
 
     for i in 1:N
-        particles[i] = prior_lo .+ (prior_hi .- prior_lo) .* rand(n_p)
+        particles[i] = prior_sample()
         try
             pred = simulate(prob, particles[i])
             distances[i] = summary_fn(pred, prob.data_values)
@@ -140,10 +168,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
                 # (b) perturb with Gaussian kernel
                 theta_star = particles[j] .+ kernel_std .* randn(n_p)
 
-                # check prior support
-                if any(theta_star .< prior_lo) || any(theta_star .> prior_hi)
-                    continue
-                end
+                # check prior support (no-op for the Gaussian prior)
+                in_support(theta_star) || continue
 
                 # (c-d) simulate and compute distance
                 local d::Float64
@@ -192,20 +218,21 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
         # ── (f) importance weights ───────────────────────────────────
         # w_i ∝ π(θ_i) / Σ_j w_j^{t-1} K(θ_i | θ_j^{t-1})
         new_weights = zeros(N)
-        prior_density = prior_volume > 0 ? 1.0 / prior_volume : 1.0
-
+        # Common constants in π(θ) cancel after normalization; shift by the
+        # max log-density to avoid underflow of exp().
+        lps = [in_support(new_particles[i]) ? prior_logpdf(new_particles[i]) :
+               -Inf for i in 1:N]
+        lp_max = maximum(lps)
         for i in 1:N
-            if any(new_particles[i] .< prior_lo) || any(new_particles[i] .> prior_hi)
-                new_weights[i] = 0.0
-                continue
-            end
+            isfinite(lps[i]) || continue
             kernel_sum = 0.0
             for j in 1:N
                 diff = new_particles[i] .- particles[j]
                 log_k = -0.5 * sum((diff ./ kernel_std).^2)
                 kernel_sum += weights[j] * exp(log_k)
             end
-            new_weights[i] = kernel_sum > 0.0 ? prior_density / kernel_sum : 0.0
+            new_weights[i] = kernel_sum > 0.0 ?
+                exp(lps[i] - lp_max) / kernel_sum : 0.0
         end
 
         wsum = sum(new_weights)
