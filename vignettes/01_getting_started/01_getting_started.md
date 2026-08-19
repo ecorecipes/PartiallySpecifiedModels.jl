@@ -49,10 +49,10 @@ This package includes 35 vignettes organized by topic:
 | **Getting started** | 01 (this), 02 (likelihoods) |
 | **Ecological models** | 03 (Lotka-Volterra), 04 (copepod), 08 (consumer-resource), 10 (chemostat), 27 (predator-prey functional response), 28 (fisheries) |
 | **Approximator types** | 05 (B-spline, GP, neural), 26 (SPDE) |
-| **Solver comparison** | 06 (all solvers), 09 (gradient matching), 31 (integral matching), 33 (ensemble Kalman), 34 (ODIN), 35 (RKHS) |
+| **Solver comparison** | 06 (all solvers), 09 (gradient matching), 17 (BNG), 21 (GCV vs LAML), 22 (two-stage, redirect to 09), 23 (derivative-free), 31 (integral matching), 33 (ensemble Kalman), 34 (ODIN), 35 (RKHS) |
 | **Shape constraints** | 13 (B-spline constraints), 16 (COMONet) |
 | **Bayesian inference** | 14 (MCMC), 15 (MAGI), 19 (pseudo-marginal), 24 (variational), 25 (ABC) |
-| **Uncertainty** | 07 (probabilistic ODE), 29 (bootstrap CIs), 32 (profile likelihood) |
+| **Uncertainty** | 07 (probabilistic ODE), 18 (DALTON), 29 (bootstrap CIs), 32 (profile likelihood) |
 | **Model selection** | 30 (marginal likelihood) |
 | **Count data** | 02 (likelihoods), 11 (epidemiological), 28 (fisheries) |
 | **Discrete time** | 12 (Ricker, Beverton-Holt), 28 (fisheries) |

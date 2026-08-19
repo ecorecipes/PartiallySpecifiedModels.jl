@@ -203,6 +203,8 @@ The `vignettes/` directory contains 35 worked examples:
 - Pya, N. & Wood, S.N. (2015). "Shape constrained additive models." *Statistics and Computing*, 25(3), 543–559.
 - Lindgren, F., Rue, H. & Lindström, J. (2011). "An explicit link between Gaussian fields and Gaussian Markov random fields: the stochastic partial differential equation approach." *JRSS-B*, 73(4), 423–498.
 - Rackauckas, C. et al. (2020). "Universal differential equations for scientific machine learning." *arXiv:2001.04385*.
+- Macdonald, B. & Husmeier, D. (2015). "Gradient matching methods for computational inference in mechanistic models for systems biology: a review and comparative analysis." *Frontiers in Bioengineering and Biotechnology*, 3, 180.
+- Turan, E.M. & Jäschke, J. (2021). "Multiple shooting for training neural differential equations on time series." *IEEE Control Systems Letters*, 6, 1897–1902.
 - Yang, S., Wong, S.W.K. & Kou, S.C. (2021). "Inference of dynamic systems from noisy and sparse data via manifold-constrained Gaussian processes." *PNAS*, 118(15).
 - Bonnaffé, W., Sheldon, B.C. & Coulson, T. (2021). "Neural ordinary differential equations for ecological and evolutionary time-series analysis." *Methods in Ecology and Evolution*, 12, 1301–1315.
 - Bonnaffé, W. & Coulson, T. (2023). "Fast fitting of neural ordinary differential equations by Bayesian neural gradient matching to infer ecological interactions from time-series data." *Methods in Ecology and Evolution*, 14, 1543–1563.

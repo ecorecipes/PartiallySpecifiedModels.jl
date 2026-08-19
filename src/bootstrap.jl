@@ -2,7 +2,8 @@
 #
 # Implements residual-based bootstrap following Wood (2001, 2006) and the
 # ddefit504 reference implementation.  Supports parametric (Gaussian residuals),
-# nonparametric (resampled residuals), and case (resampled observations) bootstrap.
+# Methods: :parametric (per-likelihood samplers) and :nonparametric
+# (Gaussian residual resampling).
 #
 # The key function is `bootstrap(sol, prob, alg; nboot, method, ...)` which
 # returns a BootstrapResult with pointwise CIs on fitted values and unknown

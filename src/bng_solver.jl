@@ -1,6 +1,6 @@
 # ─── BNG solver (Bayesian Neural Gradient matching) ──────────────
 #
-# Two-step approach from Bonnaffé, Sheldon & Bhatt (2023):
+# Two-step approach from Bonnaffé & Coulson (2023):
 #   Step 1: Smooth observed data with cubic splines → ŷ(t), dŷ/dt
 #   Step 2: Fit unknown function parameters by gradient matching:
 #           minimize Σ_k Σ_i ||dŷ_k/dt(t_i) - f_k(ŷ(t_i), p(β), t_i)||²

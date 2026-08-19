@@ -659,7 +659,7 @@ Figure 8: Trace plots for Lotka-Volterra g(H) spline coefficients
 
 - Need exact ODE trajectories in the posterior
 - Well-observed systems with cheap ODE solves
-- When IBM approximation may be insufficient
+- When Matérn-3/2 GP prior approximation may be insufficient
 
 ## Diagnostic Plots
 
