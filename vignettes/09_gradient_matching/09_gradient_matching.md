@@ -1,6 +1,6 @@
 # Integration-Free Inference with Gradient Matching
 Simon Frost
-2026-06-12
+2026-08-19
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -106,12 +106,12 @@ prob = PSMProblem(sir!, u0, tspan, [approx_β];
 
     Method               | Time (s) | Data Loss
     -------------------------------------------------------
-    GradientMatching     | 3.81     | 1023.4
-    AGM                  | 5.82     | 1184.4
-    LAML                 | 6.01     | 1740.3
-    CollocationLAML      | 2.09     | 1223.5
-    AdamSolver           | 4.27     | 1365.0
-    RodeoSolver          | 13.42    | 1476.1
+    GradientMatching     | 3.16     | 1023.4
+    AGM                  | 5.82     | 1167.2
+    LAML                 | 5.41     | 1344.8
+    CollocationLAML      | 1.67     | 771.1
+    AdamSolver           | 3.75     | 1365.0
+    RodeoSolver          | 12.55    | 1505.9
 
 ### Compare recovered β(prevalence)
 
@@ -175,9 +175,9 @@ for fitted trajectories.
 ### Inspecting AGM diagnostics
 
     AGM convergence info:
-      GP hyperparams: [(52268.25281995996, 18.0, 52.26825281995996), (864.7704326939464, 12.0, 8.647704326939465), (0.0, 0.0, 0.0)]
-      Gamma (mismatch): [3.8718, 2.9089, 32757.23]
-      Derivative loss: 11416.5672
+      GP hyperparams: [(104536.50563991992, 18.0, 52.26825281995996), (1729.5408653878928, 12.0, 8.647704326939465), (0.0, 0.0, 0.0)]
+      Gamma (mismatch): [4.0473, 3.1278, 32757.1883]
+      Derivative loss: 11427.0288
 
 ## Example 2: Logistic Growth — A Clean Demonstration
 
@@ -261,7 +261,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](09_gradient_matching_files/figure-commonmark/cell-9-output-1.svg)
 
-    Durbin-Watson: 1.588, 1.903
+    Durbin-Watson: 1.603, 1.962
 
 ## Two-Stage Smooth-Then-Differentiate
 
@@ -312,15 +312,16 @@ plot!(u_grid_d, [sol_laml_d.unknown_functions[:r](x) for x in u_grid_d], label="
 ![](09_gradient_matching_files/figure-commonmark/cell-12-output-1.svg)
 
     TwoStage    loss=0.2547  r(2)=0.9541
-    BNG         loss=1.1447  r(2)=0.9541
+    BNG         loss=0.7976  r(2)=0.9998
     LAML        loss=0.3444  r(2)=1.0232
     True        r(2)=1.0
 
-TwoStage and BNG use the same derivative-matching objective, so their
-point estimates typically coincide; BNG adds a Bayesian interpretation.
-LAML integrates the ODE and selects smoothing via marginal likelihood,
-generally recovering the functional response more accurately when data
-are sparse or noisy.
+TwoStage and BNG match similar derivative targets, so their point
+estimates are typically close; BNG marginalizes the observation and
+prior variances and fits a bootstrap × restart ensemble, adding
+uncertainty quantification. LAML integrates the ODE and selects
+smoothing via marginal likelihood, generally recovering the functional
+response more accurately when data are sparse or noisy.
 
 ## When to Use Gradient Matching
 
@@ -338,10 +339,9 @@ are sparse or noisy.
 - **Relies on good derivative estimates** from the data — needs
   sufficient, well-spaced observations
 - **Indirect data fit** — the optimization matches derivatives of the
-  smoothed data rather than the data themselves; the `data_loss`
-  reported (e.g. 1023.4 in the table above) is computed afterwards by
-  integrating the ODE at the fitted parameters and comparing to the
-  observations
+  smoothed data rather than the data themselves; the reported
+  `data_loss` is computed afterwards by integrating the ODE at the
+  fitted parameters and comparing to the observations
 - **May not generalise** for prediction — the fitted parameters work for
   the observed time window but extrapolation may be poor
 

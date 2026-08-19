@@ -1,6 +1,6 @@
 # RKHS: Reproducing Kernel Hilbert Space Estimation
 Simon Frost
-2026-06-12
+2026-08-19
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -18,30 +18,31 @@ Simon Frost
 
 ## Overview
 
-The **RKHSSolver** estimates unknown functions using kernel ridge
-regression with a Reproducing Kernel Hilbert Space (RKHS) norm penalty.
-Unlike B-splines (which rely on knot placement) or neural networks
-(which need architecture choices), RKHS methods use kernel functions to
-define function smoothness in a principled, infinite-dimensional
-function space.
+The **RKHSSolver** implements the trajectory-RKHS method of González et
+al. (2014): the *state trajectory* is represented in a time-kernel
+Reproducing Kernel Hilbert Space,
+$x_k(t) = m_k + \sum_i b_{k,i}\, k(t, t_i)$, so its derivative is
+available analytically. Fitting alternates a **linear** solve for the
+trajectory coefficients (data fit + RKHS norm + linearized ODE-gradient
+term) with gradient steps on the unknown-function parameters — no ODE
+integration is ever performed.
 
 **When to use RKHSSolver:**
 
-- You want a kernel-based alternative to splines with automatic
-  smoothness via the RKHS norm
-- Your unknown function is very smooth (RBF kernel) or has limited
-  differentiability (Matérn kernel)
-- You want a nonparametric approach without explicit knot/basis
-  placement
+- You want gradient matching with an analytic (not numerically
+  estimated) trajectory derivative
+- Your system is partially observed — the Jacobian-coupled trajectory
+  solve infers unobserved states
+- You want to avoid ODE integration entirely
 
 **Comparison with other nonparametric approaches:**
 
-| Approach | Basis | Smoothness control | Constraints |
+| Approach | Trajectory model | ODE coupling | Integration |
 |----|:--:|:--:|:--:|
-| BSpline + LAML | Local B-splines | Penalty on 2nd derivative | Shape constraints |
-| GP (MAGI/ODIN) | Kernel | Lengthscale parameter | Prior on function space |
-| Neural (UDE) | NN weights | Network width/depth | Hard to constrain |
-| **RKHS** | Representer points | RKHS norm penalty | Via kernel choice |
+| BSpline + LAML | ODE solve | Exact (through the solver) | Yes |
+| GP (MAGI/ODIN) | GP prior on states | Derivative-covariance weighted | No |
+| Neural (UDE) | ODE solve | Exact (through the solver) | Yes |
+| **RKHS** | Time-kernel expansion | Linearized gradient match | No |
 
 ## Setup
 
@@ -104,8 +105,8 @@ plot!(sol_rm.t, [sol_rm.u[i][2] for i in 1:length(sol_rm.t)],
 
 ### Fit with RKHS (RBF kernel)
 
-The RBF (Gaussian) kernel produces infinitely smooth functions. The
-**lengthscale** is automatically set from the domain width when not
+The RBF (Gaussian) time kernel produces infinitely smooth trajectories.
+The **lengthscale** is automatically set to `time_span / 8` when not
 specified (default behaviour).
 
 ``` julia
@@ -116,89 +117,44 @@ prob = PSMProblem(rm!, u0, (0.0, 80.0), [approx_f];
     known_params=NamedTuple(), solver=Tsit5())
 
 t_rbf = @elapsed sol_rbf = solve(prob,
-    RKHSSolver(kernel=:rbf, n_repr_points=25,
-               lambda_rkhs=0.01, maxiters=1000, lr=0.01, verbose=true))
+    RKHSSolver(kernel=:rbf, maxiters=400, verbose=true))
 println("\nTime: $(round(t_rbf, digits=1))s")
 ```
 
-    RKHSSolver Stage 1: Smoothing data...
-    RKHSSolver Stage 2: Building kernel representations...
-      Auto lengthscale: ℓ=16.7 (domain span=50.0)
-      25 kernel weights, 1000 iterations, λ=0.01
-      iter 1: loss=611.08 lr=0.01
-      iter 2: loss=476.34 lr=0.01
-      iter 3: loss=434.01 lr=0.01
-      iter 4: loss=401.09 lr=0.01
-      iter 5: loss=359.16 lr=0.01
-      iter 50: loss=214.85 lr=0.00994
-      iter 100: loss=208.74 lr=0.00976
-      iter 150: loss=203.8 lr=0.00946
-      iter 200: loss=199.43 lr=0.00905
-      iter 250: loss=195.87 lr=0.00854
-      iter 300: loss=193.16 lr=0.00794
-      iter 350: loss=191.17 lr=0.00727
-      iter 400: loss=189.75 lr=0.00655
-      iter 450: loss=188.76 lr=0.00578
-      iter 500: loss=188.07 lr=0.005
-      iter 550: loss=187.59 lr=0.00422
-      iter 600: loss=187.26 lr=0.00345
-      iter 650: loss=187.03 lr=0.00273
-      iter 700: loss=186.87 lr=0.00206
-      iter 750: loss=186.76 lr=0.00146
-      iter 800: loss=186.69 lr=0.000955
-      iter 850: loss=186.65 lr=0.000545
-      iter 900: loss=186.62 lr=0.000245
-      iter 950: loss=186.61 lr=6.16e-5
-      iter 1000: loss=186.61 lr=0.0
-      Best loss: 186.61
+    RKHSSolver: auto time-kernel lengthscale ℓ=10.0
+    RKHSSolver: 81 centers/state × 2 states, 8 θ, grid 30, λ=0.01 ρ=1.0
+      iter 1: J=615.886
+      iter 2: J=614.507
+      iter 3: J=614.064
+      iter 25: J=481.944
+      iter 50: J=470.568
+      iter 75: J=469.205
+      Converged at iter 87
 
-    Time: 3.7s
+    Time: 6.4s
 
 ### Fit with RKHS (Matérn-5/2 kernel)
 
-The Matérn-5/2 kernel produces twice-differentiable functions, allowing
-more local variation than the RBF kernel.
+The Matérn-5/2 time kernel produces twice-differentiable trajectories,
+allowing more local variation than the RBF kernel.
 
 ``` julia
 t_mat = @elapsed sol_mat = solve(prob,
-    RKHSSolver(kernel=:matern52, n_repr_points=25,
-               lambda_rkhs=0.01, maxiters=1000, lr=0.01, verbose=true))
+    RKHSSolver(kernel=:matern52, maxiters=400, verbose=true))
 println("\nTime: $(round(t_mat, digits=1))s")
 ```
 
-    RKHSSolver Stage 1: Smoothing data...
-    RKHSSolver Stage 2: Building kernel representations...
-      Auto lengthscale: ℓ=16.7 (domain span=50.0)
-      25 kernel weights, 1000 iterations, λ=0.01
-      iter 1: loss=611.13 lr=0.01
-      iter 2: loss=481.19 lr=0.01
-      iter 3: loss=429.96 lr=0.01
-      iter 4: loss=396.41 lr=0.01
-      iter 5: loss=359.68 lr=0.01
-      iter 50: loss=211.74 lr=0.00994
-      iter 100: loss=197.67 lr=0.00976
-      iter 150: loss=191.38 lr=0.00946
-      iter 200: loss=189.0 lr=0.00905
-      iter 250: loss=187.97 lr=0.00854
-      iter 300: loss=187.33 lr=0.00794
-      iter 350: loss=186.83 lr=0.00727
-      iter 400: loss=186.43 lr=0.00655
-      iter 450: loss=186.1 lr=0.00578
-      iter 500: loss=185.84 lr=0.005
-      iter 550: loss=185.63 lr=0.00422
-      iter 600: loss=185.47 lr=0.00345
-      iter 650: loss=185.35 lr=0.00273
-      iter 700: loss=185.25 lr=0.00206
-      iter 750: loss=185.19 lr=0.00146
-      iter 800: loss=185.14 lr=0.000955
-      iter 850: loss=185.11 lr=0.000545
-      iter 900: loss=185.1 lr=0.000245
-      iter 950: loss=185.09 lr=6.16e-5
-      iter 1000: loss=185.09 lr=0.0
-      Converged at iter 1000
-      Best loss: 185.09
+    RKHSSolver: auto time-kernel lengthscale ℓ=10.0
+    RKHSSolver: 81 centers/state × 2 states, 8 θ, grid 30, λ=0.01 ρ=1.0
+      iter 1: J=337.772
+      iter 2: J=335.965
+      iter 3: J=335.106
+      iter 25: J=194.059
+      iter 50: J=177.457
+      iter 75: J=175.505
+      Converged at iter 88
 
-    Time: 2.6s
+    Time: 0.1s
 
 ### Compare with TwoStageSolver
 
@@ -212,7 +168,7 @@ t_ts = @elapsed sol_ts = solve(prob,
 println("TwoStage time: $(round(t_ts, digits=1))s")
 ```
 
-    TwoStage time: 3.5s
+    TwoStage time: 3.1s
 
 ### Recovered Functional Response
 
@@ -250,20 +206,22 @@ println("  TwoStage:    $(round(mae_ts, digits=4))")
 ```
 
     Mean absolute error over [1, 40]:
-      RKHS-RBF:    0.0546
-      RKHS-Matérn: 0.0415
+      RKHS-RBF:    0.0691
+      RKHS-Matérn: 0.0675
       TwoStage:    0.0701
 
 ## Kernel Comparison
 
-The choice of kernel determines the smoothness properties of the
-estimated function:
+The time kernel determines the smoothness of the fitted *trajectory*
+(the unknown function’s smoothness is set by its approximator, identical
+in both fits):
 
-- **RBF (Gaussian) kernel**: $k(x, x') = \exp(-\|x - x'\|^2 / 2\ell^2)$
-  — infinitely differentiable functions; very smooth estimates
+- **RBF (Gaussian) kernel**: $k(t, t') = \exp(-(t - t')^2 / 2\ell^2)$ —
+  infinitely differentiable trajectories
 - **Matérn-5/2 kernel**:
-  $k(x, x') = (1 + \sqrt{5}r/\ell + 5r^2/3\ell^2) \exp(-\sqrt{5}r/\ell)$
-  — twice-differentiable functions; allows slightly more local variation
+  $k(t, t') = (1 + \sqrt{5}r/\ell + 5r^2/3\ell^2) \exp(-\sqrt{5}r/\ell)$,
+  $r = |t - t'|$ — twice-differentiable trajectories; allows more local
+  variation
 
 ``` julia
 plot(H_grid, [sol_rbf.unknown_functions[:f](H) for H in H_grid],
@@ -343,35 +301,39 @@ plot(p1, p2, p3, p4, layout=(2, 2), size=(700, 600))
 
 ## How It Works
 
-The RKHS approach represents the unknown function using the
-**representer theorem**: any optimal function in an RKHS can be written
-as a finite linear combination of kernel evaluations at representative
-points:
+Following the **representer theorem**, each state trajectory is a finite
+kernel expansion over the data times:
 
-$$\hat{f}(x) = \sum_{j=1}^{m} \alpha_j k(x, x_j)$$
+$$x_k(t) = m_k + \sum_{i=1}^{n} b_{k,i}\, k(t, t_i), \qquad
+\dot{x}_k(t) = \sum_{i=1}^{n} b_{k,i}\, \dot{k}(t, t_i),$$
 
-where $\{x_j\}$ are representative points spread across the domain, and
-$k(\cdot, \cdot)$ is the chosen kernel function.
+so the derivative needed for gradient matching is exact, not numerically
+estimated. The objective couples the data, the trajectory smoothness,
+and the ODE:
 
-The coefficients $\alpha_j$ are optimised by minimising a
-gradient-matching loss with RKHS norm penalty:
+$$J(B, \theta) = \sum_k \Big[ \|y_k - x_k(t_{\text{data}})\|^2 + \lambda\, b_k^\top K b_k \Big]
++ \rho \sum_k \sum_g \big(\dot{x}_k(t_g) - f_k(x(t_g), \theta)\big)^2 + \theta^\top S \theta$$
 
-$$\mathcal{L} = \underbrace{\sum_i \sum_{k \in \text{obs}} \left(\dot{y}_k(t_i) - F_k(\mathbf{y}(t_i), \hat{f})\right)^2}_{\text{gradient matching}} + \lambda_{\text{RKHS}} \underbrace{\boldsymbol{\alpha}^\top K \boldsymbol{\alpha}}_{\text{RKHS norm}}$$
+and is minimized by alternating two steps:
 
-where $\dot{y}_k$ are estimated derivatives from smoothed data, $F_k$ is
-the $k$-th component of the dynamical system, and $K_{jk} = k(x_j, x_k)$
-is the kernel Gram matrix. The RKHS norm penalty
-$\|\hat{f}\|_{\mathcal{H}}^2 = \boldsymbol{\alpha}^\top K \boldsymbol{\alpha}$
-controls smoothness.
+1.  **B-step** — linearize $f$ around the previous trajectory using the
+    grid Jacobian $\partial f/\partial x$ (one Gauss–Newton step), and
+    solve the joint linear system for all states’ coefficients. The
+    Jacobian coupling is what identifies **unobserved states**: a state
+    appearing only in other equations’ right-hand sides is still pulled
+    by their mismatch terms.
+2.  **θ-step** — Adam on the ODE mismatch with the trajectory fixed.
 
 **Key implementation details:**
 
-- The lengthscale is auto-scaled from the domain width (domain_span / 3)
-  when not specified
-- Only observed states contribute to the gradient-matching loss
-- Kernel weights are initialised from the approximator’s initial
-  function values
-- Adam optimiser with cosine learning rate annealing
+- The time-kernel lengthscale auto-scales to `time_span / 8` when not
+  specified
+- The ODE weight $\rho$ is ramped in over the first fifth of the
+  iterations, so the fit starts data-dominant
+- `n_repr_points` sets the resolution of the ODE collocation grid
+  $\{t_g\}$
+- Unobserved states have no data term and start flat at their initial
+  condition
 
 ## References
 

@@ -1,6 +1,6 @@
 # Solver Comparison: Twelve Methods on One Problem
 Simon Frost
-2026-06-12
+2026-08-19
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -148,7 +148,7 @@ mixed models. For strongly nonlinear models like prevalence-dependent
 transmission, `initial_lambda` and `warmup` keep the early IRLS steps
 well-conditioned:
 
-    LAML: data_loss=1364.5, edf=6.1, time=7.7s
+    LAML: data_loss=1342.4, edf=3.0, time=6.9s
 
 ### 2. CollocationLAML
 
@@ -157,7 +157,7 @@ collocation. A continuation schedule gradually increases the ODE
 penalty, starting from a pure data-fit and converging toward
 ODE-consistent solutions.
 
-    CollocationLAML: data_loss=1223.5, edf=2.0, time=2.5s
+    CollocationLAML: data_loss=771.1, edf=2.0, time=1.9s
 
 ### 3. GradientMatching
 
@@ -165,7 +165,7 @@ Estimates derivatives directly from a smooth interpolant of the data,
 then fits the ODE right-hand side to those derivatives. No ODE
 integration required — fast but relies on good derivative estimates.
 
-    GradientMatching: data_loss=1023.4, edf=8.0, time=2.1s
+    GradientMatching: data_loss=1023.4, edf=8.0, time=1.9s
 
 > [!NOTE]
 >
@@ -179,7 +179,7 @@ Direct optimisation of the B-spline coefficients using the Adam gradient
 descent algorithm. Integrates the ODE at each step and minimises the
 mean squared error to data.
 
-    AdamSolver: data_loss=1365.0, time=4.3s
+    AdamSolver: data_loss=1365.0, time=4.2s
 
 ### 5. AdaptiveGradientMatching (AGM)
 
@@ -188,7 +188,7 @@ parameters $\gamma_k$ that control how tightly the GP derivatives must
 satisfy the ODE. Uses pre-computed eigendecomposition for efficiency and
 a B-spline smoothing penalty.
 
-    AGM: data_loss=1184.4, time=5.1s
+    AGM: data_loss=1167.2, time=5.1s
 
 ### 6. RodeoSolver
 
@@ -197,7 +197,7 @@ Kalman filter/smoother. The ODE is enforced as pseudo-observations in a
 state-space model; the marginal likelihood is maximised over B-spline
 coefficients.
 
-    RodeoSolver: data_loss=1476.1, time=12.2s
+    RodeoSolver: data_loss=1505.9, time=11.5s
 
 ### 7. IntegralMatchingSolver
 
@@ -206,7 +206,7 @@ rather than derivatives. This avoids both derivative estimation (noisy)
 and full ODE integration (expensive), providing robustness to
 measurement noise.
 
-    IntegralMatching: data_loss=0.0, time=2.2s
+    IntegralMatching: data_loss=1023.4, time=2.0s
 
 ### 8. EnsembleKalmanSolver
 
@@ -214,7 +214,7 @@ Derivative-free ensemble method: maintains a population of parameter
 particles, propagates each through the ODE, and updates via the Kalman
 gain. Naturally handles non-smooth objectives and noisy forward models.
 
-    EnsembleKalman: data_loss=1328.7, time=2.3s
+    EnsembleKalman: data_loss=1328.8, time=1.9s
 
 ### 9. ODINSolver
 
@@ -223,16 +223,17 @@ process to the data and optimising unknown-function parameters against
 the GP’s derivative estimates. The ODE residual enters the GP marginal
 likelihood for tighter coupling.
 
-    ODIN: data_loss=1241.3, time=2.9s
+    ODIN: data_loss=1067.5, time=4.4s
 
 ### 10. RKHSSolver
 
-Represents the unknown function in a reproducing kernel Hilbert space
-using RBF kernels at representative points. The RKHS norm
-$\|\!f\!\|^2_H = \alpha'K\alpha$ acts as the smoothing penalty,
-providing a non-parametric alternative to splines.
+Trajectory-RKHS estimation (González et al. 2014): the *state
+trajectory* is represented in a time-kernel RKHS so its derivative is
+analytic, and fitting alternates a linear Gauss–Newton solve for the
+trajectory coefficients with gradient steps on the unknown-function
+parameters. No ODE integration.
 
-    RKHS: data_loss=0.0, time=1.8s
+    RKHS: data_loss=1033.7, time=4.3s
 
 ### 11. TwoStageSolver
 
@@ -240,7 +241,7 @@ Simple baseline: smooth data with cubic splines, then match derivatives
 with Adam optimisation. Fast and transparent, but the quality of
 derivative estimation limits accuracy.
 
-    TwoStage: data_loss=1023.4, time=2.2s
+    TwoStage: data_loss=1023.4, time=2.0s
 
 ## Comparison
 
@@ -297,17 +298,17 @@ p_β
 
     Solver              | Data Loss | Time (s)
     --------------------------------------------------
-    LAML                | 1364.5    | 7.7
-    CollocationLAML     | 1223.5    | 2.5
-    GradientMatching    | 1023.4    | 2.1
-    Adam                | 1365.0    | 4.3
-    AGM                 | 1184.4    | 5.1
-    Rodeo               | 1476.1    | 12.2
-    IntegralMatch       | 0.0       | 2.2
-    EnsKalman           | 1328.7    | 2.3
-    ODIN                | 1241.3    | 2.9
-    RKHS                | 0.0       | 1.8
-    TwoStage            | 1023.4    | 2.2
+    LAML                | 1342.4    | 6.9
+    CollocationLAML     | 771.1     | 1.9
+    GradientMatching    | 1023.4    | 1.9
+    Adam                | 1365.0    | 4.2
+    AGM                 | 1167.2    | 5.1
+    Rodeo               | 1505.9    | 11.5
+    IntegralMatch       | 1023.4    | 2.0
+    EnsKalman           | 1328.8    | 1.9
+    ODIN                | 1067.5    | 4.4
+    RKHS                | 1033.7    | 4.3
+    TwoStage            | 1023.4    | 2.0
 
 ## Diagnostic Plots
 
@@ -345,7 +346,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](06_solver_comparison_files/figure-commonmark/cell-19-output-1.svg)
 
-    Durbin-Watson: 1.366, 1.844
+    Durbin-Watson: 1.4, 1.82
 
 > [!TIP]
 >
