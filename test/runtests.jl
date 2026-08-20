@@ -751,6 +751,19 @@ using StableRNGs
             n_intervals=3, maxiters_inner=50, maxiters_outer=5,
             rho_init=1.0, verbose=false))
         @test abs(sol_msl.unknown_functions[:r](50.0) - true_r_msl) < 0.1
+        # The reported objective must be on the Poisson-NLL-kernel scale,
+        # not the SSE scale (pre-fix code reported weighted SSE): with
+        # counts 20–90 the NLL kernel −Σw(y·log μ − μ) is strongly negative
+        # while the SSE is O(10³) positive.
+        sse_msl = sum(prob_msl.data_weights .*
+                      (prob_msl.data_values .- sol_msl.fitted_values) .^ 2)
+        nllk_msl = -sum(prob_msl.data_weights .*
+                        (prob_msl.data_values .*
+                         log.(max.(sol_msl.fitted_values, 1e-10)) .-
+                         sol_msl.fitted_values))
+        @test isapprox(sol_msl.objective, nllk_msl; rtol=1e-8)  # penalty_weight=0
+        @test sol_msl.objective < 0.5 * sse_msl
+        @test sol_msl.data_loss ≈ sse_msl  # data_loss stays descriptive SSE
 
         # NegativeBinomial has no MS loss: clear error, not silent Gaussian
         prob_msl_nb = PSMProblem(growth_msl!, [20.0], (0.0, 5.0), [bs_msl];
@@ -777,6 +790,57 @@ using StableRNGs
         sol_dfp = solve(prob_msl,
             DerivativeFreeSolver(maxiters=4000, verbose=false))
         @test abs(sol_dfp.unknown_functions[:r](50.0) - true_r_msl) < 0.1
+        # Objective must be the Poisson NLL plus the 0.5·penalty term, not
+        # the SSE (pre-fix :mse default reported SSE + penalty, O(10³) here
+        # vs O(10²) for the full NLL)
+        nll_dfp = -PartiallySpecifiedModels.log_likelihood(
+            Poisson(), vec(prob_msl.data_values), vec(sol_dfp.fitted_values),
+            vec(prob_msl.data_weights))
+        beta_dfp = collect(sol_dfp.parameters)
+        S_dfp = penalty_matrix(bs_msl)
+        pen_dfp = 0.5 * 1.0 * dot(beta_dfp, S_dfp * beta_dfp)  # default weight
+        @test isapprox(sol_dfp.objective, nll_dfp + pen_dfp; rtol=1e-6)
+        sse_dfp = sum(prob_msl.data_weights .*
+                      (prob_msl.data_values .- sol_dfp.fitted_values) .^ 2)
+        @test sol_dfp.objective < 0.5 * sse_dfp
+    end
+
+    @testset "VariationalSolver — Poisson likelihood" begin
+        # Exponential decay observed as Poisson counts (as in the MCMC
+        # Poisson test): the ELBO data term must route through the Poisson
+        # pointwise log-likelihood, with no Gaussian noise nuisance.
+        rng_vip = StableRNG(31)
+        function exp_decay_vip!(du, u, p, t)
+            du[1] = -p.r(t) * u[1]
+        end
+        times_vip = collect(0.0:0.5:10.0)
+        mu_vip = 200.0 .* exp.(-0.3 .* times_vip)
+        function sample_poisson_vip(μ)
+            μ = max(μ, 0.01); c = 0; s = 0.0
+            while true; s -= log(rand(rng_vip)); s > μ && break; c += 1; end
+            Float64(c)
+        end
+        y_vip = sample_poisson_vip.(mu_vip)
+
+        bs_vip = BSplineApproximator(:r, (0.0, 10.0), 6; initial=0.15)
+        prob_vip = PSMProblem(exp_decay_vip!, [200.0], (0.0, 10.0), [bs_vip];
+            data_times=times_vip, data_values=reshape(y_vip, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=Poisson(), solver=Tsit5())
+
+        sol_vip = solve(prob_vip, VariationalSolver(
+            maxiters=400, n_elbo_samples=5, verbose=false))
+        @test sol_vip isa PSMSolution
+        @test isfinite(sol_vip.objective)   # finite ELBO through _vi_loglik
+        # no Gaussian noise variance is estimated for Poisson data
+        @test sol_vip.convergence[:obs_noise_var] === nothing
+        # posterior-mean recovery; same 0.2 tolerance as the Gaussian VI test
+        @test abs(sol_vip.unknown_functions[:r](5.0) - 0.3) < 0.2
+
+        # obs_noise_var is a Gaussian-only option: declaring it with Poisson
+        # data must error rather than silently fit Gaussian
+        @test_throws ErrorException solve(prob_vip,
+            VariationalSolver(maxiters=10, obs_noise_var=0.1))
     end
 
     # ─── Discrete-time model tests ─────────────────────────────────

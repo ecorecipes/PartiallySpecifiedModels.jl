@@ -313,6 +313,10 @@ delayed history).
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
+`objective` is the final single-shoot data-fit loss in the training metric
+(weighted SSE for `:mse`, the weighted Poisson NLL kernel for `:poisson`)
+plus the smoothing penalty when `penalty_weight > 0`; `data_loss` is
+always the descriptive weighted SSE.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
     _validate_problem(prob, "MultipleShootingSolver")
@@ -547,6 +551,23 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
         data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
     end
 
+    # Objective in the TRAINING metric (matching AdamSolver's reporting):
+    # weighted SSE for :mse, the weighted Poisson negative log-likelihood
+    # kernel for :poisson, plus the fixed smoothing penalty when active.
+    # data_loss above stays the descriptive weighted SSE in both cases.
+    final_obj = if loss_sym == :poisson
+        obj = 0.0
+        for j in 1:n_obs, i in 1:T_pts
+            mu = max(pred[i, j], 1e-10)
+            y = prob.data_values[i, j]
+            obj -= prob.data_weights[i, j] * (y * log(mu) - mu)
+        end
+        obj
+    else
+        data_loss
+    end
+    final_obj += adam_penalty(prob, theta_final, penalty_w)
+
     # Build evaluators for unknown functions
     uf_evals = Dict{Symbol, Any}()
     offset = 0
@@ -600,7 +621,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
         println("\nFinal (single-shoot): data_SS=$(round(data_loss, sigdigits=5))")
     end
 
-    PSMSolution(params, data_loss, data_loss, edf, Float64[],
+    PSMSolution(params, final_obj, data_loss, edf, Float64[],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
                 (optimizer=:lbfgs, method=:multiple_shooting,
