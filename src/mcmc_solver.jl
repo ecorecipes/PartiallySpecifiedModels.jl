@@ -29,7 +29,11 @@ end
 
 function LogDensityProblems.dimension(ld::PSMLogDensity)
     d = ld.n_params
-    if ld.obs_sigma === nothing; d += 1; end
+    # The σ nuisance parameter exists only for Gaussian observations;
+    # other families carry their own (fixed) dispersion.
+    if ld.obs_sigma === nothing && ld.prob.likelihood isa Gaussian
+        d += 1
+    end
     if ld.sample_smoothing; d += ld.n_smooths; end
     d
 end
@@ -53,13 +57,22 @@ function _psm_logdensity(ld::PSMLogDensity, theta)
     idx = ld.n_params
     beta = theta[1:idx]
 
-    if ld.obs_sigma === nothing
-        idx += 1
-        log_sigma = theta[idx]
-        sigma2 = exp(2 * log_sigma)
+    fam = prob.likelihood
+    if fam isa Gaussian
+        if ld.obs_sigma === nothing
+            idx += 1
+            log_sigma = theta[idx]
+            sigma2 = exp(2 * log_sigma)
+        else
+            log_sigma = nothing
+            sigma2 = T(ld.obs_sigma^2)
+        end
     else
+        # Non-Gaussian families have no σ nuisance parameter (Poisson has
+        # none; NegBin θ and TruncatedNormal σ are fixed in the family
+        # object). σ² = 1 decouples the penalty prior from the data scale.
         log_sigma = nothing
-        sigma2 = T(ld.obs_sigma^2)
+        sigma2 = one(T)
     end
 
     if ld.sample_smoothing && ld.n_smooths > 0
@@ -92,10 +105,9 @@ function _psm_logdensity(ld::PSMLogDensity, theta)
         n_obs = size(prob.data_values, 2)
     end
 
-    # Gaussian log-likelihood (accumulate as scalar to preserve Dual type).
-    # The normalizer counts only weight-carrying finite observations: a
-    # zero weight encodes a masked/missing point, and counting it in n_data
-    # biases the estimated σ² low; NaN data are skipped consistently.
+    # Observation log-likelihood, dispatched through prob.likelihood
+    # (accumulated as a scalar to preserve Dual type). Weight-zero and NaN
+    # entries are masked/missing points and are skipped for every family.
     n_t = size(prob.data_values, 1)
     n_obs = size(prob.data_values, 2)
     ll = zero(T)
@@ -111,10 +123,18 @@ function _psm_logdensity(ld::PSMLogDensity, theta)
             else
                 i <= length(sol.t) ? sol[prob.obs_to_state[j], i] : T(0)
             end
-            ll -= T(0.5) * w * (pred_ij - T(y))^2 / sigma2
+            if fam isa Gaussian
+                ll -= T(0.5) * w * (pred_ij - T(y))^2 / sigma2
+            else
+                ll += T(w) * loglik_pointwise(fam, y, pred_ij)
+            end
         end
     end
-    ll -= T(0.5) * n_eff * log(T(2π) * sigma2)
+    if fam isa Gaussian
+        # Normalizer counts only weight-carrying finite observations:
+        # counting masked points in n_data biases the estimated σ² low.
+        ll -= T(0.5) * n_eff * log(T(2π) * sigma2)
+    end
 
     # --- Log-prior: penalty (Gaussian GMRF prior) + broad prior ---
     # The roughness penalty is the prior precision λS/σ²; the prior is
@@ -210,6 +230,13 @@ Supports Hamiltonian Monte Carlo (HMC), the No-U-Turn Sampler (NUTS),
 and Metropolis–Hastings (MH), providing full posterior distributions
 over the unknown-function parameters.
 
+The observation model follows `prob.likelihood`. Gaussian data get a
+sampled (or fixed, via `obs_sigma`) noise parameter σ; Poisson,
+NegativeBinomial, TruncatedNormal, and CustomLikelihood use the family's
+pointwise log-likelihood with `data_weights` multiplied in and sample no
+σ nuisance (dispersion parameters such as NegBin's θ are fixed in the
+family object). Passing `obs_sigma` with a non-Gaussian family errors.
+
 # Algorithm
 1. Initialise parameters and define the log-posterior (log-likelihood +
    optional smoothing-penalty prior).
@@ -228,6 +255,13 @@ and the full MCMC chain in `sol.extras[:chain]`.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     _validate_problem(prob, "MCMCSolver")
+    if !(prob.likelihood isa Gaussian) && alg.obs_sigma !== nothing
+        error("MCMCSolver: obs_sigma is the Gaussian observation-noise " *
+              "standard deviation, but prob.likelihood is " *
+              "$(typeof(prob.likelihood)), which has no σ parameter " *
+              "(Poisson has none; NegativeBinomial θ and TruncatedNormal σ " *
+              "are fixed in the family object).")
+    end
     verbose = alg.verbose
 
     # Initialize parameters
@@ -257,7 +291,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
                        alg.obs_sigma, alg.sample_smoothing, n_smooths,
                        log_lambda_init)
 
-    estimate_sigma = alg.obs_sigma === nothing
+    # σ is sampled only for Gaussian observations with unspecified obs_sigma
+    estimate_sigma = alg.obs_sigma === nothing && prob.likelihood isa Gaussian
     D = LogDensityProblems.dimension(ld)
 
     # Initial point: beta0 + optional log_sigma + optional log_lambda
@@ -405,8 +440,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
 
     # Layout is [β; log σ; log λ...]: with sample_smoothing the LAST entry
     # is a smoothing parameter, so index log σ by position, not by end.
+    # Non-Gaussian families sample no σ, so there is nothing to report.
     sigma_map = estimate_sigma ? exp(map_theta[n_beta + 1]) : alg.obs_sigma
-    smoothing = [sigma_map]
+    smoothing = sigma_map === nothing ? Float64[] : [sigma_map]
 
     PSMSolution(ca, -logp_values[map_idx], data_loss, Float64(n_beta),
                 smoothing, pred, prob.data_values, collect(prob.data_times),

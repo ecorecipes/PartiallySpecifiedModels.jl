@@ -10,9 +10,13 @@
 Fit a partially specified model using derivative-free optimization.
 
 # Algorithm
-1. Define a loss function that simulates the model and computes MSE or
-   negative log-likelihood against observed data.
-2. Optionally add smoothing penalties: `Σ λ_j β_j' S_j β_j`.
+1. Define a loss function that simulates the model and computes weighted
+   SSE (`:mse`) or the negative log-likelihood of `prob.likelihood`
+   (`:likelihood`). The default `loss=:auto` picks `:mse` for Gaussian
+   data and `:likelihood` for any other family, so a declared
+   non-Gaussian likelihood is honored rather than silently ignored.
+2. Add the smoothing penalty `0.5 · penalty_weight · Σ_j β_j' S_j β_j`
+   (default `penalty_weight=1.0`; set 0 for an unpenalized fit).
 3. Use `Optim.NelderMead()` or `Optim.ParticleSwarm()` to minimize the loss.
 4. Return a `PSMSolution` with fitted parameters.
 
@@ -22,6 +26,17 @@ a large loss value, guiding the optimizer away from bad regions.
 function SciMLBase.solve(prob::PSMProblem, alg::DerivativeFreeSolver)
     _validate_problem(prob, "DerivativeFreeSolver")
     verbose = alg.verbose
+
+    # Resolve the loss: :auto follows prob.likelihood (Gaussian → :mse,
+    # anything else → :likelihood); explicit :mse/:likelihood is honored.
+    loss_sym = if alg.loss == :auto
+        prob.likelihood isa Gaussian ? :mse : :likelihood
+    elseif alg.loss in (:mse, :likelihood)
+        alg.loss
+    else
+        error("DerivativeFreeSolver: unknown loss :$(alg.loss). " *
+              "Supported: :auto, :mse, :likelihood.")
+    end
 
     # ── Initialize parameters ──
     beta0 = build_initial_params(prob)
@@ -59,7 +74,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::DerivativeFreeSolver)
 
     if verbose
         println("DerivativeFreeSolver: $n_p params, $n_data data points")
-        println("  method=$(alg.method), loss=$(alg.loss), maxiters=$(alg.maxiters)")
+        println("  method=$(alg.method), loss=$loss_sym (from $(alg.loss)), " *
+                "maxiters=$(alg.maxiters)")
     end
 
     # ── Loss function ──
@@ -76,7 +92,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DerivativeFreeSolver)
         any(x -> !isfinite(x), pred) && return 1e20
 
         # Data loss
-        data_loss = if alg.loss == :mse
+        data_loss = if loss_sym == :mse
             s = 0.0
             k = 1
             for oi in 1:n_obs, ti in 1:n_times

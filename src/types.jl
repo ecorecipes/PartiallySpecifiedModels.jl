@@ -953,7 +953,8 @@ AdamSolver(; maxiters::Int=300, lr::Float64=0.01, verbose::Bool=false,
 
 """
     MultipleShootingSolver(; n_intervals=10, maxiters_inner=100, maxiters_outer=20,
-                             rho_init=10.0, rho_max=1e6, verbose=false)
+                             rho_init=10.0, rho_max=1e6, loss=:auto,
+                             penalty_weight=0.0, verbose=false)
 
 Multiple shooting solver for training neural differential equations, following
 Turan & Jäschke (2021). Partitions the time span into intervals with shooting
@@ -966,13 +967,18 @@ Advantages over single shooting (AdamSolver):
 
 # Arguments
 - `n_intervals::Int=10`: number of shooting intervals
-- `maxiters_inner::Int=100`: Adam iterations per augmented Lagrangian step
+- `maxiters_inner::Int=100`: L-BFGS iterations per augmented Lagrangian step
 - `maxiters_outer::Int=20`: augmented Lagrangian outer iterations
-- `lr::Float64=0.01`: Adam learning rate
 - `rho_init::Float64=10.0`: initial penalty parameter for shooting constraints
 - `rho_max::Float64=1e6`: maximum penalty parameter
+- `loss::Symbol=:auto`: data-fit loss. `:auto` follows `prob.likelihood`
+  (Gaussian → `:mse` weighted SSE, Poisson → `:poisson` weighted negative
+  log-likelihood kernel; other families error). Explicit `:mse`/`:poisson`
+  are honored with a warning on mismatch, matching `AdamSolver`.
+- `penalty_weight::Float64=0.0`: fixed quadratic smoothing penalty
+  `penalty_weight · Σₖ βₖ'Sₖβₖ` added to the training objective (0 = no
+  penalty; there is no smoothing-parameter selection here)
 - `verbose::Bool=false`: print iteration details
-- `autodiff::Bool=true`: use ForwardDiff (true) or finite differences (false)
 """
 struct MultipleShootingSolver
     n_intervals::Int
@@ -980,15 +986,18 @@ struct MultipleShootingSolver
     maxiters_outer::Int
     rho_init::Float64
     rho_max::Float64
+    loss::Symbol
+    penalty_weight::Float64
     verbose::Bool
 end
 
 MultipleShootingSolver(; n_intervals::Int=10, maxiters_inner::Int=100,
                          maxiters_outer::Int=20,
                          rho_init::Float64=10.0, rho_max::Float64=1e6,
+                         loss::Symbol=:auto, penalty_weight::Float64=0.0,
                          verbose::Bool=false) =
     MultipleShootingSolver(n_intervals, maxiters_inner, maxiters_outer,
-                           rho_init, rho_max, verbose)
+                           rho_init, rho_max, loss, penalty_weight, verbose)
 
 """
     AdaptiveGradientMatching(; maxiters=200, verbose=false, gamma_init=1.0,
@@ -1108,7 +1117,10 @@ Uses LogDensityProblems.jl + AdvancedHMC.jl.
 - `target_accept`: target acceptance rate for NUTS adaptation (0.6–0.95)
 - `prior_scale`: scale for Gaussian prior on parameters (larger = weaker prior).
   When penalty matrices exist (B-spline, GP), uses the penalty; otherwise N(0, prior_scale²).
-- `obs_sigma`: observation noise std dev. If `nothing`, estimated as a parameter.
+- `obs_sigma`: observation noise std dev (Gaussian likelihoods only; errors
+  otherwise). If `nothing`, sampled as a parameter for Gaussian data; non-
+  Gaussian families sample no σ (their dispersion is fixed in the family
+  object). The data term follows `prob.likelihood` in all cases.
 - `sample_smoothing`: if `true`, jointly sample log(λ) for each smooth term
   with a weakly informative N(log(λ_init), 2²) hyperprior. This gives wider,
   more honest credible intervals for the unknown functions. Default: `false`.
@@ -1134,11 +1146,13 @@ MCMCSolver(; n_samples::Int=1000, n_warmup::Int=500, n_chains::Int=1,
                obs_sigma, sample_smoothing, verbose)
 
 """
-    MagiSolver(; n_samples=1000, n_warmup=500, n_deriv=3, n_gridpoints=200,
+    MagiSolver(; n_samples=1000, n_warmup=500, n_gridpoints=200,
                  sigma=nothing, obs_var=nothing, target_accept=0.8,
                  prior_scale=1.0, preoptimize=true, verbose=false)
 
 Manifold-constrained Gaussian process inference (MAGI) for ODE systems.
+Gaussian likelihoods only (the manifold-constrained posterior assumes
+Gaussian observation noise); non-Gaussian `prob.likelihood` errors.
 
 MAGI places a Matérn-3/2 Gaussian-process prior on each state and constrains
 the GP-implied derivative to the ODE vector field through the conditional
@@ -1154,20 +1168,25 @@ Returns an `MCMCChains.Chains` object with posterior samples.
 # Fields
 - `n_samples`: number of posterior samples after warmup
 - `n_warmup`: warmup/adaptation iterations
-- `n_deriv`: retained for interface compatibility (the Matérn-3/2 GP prior
-  is once mean-square differentiable; this field is not used by the GP)
 - `n_gridpoints`: number of discretization grid points for the GP/manifold
   constraint
-- `sigma`: GP marginal-variance scale per state (auto-estimated if `nothing`)
-- `obs_var`: observation noise variance; `nothing` (default) estimates it
-  from the data via the second-difference estimator Var(Δ²y) = 6σ²
-  (a fixed scale-blind default distorted the posterior whenever the
-  data's units differed from O(0.1))
+- `sigma`: per-state observation noise standard deviations (one entry per
+  state component). When supplied, these fixed SDs are used in the data
+  term instead of auto-estimation; mutually exclusive with `obs_var`.
+- `obs_var`: observation noise variance shared across components;
+  `nothing` (default) estimates it from the data via a local-linear
+  residual estimator (a fixed scale-blind default distorted the posterior
+  whenever the data's units differed from O(0.1))
 - `target_accept`: NUTS target acceptance rate
 - `prior_scale`: scale for Gaussian prior on parameters
 - `preoptimize`: run a short MAP pre-optimization to initialize the
   sampler (default `true`)
 - `verbose`: print progress
+
+!!! note "Changed"
+    The former `n_deriv` field was removed: it was never read anywhere
+    (the Matérn-3/2 GP prior has no derivative-order setting), so keeping
+    it only suggested a control that did not exist.
 
 # References
 - Yang, Wong & Kou (2021) PNAS 118(15): "Inference of dynamic systems
@@ -1176,7 +1195,6 @@ Returns an `MCMCChains.Chains` object with posterior samples.
 struct MagiSolver
     n_samples::Int
     n_warmup::Int
-    n_deriv::Int
     n_gridpoints::Int
     sigma::Union{Nothing, Vector{Float64}}
     obs_var::Union{Nothing, Float64}
@@ -1186,13 +1204,13 @@ struct MagiSolver
     verbose::Bool
 end
 
-MagiSolver(; n_samples::Int=1000, n_warmup::Int=500, n_deriv::Int=3,
+MagiSolver(; n_samples::Int=1000, n_warmup::Int=500,
              n_gridpoints::Int=200,
              sigma::Union{Nothing, Vector{Float64}}=nothing,
              obs_var::Union{Nothing, Float64}=nothing,
              target_accept::Float64=0.8, prior_scale::Float64=1.0,
              preoptimize::Bool=true, verbose::Bool=false) =
-    MagiSolver(n_samples, n_warmup, n_deriv, n_gridpoints, sigma, obs_var,
+    MagiSolver(n_samples, n_warmup, n_gridpoints, sigma, obs_var,
                target_accept, prior_scale, preoptimize, verbose)
 
 # ─── BNG solver (Bonnaffé et al. 2023) ────────────────────────────
@@ -1410,8 +1428,9 @@ TwoStageSolver(; n_basis_smooth::Int=20, lambda_smooth::Float64=1.0,
 Derivative-free optimization solver using NelderMead or particle swarm.
 
 The objective includes the quadratic roughness penalty
-`penalty_weight · Σₖ βₖ'Sₖβₖ` (default weight 1.0; set `penalty_weight=0`
-for an unpenalized fit — there is no smoothing-parameter selection here).
+`0.5 · penalty_weight · Σₖ βₖ'Sₖβₖ` (note the ½ factor; default
+`penalty_weight=1.0`; set `penalty_weight=0` for an unpenalized fit —
+there is no smoothing-parameter selection here).
 
 Useful as a robust fallback when gradient-based methods fail (non-smooth
 objectives, stiff dynamics, poor conditioning). Uses simulation-based
@@ -1421,7 +1440,11 @@ loss without requiring autodiff through ODE solves.
 - `method`: optimization method — `:nelder_mead` or `:particle_swarm` (default `:nelder_mead`)
 - `maxiters`: maximum function evaluations (default 10000)
 - `n_particles`: particle count for swarm methods (default 20)
-- `loss`: loss type `:mse` or `:likelihood` (default `:mse`)
+- `loss`: loss type (default `:auto`). `:auto` follows `prob.likelihood`
+  — Gaussian → `:mse` (weighted SSE), any other family → `:likelihood`
+  (the family's negative log-likelihood). Explicit `:mse` or
+  `:likelihood` is honored regardless of the likelihood family.
+- `penalty_weight`: weight of the roughness penalty above (default 1.0)
 - `verbose`: print progress
 """
 struct DerivativeFreeSolver
@@ -1434,7 +1457,7 @@ struct DerivativeFreeSolver
 end
 
 DerivativeFreeSolver(; method::Symbol=:nelder_mead, maxiters::Int=10000,
-                       n_particles::Int=20, loss::Symbol=:mse,
+                       n_particles::Int=20, loss::Symbol=:auto,
                        penalty_weight::Float64=1.0,
                        verbose::Bool=false) =
     DerivativeFreeSolver(method, maxiters, n_particles, loss, penalty_weight,
@@ -1456,6 +1479,9 @@ providing uncertainty estimates.
 - `lr`: learning rate for Adam on ELBO (default 0.01)
 - `n_elbo_samples`: Monte Carlo samples for ELBO gradient (default 10)
 - `prior_scale`: prior std on parameters (default 1.0)
+- `obs_noise_var`: Gaussian observation-noise variance (default `nothing`
+  = estimate from the data). Gaussian likelihoods only; errors otherwise.
+  Non-Gaussian families use their own pointwise log-likelihood in the ELBO.
 - `verbose`: print progress
 """
 struct VariationalSolver

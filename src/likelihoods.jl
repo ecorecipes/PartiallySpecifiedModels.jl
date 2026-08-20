@@ -132,6 +132,44 @@ function log_likelihood(fam::CustomLikelihood, y::AbstractVector,
     ll
 end
 
+# ─── Pointwise log-likelihood (single observation) ──────────────────
+
+"""
+    loglik_pointwise(fam, y, mu)
+
+Pointwise log-likelihood ℓ(y, μ) for a single observation; the caller
+multiplies in any observation weight. Term-for-term identical to what
+`log_likelihood` accumulates, so summing `w_i · loglik_pointwise(fam,
+y_i, μ_i)` reproduces `log_likelihood(fam, y, mu, w)` exactly. The
+**Gaussian** method is the σ-free kernel −½(y−μ)² (σ² is a nuisance
+parameter handled by each solver), matching the `log_likelihood`
+convention. AD-safe: `μ` may be a `ForwardDiff.Dual`.
+"""
+loglik_pointwise(::Gaussian, y::Real, mu::Real) = -0.5 * (y - mu)^2
+
+function loglik_pointwise(::Poisson, y::Real, mu::Real)
+    mu_c = max(mu, 1e-10)
+    kern = y > 0 ? y * log(mu_c) - mu_c : -mu_c
+    kern - _loggamma(y + 1)
+end
+
+function loglik_pointwise(fam::NegativeBinomial, y::Real, mu::Real)
+    θ = fam.theta
+    mu_c = max(mu, 1e-10)
+    kern = y * log(mu_c / (mu_c + θ)) + θ * log(θ / (mu_c + θ))
+    kern + _loggamma(y + θ) - _loggamma(θ) - _loggamma(y + 1)
+end
+
+function loglik_pointwise(fam::TruncatedNormal, y::Real, mu::Real)
+    σ = fam.sigma
+    a = fam.lower
+    z = (y - mu) / σ
+    -0.5 * z^2 - log(σ) - 0.5 * log(2π) - _normlogcdf((mu - a) / σ)
+end
+
+loglik_pointwise(fam::CustomLikelihood, y::Real, mu::Real) =
+    fam.loglik_scalar(y, mu)
+
 # ─── IRLS working weights ──────────────────────────────────────────
 
 """
