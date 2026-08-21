@@ -392,8 +392,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     end
 
     # Approximate effective degrees of freedom from posterior variance:
-    # Parameters with small posterior variance relative to prior are well-determined
-    edf = sum(1.0 .- (sigma_opt .^ 2) ./ (alg.prior_scale^2))
+    # the mean-field analogue of tr(I − Λ Σ_q) = Σᵢ (1 − σ_qᵢ² Λᵢᵢ),
+    # where Λ is the SAME prior precision (ridge + S/prior_scale) that
+    # defines the variational prior above.  A parameter the data pin down
+    # (σ_q² ≪ 1/Λᵢᵢ) contributes ≈1; one the prior returns to its own
+    # variance contributes ≈0.  (The old form divided σ_q² by
+    # prior_scale², which is NOT the prior variance under Λ — per-term
+    # values could go negative and the sum was dimensionally meaningless.)
+    # Each term is clamped to [0, 1], its valid range under the prior.
+    edf = sum(clamp.(1.0 .- (sigma_opt .^ 2) .* diag(Λ), 0.0, 1.0))
     edf = clamp(edf, 1.0, Float64(n_p))
 
     # Build unknown function evaluators using posterior mean

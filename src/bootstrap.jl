@@ -120,13 +120,36 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
     fitted = sol.fitted_values  # n_times × n_obs
     resid = sol.data_values .- fitted
 
-    # Residual scale per observed state, corrected for the effective model
-    # degrees of freedom (a flexible smooth absorbs part of the noise, so a
-    # raw n−1 denominator understates σ and narrows parametric CIs). The
-    # total edf is allocated evenly across observed states.
+    # Cells that actually informed the fit: positive weight AND non-NaN
+    # datum.  The rest of the package (LAML, MCMC, profile likelihood)
+    # masks data this way; a single NaN cell previously propagated into
+    # σ̂ (making it NaN), which made every pseudo-dataset all-NaN — each
+    # replicate then "fit" pure-NaN data without moving from the initial
+    # coefficients and all CIs silently collapsed to zero width.
+    valid = BitMatrix(undef, n_times, n_obs)
+    for j in 1:n_obs, i in 1:n_times
+        valid[i, j] = prob.data_weights[i, j] > 0 && !isnan(sol.data_values[i, j])
+    end
+
+    # Residual scale per observed state, over usable cells only and with
+    # the data weights applied (w is a precision weight: Var(yᵢ) = σ²/wᵢ),
+    # corrected for the effective model degrees of freedom (a flexible
+    # smooth absorbs part of the noise, so a raw n−1 denominator
+    # understates σ and narrows parametric CIs). The total edf is
+    # allocated evenly across observed states.
     edf_j = sol.edf / n_obs
-    σ_hat = Float64[sqrt(sum(abs2, resid[:, j]) /
-                         max(n_times - edf_j, 1.0)) for j in 1:n_obs]
+    σ_hat = Vector{Float64}(undef, n_obs)
+    for j in 1:n_obs
+        nv = count(view(valid, :, j))
+        nv > 0 || error("bootstrap: observed column $j has no usable cells " *
+                        "(every entry is NaN or has zero weight)")
+        ss = 0.0
+        for i in 1:n_times
+            valid[i, j] || continue
+            ss += prob.data_weights[i, j] * abs2(resid[i, j])
+        end
+        σ_hat[j] = sqrt(ss / max(nv - edf_j, 1.0))
+    end
 
     # Build UF evaluation grids (approximators without a domain — e.g. a
     # NeuralApproximator constructed without one — cannot be gridded)
@@ -150,7 +173,8 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
         # to ensure reproducibility regardless of thread scheduling.
         rngs = [Random.Xoshiro(rand(rng, UInt64)) for _ in 1:nboot]
         boot_data = [_resample_data(method, prob.likelihood, fitted, resid,
-                                    σ_hat, n_times, n_obs, rngs[b])
+                                    σ_hat, valid, prob.data_values,
+                                    n_times, n_obs, rngs[b])
                      for b in 1:nboot]
 
         # Per-replicate result storage (avoid races)
@@ -242,7 +266,8 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
             end
 
             y_boot = _resample_data(method, prob.likelihood, fitted, resid,
-                                    σ_hat, n_times, n_obs, rng)
+                                    σ_hat, valid, prob.data_values,
+                                    n_times, n_obs, rng)
 
             prob_boot = PSMProblem(prob.dynamics!, prob.u0, prob.tspan,
                 deepcopy(prob.approximators);   # isolate adaptive (mutable) state per replicate
@@ -343,7 +368,8 @@ end
 # ─── Resampling methods ──────────────────────────────────────────
 
 """
-    _resample_data(method, family, fitted, resid, σ_hat, n_times, n_obs, rng)
+    _resample_data(method, family, fitted, resid, σ_hat, valid, orig,
+                   n_times, n_obs, rng)
 
 Generate bootstrap pseudo-data.
 
@@ -355,11 +381,20 @@ For `:parametric`, the sampling distribution depends on the likelihood family:
 - Other: falls back to Gaussian residuals
 
 For `:nonparametric`, residuals are resampled with replacement per state
-(valid for Gaussian likelihoods; rejected earlier for other families).
+(valid for Gaussian likelihoods; rejected earlier for other families),
+drawing only from cells marked usable in `valid` (positive weight,
+non-NaN datum).
+
+Cells NOT in `valid` keep their original value from `orig`: replicates
+must present the same missingness pattern as the real data (they are
+refit with the same `data_weights`, so masked cells never enter the
+replicate objective), and perturbing a NaN cell would either fabricate
+data or propagate NaN into the replicate fit.
 """
 function _resample_data(method::Symbol, family::AbstractLikelihood,
                         fitted::Matrix{Float64},
                         resid::Matrix{Float64}, σ_hat::Vector{Float64},
+                        valid::BitMatrix, orig::Matrix{Float64},
                         n_times::Int, n_obs::Int, rng)
     y_boot = similar(fitted)
 
@@ -367,11 +402,25 @@ function _resample_data(method::Symbol, family::AbstractLikelihood,
         _parametric_resample!(y_boot, family, fitted, σ_hat, n_times, n_obs, rng)
     elseif method == :nonparametric
         for j in 1:n_obs
-            idx = rand(rng, 1:n_times, n_times)
+            # Pool of usable residuals for this column, CENTERED before
+            # resampling: a penalized fit need not have mean-zero
+            # residuals (the roughness penalty biases the fit toward
+            # smoothness, leaving a systematic offset in the residuals),
+            # and resampling an off-center pool would shift every
+            # pseudo-dataset by that same offset instead of representing
+            # pure noise around the fit.
+            pool = Float64[resid[i, j] for i in 1:n_times if valid[i, j]]
+            pool .-= mean(pool)
+            np = length(pool)
             for i in 1:n_times
-                y_boot[i, j] = fitted[i, j] + resid[idx[i], j]
+                y_boot[i, j] = fitted[i, j] + pool[rand(rng, 1:np)]
             end
         end
+    end
+
+    # Restore the original values (including the NaN pattern) at masked cells
+    for j in 1:n_obs, i in 1:n_times
+        valid[i, j] || (y_boot[i, j] = orig[i, j])
     end
 
     y_boot
