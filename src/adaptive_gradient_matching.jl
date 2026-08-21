@@ -690,10 +690,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
             sk = prob.obs_to_state[j]
             y = Float64.(prob.data_values[:, j])
 
-            σ², ℓ, σn² = optimize_gp_hyperparams(times, y, alg.kernel; verbose=verbose)
+            # Center the data before GP fitting (zero-mean GP prior); add the
+            # mean back to the smoothed states. Without centering, data with
+            # large mean levels get shrunk toward 0 (cf. the MCMC path).
+            ȳ = mean(y)
+            σ², ℓ, σn² = optimize_gp_hyperparams(times, y .- ȳ, alg.kernel; verbose=verbose)
             gp_hyperparams[sk] = (σ², ℓ, σn²)
 
-            xs, _, gc = gp_gradient_inference(times, y, σ², ℓ, σn², alg.kernel)
+            xs, _, gc = gp_gradient_inference(times, y .- ȳ, σ², ℓ, σn², alg.kernel)
+            xs = xs .+ ȳ
             x_smooth[:, sk] .= xs
 
             # For discrete: "gradient_mean" = next state value (forward shift)
@@ -711,11 +716,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
             sk = prob.obs_to_state[j]
             y = Float64.(prob.data_values[:, j])
 
-            σ², ℓ, σn² = optimize_gp_hyperparams(times, y, alg.kernel; verbose=verbose)
+            # Center the data before GP fitting (zero-mean GP prior); add the
+            # mean back to the smoothed states. Derivative estimates need no
+            # offset (d/dt of a constant is zero). Cf. the MCMC path, which
+            # centers via m_center[sk].
+            ȳ = mean(y)
+            σ², ℓ, σn² = optimize_gp_hyperparams(times, y .- ȳ, alg.kernel; verbose=verbose)
             gp_hyperparams[sk] = (σ², ℓ, σn²)
 
-            xs, gm, gc = gp_gradient_inference(times, y, σ², ℓ, σn², alg.kernel)
-            x_smooth[:, sk] .= xs
+            xs, gm, gc = gp_gradient_inference(times, y .- ȳ, σ², ℓ, σn², alg.kernel)
+            x_smooth[:, sk] .= xs .+ ȳ
             grad_means[:, sk] .= gm
             grad_covs[sk] = gc
         end

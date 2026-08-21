@@ -539,6 +539,33 @@ using StableRNGs
         @test sol_pm2.unknown_functions[:r](3.0) == sol_pm.unknown_functions[:r](3.0)
     end
 
+    @testset "Adaptive gradient matching MAP — large-mean data" begin
+        # Exponential relaxation to a large baseline: du/dt = -f(u) with
+        # f(u) = 0.5*(u - 1000). The state lives at ~1000-1010 while the
+        # signal amplitude is only 10, so the MAP path must center the data
+        # before GP smoothing (as the MCMC path does): an uncentered GP
+        # shrinks the smoothed states toward 0 and injects boundary
+        # derivative artifacts proportional to the mean level (pre-fix
+        # max error 3.9 with the wrong sign at f(1002); post-fix 0.09).
+        f_relax(u) = 0.5 * (u - 1000.0)
+        function relax_agm!(du, u, p, t)
+            du[1] = -p.f(u[1])
+        end
+        t_agm = collect(0.0:0.25:8.0)
+        u_true_agm = 1000.0 .+ 10.0 .* exp.(-0.5 .* t_agm)
+        data_agm = u_true_agm .+ 0.05 .* randn(Random.Xoshiro(11), length(t_agm))
+
+        uf_agm = BSplineApproximator(:f, (999.5, 1011.0), 6)
+        prob_agm = PSMProblem(relax_agm!, [1010.0], (0.0, 8.0), [uf_agm];
+            data_times=t_agm, data_values=reshape(data_agm, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_agm = solve(prob_agm, AdaptiveGradientMatching(maxiters=100, verbose=false))
+        err_agm = maximum(abs(sol_agm.unknown_functions[:f](x) - f_relax(x))
+                          for x in (1002.0, 1005.0, 1008.0))
+        @test err_agm < 0.5
+    end
+
     @testset "Rodeo solver (B-spline)" begin
         # Exponential growth: du/dt = r(x)*u, r(x) ≈ constant
         true_r = 0.3
@@ -2411,6 +2438,89 @@ using StableRNGs
         @test abs(sol_ek.unknown_functions[:f](3.0) - 1.5) < 0.45  # stochastic ensemble (30 particles)
     end
 
+    @testset "EnsembleKalmanSolver — discrete map, gapped data times" begin
+        # Stable affine decay map N[t+1] = f(N[t]), f(N) = 0.5N + 2, with
+        # data only every 2 steps. EKI must follow the package-canonical
+        # simulate_discrete convention (iterate unit steps over tspan);
+        # applying the map once per data time would instead fit the
+        # two-step composition 0.25N + 3 (f(8): true 6.0 vs wrong 5.0;
+        # pre-fix error 1.28, post-fix 0.17).
+        f_map_ek(N) = 0.5 * N + 2.0
+        function decmap_ek!(u_next, u, p, t)
+            u_next[1] = p.f(u[1])
+        end
+        N0_ek = 12.0
+        N_full = zeros(21)
+        N_full[1] = N0_ek
+        for i in 1:20
+            N_full[i+1] = f_map_ek(N_full[i])
+        end
+        t_gap = collect(0.0:2.0:20.0)
+        data_gap = [N_full[Int(t)+1] for t in t_gap] .+
+                   0.05 .* randn(Random.Xoshiro(123), length(t_gap))
+
+        uf_ekd = BSplineApproximator(:f, (0.0, 14.0), 6; initial=5.0)
+        prob_ekd = PSMProblem(decmap_ek!, [N0_ek], (0.0, 20.0), [uf_ekd];
+            data_times=t_gap, data_values=reshape(max.(data_gap, 0.01), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian(), discrete=true)
+        sol_ekd = solve(prob_ekd,
+            EnsembleKalmanSolver(n_ensemble=40, n_iterations=20, verbose=false))
+
+        @test abs(sol_ekd.unknown_functions[:f](8.0) - f_map_ek(8.0)) < 0.5
+        # The fitted trajectory must be exactly the canonical discrete
+        # simulation at the fitted parameters.
+        pred_canon = PartiallySpecifiedModels.simulate_discrete(
+            prob_ekd, collect(sol_ekd.parameters))
+        @test maximum(abs.(sol_ekd.fitted_values .- pred_canon)) < 1e-8
+    end
+
+    @testset "GradientMatching sigma2 — masked residuals excluded" begin
+        # Same observed dynamics, once as a 1-state problem and once with an
+        # appended unobserved nuisance state that does not feed back. The
+        # unobserved state's residual rows are zero-weighted, so the fit and
+        # the sigma2-driven theta update must be identical; a divisor that
+        # counts the masked rows halves sigma2 (pre-fix theta ratio was
+        # exactly 2). Dynamics are nonlinear in r so Gauss-Newton iterates
+        # past the iter-5 theta update.
+        r_gm2(N) = 0.5 * (1.0 - N / 10.0)
+        function nl1_gm!(du, u, p, t)
+            r = p.r(u[1])
+            du[1] = r * u[1] * (1.0 + 0.3 * r)
+        end
+        function nl2_gm!(du, u, p, t)
+            r = p.r(u[1])
+            du[1] = r * u[1] * (1.0 + 0.3 * r)
+            du[2] = -u[2]
+        end
+        true_nl!(du, u, p, t) = (r = r_gm2(u[1]); du[1] = r * u[1] * (1.0 + 0.3 * r))
+        sol_true_nl = OrdinaryDiffEq.solve(
+            ODEProblem(true_nl!, [1.0], (0.0, 15.0), nothing), Tsit5(); saveat=0.5)
+        t_nl = collect(sol_true_nl.t)
+        rng_nl = Random.Xoshiro(21)
+        data_nl = [sol_true_nl.u[i][1] + 0.1*randn(rng_nl) for i in 1:length(t_nl)]
+        dvals_nl = reshape(max.(data_nl, 0.01), :, 1)
+
+        prob_nl1 = PSMProblem(nl1_gm!, [1.0], (0.0, 15.0),
+            [BSplineApproximator(:r, (0.0, 12.0), 8)];
+            data_times=t_nl, data_values=dvals_nl,
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        prob_nl2 = PSMProblem(nl2_gm!, [1.0, 1.0], (0.0, 15.0),
+            [BSplineApproximator(:r, (0.0, 12.0), 8)];
+            data_times=t_nl, data_values=dvals_nl,
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_nl1 = solve(prob_nl1, GradientMatching(maxiters=30, tol=0.0, verbose=false))
+        sol_nl2 = solve(prob_nl2, GradientMatching(maxiters=30, tol=0.0, verbose=false))
+
+        @test isapprox(sol_nl1.smoothing_params[1], sol_nl2.smoothing_params[1];
+                       rtol=1e-6)
+        @test isapprox(sol_nl1.unknown_functions[:r](5.0),
+                       sol_nl2.unknown_functions[:r](5.0); atol=1e-6)
+        @test abs(sol_nl1.unknown_functions[:r](5.0) - 0.25) < 0.05
+    end
+
     @testset "ODINSolver — logistic growth" begin
         r_od(N) = 0.5 * (1.0 - N / 10.0)
         function logistic_od!(du, u, p, t)
@@ -2438,6 +2548,17 @@ using StableRNGs
         # GP hyperparameters are estimated per state by marginal likelihood
         hp = sol_od.convergence.gp_hyperparams[1]
         @test hp.ℓ > 0 && hp.σ² > 0 && hp.σn² > 0
+
+        # Reported data_loss must apply data_weights (like GM/BNG siblings)
+        w_od = reshape([isodd(i) ? 2.0 : 0.5 for i in 1:length(t_od)], :, 1)
+        prob_odw = PSMProblem(logistic_od!, [1.0], (0.0, 15.0), [uf_od];
+            data_times=t_od, data_values=reshape(max.(data_od, 0.01), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian(), data_weights=w_od)
+        sol_odw = solve(prob_odw, ODINSolver(maxiters=10, verbose=false))
+        @test isapprox(sol_odw.data_loss,
+                       sum(w_od .* abs2.(prob_odw.data_values .- sol_odw.fitted_values));
+                       rtol=1e-10)
     end
 
     @testset "ODINSolver — partially observed oscillator" begin

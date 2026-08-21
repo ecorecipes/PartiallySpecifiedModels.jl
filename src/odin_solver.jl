@@ -232,7 +232,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
         pred[:, j] .= X_fit[:, prob.obs_to_state[j]]
     end
 
-    data_loss = sum(abs2, prob.data_values .- pred)
+    data_loss = sum(prob.data_weights .* abs2.(prob.data_values .- pred))
 
     uf_evals = Dict{Symbol, Any}()
     offset = 0
