@@ -389,12 +389,54 @@ end
 """
     penalty_matrix(a::ShapeConstrainedSPDEApproximator)
 
-Compute the Matérn SPDE penalty matrix for the constrained approximator.
-The penalty operates in the unconstrained parameter space (γ), so it is
-transformed as P_γ = Σᵀ P_β Σ where P_β is the SPDE FEM penalty.
+Penalty matrix in the unconstrained parameter space (γ). Two modes,
+selected by the approximator's `penalty` field:
+
+- `:gamma_matern` (default): the Matérn FEM precision `P_β` is pushed
+  through the LINEAR map Σ as `P_γ = Σᵀ P_β Σ`, ignoring the nonlinear
+  softplus in β = Σ·d(γ). Since `P_β` is SPD and Σ has full column rank,
+  `P_γ` is SPD — it has NO null space. Consequently λ→∞ drives γ → 0
+  entirely, whose image under the constraint map is a fixed ramp with
+  per-node increment `softplus(0) = log 2` (for monotone constraints) —
+  an arbitrary function, not a maximally smooth member of the constraint
+  family — and the free level γ₁ is shrunk along with everything else.
+  Kept as the default for backward compatibility.
+
+- `:difference`: the Pya & Wood (2015) SCOP first-difference penalty
+  `DᵀD` built directly on γ, mirroring the
+  `penalty_matrix(::ShapeConstrainedBSplineApproximator)` construction: the
+  chain of first differences runs over the curvature-carrying components
+  only, skipping the free level (and the slope-like component for
+  curvature constraints) per `_penalty_skip_indices`. The null space then
+  contains the free level/slope shifts and the constant-increment vector,
+  so the λ→∞ limit is a maximally smooth member of the constraint family
+  (e.g. the best-fitting straight line for `:increasing`), with the level
+  unshrunk. The SCSPDE mesh is always uniform (built with `range`), so
+  the plain unweighted difference matrix is the natural choice — no mesh
+  weighting is needed. Note this mode does not use the Matérn κ/ρ
+  structure; smoothness is controlled by λ alone.
+
+Prefer `:difference` when you want the classical penalized-spline λ→∞
+semantics (shrinkage toward the smooth null family); keep `:gamma_matern`
+if you want Matérn-correlated shrinkage of γ toward zero and accept its
+fixed-ramp limit.
 """
 function penalty_matrix(a::ShapeConstrainedSPDEApproximator)
-    # Build the SPDE penalty in mesh-value space
+    if a.penalty == :difference
+        # P&W SCOP difference penalty on γ, exactly as in the SCBSpline path.
+        np = nparams(a)
+        skip = _penalty_skip_indices(a.constraint, np)
+        idxs = [i for i in 1:np if !(i in skip)]
+        n_c = length(idxs)
+        D = zeros(max(n_c - 1, 0), np)
+        for r in 1:(n_c - 1)
+            D[r, idxs[r]]   = -1.0
+            D[r, idxs[r+1]] =  1.0
+        end
+        return D' * D
+    end
+
+    # :gamma_matern — build the SPDE penalty in mesh-value space
     C, G = spde_fem_matrices(a.mesh_points)
     κ = a.kappa
     C_inv = Diagonal(1.0 ./ diag(C))

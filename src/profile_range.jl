@@ -13,7 +13,8 @@ end
 
 function with_range_param(a::ShapeConstrainedSPDEApproximator, range_param::Float64)
     ShapeConstrainedSPDEApproximator(a.name, a.domain, a.n_basis, a.constraint;
-        nu=a.nu, range_param=range_param, initial=a.initial_func)
+        nu=a.nu, range_param=range_param, initial=a.initial_func,
+        penalty=a.penalty)
 end
 
 """
