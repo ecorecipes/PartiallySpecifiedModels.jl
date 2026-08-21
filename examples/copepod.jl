@@ -81,7 +81,10 @@ function compute_u0(p)
     μ_j0 = p.mu_j(0.0)
     μ_a0 = p.mu_a(0.0)
 
-    u0 = zeros(Float64, 11)
+    # Allocate from the parameter eltype so the closure stays compatible
+    # with dual numbers (ForwardDiff through AdamSolver/MultipleShooting)
+    T = promote_type(typeof(R0), typeof(μ_j0), typeof(μ_a0))
+    u0 = zeros(T, 11)
     inflow = R0
     for i in 1:11
         death = i <= 6 ? μ_j0 : μ_a0

@@ -2,13 +2,16 @@
 #
 # This example fits an SIR model where the transmission rate β(t)
 # is an unknown function of time, modeled with a penalized B-spline.
-# The data are incident case counts with a Poisson likelihood.
+# The data are cumulative case counts (Poisson-noised daily incidence,
+# accumulated) fitted with a Poisson likelihood (identity link, so the
+# spline is fitted on the response scale).
 #
 # Model: dS/dt = -β(t)*S*I/N
 #        dI/dt =  β(t)*S*I/N - γ*I
 #        dR/dt =  γ*I
 #
-# Observed: daily new infections ≈ β(t)*S*I/N (Poisson distributed)
+# Observed: cumulative cases C(t), whose daily increments
+#           ≈ β(t)*S*I/N are Poisson distributed
 #
 # Reference: Based on the SIR PSM example from
 # https://github.com/epirecipes/sir-julia/blob/master/markdown/psm/psm.md
@@ -45,16 +48,13 @@ u0_true = [N - 10.0, 10.0, 0.0, 0.0]
 prob_true = ODEProblem(sir_true!, u0_true, tspan)
 sol_true = OrdinaryDiffEq.solve(prob_true, Tsit5(); saveat=data_times)
 
-# Generate Poisson-distributed daily new case counts
+# Generate daily new case counts from the true trajectory
 cum_cases = [sol_true(t)[4] for t in data_times]
 daily_cases = diff(vcat(0.0, cum_cases))
 daily_cases = max.(daily_cases, 0.1)  # floor at 0.1
 
-# Add Poisson noise
-observed_cases = Float64[max(rand(Distributions_poisson(c)), 0.0) for c in daily_cases]
-
 # Simple Poisson sampler (avoid extra dependency)
-function Distributions_poisson(λ)
+function poisson_rand(λ)
     if λ <= 0; return 0; end
     L = exp(-λ)
     k = 0
@@ -66,8 +66,11 @@ function Distributions_poisson(λ)
     return k - 1
 end
 
-# Re-generate with our sampler
-observed_cases = Float64[max(Distributions_poisson(c), 0.0) for c in daily_cases]
+# Poisson-noised daily counts, accumulated into observed cumulative counts.
+# (A sum of independent Poisson increments is itself Poisson; successive
+# cumulative observations are correlated, which we ignore for simplicity.)
+observed_cases = Float64[poisson_rand(c) for c in daily_cases]
+cum_obs = cumsum(observed_cases)
 
 println("Synthetic SIR data: $(length(data_times)) days")
 println("Total true cases: $(round(Int, sum(daily_cases)))")
@@ -97,17 +100,17 @@ approx_β = BSplineApproximator(:β, (0.0, 80.0), 15;
 
 u0 = [N - 10.0, 10.0, 0.0, 0.0]
 
-# Observed: daily new cases = ΔC (difference of cumulative)
-# We observe cumulative cases and fit to the daily increment
-# For simplicity, observe cumulative cases at each time point
-data_values = reshape(cum_cases, :, 1)
+# Observed: Poisson-noised cumulative case counts (state 4).
+# The package's Poisson likelihood uses the identity link, so the model
+# prediction C(t) is compared with the counts on the response scale.
+data_values = reshape(cum_obs, :, 1)
 
 prob = PSMProblem(sir_psm!, u0, tspan, [approx_β];
     data_times = data_times,
     data_values = data_values,
     obs_to_state = [4],  # observe cumulative cases (state 4)
     known_params = (γ = γ, N = N),
-    likelihood = Gaussian(),  # Gaussian on cumulative for simplicity
+    likelihood = Poisson(),  # counts → Poisson (identity link)
     solver = Tsit5(),
     abstol = 1e-6,
     reltol = 1e-6)
@@ -119,7 +122,7 @@ sol = solve(prob, LAML(maxiters=80, verbose=true))
 
 println("\n" * "="^60)
 println("Results:")
-println("  Data loss (SS): ", @sprintf("%.4e", sol.data_loss))
+println("  Data loss:      ", @sprintf("%.4e", sol.data_loss))
 println("  EDF:            ", round(sol.edf, digits=2))
 println("  Smoothing λ:    ", [round(s, sigdigits=4) for s in sol.smoothing_params])
 
