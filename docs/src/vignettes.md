@@ -36,7 +36,7 @@ The `vignettes/` directory contains 35 worked examples covering every solver, ap
 
 | # | Vignette | Description |
 |:--|:---------|:------------|
-| 06 | [Solver Comparison](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/06_solver_comparison/06_solver_comparison.md) | Side-by-side comparison of seven solvers |
+| 06 | [Solver Comparison](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/06_solver_comparison/06_solver_comparison.md) | Side-by-side comparison of eleven solvers |
 | 07 | [Probabilistic Fitting](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/07_probabilistic_fitting/07_probabilistic_fitting.md) | Probabilistic ODE fitting with uncertainty quantification |
 | 09 | [Gradient Matching](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/09_gradient_matching/09_gradient_matching.md) | Integration-free inference with adaptive gradient matching |
 | 14 | [MCMC](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/14_mcmc/14_mcmc.md) | Full Bayesian inference with HMC/NUTS posterior sampling |

@@ -245,8 +245,9 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 >
 > ### See Also
 >
-> - [Vignette 27: Blowfly DDE](../27_blowfly_dde/27_blowfly_dde.qmd) —
->   ecological DDE application with bootstrap confidence intervals
+> - [Vignette 27: Predator–Prey Functional
+>   Response](../27_predator_prey/27_predator_prey.qmd) — ecological
+>   application with bootstrap confidence intervals
 
 ## Summary
 

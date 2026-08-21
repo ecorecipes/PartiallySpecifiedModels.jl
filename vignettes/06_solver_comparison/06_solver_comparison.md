@@ -1,4 +1,4 @@
-# Solver Comparison: Twelve Methods on One Problem
+# Solver Comparison: Eleven Methods on One Problem
 Simon Frost
 2026-08-19
 
@@ -32,9 +32,11 @@ Simon Frost
 ## Overview
 
 `PartiallySpecifiedModels.jl` provides **22 different solvers** for
-fitting partially specified models. This vignette compares 12
+fitting partially specified models. This vignette compares 11
 representative methods on the same test problem, highlighting the
-diversity of algorithmic approaches:
+diversity of algorithmic approaches (`ProfileLikelihoodSolver` is listed
+in the table for context but is demonstrated separately in Vignette 32
+rather than fitted here):
 
 | Solver | Approach | Integration? | Smoothing |
 |----|----|:--:|----|
@@ -48,7 +50,7 @@ diversity of algorithmic approaches:
 | **EnsembleKalmanSolver** | Ensemble Kalman Inversion | Yes | Ensemble-based |
 | **ODINSolver** | ODE-Informed GP regression | No | GP marginal likelihood |
 | **RKHSSolver** | Kernel ridge regression (RKHS) | No | RKHS norm penalty |
-| **ProfileLikelihoodSolver** | Profile likelihood for identifiability | Yes (inner) | Automatic (LAML inner) |
+| **ProfileLikelihoodSolver** | Profile likelihood for identifiability | Yes | Fixed λ̂ (from LAML fit) |
 | **TwoStageSolver** | Smooth-then-differentiate | No | Manual (penalty-based) |
 
 This vignette fits the **same model and data** with all methods,

@@ -164,7 +164,7 @@ The `vignettes/` directory contains 35 worked examples:
 | 03 | Lotka–Volterra | Hare–lynx predator-prey with LAML and collocation |
 | 04 | Copepod | 11-stage structured population model with multiple unknown functions |
 | 05 | Neural Networks | Comparing B-spline, GP, and neural network approximators on SIR |
-| 06 | Solver Comparison | Side-by-side comparison of seven solvers |
+| 06 | Solver Comparison | Side-by-side comparison of eleven solvers |
 | 07 | Probabilistic Fitting | Probabilistic ODE fitting with uncertainty quantification |
 | 08 | Rosenzweig–MacArthur | Recovering functional responses in consumer-resource dynamics |
 | 09 | Gradient Matching | Integration-free inference with adaptive gradient matching |
