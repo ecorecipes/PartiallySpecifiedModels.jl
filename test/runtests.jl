@@ -2017,6 +2017,68 @@ using StableRNGs
             @test p ≈ p2
         end
 
+        @testset "Dual-safe neural evaluator" begin
+            import ForwardDiff
+            using PartiallySpecifiedModels: build_param_struct,
+                                            build_initial_params,
+                                            build_neural_evaluator,
+                                            mlp_spec_from_lux
+
+            model = Lux.Chain(Lux.Dense(1, 8, tanh), Lux.Dense(8, 1))
+            uf = NeuralApproximator(:g, model; domain=(0.0, 5.0), rng_seed=42)
+            decay!(du, u, p, t) = (du[1] = -p.g(u[1]) * u[1])
+            ts = collect(0.0:0.5:10.0)
+            prob = PSMProblem(decay!, [5.0], (0.0, 10.0), [uf];
+                data_times=ts,
+                data_values=reshape(5.0 .* exp.(-0.5 .* ts), :, 1),
+                obs_to_state=[1], known_params=NamedTuple(), solver=Tsit5())
+            beta = build_initial_params(prob)
+            p = build_param_struct(prob, beta)
+
+            # Derivative w.r.t. the input x (needed for autodiff Jacobians
+            # in stiff ODE solvers) — threw a MethodError before the
+            # Float32/Lux.apply evaluator was replaced
+            d = ForwardDiff.derivative(x -> p.g(x), 0.5)
+            @test isfinite(d)
+
+            # Gradient w.r.t. β through build_param_struct — also threw
+            g_ad = ForwardDiff.gradient(b -> build_param_struct(prob, b).g(0.5),
+                                        beta)
+            @test all(isfinite, g_ad)
+            @test any(!iszero, g_ad)
+
+            # Stiff-solver smoke test: autodiff Jacobians differentiate the
+            # neural evaluator w.r.t. the state (failed pre-fix)
+            ode = ODEProblem((du, u, pp, t) -> decay!(du, u, p, t),
+                             [5.0], (0.0, 10.0))
+            sol_stiff = OrdinaryDiffEq.solve(ode, TRBDF2(); saveat=0.5)
+            @test sol_stiff.retcode == SciMLBase.ReturnCode.Success
+            sol_rb = OrdinaryDiffEq.solve(ode, Rosenbrock23(); saveat=0.5)
+            @test sol_rb.retcode == SciMLBase.ReturnCode.Success
+
+            # Non-Dense chains must NOT go through the MLP path: skipping a
+            # zero-parameter layer (WrappedFunction, Dropout, …) would
+            # silently evaluate a different function than the model
+            # defines. mlp_spec_from_lux refuses, and build_neural_evaluator
+            # routes to the Lux.apply fallback, which must match a direct
+            # Lux.apply evaluation of the true model.
+            model_wf = Lux.Chain(Lux.Dense(1, 4, tanh),
+                                 Lux.WrappedFunction(x -> x .^ 2),
+                                 Lux.Dense(4, 1))
+            @test_throws ErrorException mlp_spec_from_lux(model_wf)
+            uf_wf = NeuralApproximator(:h, model_wf; domain=(0.0, 5.0),
+                                       rng_seed=7)
+            ev_wf = build_neural_evaluator(uf_wf, initial_params(uf_wf))
+            ps_nt, st_nt = Lux.setup(Random.Xoshiro(7), model_wf)
+            xn = (0.7 - 0.0) / 5.0
+            out_direct, _ = Lux.apply(model_wf, reshape(Float32[xn], 1, 1),
+                                      ps_nt, st_nt)
+            # rtol covers the reference being computed in Float32 (Lux's
+            # native parameter storage) vs the evaluator's Float64 path
+            @test isapprox(ev_wf(0.7), out_direct[1]; rtol=1e-4)
+            @test isfinite(ForwardDiff.derivative(ev_wf, 0.7))
+        end
+
         @testset "AdamSolver with NeuralApproximator" begin
             Random.seed!(42)
             function decay_nn!(du, u, p, t)
@@ -2036,11 +2098,23 @@ using StableRNGs
                 data_times=t_obs, data_values=data, obs_to_state=[1],
                 known_params=NamedTuple(), solver=Tsit5())
 
-            sol = solve(prob, AdamSolver(lr=0.01, maxiters=500, verbose=false))
-            @test sol.data_loss < 5.0
+            sol = solve(prob, AdamSolver(lr=0.02, maxiters=1000, verbose=false))
+            @test sol.data_loss < 1.0
             @test haskey(sol.unknown_functions, :f)
-            # Check the function is callable
-            @test isfinite(sol.unknown_functions[:f](1.0))
+
+            # Recovery of the truth f(x) = 0.5x. Observation noise is
+            # σ = 0.1 on the state, and with the trajectory u(t) = 5/(1+2.5t)
+            # most observations lie at small u, so identifiability is
+            # tightest for small x and loosens where data are sparse
+            # (x ≳ 3). Observed max error ≈ 0.02 for x ≤ 1 and ≈ 0.11 at
+            # x = 3–4; assert with ~2x headroom.
+            fhat = sol.unknown_functions[:f]
+            for x in (0.5, 1.0, 2.0)
+                @test abs(fhat(x) - 0.5 * x) < 0.15
+            end
+            for x in (3.0, 4.0)
+                @test abs(fhat(x) - 0.5 * x) < 0.25
+            end
         end
     end
 

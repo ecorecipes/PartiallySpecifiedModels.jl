@@ -524,23 +524,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            _, st = Lux.setup(rng, approx.model)
-            rng2 = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            ps_ca = Float64.(ComponentArray(Lux.initialparameters(rng2, approx.model)))
-            ps_final = similar(ps_ca)
-            ps_final .= params_k
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            uf_evals[approx.name] = x -> begin
-                xn = if lo !== nothing && span !== nothing && span > 0
-                    (Float64(x isa AbstractArray ? x[1] : x) - lo) / span
-                else
-                    Float64(x isa AbstractArray ? x[1] : x)
-                end
-                out, _ = Lux.apply(approx.model, Float32.(reshape([xn], :, 1)), ps_final, st)
-                length(out) == 1 ? Float64(out[1]) : Float64.(out)
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator

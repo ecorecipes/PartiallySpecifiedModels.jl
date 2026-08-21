@@ -202,23 +202,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
         elseif approx isa COMONetApproximator
             uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
         elseif approx isa NeuralApproximator
-            rng_nn = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            _, st = Lux.setup(rng_nn, approx.model)
-            rng_nn2 = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            ps_ca = Float64.(ComponentArray(Lux.initialparameters(rng_nn2, approx.model)))
-            ps_vec = similar(ps_ca)
-            ps_vec .= params_k
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            uf_evals[approx.name] = x -> begin
-                xn = if lo !== nothing && span !== nothing && span > 0
-                    (Float64(x isa AbstractArray ? x[1] : x) - lo) / span
-                else
-                    Float64(x isa AbstractArray ? x[1] : x)
-                end
-                out, _ = Lux.apply(approx.model, Float32.(reshape([xn], :, 1)), ps_vec, st)
-                length(out) == 1 ? Float64(out[1]) : Float64.(out)
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         end
     end
 
