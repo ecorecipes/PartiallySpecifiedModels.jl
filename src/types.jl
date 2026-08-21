@@ -52,6 +52,17 @@ Neural network approximator using a Lux.jl model.
 - `model`: a Lux.jl model (Chain, Dense, etc.)
 - `penalty_weight`: L2 regularization weight (>0 enables LAML smoothing)
 - `domain`: optional `(lo, hi)` for input normalization to `[0, 1]`
+
+# Evaluation and autodiff
+For a `Lux.Chain` of `Lux.Dense` layers (or a bare `Lux.Dense`), the
+network is evaluated through a hand-rolled, eltype-generic MLP path
+(`build_neural_evaluator`) that is fully compatible with
+`ForwardDiff.Dual` numbers — stiff ODE solvers with autodiff Jacobians
+(e.g. `TRBDF2()`, `Rosenbrock23()`) and gradient-based solvers work.
+Other architectures fall back to `Lux.apply` with the input and
+parameters promoted to a common element type; that fallback is only as
+Dual-safe as the Lux kernels of the layers involved, so exotic layers
+may not support ForwardDiff through the dynamics.
 """
 struct NeuralApproximator <: AbstractApproximator
     name::Symbol

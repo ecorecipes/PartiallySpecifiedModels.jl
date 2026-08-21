@@ -10,92 +10,9 @@
 using LinearAlgebra: norm, dot
 using ForwardDiff
 
-# ─── ForwardDiff-compatible MLP ──────────────────────────────────
-
-"""
-    MLPSpec
-
-Specification for a simple MLP (Multi-Layer Perceptron) that can be evaluated
-with ForwardDiff Dual numbers. Stores layer sizes and activation functions.
-"""
-struct MLPSpec
-    layer_sizes::Vector{Tuple{Int,Int}}  # [(n_in, n_out), ...]
-    activations::Vector{Function}         # activation per layer
-    n_params::Int
-end
-
-"""
-Extract MLP specification from a Lux Chain model.
-"""
-function mlp_spec_from_lux(model::Lux.Chain)
-    layers = Tuple{Int,Int}[]
-    activations = Function[]
-    n_params = 0
-
-    for layer in model.layers
-        if layer isa Lux.Dense
-            n_in = layer.in_dims
-            n_out = layer.out_dims
-            push!(layers, (n_in, n_out))
-            act = layer.activation
-            push!(activations, act)
-            n_params += n_in * n_out + n_out  # weights + bias
-        end
-    end
-    # Any parameterized non-Dense layer (Scale, SkipConnection, nested Chain…)
-    # would be counted by nparams() but skipped here, leaving its parameters
-    # silently untrained — refuse instead.
-    n_params == Lux.parameterlength(model) ||
-        error("AdamSolver's MLP evaluator supports Chains of Lux.Dense layers " *
-              "only; the given model has $(Lux.parameterlength(model)) " *
-              "parameters but its Dense layers account for $n_params. " *
-              "Restructure the network or use a different solver.")
-    MLPSpec(layers, activations, n_params)
-end
-
-"""
-    mlp_evaluate(spec, params, x)
-
-Evaluate MLP with given parameter vector. Works with any numeric type
-including ForwardDiff.Dual.
-
-Parameters are packed as: [W1..., b1..., W2..., b2..., ...]
-where Wi is column-major (n_out × n_in).
-"""
-function mlp_evaluate(spec::MLPSpec, params, x_scalar)
-    T = eltype(params)
-    x = T[T(x_scalar)]
-    offset = 0
-
-    for (i, (n_in, n_out)) in enumerate(spec.layer_sizes)
-        # Extract weights (column-major: n_out × n_in)
-        W = reshape(view(params, offset+1:offset+n_in*n_out), n_out, n_in)
-        offset += n_in * n_out
-        b = view(params, offset+1:offset+n_out)
-        offset += n_out
-
-        x = spec.activations[i].(W * x .+ b)
-    end
-
-    length(x) == 1 ? x[1] : x
-end
-
-"""
-Initialize MLP parameters matching Lux's Glorot uniform initialization.
-Returns Float64 vector.
-"""
-function init_mlp_params(spec::MLPSpec, rng::AbstractRNG)
-    params = Float64[]
-    for (n_in, n_out) in spec.layer_sizes
-        # Glorot uniform
-        scale = sqrt(24.0 / (n_in + n_out))
-        W = (rand(rng, n_out * n_in) .- 0.5) .* scale
-        b = zeros(n_out)
-        append!(params, W)
-        append!(params, b)
-    end
-    params
-end
+# The ForwardDiff-compatible MLP machinery (MLPSpec, mlp_spec_from_lux,
+# mlp_evaluate, init_mlp_params) lives in neural_evaluator.jl, shared by
+# all solvers.
 
 # ─── ForwardDiff-compatible param struct builder ─────────────────
 
@@ -118,22 +35,9 @@ function build_autodiff_param_struct(prob::PSMProblem, beta)
             evaluator = build_bspline_evaluator(knots_x, params_k)
             push!(uf_entries, approx.name => evaluator)
         elseif approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            # Closure captures params_k (which may be Dual-valued)
-            let pk = params_k, s = spec, lo_ = lo, span_ = span
-                evaluator = x -> begin
-                    xval = x isa AbstractArray ? x[1] : x
-                    xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
-                        (xval - lo_) / span_
-                    else
-                        xval
-                    end
-                    mlp_evaluate(s, pk, xn)
-                end
-                push!(uf_entries, approx.name => evaluator)
-            end
+            # Shared Dual-safe evaluator (closure captures params_k, which
+            # may be Dual-valued)
+            push!(uf_entries, approx.name => build_neural_evaluator(approx, params_k))
         elseif approx isa GPApproximator
             evaluator = build_gp_evaluator(approx, params_k)
             push!(uf_entries, approx.name => evaluator)
@@ -585,19 +489,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_specs[approx.name]
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                uf_evals[approx.name] = x -> begin
-                    xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
-                        (Float64(x isa AbstractArray ? x[1] : x) - lo_) / span_
-                    else
-                        Float64(x isa AbstractArray ? x[1] : x)
-                    end
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator
