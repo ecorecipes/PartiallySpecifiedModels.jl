@@ -225,7 +225,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
         alg.sigma
     end
 
-    obs_var = alg.obs_var
+    # Observation noise variance: auto-estimate from the data scale when not
+    # provided (same estimator as RodeoSolver/PseudoMarginalSolver — a fixed
+    # default like 0.01 is scale-blind and badly misfits data of order ≫ 1).
+    obs_var = if alg.obs_var === nothing
+        total_var = 0.0
+        for j in 1:n_obs
+            total_var += var(prob.data_values[:, j])
+        end
+        max(total_var / n_obs * 0.01, 1e-4)
+    else
+        alg.obs_var
+    end
 
     if verbose
         @printf("  σ (IBM scale): %s\n", string(round.(sigma, sigdigits=3)))
