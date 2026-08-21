@@ -211,9 +211,16 @@ function _adapt_gp_hyperparams!(a::GPApproximator, beta_k::AbstractVector)
     best_ll = -Inf
     best_ℓ = a.lengthscale
     best_σ² = a.variance
+    # Score the INCUMBENT (current ℓ, σ²) first: with the strict `>` below,
+    # "no change" wins ties and adaptation is monotone in the marginal
+    # likelihood — a grid that never scored the incumbent could replace a
+    # better off-grid setting with a worse grid point.
+    cands = [(a.lengthscale, a.variance)]
     for frac in (0.08, 0.15, 0.25, 0.4, 0.6, 1.0), σm in (0.5, 1.0, 2.0)
-        ℓ_try = frac * span
-        σ²_try = σm * v
+        push!(cands, (frac * span, σm * v))
+    end
+    for (ℓ_try, σ²_try) in cands
+        (ℓ_try > 0 && σ²_try > 0) || continue
         kf = _kernel_func(a.kernel, ℓ_try, σ²_try)
         K = _build_kernel_matrix(kf, x)
         F = cholesky(Symmetric(K + nug * I), check=false)

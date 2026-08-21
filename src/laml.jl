@@ -371,11 +371,18 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
     V_prev = -Inf
     n_newton = family isa Gaussian ? max(0, maxiter - n_fs) : 0
 
+    # The Gaussian objective's RSS must use the SAME coefficients β̂_fs as
+    # its penalty term: passing the stale outer-loop μ paired RSS(β_outer)
+    # with pen(β_fs). Shift μ to the working-model fit so that
+    # y − μ_fs = z_work − J β̂_fs, exactly the FS phase's working residuals.
+    # (Only the Gaussian family reaches Newton, and it reads μ only via RSS.)
+    mu_fs = mu .+ J * (beta_fs .- beta)
+
     for iter in 1:min(n_newton, 20)
         # Evaluate at the working-model optimum β̂(λ) from the FS phase —
         # not the stale outer-loop β. (Within Newton the β̂ is held fixed:
         # a small approximation, polished by the outer IRLS re-linearization.)
-        V, H, S_lambda, sigma2 = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu,
+        V, H, S_lambda, sigma2 = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu_fs,
                                                  S_list, offsets, nknots_list, rho, n_p)
         if !isfinite(V)
             if verbose; println("LAML-Newton: non-finite V, stopping"); end
@@ -418,7 +425,7 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
         step = 1.0
         rho_new = clamp.(rho .+ step .* delta, RHO_MIN, RHO_MAX)
         V_new = try
-            v, _, _, _ = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu,
+            v, _, _, _ = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu_fs,
                                          S_list, offsets, nknots_list, rho_new, n_p)
             v
         catch; -Inf end
@@ -428,7 +435,7 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
             step *= 0.5
             rho_new = clamp.(rho .+ step .* delta, RHO_MIN, RHO_MAX)
             V_new = try
-                v, _, _, _ = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu,
+                v, _, _, _ = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu_fs,
                                              S_list, offsets, nknots_list, rho_new, n_p)
                 v
             catch; -Inf end

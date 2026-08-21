@@ -17,8 +17,9 @@
 """
     solve(prob::PSMProblem, alg::RodeoSolver)
 
-Fit a partially specified model using the RODEO (Reverse-mode ODE
-Observation) probabilistic numerics solver. An integrated Brownian motion
+Fit a partially specified model using the RODEO probabilistic-numerics
+solver (named after Wu & Lysy's `rodeo` package, the algorithmic
+reference for this implementation). An integrated Brownian motion
 (IBM) prior is placed over the state and Kalman filtering/smoothing is
 used to condition on both the observations and the ODE constraints.
 

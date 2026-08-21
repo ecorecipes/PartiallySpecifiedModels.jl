@@ -3429,4 +3429,142 @@ using StableRNGs
         end
     end
 
+    @testset "Minor-batch fixes (T10)" begin
+        @testset "_normlogcdf: tail accuracy and branch continuity" begin
+            using PartiallySpecifiedModels: _normlogcdf, _normcdf
+            # References from 512-bit BigFloat Simpson quadrature of φ.
+            refs = ((-5.5, -17.779376352625253),
+                    (-6.0, -20.736768949974696),
+                    (-6.5, -23.938149495161824),
+                    (-7.0, -27.384307498811054),
+                    (-8.0, -35.01343715991452))
+            for (x, r) in refs
+                # Old truncated asymptotic branch erred by 2.5e-3–2.6e-2 here.
+                @test _normlogcdf(x) ≈ r atol=1e-10
+            end
+            # The two branches agree at the x = −1 seam (old seam at −6
+            # jumped by ~0.022).
+            @test abs(_normlogcdf(-1.0) - log(_normcdf(-1.0))) < 1e-7
+            @test abs(_normlogcdf(-1.0 + 1e-10) - _normlogcdf(-1.0 - 1e-10)) < 1e-7
+        end
+
+        @testset "Poisson: mu floor consistent between loglik and weights" begin
+            using PartiallySpecifiedModels: log_likelihood, loglik_pointwise,
+                irls_weights, _loggamma
+            # Healthy fit (μ ≫ 1e-6): value unchanged by the unification.
+            y_p = [5.0, 10.0, 3.0]; mu_p = [4.5, 11.0, 3.2]; w = ones(3)
+            ll_ref = sum(y_p[i] * log(mu_p[i]) - mu_p[i] -
+                         _loggamma(y_p[i] + 1) for i in 1:3)
+            @test log_likelihood(Poisson(), y_p, mu_p, w) ≈ ll_ref atol=1e-12
+            # Nonpositive μ sees the SAME effective mean max(|μ|, 1e-6) as
+            # the IRLS weights (old floor at 1e-10 was a cliff the
+            # curvature never saw).
+            @test log_likelihood(Poisson(), [2.0], [-0.5], [1.0]) ==
+                  log_likelihood(Poisson(), [2.0], [0.5], [1.0])
+            @test loglik_pointwise(Poisson(), 2.0, -0.5) ==
+                  loglik_pointwise(Poisson(), 2.0, 0.5)
+            @test irls_weights(Poisson(), [2.0], [-0.5], [1.0]) ==
+                  irls_weights(Poisson(), [2.0], [0.5], [1.0])
+        end
+
+        @testset "SCOP initial_params: unclamped Greville reproduces linears" begin
+            using PartiallySpecifiedModels: initial_params,
+                build_constrained_bspline_evaluator
+            lin = x -> 1.0 + 2.0 * x
+            a = ShapeConstrainedBSplineApproximator(:f, (0.0, 1.0), 8,
+                                                    :increasing; initial=lin)
+            ev = build_constrained_bspline_evaluator(a, initial_params(a))
+            # Clamped Greville evaluation had max error 0.067 on this target.
+            @test maximum(abs(ev(x) - lin(x))
+                          for x in range(0.0, 1.0, length=101)) < 1e-10
+            # A function that THROWS outside its domain still initializes
+            # (per-point fallback: clamped value + one-sided-slope
+            # extrapolation), and stays exact for a linear target.
+            f_strict = x -> (0.0 <= x <= 1.0 || throw(DomainError(x));
+                             1.0 + 2.0 * x)
+            a2 = ShapeConstrainedBSplineApproximator(:f, (0.0, 1.0), 8,
+                                                     :increasing;
+                                                     initial=f_strict)
+            p2 = initial_params(a2)
+            @test all(isfinite, p2)
+            ev2 = build_constrained_bspline_evaluator(a2, p2)
+            @test maximum(abs(ev2(x) - lin(x))
+                          for x in range(0.0, 1.0, length=101)) < 1e-10
+        end
+
+        @testset "GP adaptation: incumbent hyperparameters win" begin
+            using PartiallySpecifiedModels: _adapt_gp_hyperparams!,
+                _kernel_func, _build_kernel_matrix
+            g = GPApproximator(:g, (0.0, 1.0), 12)
+            @test g.adapt
+            xind = g.inducing_points
+            beta_k = sin.(4.0 .* xind) .+ 0.3 .* xind
+            # Sample variance (matches Statistics.var used inside the adapter).
+            mβ = sum(beta_k) / length(beta_k)
+            v = sum(abs2, beta_k .- mβ) / (length(beta_k) - 1)
+            nug = 1e-6 * v
+            gp_ll = (ℓ, σ²) -> begin
+                K = _build_kernel_matrix(_kernel_func(g.kernel, ℓ, σ²), xind)
+                F = cholesky(Symmetric(K + nug * I), check=false)
+                issuccess(F) || return -Inf
+                -0.5 * dot(beta_k, F \ beta_k) - sum(log, diag(F.U))
+            end
+            # Fine sweep (superset of the adaptation grid) → off-grid optimum.
+            best_ll = -Inf; best_ℓ = 0.0; best_σ² = 0.0
+            for frac in 0.04:0.01:1.2, σm in 0.3:0.1:3.0
+                llv = gp_ll(frac, σm * v)
+                if llv > best_ll
+                    best_ll = llv; best_ℓ = frac; best_σ² = σm * v
+                end
+            end
+            # Grid best, for the discrimination guard below.
+            gbest_ll = -Inf; gbest_ℓ = 0.0
+            for frac in (0.08, 0.15, 0.25, 0.4, 0.6, 1.0), σm in (0.5, 1.0, 2.0)
+                llv = gp_ll(frac, σm * v)
+                if llv > gbest_ll
+                    gbest_ll = llv; gbest_ℓ = frac
+                end
+            end
+            # The incumbent must beat the grid materially, else this test
+            # could not distinguish the fix.
+            @test abs(log(best_ℓ / gbest_ℓ)) > 0.05
+            g.lengthscale = best_ℓ; g.variance = best_σ²
+            # Pre-fix, adaptation moved to the worse grid best; now the
+            # incumbent is scored first and "no change" wins.
+            @test _adapt_gp_hyperparams!(g, beta_k) == false
+            @test g.lengthscale == best_ℓ
+            @test g.variance == best_σ²
+        end
+
+        @testset "TwoStageSolver.n_basis_smooth is wired to the smoother" begin
+            using PartiallySpecifiedModels: _smoothing_spline
+            t = collect(range(0.0, 10.0, length=40))
+            yy = sin.(t) .+ 0.05 .* cos.(7 .* t)
+            v_def, _ = _smoothing_spline(t, yy)
+            v_15, _ = _smoothing_spline(t, yy; max_basis=15)
+            v_8, _ = _smoothing_spline(t, yy; max_basis=8)
+            # Default preserved exactly (the field was dead at an effective 15).
+            @test v_def(3.7) == v_15(3.7)
+            # A non-default basis cap actually changes the smoother.
+            @test abs(v_def(3.7) - v_8(3.7)) > 1e-6
+            @test TwoStageSolver().n_basis_smooth == 15
+            @test TwoStageSolver(n_basis_smooth=8).n_basis_smooth == 8
+            @test_throws ArgumentError TwoStageSolver(n_basis_smooth=3)
+        end
+
+        @testset "smooth_and_differentiate warns on duplicate obs targets" begin
+            using PartiallySpecifiedModels: smooth_and_differentiate
+            times = collect(range(0.0, 1.0, length=10))
+            data = hcat(times, 2 .* times)
+            @test_logs (:warn, r"multiple observation columns") smooth_and_differentiate(
+                times, data, [1, 1], 2)
+            # Later column wins (documented overwrite behavior); the linear
+            # target is reproduced exactly by the penalized smoother.
+            ys, _ = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+                smooth_and_differentiate(times, data, [1, 1], 2)
+            end
+            @test isapprox(ys[5, 1], 2 * times[5], atol=1e-6)
+        end
+    end
+
 end
