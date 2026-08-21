@@ -49,7 +49,9 @@ Fit a partially specified model by ensemble Bayesian gradient matching
 
 # Returns
 `PSMSolution`. Fitted values re-simulate the ODE/map with the best
-member's parameters.
+member's parameters. `sol.convergence` carries the honest-convergence keys
+`(converged, iterations, reason)` plus per-member `member_converged` — see
+the `BNGSolver` docstring for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     _validate_problem(prob, "BNGSolver")
@@ -203,6 +205,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
         loss_fn = β -> bng_loss(β, y_smooth, dydt)
         result = DiffResults.MutableDiffResult(0.0, (zeros(n_beta),))
         iters_used = alg.maxiters
+        plateaued = false
         for iter in 1:alg.maxiters
             ForwardDiff.gradient!(result, loss_fn, beta)
             loss_val = DiffResults.value(result)
@@ -222,16 +225,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
                 rmin, rmax = extrema(loss_window)
                 if (rmax - rmin) / max(abs(rmin), 1.0) < 1e-6
                     iters_used = iter
+                    plateaued = true
                     break
                 end
             end
         end
-        best_beta, best_loss, iters_used
+        best_beta, best_loss, iters_used, plateaued
     end
 
     # ── Step 2/3: the K_o × K_p ensemble ─────────────────────────
     member_betas = Vector{Vector{Float64}}()
     member_losses = Float64[]
+    member_plateaued = Bool[]
     total_iters = 0
     for ko in 1:alg.k_obs
         data_ko = if ko == 1
@@ -245,9 +250,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
         end
         y_smooth, dydt = smooth_targets(data_ko)
         for kp in 1:alg.k_proc
-            beta_fit, loss_fit, it = fit_member(init_beta(kp), y_smooth, dydt)
+            beta_fit, loss_fit, it, plat = fit_member(init_beta(kp), y_smooth, dydt)
             push!(member_betas, beta_fit)
             push!(member_losses, loss_fit)
+            push!(member_plateaued, plat)
             total_iters += it
             if verbose
                 println("  member (obs $ko, proc $kp): " *
@@ -417,7 +423,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     PSMSolution(params, best_loss, data_loss, edf, Float64[],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (converged=true, iterations=total_iters, method=:bng,
+                (converged=member_plateaued[best_idx], iterations=total_iters,
+                 reason=(member_plateaued[best_idx] ? :plateau : :maxiters),
+                 method=:bng,
                  n_ensemble=K_total, member_losses=member_losses,
-                 member_weights=w_members, ensemble_std=ensemble_std))
+                 member_weights=w_members, member_converged=member_plateaued,
+                 ensemble_std=ensemble_std))
 end

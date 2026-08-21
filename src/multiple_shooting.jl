@@ -316,7 +316,10 @@ delayed history).
 `objective` is the final single-shoot data-fit loss in the training metric
 (weighted SSE for `:mse`, the weighted Poisson NLL kernel for `:poisson`)
 plus the smoothing penalty when `penalty_weight > 0`; `data_loss` is
-always the descriptive weighted SSE.
+always the descriptive weighted SSE. `sol.convergence` is a NamedTuple
+`(optimizer, method, n_intervals, converged, iterations, reason, max_gap,
+rho_final)` — see the `MultipleShootingSolver` docstring for the key
+taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
     _validate_problem(prob, "MultipleShootingSolver")
@@ -411,8 +414,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
 
     prev_max_gap = Inf
 
+    # Honest convergence reporting: defaults describe outer-loop exhaustion.
+    conv_converged = false
+    conv_reason = :maxiters
+    conv_iters = 0
+    final_max_gap = NaN
+
     # Outer loop: augmented Lagrangian
     for outer in 1:alg.maxiters_outer
+        conv_iters = outer
         # Re-create loss function with current lagrange_mult and rho
         loss_fn = z_ -> ms_loss(prob, z_, n_theta, K, boundaries, intervals,
                                 lagrange_mult, rho, loss_sym, penalty_w)
@@ -501,9 +511,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
         end
 
         # Check convergence (relative to state scale)
+        final_max_gap = max_gap
         state_scale = norm(u0_init)
         if max_gap < 1e-2 * state_scale
             if verbose; println("  Shooting gaps converged!"); end
+            conv_converged = true
+            conv_reason = :converged_tol
             break
         end
 
@@ -625,5 +638,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
                 (optimizer=:lbfgs, method=:multiple_shooting,
-                 n_intervals=n_intervals))
+                 n_intervals=n_intervals,
+                 converged=conv_converged, iterations=conv_iters,
+                 reason=conv_reason, max_gap=final_max_gap, rho_final=rho))
 end

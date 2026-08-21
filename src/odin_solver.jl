@@ -40,7 +40,9 @@ initial condition, and are identified through the ODE terms alone.
 # Returns
 `PSMSolution` with fitted parameters, the jointly optimised trajectory,
 and unknown functions. `sol.convergence.gp_hyperparams` records the
-per-state `(σ², ℓ, σ_n²)`.
+per-state `(σ², ℓ, σ_n²)`; `sol.convergence` also carries the honest
+convergence keys `(converged, iterations, reason)` — see the `ODINSolver`
+docstring.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
     _validate_problem(prob, "ODINSolver"; require_continuous=true)
@@ -204,10 +206,19 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
     m_adam = zeros(n_z); v_adam = zeros(n_z)
     n_total = alg.maxiters * 20
     result = DiffResults.MutableDiffResult(0.0, (zeros(n_z),))
+    # Honest convergence reporting: objective-plateau check following the
+    # gradient-matching family convention (30-step window, relative range
+    # < 1e-6 after step 60). Defaults describe loop exhaustion.
+    conv_converged = false
+    conv_reason = :maxiters
+    conv_iters = 0
+    loss_window = fill(Inf, 30)
     for step in 1:n_total
+        conv_iters = step
         ForwardDiff.gradient!(result, odin_risk, z)
         loss_val = DiffResults.value(result)
         grad = DiffResults.gradient(result)
+        loss_window[mod1(step, 30)] = loss_val
         lr_t = lr * 0.5 * (1 + cos(π * step / n_total))
         m_adam .= β1_adam .* m_adam .+ (1 - β1_adam) .* grad
         v_adam .= β2_adam .* v_adam .+ (1 - β2_adam) .* grad .^ 2
@@ -221,6 +232,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
         z .-= lr_t .* m_hat ./ (sqrt.(v_hat) .+ eps_adam)
         if verbose && (step <= 3 || step % 100 == 0 || step == n_total)
             println("  step $step: risk=$(round(loss_val, sigdigits=5))")
+        end
+        # Plateau convergence, guarded against the cosine lr schedule
+        # manufacturing a plateau as lr_t → 0 near n_total.
+        if step > 60 && lr_t > 0.05 * lr
+            rmin, rmax = extrema(loss_window)
+            if (rmax - rmin) / max(abs(rmin), 1.0) < 1e-6
+                if verbose; println("  Converged at step $step (loss plateau)"); end
+                conv_converged = true
+                conv_reason = :plateau
+                break
+            end
         end
     end
     X_fit = reshape(best_z[1:n_state], n_times, n_vars)
@@ -285,6 +307,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
     PSMSolution(params, best_loss, data_loss, edf, Float64[ode_weight],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (converged=true, iterations=alg.maxiters, method=:odin,
+                (converged=conv_converged, iterations=conv_iters,
+                 reason=conv_reason, method=:odin,
                  gp_hyperparams=[hyper[k] for k in 1:n_vars]))
 end

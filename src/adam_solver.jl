@@ -308,6 +308,9 @@ differentiation through the ODE/map solver via `ForwardDiff.jl`.
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
+`sol.convergence` is a NamedTuple `(optimizer, method, converged, iterations,
+reason, final_grad_norm)` — see the `AdamSolver` docstring for the key
+taxonomy and the guarded plateau criterion.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
     _validate_problem(prob, "AdamSolver")
@@ -372,7 +375,14 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
     best_loss = Inf
     loss_window = fill(Inf, 30)
 
+    # Honest convergence reporting: defaults describe loop exhaustion.
+    conv_converged = false
+    conv_reason = :maxiters
+    conv_iters = 0
+    final_grad_norm = NaN
+
     for iter in 1:alg.maxiters
+        conv_iters = iter
         # Compute gradient
         local loss_val
         if alg.autodiff
@@ -393,6 +403,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
                 beta[i] -= h
             end
         end
+
+        final_grad_norm = norm(grad)
 
         if loss_val < best_loss
             best_loss = loss_val
@@ -417,11 +429,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
         # Convergence: loss plateau. A plateau at the 1e10 failure sentinel
         # is a stuck solver, not convergence — keep iterating (the Adam
         # moments may still walk out of the failing region).
-        if iter > 60 && best_loss < 1e9
+        # Guard against SPURIOUS plateaus manufactured by the cosine lr
+        # schedule: near maxiters lr_t → 0, so the loss stops moving no matter
+        # how far from an optimum we are. Only declare plateau-convergence
+        # while the step size is still meaningful (lr_t > 5% of the base lr).
+        if iter > 60 && best_loss < 1e9 && lr_t > 0.05 * lr
             recent_min = minimum(loss_window)
             recent_max = maximum(loss_window)
             if (recent_max - recent_min) / max(abs(recent_min), 1.0) < 1e-4
                 if verbose; println("  Converged at iter $iter (loss plateau)"); end
+                conv_converged = true
+                conv_reason = :plateau
                 break
             end
         end
@@ -520,5 +538,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
     PSMSolution(params, best_loss, data_loss, edf, Float64[],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (optimizer=:adam, method=:adam_ode))
+                (optimizer=:adam, method=:adam_ode,
+                 converged=conv_converged, iterations=conv_iters,
+                 reason=conv_reason, final_grad_norm=final_grad_norm))
 end

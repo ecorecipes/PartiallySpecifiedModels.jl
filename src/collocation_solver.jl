@@ -404,6 +404,9 @@ soft constraint.
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
+`sol.convergence` is a NamedTuple `(ode_compliance, lambda_ode_final,
+converged, iterations, reason, iterations_total)` — see the
+`CollocationLAML` docstring for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     _validate_problem(prob, "CollocationLAML")
@@ -498,14 +501,26 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     # ─── Continuation loop ────────────────────────────────────────
     edf_final = Float64(sum(uf_nk))   # updated by the Fellner–Schall step
     fs_skip_warned = false            # warn once if the FS step never runs
+    # Honest convergence reporting: converged/reason describe the FINAL
+    # continuation level's inner loop; iterations counts its inner iterations
+    # (iterations_total accumulates across all levels).
+    conv_converged = false
+    conv_reason = :maxiters
+    conv_iters = 0
+    conv_iters_total = 0
     for (level, lambda_ode) in enumerate(lambda_ode_schedule)
         if verbose
             println("\n=== Continuation level $level: λ_ode = $(round(lambda_ode, sigdigits=4)) ===")
         end
 
         prev_obj = Inf
+        conv_converged = false
+        conv_reason = :maxiters
+        conv_iters = 0
 
         for iter in 1:alg.maxiters
+            conv_iters = iter
+            conv_iters_total += 1
             # Compute combined residual and Jacobian
             resid, J_full = collocation_residual_jacobian(
                 prob, times, alpha, beta, D, lambda_ode, w_vec)
@@ -538,6 +553,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
             # Check convergence
             if iter > 1 && abs(curr_obj - prev_obj) < alg.tol * max(abs(prev_obj), 1.0)
                 if verbose; println("  Converged at iter $iter"); end
+                conv_converged = true
+                conv_reason = :converged_tol
                 break
             end
             prev_obj = curr_obj
@@ -560,6 +577,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                     (JtJ + 1e-6 * I) \ neg_Jtr
                 catch
                     if verbose; println("  Singular system, breaking"); end
+                    conv_reason = :early_break
                     break
                 end
             end
@@ -586,6 +604,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
 
             if best_step == 0.0
                 if verbose; println("  No improvement, stopping"); end
+                conv_converged = true
+                conv_reason = :plateau
                 break
             end
 
@@ -747,5 +767,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     PSMSolution(params, obj_val, data_loss, edf, copy(theta),
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (ode_compliance=ode_loss, lambda_ode_final=alg.lambda_ode_end))
+                (ode_compliance=ode_loss, lambda_ode_final=alg.lambda_ode_end,
+                 converged=conv_converged, iterations=conv_iters,
+                 reason=conv_reason, iterations_total=conv_iters_total))
 end

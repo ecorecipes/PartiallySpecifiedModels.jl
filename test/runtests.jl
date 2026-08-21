@@ -3237,4 +3237,196 @@ using StableRNGs
         @test abs(sol_p1.unknown_functions[:f](3000.0) - 1500.0) < 300.0
     end
 
+    @testset "Convergence reporting — honest converged/iterations/reason" begin
+        # Every iterative solver must report (converged, iterations, reason)
+        # in sol.convergence: converged=true ONLY when a genuine criterion
+        # fired, iterations = actual work done (not the budget), and reason
+        # distinguishing :converged_tol / :plateau / :maxiters / :early_break.
+        # Shared cheap problem: exponential growth with a spline growth rate.
+        function growth_conv!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+        end
+        t_conv = collect(range(0.0, 5.0, length=30))
+        y_conv = reshape(exp.(0.3 .* t_conv), :, 1)
+        prob_conv = PSMProblem(growth_conv!, [1.0], (0.0, 5.0),
+            [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+            data_times=t_conv, data_values=y_conv,
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=Gaussian(), solver=Tsit5(),
+            abstol=1e-8, reltol=1e-8, maxiters=10000)
+
+        # Shared sanity check on the extension keys
+        function check_conv_keys(c)
+            @test c.converged isa Bool
+            @test c.iterations isa Int
+            @test c.reason isa Symbol
+            @test c.reason in (:converged_tol, :plateau, :maxiters, :early_break)
+        end
+
+        @testset "LAML" begin
+            # (a) budget exhaustion is reported as such
+            c = solve(prob_conv, LAML(maxiters=2)).convergence
+            check_conv_keys(c)
+            @test !c.converged
+            @test c.reason == :maxiters
+            @test c.iterations == 2
+            @test c.laml_failures isa Int && c.laml_failures >= 0
+            # existing keys survive (confidence_band depends on them)
+            @test c.V_beta !== nothing
+            @test c.sigma2 isa Float64
+            # (b) genuine convergence fires the tolerance criterion
+            c2 = solve(prob_conv, LAML(maxiters=60)).convergence
+            check_conv_keys(c2)
+            @test c2.converged
+            @test c2.reason in (:converged_tol, :plateau)
+            @test 0 < c2.iterations < 60
+        end
+
+        @testset "GCVSolver" begin
+            c = solve(prob_conv, GCVSolver(maxiters=2)).convergence
+            check_conv_keys(c)
+            @test !c.converged
+            @test c.reason == :maxiters
+            @test c.iterations == 2
+            @test c.gcv isa Float64
+            c2 = solve(prob_conv, GCVSolver(maxiters=30)).convergence
+            @test c2.converged
+            @test c2.reason == :converged_tol
+            @test 0 < c2.iterations < 30
+        end
+
+        @testset "CollocationLAML" begin
+            c = solve(prob_conv, CollocationLAML(maxiters=1,
+                lambda_ode_start=0.01, lambda_ode_end=100.0,
+                n_continuation=2)).convergence
+            check_conv_keys(c)
+            @test !c.converged
+            @test c.reason == :maxiters
+            @test c.iterations == 1          # final continuation level
+            @test c.iterations_total == 2    # 1 per level × 2 levels
+            # existing keys survive
+            @test c.ode_compliance isa Float64
+            @test c.lambda_ode_final == 100.0
+            c2 = solve(prob_conv, CollocationLAML(maxiters=20,
+                lambda_ode_start=0.01, lambda_ode_end=100.0,
+                n_continuation=4)).convergence
+            @test c2.converged
+            @test c2.reason in (:converged_tol, :plateau)
+            @test c2.iterations_total >= c2.iterations
+        end
+
+        @testset "AdamSolver" begin
+            c = solve(prob_conv, AdamSolver(maxiters=5, lr=0.01)).convergence
+            check_conv_keys(c)
+            @test !c.converged
+            @test c.reason == :maxiters
+            @test c.iterations == 5
+            @test c.final_grad_norm isa Float64 && isfinite(c.final_grad_norm)
+            # existing keys survive
+            @test c.optimizer == :adam
+            @test c.method == :adam_ode
+            # Spurious-plateau guard: with maxiters=70, every iteration where
+            # the plateau check is reachable (iter > 60) has a cosine-annealed
+            # lr_t below 5% of the base lr (0.5·(1+cos(π·61/70)) ≈ 0.041), so
+            # a flat loss window there is the schedule's artifact, not
+            # convergence — the guard must forbid reason=:plateau.
+            cg = solve(prob_conv, AdamSolver(maxiters=70, lr=0.01)).convergence
+            @test !cg.converged
+            @test cg.reason == :maxiters   # NOT :plateau
+            @test cg.iterations == 70
+            # A genuine plateau (mid-schedule, lr still meaningful) IS
+            # reported as convergence.
+            c2 = solve(prob_conv, AdamSolver(maxiters=300, lr=0.01)).convergence
+            @test c2.converged
+            @test c2.reason == :plateau
+            @test 60 < c2.iterations < 300
+        end
+
+        @testset "MultipleShootingSolver" begin
+            # Starved budget with a negligible continuity penalty leaves
+            # visible shooting gaps: must NOT be reported as converged.
+            c = solve(prob_conv, MultipleShootingSolver(
+                n_intervals=5, maxiters_inner=1, maxiters_outer=1,
+                rho_init=1e-6)).convergence
+            check_conv_keys(c)
+            @test !c.converged
+            @test c.reason == :maxiters
+            @test c.iterations == 1
+            @test c.max_gap isa Float64 && c.max_gap > 0.0
+            @test c.rho_final isa Float64 && c.rho_final >= 1e-6
+            # existing keys survive
+            @test c.optimizer == :lbfgs
+            @test c.method == :multiple_shooting
+            @test c.n_intervals == 5
+            # Normal run: shooting gaps close below the tolerance
+            c2 = solve(prob_conv, MultipleShootingSolver(
+                n_intervals=3, maxiters_inner=50, maxiters_outer=5,
+                rho_init=1.0)).convergence
+            @test c2.converged
+            @test c2.reason == :converged_tol
+            @test c2.max_gap < 1e-2   # tolerance is 1e-2 · ‖u0‖, u0 = [1.0]
+        end
+
+        @testset "TwoStageSolver" begin
+            c = solve(prob_conv, TwoStageSolver(maxiters=10)).convergence
+            check_conv_keys(c)
+            @test !c.converged
+            @test c.reason == :maxiters
+            @test c.iterations == 10
+            @test c.method == :two_stage
+            c2 = solve(prob_conv, TwoStageSolver(maxiters=1000)).convergence
+            @test c2.converged
+            @test c2.reason == :plateau
+            @test 60 < c2.iterations < 1000
+        end
+
+        @testset "IntegralMatchingSolver" begin
+            c = solve(prob_conv, IntegralMatchingSolver(maxiters=10)).convergence
+            check_conv_keys(c)
+            @test !c.converged
+            @test c.reason == :maxiters
+            @test c.iterations == 10
+            @test c.method == :integral_matching
+            c2 = solve(prob_conv,
+                       IntegralMatchingSolver(maxiters=1000)).convergence
+            @test c2.converged
+            @test c2.reason == :plateau
+            @test 60 < c2.iterations < 1000
+        end
+
+        @testset "ODINSolver" begin
+            # ODIN's budget is 20 Adam steps per maxiter; iterations counts
+            # the steps actually performed.
+            c = solve(prob_conv, ODINSolver(maxiters=3)).convergence
+            check_conv_keys(c)
+            @test !c.converged
+            @test c.reason == :maxiters
+            @test c.iterations == 60   # 20 · maxiters, plateau needs step > 60
+            @test c.method == :odin
+            c2 = solve(prob_conv, ODINSolver(maxiters=50)).convergence
+            @test c2.converged
+            @test c2.reason == :plateau
+            @test 60 < c2.iterations < 1000
+        end
+
+        @testset "BNGSolver" begin
+            c = solve(prob_conv, BNGSolver(maxiters=5, k_obs=2, k_proc=1,
+                                           rng_seed=7)).convergence
+            check_conv_keys(c)
+            @test !c.converged
+            @test c.reason == :maxiters
+            @test c.iterations == 10   # 2 members × 5 iters, all exhausted
+            @test c.member_converged == [false, false]
+            # existing keys survive
+            @test c.n_ensemble == 2
+            @test length(c.member_losses) == 2
+            c2 = solve(prob_conv, BNGSolver(maxiters=500, k_obs=2, k_proc=1,
+                                            rng_seed=7)).convergence
+            @test c2.converged
+            @test c2.reason == :plateau
+            @test all(c2.member_converged)
+            @test c2.iterations < 1000   # both members plateaued early
+        end
+    end
+
 end
