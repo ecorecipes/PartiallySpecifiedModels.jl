@@ -59,6 +59,16 @@ end
 
 # ─── ODE/Discrete RHS evaluation at collocation points ────────────
 
+# Failure-sentinel convention: when the dynamics throw a genuinely
+# numerical error (domain error, NaN/Inf conversion, ...) at a collocation
+# point, the RHS is replaced by _COLLOC_FAIL_SENTINEL everywhere it is
+# used — both in the residual and as the base point of finite-difference
+# Jacobians — so the linearization is consistent with the residual it
+# linearizes. A perturbed evaluation that fails falls back to the base
+# value, giving a zero FD derivative: the sentinel is locally constant.
+# Programming errors (see `_is_program_error`) are always rethrown.
+const _COLLOC_FAIL_SENTINEL = 1e6
+
 """
 Evaluate the dynamics right-hand side at all collocation points.
 
@@ -78,8 +88,9 @@ function eval_ode_rhs(prob::PSMProblem, times::Vector{Float64},
         u = alpha[i, :]
         try
             prob.dynamics!(du, u, p, times[i])
-        catch
-            du .= 1e6  # Large residual for failed evaluations
+        catch e
+            _is_program_error(e) && rethrow()
+            du .= _COLLOC_FAIL_SENTINEL  # numerical failure → large residual
         end
         F[i, :] .= du
     end
@@ -194,12 +205,22 @@ function collocation_residual_jacobian(
         # ∂/∂alpha[i,k_pert]: -sqrt_lode * ∂F[i,k_eq]/∂x[k_pert]
         for i in 1:(T-1)
             u = alpha[i, :]
-            try; prob.dynamics!(du0, u, p, times[i]); catch; du0 .= 0; end
+            try
+                prob.dynamics!(du0, u, p, times[i])
+            catch e
+                _is_program_error(e) && rethrow()
+                du0 .= _COLLOC_FAIL_SENTINEL  # match the residual sentinel
+            end
 
             for k_pert in 1:K
                 u_p = copy(u)
                 u_p[k_pert] += eps_x
-                try; prob.dynamics!(du_p, u_p, p, times[i]); catch; du_p .= du0; end
+                try
+                    prob.dynamics!(du_p, u_p, p, times[i])
+                catch e
+                    _is_program_error(e) && rethrow()
+                    du_p .= du0  # sentinel is locally constant → zero FD slope
+                end
                 dF_dx = (du_p .- du0) ./ eps_x
 
                 col_i = (k_pert - 1) * T + i  # alpha[i, k_pert]
@@ -221,12 +242,22 @@ function collocation_residual_jacobian(
         # ∂F/∂x is the state Jacobian of the ODE RHS, computed by pointwise FD
         for i in 1:T
             u = alpha[i, :]
-            try; prob.dynamics!(du0, u, p, times[i]); catch; du0 .= 0; end
+            try
+                prob.dynamics!(du0, u, p, times[i])
+            catch e
+                _is_program_error(e) && rethrow()
+                du0 .= _COLLOC_FAIL_SENTINEL  # match the residual sentinel
+            end
 
             for k_pert in 1:K
                 u_p = copy(u)
                 u_p[k_pert] += eps_x
-                try; prob.dynamics!(du_p, u_p, p, times[i]); catch; du_p .= du0; end
+                try
+                    prob.dynamics!(du_p, u_p, p, times[i])
+                catch e
+                    _is_program_error(e) && rethrow()
+                    du_p .= du0  # sentinel is locally constant → zero FD slope
+                end
                 dF_dx = (du_p .- du0) ./ eps_x  # ∂f/∂x_k at time i
 
                 col = (k_pert - 1) * T + i  # alpha parameter index
@@ -376,6 +407,11 @@ soft constraint.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     _validate_problem(prob, "CollocationLAML")
+    isempty(prob.delays) ||
+        error("CollocationLAML does not support DDE problems: " *
+              "the collocation residual evaluates the dynamics with the " *
+              "4-argument ODE signature and cannot supply the delayed " *
+              "history. Use LAML for DDEs.")
     times = Float64.(prob.data_times)
     T_pts = length(times)
     n_obs = size(prob.data_values, 2)
@@ -461,6 +497,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
 
     # ─── Continuation loop ────────────────────────────────────────
     edf_final = Float64(sum(uf_nk))   # updated by the Fellner–Schall step
+    fs_skip_warned = false            # warn once if the FS step never runs
     for (level, lambda_ode) in enumerate(lambda_ode_schedule)
         if verbose
             println("\n=== Continuation level $level: λ_ode = $(round(lambda_ode, sigdigits=4)) ===")
@@ -569,10 +606,19 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
             ord(M) = Float64[M[i, j] for j in 1:n_obs for i in 1:T_pts]
             μ_pred = try
                 simulate(prob, beta)
-            catch
+            catch e
+                _is_program_error(e) && rethrow()
                 nothing
             end
-            if μ_pred !== nothing
+            if μ_pred === nothing
+                if !fs_skip_warned
+                    @warn "CollocationLAML: model simulation failed during " *
+                          "the Fellner–Schall step; smoothing parameters " *
+                          "remain at their initialization and the reported " *
+                          "EDF is an upper bound from initialization."
+                    fs_skip_warned = true
+                end
+            else
                 y_vec2 = ord(prob.data_values)
                 w_vec2 = ord(prob.data_weights)
                 mu_base = ord(μ_pred)
@@ -581,7 +627,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                 for b in 1:n_beta
                     step = max(1e-6, abs(beta[b]) * 1e-6)
                     bp = copy(beta); bp[b] += step
-                    pp = try; simulate(prob, bp); catch; μ_pred; end
+                    pp = try
+                        simulate(prob, bp)
+                    catch e
+                        _is_program_error(e) && rethrow()
+                        μ_pred  # zero FD column on numerical failure
+                    end
                     Jb[:, b] .= (ord(pp) .- mu_base) ./ step
                 end
                 JWJ = Jb' * Diagonal(w_vec2) * Jb
@@ -612,8 +663,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                     # null space (rank + nullity − θtr(H⁻¹S)) and bias θ up.
                     r_k = _rank_penalty(S_list[l])
                     trHS = tr(H_inv[idx, idx] * S_list[l])
-                    fs_num = clamp(r_k - theta[l] * trHS, 0.01, Float64(uf_nk[l]))
-                    if bSb > 1e-30
+                    # Keep θ_k unchanged when the effective numerator is ≤ 0
+                    # (matching estimate_smoothing_params in laml.jl): a
+                    # non-positive numerator means the FS update prescribes
+                    # keeping/decreasing λ, and flooring it at 0.01 would
+                    # manufacture a spurious increase. Preserve the upper cap.
+                    fs_num = min(r_k - theta[l] * trHS, Float64(uf_nk[l]))
+                    if bSb > 1e-30 && fs_num > 0
                         theta[l] = clamp(sigma2_est * fs_num / bSb, 1e-20, 1e20)
                     end
                 end
