@@ -179,7 +179,7 @@ IntegralMatchingSolver
 
 ### ProfileLikelihoodSolver
 
-nuisance coefficients are re-optimised at each grid point by a long Nelder–Mead run under the penalized objective at the fitted smoothing parameters (Gaussian likelihoods only; CI endpoints are interpolated between grid points)
+**Profile likelihood** for identifiability analysis and confidence intervals (Simpson & Maclaren 2023). Each unknown-function parameter is swept over a grid; the profile is taken through the penalized objective at the fitted smoothing parameters λ̂ — a penalized spline is not identified through its raw RSS — and the statistic ΔPenSS/σ̂² is referenced against χ²₁, with CI endpoints interpolated between grid points. Nuisance coefficients are re-optimised at each grid point by a long Nelder–Mead run. Gaussian likelihoods only.
 
 ```@docs
 ProfileLikelihoodSolver
@@ -217,10 +217,14 @@ RKHSSolver
 | Automatic smoothing comparison | [`GCVSolver`](@ref) |
 | Stiff or chaotic systems | [`CollocationLAML`](@ref) |
 | Quick baseline | [`TwoStageSolver`](@ref) |
+| Integration-free derivative matching | [`GradientMatching`](@ref) |
+| GP-based gradient matching (MAP or MCMC) | [`AdaptiveGradientMatching`](@ref) |
+| Ensemble gradient matching with uncertainty | [`BNGSolver`](@ref) |
 | Neural network approximators | [`AdamSolver`](@ref) |
 | Robust neural fitting | [`MultipleShootingSolver`](@ref) |
 | When gradients fail | [`DerivativeFreeSolver`](@ref) |
 | Uncertainty quantification | [`MCMCSolver`](@ref) or [`MagiSolver`](@ref) |
+| Exact posterior accounting for ODE-solver error | [`PseudoMarginalSolver`](@ref) |
 | Fast approximate Bayesian | [`VariationalSolver`](@ref) |
 | Intractable likelihood | [`ABCSolver`](@ref) |
 | Probabilistic numerics | [`RodeoSolver`](@ref) or [`DaltonSolver`](@ref) |

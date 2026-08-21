@@ -515,8 +515,9 @@ assume approximately independent errors).
 >   intervals via NUTS sampling
 > - [Vignette 24: Variational](../24_variational/24_variational.qmd) —
 >   approximate Bayesian posterior intervals
-> - [Vignette 20: Delay Differential Equations](../27_blowfly_dde/27_blowfly_dde.qmd) —
->   bootstrap CIs on a DDE model
+> - [Vignette 27: Predator–Prey Functional
+>   Response](../27_predator_prey/27_predator_prey.qmd) — bootstrap CIs
+>   on a shape-constrained functional response
 > - [Vignette 28: Fisheries](../28_fisheries/28_fisheries.qmd) — Poisson
 >   parametric bootstrap on count data
 
