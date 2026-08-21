@@ -1559,7 +1559,13 @@ using StableRNGs
             data_times=t_dal, data_values=reshape(max.(data_dal, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
             likelihood=PartiallySpecifiedModels.Gaussian())
-        sol_dal = solve(prob_dal, DaltonSolver(n_steps=100, maxiters=50, verbose=false))
+        # obs_var pinned to the historical fixed default: this fit was
+        # calibrated against it, and Dalton's NM+LBFGS optimization is
+        # knife-edge sensitive to obs_var on this problem (obs_var≈0.02
+        # diverges). The auto-estimated default is exercised in the
+        # "DaltonSolver — auto obs_var on large-scale data" testset.
+        sol_dal = solve(prob_dal, DaltonSolver(n_steps=100, maxiters=50,
+                                               obs_var=0.01, verbose=false))
 
         @test sol_dal isa PSMSolution
         @test isfinite(sol_dal.objective)
@@ -3110,6 +3116,125 @@ using StableRNGs
         @test isapprox(predict(sol, prob),
                        simulate(prob, Float64.(collect(sol.parameters)));
                        rtol=1e-5)
+    end
+
+    @testset "construction validation — approximators" begin
+        # Inverted domains are rejected everywhere (previously accepted
+        # silently, producing reversed knot/mesh grids downstream)
+        @test_throws ArgumentError BSplineApproximator(:f, (1.0, 0.0), 5)
+        @test_throws ArgumentError GPApproximator(:f, (1.0, 0.0), 5)
+        @test_throws ArgumentError SPDEApproximator(:f, (1.0, 0.0), 5)
+        @test_throws ArgumentError ShapeConstrainedBSplineApproximator(
+            :f, (1.0, 0.0), 6, :increasing)
+        @test_throws ArgumentError ShapeConstrainedSPDEApproximator(
+            :f, (1.0, 0.0), 6, :increasing)
+        @test_throws ArgumentError NeuralApproximator(
+            :f, Lux.Dense(1 => 1); domain=(1.0, 0.0))
+        # COMONet with lo == hi previously divided by zero when normalizing
+        # inputs and silently evaluated to NaN
+        @test_throws ArgumentError COMONetApproximator(
+            :f, (1.0, 1.0), (8,), :increasing)
+        @test_throws ArgumentError COMONetApproximator(
+            :f, (1.0, 0.0), (8,), :increasing)
+        # CubicSpline needs ≥ 3 knots; nknots=2 previously surfaced much
+        # later as a raw BoundsError from DataInterpolations
+        @test_throws ArgumentError BSplineApproximator(:f, (0.0, 1.0), 2)
+        @test_throws ArgumentError BSplineApproximator(:f, (0.0, 1.0), 1)
+        # Minimal valid constructions still work
+        @test BSplineApproximator(:f, (0.0, 1.0), 3) isa BSplineApproximator
+        @test COMONetApproximator(:f, (0.0, 1.0), (4,), :increasing) isa
+              COMONetApproximator
+    end
+
+    @testset "construction validation — PSMProblem" begin
+        dyn_val!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1]; nothing)
+        tt = collect(0.0:0.5:5.0)
+        dv = reshape(exp.(0.3 .* tt), :, 1)
+        # Duplicate approximator names: build_param_struct's NamedTuple
+        # keeps only the last evaluator while both consume β slices —
+        # previously accepted silently
+        @test_throws ArgumentError PSMProblem(dyn_val!, [1.0], (0.0, 5.0),
+            [BSplineApproximator(:r, (0.5, 6.0), 5),
+             BSplineApproximator(:r, (0.5, 6.0), 7)];
+            data_times=tt, data_values=dv)
+        # Wrong-shaped data_weights: solvers previously indexed a
+        # valid-but-wrong subset silently
+        @test_throws ArgumentError PSMProblem(dyn_val!, [1.0], (0.0, 5.0),
+            [BSplineApproximator(:r, (0.5, 6.0), 5)];
+            data_times=tt, data_values=dv, data_weights=ones(3, 1))
+        @test_throws ArgumentError PSMProblem(dyn_val!, [1.0], (0.0, 5.0),
+            [BSplineApproximator(:r, (0.5, 6.0), 5)];
+            data_times=tt, data_values=dv,
+            data_weights=ones(length(tt), 2))
+        # Correct shape and distinct names still construct
+        prob_ok = PSMProblem(dyn_val!, [1.0], (0.0, 5.0),
+            [BSplineApproximator(:r, (0.5, 6.0), 5),
+             BSplineApproximator(:s, (0.5, 6.0), 5)];
+            data_times=tt, data_values=dv,
+            data_weights=ones(length(tt), 1))
+        @test prob_ok isa PSMProblem
+    end
+
+    @testset "construction validation — probnum solver options" begin
+        # Typo'd option symbols previously fell through silently
+        # (any interrogate ≠ :schober ran :kramer; any method ≠ :fenrir
+        # ran :basic)
+        @test_throws ArgumentError RodeoSolver(interrogate=:shober)
+        @test_throws ArgumentError RodeoSolver(method=:fenrirr)
+        @test_throws ArgumentError DaltonSolver(interrogate=:kramerr)
+        # n_deriv=1 previously BoundsError'd deep in the Kalman selectors
+        @test_throws ArgumentError RodeoSolver(n_deriv=1)
+        @test_throws ArgumentError DaltonSolver(n_deriv=1)
+        @test_throws ArgumentError PseudoMarginalSolver(n_deriv=1)
+        # Valid symbol combinations still construct
+        @test RodeoSolver(method=:fenrir, interrogate=:schober) isa RodeoSolver
+        @test DaltonSolver(interrogate=:schober) isa DaltonSolver
+    end
+
+    @testset "DaltonSolver — auto obs_var on large-scale data" begin
+        # Scale-blind fixed obs_var=0.01 (the old default) badly misfits
+        # data of order 1000; the auto default estimates from the data
+        # scale (same estimator family as RodeoSolver/PseudoMarginal).
+        function decay_sc!(du, u, p, t)
+            du[1] = -p.f(u[1])
+        end
+        rng_sc = Random.Xoshiro(42)
+        sol_true_sc = OrdinaryDiffEq.solve(
+            ODEProblem(decay_sc!, [5000.0], (0.0, 10.0), (; f=x -> 0.5*x)),
+            Tsit5(); saveat=0.5)
+        t_sc = collect(sol_true_sc.t)
+        truth_sc = [u[1] for u in sol_true_sc.u]
+        data_sc = truth_sc .+ 50.0 .* randn(rng_sc, length(t_sc))
+        prob_sc = PSMProblem(decay_sc!, [5000.0], (0.0, 10.0),
+            [BSplineApproximator(:f, (0.0, 6000.0), 8)];
+            data_times=t_sc, data_values=reshape(max.(data_sc, 0.01), :, 1))
+
+        # Old fixed default demonstrably fails: f(3000) ≈ 1.35e5 vs true
+        # 1500 (~90× off), fit RMSE ≈ 1.2e4 on data of order 5000
+        sol_old = solve(prob_sc, DaltonSolver(n_steps=100, maxiters=50,
+                                              obs_var=0.01))
+        err_old = abs(sol_old.unknown_functions[:f](3000.0) - 1500.0)
+
+        # New auto default recovers the right scale: f(3000) ≈ 966,
+        # fit RMSE ≈ 500
+        sol_auto = solve(prob_sc, DaltonSolver(n_steps=100, maxiters=50))
+        f3k_auto = sol_auto.unknown_functions[:f](3000.0)
+        err_auto = abs(f3k_auto - 1500.0)
+        @test err_auto < 900.0            # right order of magnitude
+        @test err_old > 10 * err_auto     # old default badly underperforms
+        _rmse_sc(x, y) = sqrt(sum(abs2, x .- y) / length(y))
+        rmse_auto = _rmse_sc(sol_auto.fitted_values[:, 1], truth_sc)
+        rmse_old = _rmse_sc(sol_old.fitted_values[:, 1], truth_sc)
+        @test rmse_auto < rmse_old / 5
+
+        # Explicit obs_var is honored exactly: identical pinned runs agree
+        sol_p1 = solve(prob_sc, DaltonSolver(n_steps=100, maxiters=50,
+                                             obs_var=2500.0))
+        sol_p2 = solve(prob_sc, DaltonSolver(n_steps=100, maxiters=50,
+                                             obs_var=2500.0))
+        @test collect(sol_p1.parameters) == collect(sol_p2.parameters)
+        # ... and with the true noise variance the fit is accurate
+        @test abs(sol_p1.unknown_functions[:f](3000.0) - 1500.0) < 300.0
     end
 
 end

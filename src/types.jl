@@ -12,6 +12,16 @@ Subtypes must implement:
 """
 abstract type AbstractApproximator end
 
+# Shared domain sanity check: every approximator needs an oriented,
+# non-degenerate domain. An inverted domain silently produced reversed
+# knot/mesh grids downstream; a degenerate one (lo == hi) produced NaNs
+# (e.g. COMONet divides by the domain width when normalizing inputs).
+function _validate_domain(ctor::AbstractString, domain::Tuple{Float64, Float64})
+    domain[2] > domain[1] || throw(ArgumentError(
+        "$ctor: domain must satisfy hi > lo, got ($(domain[1]), $(domain[2]))"))
+    nothing
+end
+
 """
     BSplineApproximator(name, domain, nknots; initial=nothing)
 
@@ -32,6 +42,12 @@ function BSplineApproximator(name::Union{Symbol,String},
                              initial=nothing)
     name = Symbol(name)
     d = (Float64(domain[1]), Float64(domain[2]))
+    _validate_domain("BSplineApproximator", d)
+    # CubicSpline interpolation needs at least 3 knots; fewer used to fail
+    # much later with a raw BoundsError from inside DataInterpolations.
+    nknots >= 3 || throw(ArgumentError(
+        "BSplineApproximator needs nknots ≥ 3 for cubic spline " *
+        "interpolation (got $nknots)"))
     init_func = if initial === nothing
         x -> 0.0
     elseif initial isa Function
@@ -77,6 +93,7 @@ function NeuralApproximator(name::Union{Symbol,String}, model;
                             domain::Union{Nothing, Tuple{<:Real, <:Real}}=nothing,
                             rng_seed::Union{Nothing, Int}=nothing)
     d = domain === nothing ? nothing : (Float64(domain[1]), Float64(domain[2]))
+    d === nothing || _validate_domain("NeuralApproximator", d)
     NeuralApproximator(Symbol(name), model, penalty_weight, d, rng_seed)
 end
 
@@ -176,6 +193,7 @@ function GPApproximator(name::Union{Symbol,String},
                         initial=nothing)
     name_s = Symbol(name)
     d = (Float64(domain[1]), Float64(domain[2]))
+    _validate_domain("GPApproximator", d)
     σ² = Float64(variance)
     ℓ = if lengthscale === nothing
         # Default lengthscale: normalize so adjacent inducing points have
@@ -297,6 +315,7 @@ function SPDEApproximator(name::Union{Symbol,String},
                           initial=nothing)
     name_s = Symbol(name)
     d = (Float64(domain[1]), Float64(domain[2]))
+    _validate_domain("SPDEApproximator", d)
     ν = Float64(nu)
     ν ∈ SPDE_SMOOTHNESS || error("nu must be one of $SPDE_SMOOTHNESS, got $ν")
     n_basis >= 3 || error("n_basis must be ≥ 3, got $n_basis")
@@ -387,6 +406,7 @@ function ShapeConstrainedSPDEApproximator(name::Union{Symbol,String},
                                           initial=nothing)
     name_s = Symbol(name)
     d = (Float64(domain[1]), Float64(domain[2]))
+    _validate_domain("ShapeConstrainedSPDEApproximator", d)
     ν = Float64(nu)
     ν ∈ SPDE_SMOOTHNESS || error("nu must be one of $SPDE_SMOOTHNESS, got $ν")
     n_basis >= 4 || error("n_basis must be ≥ 4 for shape-constrained SPDE, got $n_basis")
@@ -529,6 +549,7 @@ function ShapeConstrainedBSplineApproximator(name::Union{Symbol,String},
                                              initial=nothing)
     name = Symbol(name)
     d = (Float64(domain[1]), Float64(domain[2]))
+    _validate_domain("ShapeConstrainedBSplineApproximator", d)
     constraint in SHAPE_CONSTRAINTS || throw(ArgumentError(
         "Unknown constraint :$constraint. Must be one of $SHAPE_CONSTRAINTS"))
     nknots >= 4 || throw(ArgumentError("Need nknots ≥ 4, got $nknots"))
@@ -669,6 +690,7 @@ function COMONetApproximator(name::Union{Symbol,String},
                              rng_seed::Union{Nothing, Int}=nothing)
     name = Symbol(name)
     d = (Float64(domain[1]), Float64(domain[2]))
+    _validate_domain("COMONetApproximator", d)
     constraint in COMONET_CONSTRAINTS || throw(ArgumentError(
         "Unknown constraint :$constraint. Must be one of $COMONET_CONSTRAINTS"))
     activation in COMONET_ACTIVATIONS || throw(ArgumentError(
@@ -1106,13 +1128,24 @@ struct RodeoSolver
     verbose::Bool
 end
 
-RodeoSolver(; n_steps::Int=200, n_deriv::Int=3,
-              sigma::Union{Nothing, Vector{Float64}}=nothing,
-              obs_var::Union{Nothing, Float64}=nothing,
-              method::Symbol=:basic,
-              interrogate::Symbol=:kramer,
-              maxiters::Int=200, verbose::Bool=false) =
+function RodeoSolver(; n_steps::Int=200, n_deriv::Int=3,
+                       sigma::Union{Nothing, Vector{Float64}}=nothing,
+                       obs_var::Union{Nothing, Float64}=nothing,
+                       method::Symbol=:basic,
+                       interrogate::Symbol=:kramer,
+                       maxiters::Int=200, verbose::Bool=false)
+    method in (:basic, :fenrir) ||
+        throw(ArgumentError("RodeoSolver: method must be :basic or :fenrir " *
+                            "(got :$method)"))
+    interrogate in (:kramer, :schober) ||
+        throw(ArgumentError("RodeoSolver: interrogate must be :kramer or " *
+                            ":schober (got :$interrogate)"))
+    # The IBM prior needs at least value + first derivative per state;
+    # n_deriv=1 BoundsErrors inside the Kalman filter selectors.
+    n_deriv >= 2 ||
+        throw(ArgumentError("RodeoSolver: n_deriv must be ≥ 2 (got $n_deriv)"))
     RodeoSolver(n_steps, n_deriv, sigma, obs_var, method, interrogate, maxiters, verbose)
+end
 
 """
     MCMCSolver(; n_samples=1000, n_warmup=500, n_chains=1, target_accept=0.8,
@@ -1295,7 +1328,12 @@ filter passes — one joint (ODE + observations) and one marginal (ODE only).
 - `n_steps`: number of discretization steps (default 200)
 - `n_deriv`: IBM prior derivative order (default 3)
 - `sigma`: IBM scale parameters (nothing = auto-estimate)
-- `obs_var`: observation noise variance (default 0.01)
+- `obs_var`: observation noise variance. `nothing` (the default)
+  auto-estimates it from the data at solve time as 1% of the mean
+  per-column data variance (the same estimator `RodeoSolver` and
+  `PseudoMarginalSolver` use). A fixed numeric value is honored exactly;
+  note a fixed value must be chosen relative to the data scale — a value
+  appropriate for data of order 1 badly misfits data of order 1000.
 - `interrogate`: interrogation method `:kramer` or `:schober` (default `:kramer`)
 - `maxiters`: optimization iterations (default 200)
 - `verbose`: print progress
@@ -1304,18 +1342,25 @@ struct DaltonSolver
     n_steps::Int
     n_deriv::Int
     sigma::Union{Nothing, Vector{Float64}}
-    obs_var::Float64
+    obs_var::Union{Nothing, Float64}
     interrogate::Symbol
     maxiters::Int
     verbose::Bool
 end
 
-DaltonSolver(; n_steps::Int=200, n_deriv::Int=3,
-               sigma::Union{Nothing, Vector{Float64}}=nothing,
-               obs_var::Float64=0.01,
-               interrogate::Symbol=:kramer,
-               maxiters::Int=200, verbose::Bool=false) =
+function DaltonSolver(; n_steps::Int=200, n_deriv::Int=3,
+                        sigma::Union{Nothing, Vector{Float64}}=nothing,
+                        obs_var::Union{Nothing, Float64}=nothing,
+                        interrogate::Symbol=:kramer,
+                        maxiters::Int=200, verbose::Bool=false)
+    interrogate in (:kramer, :schober) ||
+        throw(ArgumentError("DaltonSolver: interrogate must be :kramer or " *
+                            ":schober (got :$interrogate)"))
+    # See RodeoSolver: n_deriv=1 BoundsErrors in the Kalman selectors.
+    n_deriv >= 2 ||
+        throw(ArgumentError("DaltonSolver: n_deriv must be ≥ 2 (got $n_deriv)"))
     DaltonSolver(n_steps, n_deriv, sigma, obs_var, interrogate, maxiters, verbose)
+end
 
 # ─── Pseudo-marginal solver (Chkrebtii et al. 2016) ───────────────
 
@@ -1357,17 +1402,22 @@ struct PseudoMarginalSolver
     verbose::Bool
 end
 
-PseudoMarginalSolver(; n_samples::Int=1000, n_warmup::Int=500,
-                       n_steps::Int=200, n_deriv::Int=3,
-                       sigma::Union{Nothing, Vector{Float64}}=nothing,
-                       obs_var::Union{Nothing, Float64}=nothing,
-                       target_accept::Float64=0.8, prior_scale::Float64=1.0,
-                       inner_method::Symbol=:ffbs,
-                       initial_params::Union{Nothing, Vector{Float64}}=nothing,
-                       verbose::Bool=false) =
+function PseudoMarginalSolver(; n_samples::Int=1000, n_warmup::Int=500,
+                                n_steps::Int=200, n_deriv::Int=3,
+                                sigma::Union{Nothing, Vector{Float64}}=nothing,
+                                obs_var::Union{Nothing, Float64}=nothing,
+                                target_accept::Float64=0.8, prior_scale::Float64=1.0,
+                                inner_method::Symbol=:ffbs,
+                                initial_params::Union{Nothing, Vector{Float64}}=nothing,
+                                verbose::Bool=false)
+    # See RodeoSolver: n_deriv=1 BoundsErrors in the Kalman selectors.
+    n_deriv >= 2 ||
+        throw(ArgumentError("PseudoMarginalSolver: n_deriv must be ≥ 2 " *
+                            "(got $n_deriv)"))
     PseudoMarginalSolver(n_samples, n_warmup, n_steps, n_deriv, sigma, obs_var,
                           target_accept, prior_scale, inner_method,
                           initial_params, verbose)
+end
 
 # ─── GCV solver (Wood 2001 / ddefit504) ────────────────────────────
 
@@ -1642,7 +1692,11 @@ ensemble collapses around the MAP estimate.
 # Fields
 - `n_ensemble`: ensemble size (default 50)
 - `n_iterations`: EKI iterations (default 30)
-- `noise_scale`: observation noise std for regularisation (default 0.1)
+- `noise_scale`: observation noise std for regularisation (default 0.1).
+  This is a FIXED scale, not auto-estimated from the data: set it
+  relative to the magnitude of your observations (e.g. roughly the
+  expected noise std). The default suits data of order 1; for data of
+  order 1000 use a correspondingly larger value.
 - `verbose`: print progress
 
 # References
@@ -1856,10 +1910,24 @@ function PSMProblem(dynamics!, u0, tspan,
                                 "that collides with an approximator of the " *
                                 "same name; rename one of them"))
     end
+    # Two approximators sharing a name would silently misalign: each still
+    # consumes its own β slice, but the parameter NamedTuple keeps only the
+    # LAST evaluator, so earlier ones become dead weight.
+    approx_names = Symbol[approx.name for approx in approximators]
+    if !allunique(approx_names)
+        dups = unique(n for n in approx_names if count(==(n), approx_names) > 1)
+        throw(ArgumentError("duplicate approximator name(s) $(dups); " *
+                            "each approximator needs a unique name — " *
+                            "rename the duplicates"))
+    end
 
     w = if data_weights === nothing
         ones(Float64, n_times, n_obs)
     else
+        size(data_weights) == size(data_values) ||
+            throw(ArgumentError("data_weights has size $(size(data_weights)) " *
+                                "but data_values has size $(size(data_values)); " *
+                                "they must match"))
         Float64.(data_weights)
     end
 
