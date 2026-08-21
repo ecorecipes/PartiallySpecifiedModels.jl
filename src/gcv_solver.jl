@@ -334,36 +334,21 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
         neg_ll + 0.5 * dot(p_eval, B * p_eval)
     end
 
-    # PCLS step: augmented system [W^½J; C] β = [W^½z; 0]
+    # PCLS step: truncated-SVD solve of the augmented system
+    # [W^½J; C] β = [W^½z; 0] — see _pcls_augmented_solve in pcls.jl.
+    # (Shared with the LAML solver; the SVD truncation guards against
+    # exploding coefficients along numerically-null Jacobian directions
+    # at poor initializations, and equals the plain QR solve when the
+    # system is well-conditioned.)
     function pcls_step(J_mat, z_pseudo, th, w_irls)
         B = build_B(th)
-        C = penalty_sqrt_matrix(B)
-        n_pen = size(C, 1)
-        W_sqrt = sqrt.(max.(w_irls, 1e-15))
-        F_aug = vcat(Diagonal(W_sqrt) * J_mat, C)
-        z_aug = vcat(W_sqrt .* z_pseudo, zeros(n_pen))
-        F_aug \ z_aug, B
+        _pcls_augmented_solve(J_mat, z_pseudo, B, w_irls), B
     end
 
-    # Step contraction: backtracking line search
-    function step_contract(a_old, a_new, B)
-        f_old = penalized_objective(a_old, B)
-        direction = a_new .- a_old
-
-        best_f = f_old
-        best_a = copy(a_old)
-
-        for k in 0:15
-            α = 2.0^(-k)
-            a_try = a_old .+ α .* direction
-            f_try = penalized_objective(a_try, B)
-            if f_try < best_f
-                best_f = f_try
-                best_a = copy(a_try)
-            end
-        end
-        best_a, best_f
-    end
+    # Step contraction: backtracking with explosive-step rescue — see
+    # _pcls_step_contract in pcls.jl.
+    step_contract(a_old, a_new, B) =
+        _pcls_step_contract(penalized_objective, a_old, a_new, B)
 
     # Initialize
     beta  = build_initial_params(prob)
@@ -427,12 +412,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
             end
         end
 
-        # PCLS step at current θ
+        # PCLS step at current θ; step_contract already returns the
+        # penalized objective at the accepted point (a full ODE solve),
+        # so reuse it for convergence tracking instead of recomputing.
         beta_new_pcls, B_new = pcls_step(J, z_pseudo, theta, w_irls)
-        beta_new, obj_new = step_contract(beta, beta_new_pcls, B_new)
-
-        # Track penalized objective for convergence
-        curr_obj = penalized_objective(beta_new, B_new)
+        beta_new, curr_obj = step_contract(beta, beta_new_pcls, B_new)
 
         if verbose && (iter <= 4 || iter % 10 == 0)
             data_ss = sum(w_vec[i] * (y_vec[i] - f_vec[i])^2 for i in 1:n_data)
