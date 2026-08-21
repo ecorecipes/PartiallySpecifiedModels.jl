@@ -25,9 +25,11 @@ nonlinear least squares against those smoothed derivatives.
 # Algorithm
 1. Smooth each observed state with a penalized (GCV) smoothing spline and evaluate derivatives
    at the data time points.
-2. Interpolate unobserved states from observed ones using the model.
-3. Minimise ∑ₜ ‖x′(t) − f(x(t), uf(t; β))‖² with respect to β using
-   `Optim.NelderMead`.
+2. Hold unobserved states constant at their initial-condition values and
+   MASK them out of the matching loss (their fabricated targets carry no
+   information).
+3. Minimise ∑ₜ ‖x′(t) − f(x(t), uf(t; β))‖² plus the smoothing penalty with
+   respect to β using Adam with ForwardDiff gradients.
 4. Reconstruct the unknown functions at the fitted parameters.
 
 # References
@@ -63,7 +65,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             push!(observed_states, sk)
-            val, _ = _smoothing_spline(times, prob.data_values[:, j])
+            val, _ = _smoothing_spline(times, prob.data_values[:, j];
+                                       max_basis=alg.n_basis_smooth)
             for i in 1:n_times
                 y_smooth[i, sk] = val(times[i])
             end
@@ -80,7 +83,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             push!(observed_states, sk)
-            val, der = _smoothing_spline(times, prob.data_values[:, j])
+            val, der = _smoothing_spline(times, prob.data_values[:, j];
+                                         max_basis=alg.n_basis_smooth)
             for i in 1:n_times
                 y_smooth[i, sk] = val(times[i])
                 dydt[i, sk] = der(times[i])

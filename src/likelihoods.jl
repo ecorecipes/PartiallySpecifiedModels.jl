@@ -32,13 +32,46 @@ function _normcdf(x::Real)
     end
 end
 
-"""Standard normal log-CDF log Φ(x), stable for large negative x."""
+"""
+Standard normal log-CDF log Φ(x), stable and accurate for large negative x.
+
+Replaces a truncated asymptotic expansion that dropped the Mills-series
+correction, causing a ~0.022 jump at the old x = −6 branch switch and
+0.3–0.7% log error across the tail (the A&S rational `_normcdf` is accurate
+ABSOLUTELY to 7.5e-8, so its log error also grows in the tail). Both
+branches below are accurate to ~1e-15, so the x = −1 seam is smooth to
+machine precision — second differences across it (e.g. finite-difference
+information checks) stay clean.
+"""
 function _normlogcdf(x::Real)
-    if x > -6.0
+    if x > 6.0
+        # Φ ≈ 1: the rational approximation's log error here is ≲1e-12.
         log(_normcdf(x))
+    elseif x > -1.0
+        # Exact small-|x| series (Abramowitz & Stegun 26.2.11):
+        #   Φ(x) = ½ + φ(x) Σ_{n≥0} x^{2n+1}/(2n+1)!!
+        # All terms share x's sign — no cancellation for x > −1 — and the
+        # ratio x²/(2n+3) → 0 guarantees fast convergence on this range.
+        term = x
+        s = x
+        n = 0
+        while abs(term) > 1e-17 * abs(s) && n < 200
+            n += 1
+            term *= x * x / (2n + 1)
+            s += term
+        end
+        log(0.5 + _normpdf(x) * s)
     else
-        # Asymptotic expansion: log Φ(x) ≈ -½x² - log(-x√(2π))
-        -0.5 * x^2 - log(-x) - 0.5 * log(2π)
+        # Mills-ratio Laplace continued fraction: for t = −x ≥ 1,
+        #   Φ(x) = φ(t)·R(t),  R(t) = 1/(t + 1/(t + 2/(t + 3/(t + ⋯)))),
+        # evaluated by backward recurrence (depth 400: machine precision
+        # for t ≥ 1, and trivially cheap).
+        t = -x
+        r = zero(t)
+        for k in 400:-1:1
+            r = k / (t + r)
+        end
+        -0.5 * x^2 - 0.5 * log(2π) - log(t + r)
     end
 end
 
@@ -88,7 +121,13 @@ function log_likelihood(::Poisson, y::AbstractVector,
                         mu::AbstractVector, w::AbstractVector)
     ll = 0.0
     for i in eachindex(y)
-        mu_i = max(mu[i], 1e-10)
+        # Convention (shared with irls_weights): μ ≤ 0 is regularized as
+        # max(|μ|, 1e-6) so the objective and the IRLS curvature see the
+        # SAME effective mean when identity-link iterates transiently go
+        # nonpositive. (Flooring at 1e-10 here while the weights used
+        # max(|μ|, 1e-6) put a flat cliff in the objective exactly where
+        # the curvature was still finite.) Identity for healthy μ > 1e-6.
+        mu_i = max(abs(mu[i]), 1e-6)
         kern = y[i] > 0 ? y[i] * log(mu_i) - mu_i : -mu_i
         ll += w[i] * (kern - _loggamma(y[i] + 1))   # − log(y!)
     end
@@ -148,7 +187,8 @@ convention. AD-safe: `μ` may be a `ForwardDiff.Dual`.
 loglik_pointwise(::Gaussian, y::Real, mu::Real) = -0.5 * (y - mu)^2
 
 function loglik_pointwise(::Poisson, y::Real, mu::Real)
-    mu_c = max(mu, 1e-10)
+    # Same μ ≤ 0 convention as log_likelihood/irls_weights: max(|μ|, 1e-6).
+    mu_c = max(abs(mu), 1e-6)
     kern = y > 0 ? y * log(mu_c) - mu_c : -mu_c
     kern - _loggamma(y + 1)
 end

@@ -578,8 +578,30 @@ function initial_params(a::ShapeConstrainedBSplineApproximator)
     # O(slope·spacing) error.
     xk = _scam_knot_vector(a.domain, a.nknots)
     xs = [(xk[i+1] + xk[i+2] + xk[i+3]) / 3 for i in 1:a.nknots]
-    beta_target = Float64[a.initial_func(clamp(x, a.domain[1], a.domain[2]))
-                          for x in xs]
+    # Evaluate at the UNCLAMPED Greville points: the boundary abscissae lie
+    # slightly outside the domain, and clamping them there broke the exact
+    # linear reproduction this initialization is built on (max error 0.067
+    # on 1+2x with 8 knots). Only if the user's function throws outside its
+    # domain do we fall back, per point, to the clamped value extrapolated
+    # linearly with a one-sided finite-difference slope.
+    lo, hi = a.domain
+    h = 1e-6 * (hi - lo)
+    beta_target = Vector{Float64}(undef, a.nknots)
+    for (i, x) in enumerate(xs)
+        beta_target[i] = if lo <= x <= hi
+            Float64(a.initial_func(x))
+        else
+            try
+                Float64(a.initial_func(x))
+            catch
+                xc = clamp(x, lo, hi)
+                slope = x < lo ?
+                    (a.initial_func(xc + h) - a.initial_func(xc)) / h :
+                    (a.initial_func(xc) - a.initial_func(xc - h)) / h
+                Float64(a.initial_func(xc) + slope * (x - xc))
+            end
+        end
+    end
     # Solve Σ * d = β_target for the coefficient vector d.
     # For square Σ: direct solve; for rectangular (q × np): least-squares.
     d = a.Sigma \ beta_target
@@ -1228,7 +1250,10 @@ Manifold-constrained Gaussian process inference (MAGI) for ODE systems.
 Gaussian likelihoods only (the manifold-constrained posterior assumes
 Gaussian observation noise); non-Gaussian `prob.likelihood` errors.
 
-MAGI places a Matérn-3/2 Gaussian-process prior on each state and constrains
+MAGI places a Matérn-3/2 Gaussian-process prior on each state (the MAGI
+paper uses a generalized Matérn kernel with ν ≈ 2.01; with ν = 3/2 the
+implied derivative process is rougher — mean-square continuous but not
+mean-square differentiable) and constrains
 the GP-implied derivative to the ODE vector field through the conditional
 derivative covariance `K* = ''K − 'K C⁻¹ ('K)ᵀ`. The state values on the
 discretization grid are sampled jointly with the unknown-function
@@ -1409,7 +1434,9 @@ end
 Pseudo-marginal MCMC using a probabilistic ODE solver for likelihood estimation.
 
 Uses RODEO/fenrir as an inner solver to compute an unbiased estimate of the
-marginal likelihood p(Y|θ), then samples from the posterior p(θ|Y) via NUTS.
+marginal likelihood p(Y|θ), then samples from the posterior p(θ|Y) via
+adaptive random-walk Metropolis (the proposal scale is tuned toward
+`target_accept` during warmup).
 
 # Fields
 - `n_samples`: number of posterior samples (default 1000)
@@ -1418,8 +1445,12 @@ marginal likelihood p(Y|θ), then samples from the posterior p(θ|Y) via NUTS.
 - `n_deriv`: IBM prior derivative order (default 3)
 - `sigma`: IBM scale parameters (nothing = auto-estimate)
 - `obs_var`: observation noise variance (default 0.01)
-- `target_accept`: NUTS target acceptance rate (default 0.8)
-- `prior_scale`: prior standard deviation on parameters (default 1.0)
+- `target_accept`: target acceptance rate for the adaptive random-walk
+  Metropolis proposal-scale adaptation (default 0.8)
+- `prior_scale`: prior VARIANCE on parameters (default 1.0). Used directly
+  as the variance of the Gaussian smoothing prior
+  `exp(−½ βₖ'Sₖβₖ / prior_scale)` and of the weak ridge
+  `exp(−½ ‖β‖² / (100·prior_scale))` — it is not squared.
 - `inner_method`: likelihood estimator — `:ffbs` (default; unbiased FFBS
   Monte-Carlo average, giving genuine pseudo-marginal MCMC), `:fenrir`
   (deterministic Fenrir evidence; the chain is then plain adaptive RWM on
@@ -1473,7 +1504,9 @@ produces slightly less smooth estimates.
 - `n_grid`: number of grid points for initial λ search (default 50)
 - `maxiters`: maximum IRLS iterations (default 50)
 - `tol`: convergence tolerance (default 1e-6)
-- `gamma`: GCV inflation factor (default 1.4, >1 guards against under-smoothing)
+- `gamma`: GCV inflation factor (default 1.4, >1 guards against
+  under-smoothing; `gamma=1.0` reproduces the classical unmodified GCV of
+  Wood (2001) / ddefit)
 - `verbose`: print progress
 
 # Convergence info
@@ -1507,7 +1540,15 @@ Stage 2: Numerically differentiate smoothed curves, then match ODE RHS
 This is the original approach from Wood (2001) / deGradInfer (Macdonald & Husmeier 2015).
 
 # Fields
-- `n_basis_smooth`: spline basis functions for data smoothing (default 20)
+- `n_basis_smooth`: upper limit on the number of B-spline coefficients used
+  by the stage-1 smoother; the actual basis size is
+  `clamp(n − 2, 4, n_basis_smooth)` for `n` data points (default 15).
+
+  !!! note "Changed"
+      This field was previously dead: it was documented (default 20) but
+      never read — the smoother always capped the basis at 15. It is now
+      wired through; the default was set to 15 so default fits are
+      byte-identical to before.
 - `lambda_smooth`: smoothing penalty for initial data fit (default 1.0)
 - `maxiters`: max iterations for parameter matching (default 1000)
 - `lr`: learning rate for Adam optimization in matching step (default 0.01)
@@ -1527,9 +1568,13 @@ struct TwoStageSolver
     verbose::Bool
 end
 
-TwoStageSolver(; n_basis_smooth::Int=20, lambda_smooth::Float64=1.0,
-                 maxiters::Int=1000, lr::Float64=0.01, verbose::Bool=false) =
+function TwoStageSolver(; n_basis_smooth::Int=15, lambda_smooth::Float64=1.0,
+                          maxiters::Int=1000, lr::Float64=0.01, verbose::Bool=false)
+    n_basis_smooth >= 4 ||
+        throw(ArgumentError("TwoStageSolver: n_basis_smooth must be ≥ 4 " *
+                            "(cubic B-spline basis; got $n_basis_smooth)"))
     TwoStageSolver(n_basis_smooth, lambda_smooth, maxiters, lr, verbose)
+end
 
 # ─── Derivative-free solver (stochastic + NelderMead) ──────────────
 

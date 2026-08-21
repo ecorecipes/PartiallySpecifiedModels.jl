@@ -16,26 +16,28 @@ using Statistics
 # ─── Step 1: Data smoothing ──────────────────────────────────────
 
 """
-    _smoothing_spline(t, y) -> (value, derivative)
+    _smoothing_spline(t, y; max_basis=15) -> (value, derivative)
 
 Fit a penalized cubic regression spline (P-spline: cubic B-spline basis +
 second-order difference penalty) to `(t, y)` with the smoothing parameter
 chosen by Generalized Cross-Validation, and return callables for the fitted
-value and its first derivative.
+value and its first derivative. The basis size is `clamp(n − 2, 4, max_basis)`
+(`max_basis ≥ 4`; `TwoStageSolver` wires its `n_basis_smooth` field here).
 
 This is a genuine SMOOTHER (it does not interpolate the noisy data), which
 is what gradient matching requires: differentiating an interpolant amplifies
 observation noise, whereas the penalized fit suppresses it (Wood 2001;
 Varah 1982). Shared by the gradient-matching, two-stage, and BNG solvers.
 """
-function _smoothing_spline(t::AbstractVector{Float64}, y::AbstractVector{Float64})
+function _smoothing_spline(t::AbstractVector{Float64}, y::AbstractVector{Float64};
+                           max_basis::Int=15)
     n = length(t)
     a, b = minimum(t), maximum(t)
     if b <= a || n < 4
         ȳ = sum(y) / max(n, 1)
         return (x -> ȳ), (x -> 0.0)
     end
-    q = clamp(n - 2, 4, 15)                     # number of B-spline coefficients
+    q = clamp(n - 2, 4, max(max_basis, 4))      # number of B-spline coefficients
     knots = _scam_knot_vector((a, b), q)
     B = zeros(n, q)
     for i in 1:n
@@ -88,6 +90,15 @@ function smooth_and_differentiate(times::Vector{Float64},
     n_obs = size(data, 2)
     y_smooth = zeros(T, K)
     dydt = zeros(T, K)
+
+    # KNOWN LIMITATION: when several observation columns map to the same
+    # state, each later column overwrites the earlier one's smooth below —
+    # only the LAST column mapped to a state is used (no averaging).
+    if length(unique(@view obs_to_state[1:n_obs])) < n_obs
+        @warn "smooth_and_differentiate: multiple observation columns map to " *
+              "the same state; only the last column per state is used in the " *
+              "smoothing path (earlier columns are ignored, not averaged)." maxlog=1
+    end
 
     for j in 1:n_obs
         sk = obs_to_state[j]
