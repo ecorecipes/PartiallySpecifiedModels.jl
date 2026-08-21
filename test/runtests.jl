@@ -173,6 +173,90 @@ using StableRNGs
         @test abs(r_eval(1.0) - true_r) < 0.15
     end
 
+    @testset "CollocationLAML error policy" begin
+        data_times = collect(range(0.0, 5.0, length=30))
+        data_values = reshape(exp.(0.3 .* data_times), :, 1)
+        approx_r = () -> BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)
+
+        # 1) DDE problems are rejected up front: eval_ode_rhs calls the
+        #    4-arg ODE signature, so pre-fix every RHS silently became the
+        #    1e6 failure sentinel and the solver "converged" to garbage.
+        function dde_dyn!(du, u, h, p, t)
+            du[1] = p.r(u[1]) * h(p, t - 1.0)[1]
+        end
+        prob_dde = PSMProblem(dde_dyn!, [1.0], (0.0, 5.0), [approx_r()];
+            data_times=data_times, data_values=data_values,
+            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5(),
+            delays=[1.0], history=(p, t) -> [1.0])
+        err = try
+            solve(prob_dde, CollocationLAML(maxiters=5, verbose=false,
+                n_continuation=2))
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("does not support DDE problems", err.msg)
+
+        # 2) Programming errors in the user dynamics propagate instead of
+        #    being swallowed into a silent flat fit (pre-fix this converged
+        #    silently with data_loss ≈ 4.16e13 and r(1.0) ≈ 0.005).
+        function buggy_colloc!(du, u, p, t)
+            du[1] = p.r(u[1]) * colloc_undefined_helper(u[1])
+        end
+        prob_bug = PSMProblem(buggy_colloc!, [1.0], (0.0, 5.0), [approx_r()];
+            data_times=data_times, data_values=data_values,
+            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+        @test_throws UndefVarError solve(prob_bug,
+            CollocationLAML(maxiters=5, verbose=false, n_continuation=2))
+
+        function oob_colloc!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[2]   # u has length 1
+        end
+        prob_oob = PSMProblem(oob_colloc!, [1.0], (0.0, 5.0), [approx_r()];
+            data_times=data_times, data_values=data_values,
+            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+        @test_throws BoundsError solve(prob_oob,
+            CollocationLAML(maxiters=5, verbose=false, n_continuation=2))
+
+        # 3) When the Fellner–Schall simulation fails (exploding dynamics),
+        #    the solve still returns but warns exactly once that smoothing
+        #    parameters remain at initialization (pre-fix: silent skip,
+        #    inflated initialization EDF reported as the answer).
+        # tanh bounds the fitted term so no estimate of r can cancel the
+        # u² blow-up: du ≥ 50u² − 1, so forward simulation always diverges.
+        function explode_colloc!(du, u, p, t)
+            du[1] = 50.0 * u[1]^2 + tanh(p.r(clamp(u[1], 0.5, 5.0)))
+        end
+        prob_expl = PSMProblem(explode_colloc!, [1.0], (0.0, 5.0), [approx_r()];
+            data_times=data_times, data_values=data_values,
+            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+        local sol_expl
+        logs, _ = Test.collect_test_logs() do
+            sol_expl = solve(prob_expl, CollocationLAML(maxiters=5,
+                verbose=false, n_continuation=3))
+        end
+        fs_warns = count(l -> occursin("Fellner", string(l.message)), logs)
+        @test fs_warns == 1   # once per solve, not per continuation level
+        @test sol_expl isa PSMSolution
+        @test isfinite(sol_expl.edf)
+
+        # 4) FS numerator convention: no cheap deterministic problem drives
+        #    the numerator r_k − θ·tr(H⁻¹S_k) ≤ 0 (it happens only on
+        #    transient θ overshoot), and the update is inline in solve, so
+        #    the ≤ 0 branch is pinned by convention parity with laml.jl's
+        #    estimate_smoothing_params (keep θ unchanged) rather than a
+        #    behavioral fixture. Here we assert the update leaves θ finite
+        #    and positive on a well-posed fit.
+        prob_ok = PSMProblem((du, u, p, t) -> (du[1] = p.r(u[1]) * u[1]),
+            [1.0], (0.0, 5.0), [approx_r()];
+            data_times=data_times, data_values=data_values,
+            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+        sol_ok = solve(prob_ok, CollocationLAML(maxiters=10, verbose=false,
+            n_continuation=2))
+        @test all(t -> isfinite(t) && t > 0, sol_ok.smoothing_params)
+    end
+
     @testset "GPApproximator" begin
         # Kernel matrix is positive definite
         gp = GPApproximator(:f, (0.0, 1.0), 8; kernel=:matern52)
