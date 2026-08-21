@@ -37,11 +37,21 @@ function mlp_spec_from_lux(model::Lux.Chain)
             act = layer.activation
             push!(activations, act)
             n_params += n_in * n_out + n_out  # weights + bias
+        else
+            # Refuse ANY non-Dense layer. A parameterized one (Scale,
+            # SkipConnection, nested Chain…) would leave its parameters
+            # silently untrained, and even a zero-parameter one
+            # (WrappedFunction, Dropout…) transforms the signal, so
+            # skipping it would evaluate a different function than the
+            # model defines. build_neural_evaluator catches this error
+            # and falls back to Lux.apply.
+            error("The Dual-safe MLP evaluator supports Chains of " *
+                  "Lux.Dense layers only; the given model contains a " *
+                  "$(typeof(layer)) layer. Restructure the network or " *
+                  "use a solver that evaluates through Lux.apply.")
         end
     end
-    # Any parameterized non-Dense layer (Scale, SkipConnection, nested Chain…)
-    # would be counted by nparams() but skipped here, leaving its parameters
-    # silently untrained — refuse instead.
+    # Belt-and-braces: the Dense layers must account for every parameter.
     n_params == Lux.parameterlength(model) ||
         error("The Dual-safe MLP evaluator supports Chains of Lux.Dense layers " *
               "only; the given model has $(Lux.parameterlength(model)) " *
@@ -125,7 +135,8 @@ function build_neural_evaluator(approx::NeuralApproximator, params_k)
 
     spec = try
         mlp_spec_from_lux(approx.model)
-    catch
+    catch e
+        e isa InterruptException && rethrow()
         nothing  # exotic architecture — use the Lux.apply fallback below
     end
 
@@ -153,8 +164,13 @@ function build_neural_evaluator(approx::NeuralApproximator, params_k)
     rng2 = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) :
            Random.default_rng()
     ax = getaxes(ComponentArray(Lux.initialparameters(rng2, approx.model)))
+    # Cache the parameter ComponentArray for the common non-Dual case;
+    # only rebuild per call when the promoted eltype differs (Dual x
+    # and/or Dual params).
+    ps_cached = eltype(params_k) <: AbstractFloat ?
+                ComponentArray(collect(params_k), ax) : nothing
     let pk = params_k, model = approx.model, st_ = st, ax_ = ax,
-        lo_ = lo, span_ = span
+        psc = ps_cached, lo_ = lo, span_ = span
         return x -> begin
             xval = x isa AbstractArray ? x[1] : x
             xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
@@ -163,7 +179,8 @@ function build_neural_evaluator(approx::NeuralApproximator, params_k)
                 xval
             end
             T = promote_type(typeof(xn), eltype(pk))
-            ps = ComponentArray(convert(Vector{T}, collect(pk)), ax_)
+            ps = (psc !== nothing && T === eltype(psc)) ? psc :
+                 ComponentArray(convert(Vector{T}, collect(pk)), ax_)
             out, _ = Lux.apply(model, reshape(T[xn], :, 1), ps, st_)
             length(out) == 1 ? out[1] : out
         end
