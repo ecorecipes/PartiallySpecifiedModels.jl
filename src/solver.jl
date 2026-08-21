@@ -488,13 +488,23 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         B
     end
 
-    # Flatten data
+    # Flatten data, enforcing the package's masking convention: a cell is
+    # usable only if its weight is positive AND its datum is non-NaN.
+    # Masked cells get weight 0 and a finite placeholder value — every
+    # downstream use multiplies by the weight, but IEEE `0 * NaN = NaN`,
+    # so leaving a NaN datum in y_vec would silently poison the objective
+    # (the optimizer would then reject every step and return the initial
+    # coefficients unchanged, without any error).
     y_vec = zeros(n_data)
     w_vec = zeros(n_data)
     k = 1
     for oi in 1:n_obs, ti in 1:n_times
-        y_vec[k] = prob.data_values[ti, oi]
-        w_vec[k] = prob.data_weights[ti, oi]
+        y = prob.data_values[ti, oi]
+        wv = prob.data_weights[ti, oi]
+        if wv > 0 && !isnan(y)
+            y_vec[k] = y
+            w_vec[k] = wv
+        end   # else keep the 0.0 placeholder with weight 0.0
         k += 1
     end
 
@@ -786,10 +796,14 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     p_opt = copy(beta)
     pred = simulate(prob, p_opt)
 
-    # Compute data loss
+    # Compute data loss (masked cells — zero weight or NaN datum — are
+    # skipped; `0 * NaN = NaN` would otherwise contaminate the total)
     data_loss = 0.0
     for j in 1:n_obs, i in 1:n_times
-        data_loss += prob.data_weights[i,j] * (prob.data_values[i,j] - pred[i,j])^2
+        wv = prob.data_weights[i,j]
+        y = prob.data_values[i,j]
+        (wv > 0 && !isnan(y)) || continue
+        data_loss += wv * (y - pred[i,j])^2
     end
 
     # EDF from hat matrix

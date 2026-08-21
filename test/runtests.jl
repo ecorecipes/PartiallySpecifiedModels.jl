@@ -1784,6 +1784,15 @@ using StableRNGs
         @test haskey(sol_vi.unknown_functions, :r)
         @test haskey(sol_vi.convergence, :posterior_std)
         @test abs(sol_vi.unknown_functions[:r](5.0) - 0.25) < 0.2
+        # edf is the mean-field analogue of tr(I − Λ Σ_q) with per-term
+        # clamping to [0, 1]: it must be a valid dof count and, with the
+        # smoothness prior active, materially below the raw parameter
+        # count.  (Pre-fix the per-term values compared σ_q² to
+        # prior_scale², which is not the prior variance under Λ —
+        # per-term values could go negative and the sum was ≈ n_p.)
+        n_p_vi = length(sol_vi.parameters)
+        @test 0.0 <= sol_vi.edf <= n_p_vi
+        @test sol_vi.edf <= n_p_vi - 1.0
     end
 
     @testset "ABCSolver — exponential decay" begin
@@ -1815,6 +1824,71 @@ using StableRNGs
             n_generations=6, prior=:box, verbose=false))
         @test abs(sol_abc_box.unknown_functions[:f](3.0) - 1.5) < 0.6
         @test_throws ErrorException solve(prob_abc, ABCSolver(prior=:bogus))
+    end
+
+    @testset "ABCSolver — NaN-masked observation" begin
+        # Pre-fix: the :auto distance was NaN whenever any observation was
+        # NaN; `NaN < ε` is false, so no particle was ever accepted (the
+        # 1000-attempt budget was burned for every slot each generation)
+        # and the solver returned the untouched prior population with
+        # no finite distances (ε stayed Inf throughout).
+        function decay_abcn!(du, u, p, t)
+            du[1] = -p.f(u[1])
+        end
+        rng_abcn = Random.Xoshiro(42)
+        sol_true_abcn = OrdinaryDiffEq.solve(
+            ODEProblem(decay_abcn!, [5.0], (0.0, 10.0), (; f=x -> 0.5*x)),
+            Tsit5(); saveat=1.0)
+        t_abcn = collect(sol_true_abcn.t)
+        d_abcn = [sol_true_abcn.u[i][1] + 0.05*randn(rng_abcn)
+                  for i in 1:length(t_abcn)]
+        d_abcn = reshape(max.(d_abcn, 0.01), :, 1)
+        w_abcn = ones(length(t_abcn), 1)
+        d_abcn[4, 1] = NaN
+        w_abcn[4, 1] = 0.0
+        uf_abcn = BSplineApproximator(:f, (0.0, 6.0), 6)
+        prob_abcn = PSMProblem(decay_abcn!, [5.0], (0.0, 10.0), [uf_abcn];
+            data_times=t_abcn, data_values=d_abcn, data_weights=w_abcn,
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        Random.seed!(7)
+        sol_abcn = solve(prob_abcn, ABCSolver(n_particles=100,
+                                              n_generations=6, verbose=false))
+        # particles were actually accepted and the tolerance shrank
+        @test all(isfinite, sol_abcn.convergence.distances)
+        th_abcn = sol_abcn.convergence.tolerance_history
+        @test all(isfinite, th_abcn)
+        @test th_abcn[end] < th_abcn[1]
+        @test isapprox(sum(sol_abcn.convergence.weights), 1.0; atol=1e-8)
+        @test isfinite(sol_abcn.data_loss)
+        # sane fit despite the missing cell (true f(3) = 1.5)
+        @test abs(sol_abcn.unknown_functions[:f](3.0) - 1.5) < 0.8
+    end
+
+    @testset "ABC importance weights — log-space denominator + ESS" begin
+        using PartiallySpecifiedModels: _abc_importance_weights
+        N_iw = 40; n_dim = 3
+        prev_iw = [0.1 .* randn(Random.Xoshiro(i), n_dim) for i in 1:N_iw]
+        w_prev = fill(1.0 / N_iw, N_iw)
+        ks_iw = fill(0.1, n_dim)
+        newp_iw = [copy(prev_iw[i]) for i in 1:N_iw]
+        # A particle far from the entire previous population: the linear-
+        # space kernel mixture Σ wⱼ exp(log_k) underflows to exactly 0
+        # here, and the pre-fix code then assigned weight 0 — the exact
+        # opposite of the correct limit (weight ∝ π/denominator should be
+        # LARGE when the proposal density is tiny).
+        newp_iw[1] = fill(50.0, n_dim)
+        lps_iw = zeros(N_iw)               # equal prior log-density
+        local w_iw, ess_iw
+        @test_logs (:warn, r"effective sample size") begin
+            w_iw, ess_iw = _abc_importance_weights(newp_iw, prev_iw, w_prev,
+                                                   ks_iw, lps_iw; gen=1)
+        end
+        @test isapprox(sum(w_iw), 1.0; atol=1e-12)
+        @test w_iw[1] > 0.0                # pre-fix: exactly 0
+        @test argmax(w_iw) == 1            # far particle dominates
+        @test 1.0 <= ess_iw <= N_iw
+        @test ess_iw < N_iw / 2            # concentrated weights → warning fired
     end
 
     # ─── Discrete-time tests for additional solvers ───────────────────
@@ -2375,6 +2449,42 @@ using StableRNGs
                 nboot=10, method=:nonparametric, rng=Random.Xoshiro(2))
             @test bs.n_success >= 5
             @test all(bs.ci_fitted.lower .<= bs.ci_fitted.upper)
+        end
+
+        @testset "NaN-masked data" begin
+            # Pre-fix: σ̂ was computed over ALL cells, so one NaN datum
+            # made σ̂ (and hence every pseudo-dataset) NaN; each replicate
+            # then "fit" pure-NaN data without moving off the initial
+            # coefficients and all CIs silently collapsed to zero width.
+            # (LAML itself also no-opped on NaN cells — `0 * NaN = NaN`
+            # poisoned the objective — so the base fit was garbage too.)
+            data_nan = copy(data)
+            w_nan = ones(length(t_obs), 1)
+            data_nan[7, 1] = NaN;  w_nan[7, 1] = 0.0
+            data_nan[15, 1] = NaN; w_nan[15, 1] = 0.0
+            uf_nan = BSplineApproximator(:r, (0.1, 10.0), 6; initial=x -> 0.3)
+            prob_nan = PSMProblem(logistic_bs!, [1.0], (0.0, 15.0), [uf_nan];
+                data_times=t_obs, data_values=data_nan, data_weights=w_nan,
+                obs_to_state=[1], known_params=NamedTuple(), solver=Tsit5())
+            sol_nan = solve(prob_nan, LAML(maxiters=50, verbose=false))
+            # the base fit must actually move off the initial guess
+            @test isfinite(sol_nan.data_loss)
+            @test abs(sol_nan.unknown_functions[:r](5.0) - 0.25) < 0.1
+            for (bs_method, seed) in ((:parametric, 21), (:nonparametric, 22))
+                bs = bootstrap(sol_nan, prob_nan, LAML(maxiters=50, verbose=false);
+                    nboot=10, method=bs_method, rng=Random.Xoshiro(seed))
+                @test bs.n_success >= 5
+                @test all(bs.ci_fitted.lower .<= bs.ci_fitted.upper)
+                # replicates must vary (pre-fix: all identical → zero-width bands)
+                @test maximum(bs.ci_uf[:r].upper .- bs.ci_uf[:r].lower) > 1e-3
+                # truth containment of the UF band on the data-supported
+                # region: true r(N) = 0.5(1 − N/10)
+                band = bs.ci_uf[:r]; grid = bs.uf_grid[:r]
+                inside = [band.lower[i] - 1e-9 <= 0.5*(1 - grid[i]/10) <=
+                          band.upper[i] + 1e-9
+                          for i in eachindex(grid) if 1.0 <= grid[i] <= 8.0]
+                @test sum(inside) / length(inside) > 0.7
+            end
         end
 
         @testset "case bootstrap removed" begin
