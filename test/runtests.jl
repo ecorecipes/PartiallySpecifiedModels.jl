@@ -2359,6 +2359,135 @@ using StableRNGs
         end
     end
 
+    # ─── Mixed spline+NN LAML: REML dof accounting ────────────────
+    #
+    # Regression tests for the mixed-approximator Mp bug: the Gaussian REML
+    # scale used Mp = n_p − total_rank, counting every parameter without a
+    # penalty block (e.g. NeuralApproximator weights, penalty_weight = 0) as
+    # a REML fixed effect. When the NN weights rival or exceed n, the scale
+    # denominator max(n − Mp, 1) collapses to its floor of 1, inflating σ̂²
+    # by up to a factor n, and Fellner-Schall converts that into runaway λ.
+    #
+    # Documented pre-fix pathology (LV ODE, 6-knot spline + 25-weight NN,
+    # n = 14, Mp = 27, seeded): σ̂² entered Fellner-Schall at ≈ 4.8e3 (true
+    # σ² = 0.09) and FS drove λ: 1.4e3 → 2.4e6 → 1.4e8 → 2.2e17 in five
+    # iterations, pinning at exp(RHO_MAX) = 2.354e17. The spline collapsed
+    # to its penalty null space (a straight line, r̂(H) ≈ −63…−47 vs truth
+    # ≈ 0.45), EDF = 0.0, data_loss = 1.81e4 (spline-only fit of the same
+    # data: 3.56), and σ̂² spiralled as far as 1.5e13. Post-fix the scale
+    # uses the EDF-based restricted dof n − Mp_null − Σ_unpen diag(H⁻¹J'WJ)
+    # and the same problem fits (λ = 2.1e-2, EDF = 3.4, data_loss = 3.3,
+    # max spline error 0.008).
+
+    @testset "LAML mixed unpenalized-params — scale dof (unit)" begin
+        using PartiallySpecifiedModels: estimate_smoothing_params,
+                                        spline_penalty_matrix
+        # Working-model construction with a deterministic spline-like design
+        # and 30 appended all-zero columns standing in for unpenalized NN
+        # weights. The zero columns leave RSS, the penalty, and every FS
+        # quantity untouched, so the estimated λ must be IDENTICAL to the
+        # pure-spline call — any difference is dof mis-accounting.
+        #
+        # Pre-fix (measured): the 30 phantom fixed effects push the scale
+        # denominator max(n − Mp, 1) = max(20 − 32, 1) to 1, and
+        # λ_mixed/λ_pure = 1.09e12 (3.4e-6 → 3.7e6), EDF 7.72 → 1.54.
+        n = 20
+        nk = 8
+        xs = range(0.0, 1.0, length=n)
+        J_spline = [exp(-((xs[i] - (j - 1) / (nk - 1))^2) / 0.02)
+                    for i in 1:n, j in 1:nk]
+        S = spline_penalty_matrix(collect(range(0.0, 1.0, length=nk)))
+        y = sin.(2π .* xs) .+ 0.1 .* sin.(37.0 .* (1:n))  # fixed pseudo-noise
+        w = ones(n)
+        beta0 = fill(0.1, nk)
+        mu0 = J_spline * beta0
+
+        lam_pure, edf_pure = estimate_smoothing_params(
+            J_spline, w, w, y, mu0, beta0, [S], [0], [nk], nk;
+            family=Gaussian(), maxiter=50)
+
+        n_extra = 30
+        J_mixed = hcat(J_spline, zeros(n, n_extra))
+        beta0m = vcat(beta0, zeros(n_extra))
+        lam_mixed, edf_mixed = estimate_smoothing_params(
+            J_mixed, w, w, y, mu0, beta0m, [S], [0], [nk], nk + n_extra;
+            family=Gaussian(), maxiter=50)
+
+        @test lam_mixed[1] ≈ lam_pure[1] rtol=1e-8
+        @test edf_mixed ≈ edf_pure rtol=1e-8
+    end
+
+    @testset "LAML mixed spline+NN — end-to-end sanity" begin
+        import Lux
+        # LV predator-prey with a curved prey growth response r(H) modeled
+        # by a spline and a constant predator death rate δ(L) modeled by an
+        # unpenalized 7-weight NN. n = 14 data, Mp = 9 pre-fix (rank-based
+        # residual dof 5 < 10, so the over-parameterization advisory fires).
+        # Noise draws are hardcoded (MersenneTwister(3), σ = 0.3) so the
+        # problem is identical across Julia/RNG versions.
+        noise_H = [-0.6044823949505874, 0.3671333091212046, -0.251977240821784,
+                   2.2840017482782655, -1.6866405771212383,
+                   -0.22035000120986906, -1.8908352129955002]
+        noise_L = [-1.1344899010525022, 1.363431109330394, 0.2090876725125474,
+                   0.4819788902412847, 0.807176470329074,
+                   -0.14331293738481027, -0.08570497833822943]
+        r_true_mix(H) = 0.7 * exp(-H / 60)   # curved: not in penalty null space
+        function lv_mix_true!(du, u, p, t)
+            H, L = u
+            du[1] = r_true_mix(H) * H - 0.01 * H * L
+            du[2] = 0.01 * H * L - 0.25 * L
+        end
+        function lv_mix!(du, u, p, t)
+            H, L = u
+            du[1] = p.r(H) * H - p.α * H * L
+            du[2] = p.α * H * L - p.δ(L) * L
+        end
+        n_times = 7
+        dtimes = collect(range(0.5, 13.5, length=n_times))
+        st_true = OrdinaryDiffEq.solve(
+            ODEProblem(lv_mix_true!, [30.0, 40.0], (0.0, 14.0)), Tsit5();
+            saveat=dtimes, abstol=1e-8, reltol=1e-8)
+        dvals = hcat([st_true(t)[1] for t in dtimes] .+ 0.3 .* noise_H,
+                     [st_true(t)[2] for t in dtimes] .+ 0.3 .* noise_L)
+
+        approx_r = BSplineApproximator(:r, (0.0, 80.0), 6; initial=x -> 0.4)
+        nn_mix = Lux.Chain(Lux.Dense(1, 2, Lux.tanh),
+                           Lux.Dense(2, 1, Lux.softplus))
+        approx_d = NeuralApproximator(:δ, nn_mix; domain=(0.0, 100.0),
+                                      rng_seed=7)
+
+        prob = PSMProblem(lv_mix!, [30.0, 40.0], (0.0, 14.0),
+                          [approx_r, approx_d];
+                          data_times=dtimes, data_values=dvals,
+                          obs_to_state=[1, 2], known_params=(α=0.01,),
+                          likelihood=Gaussian(), solver=Tsit5())
+
+        # The over-parameterization advisory must fire (rank-based residual
+        # dof = 14 − 9 = 5 < 10)
+        sol = @test_logs (:warn, r"unpenalized parameters") match_mode=:any solve(
+            prob, LAML(maxiters=15, verbose=false))
+
+        # Measured post-fix: λ = 3.1e5, EDF = 4.32, σ̂² = 5.2,
+        # data_loss = 50.5, max spline error 0.031, δ̂(46) = 0.264.
+        # λ not pinned at the RHO_MAX ceiling exp(40) ≈ 2.4e17
+        @test all(sol.smoothing_params .< 1e10)
+        # Spline not collapsed to its penalty null space
+        @test sol.edf > 2.0
+        # Scale finite and plausible
+        @test isfinite(sol.convergence.sigma2)
+        @test sol.convergence.sigma2 < 100.0
+        # Fit quality preserved
+        @test sol.data_loss < 500.0
+        # Recovery on the visited range H ∈ [23, 30.5] (truth ≈ 0.43–0.48);
+        # ~5x headroom over the measured 0.031
+        r_hat = sol.unknown_functions[:r]
+        @test maximum(abs(r_hat(h) - r_true_mix(h))
+                      for h in range(23.0, 30.5, length=20)) < 0.15
+        # NN recovers the constant death rate on the visited L range
+        d_hat = sol.unknown_functions[:δ]
+        @test abs(d_hat(46.0) - 0.25) < 0.15
+    end
+
     # ─── Poisson warm-start test ──────────────────────────────────
 
     @testset "Poisson LAML warm-start" begin

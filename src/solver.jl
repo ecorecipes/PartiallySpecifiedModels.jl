@@ -465,6 +465,25 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     S_list, uf_offsets, uf_nk = build_penalty_matrices(prob)
     m = length(S_list)
 
+    # Mixed-approximator dof advisory: parameters without a penalty block
+    # (e.g. NeuralApproximator weights with penalty_weight = 0) are not REML
+    # fixed effects in any useful sense when they rival the data size. The
+    # LAML scale estimate replaces the rank-based restricted dof n − Mp with
+    # an EDF-based count in that case (see laml.jl); warn when the rank-based
+    # count would have been (nearly) exhausted so users know the model is
+    # heavily over-parameterized relative to the data.
+    n_unpenalized = n_p - sum(uf_nk; init=0)
+    if m > 0 && n_unpenalized > 0
+        total_rank = sum(_rank_penalty(S_list[l]) for l in 1:m)
+        if n_data - (n_p - total_rank) < 10
+            @warn "LAML: $n_unpenalized unpenalized parameters (e.g. neural network " *
+                  "weights) leave at most $(n_data - (n_p - total_rank)) rank-based " *
+                  "residual degrees of freedom for the n=$n_data data points. The " *
+                  "Gaussian scale σ̂² uses the EDF-based restricted dof instead; " *
+                  "consider more data, a smaller network, or penalty_weight > 0."
+        end
+    end
+
     # Initialize smoothing: user-specified or data-driven default.
     # The penalty matrices are computed on a normalised [0,1] domain,
     # so their eigenvalue spectrum is stable across problems.
