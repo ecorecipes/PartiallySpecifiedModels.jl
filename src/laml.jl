@@ -72,6 +72,13 @@ For Gaussian (profiled REML):
 For non-Gaussian:
   V = ℓ(β̂) - ½ β̂'S^λ β̂ + ½ log|S^λ|_+ - ½ log|H| + Mp/2 log(2π)
 
+For mixed problems containing unpenalized approximator blocks (e.g. a
+`NeuralApproximator` with `penalty_weight = 0`), the Gaussian restricted dof
+uses the block's data-supported EDF, `n − Mp_null − Σ_unpen diag(H⁻¹J'WJ)`,
+instead of the rank-based `n − Mp` (which counts every NN weight as a fixed
+effect and can collapse the scale denominator when the weights outnumber the
+data). Pure-spline problems are unaffected.
+
 Returns `(V, H, S_lambda, sigma2)`.
 """
 function laml_objective(family::AbstractLikelihood,
@@ -110,11 +117,30 @@ function laml_objective(family::AbstractLikelihood,
 
     if family isa Gaussian
         RSS = sum(w_data[i] * (y[i] - mu[i])^2 for i in 1:n)
-        n_eff = n - Mp
         # Profiled REML scale uses the restricted dof (n − Mp), NOT n. Using
         # /n (the ML scale) leaves the analytic gradient inconsistent with V
         # by a factor (n−Mp)/n on the penalty term and biases toward
         # undersmoothing. (Wood 2011, "Fast stable REML".)
+        #
+        # Mixed-approximator correction: Mp = n_p − total_rank counts EVERY
+        # parameter without a penalty block (e.g. NeuralApproximator weights
+        # with penalty_weight = 0) as a REML fixed effect. For a mixed
+        # spline+NN model the NN weights can exceed n, collapsing the scale
+        # denominator to its floor of 1 and inflating σ̂² by up to a factor n —
+        # which Fellner-Schall then converts into runaway λ (oversmoothing the
+        # spline into its penalty null space). Replace the rank-based count by
+        # the data-supported EDF of the unpenalized block, diag(H⁻¹J'WJ) summed
+        # over unpenalized indices (mgcv-style φ̂ = RSS_w/(n − edf)). When there
+        # are no unpenalized parameters this is EXACTLY the original n − Mp.
+        unpen = _unpenalized_indices(offsets, nknots_list, n_p)
+        n_eff = if isempty(unpen)
+            n - Mp
+        else
+            H_inv = _safe_inv(H)
+            edf_unpen = sum(dot(view(H_inv, i, :), view(JWJ, :, i)) for i in unpen)
+            Mp_null = (n_p - length(unpen)) - total_rank
+            max(n - Mp_null - edf_unpen, 1.0)
+        end
         sigma2 = max((RSS + pen) / max(n_eff, 1), 1e-30)
         V = -0.5 * n_eff * log(sigma2) + 0.5 * log_det_S_plus - 0.5 * log_det_H
     else
@@ -274,6 +300,13 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
     ranks = [_rank_penalty(S_list[k]) for k in 1:m]
     total_rank = sum(ranks)
     Mp = n_p - total_rank
+    # Parameters outside every penalty block (e.g. unpenalized NN weights):
+    # excluded from the rank-based REML fixed-effect count and replaced by
+    # their data-supported EDF in the Gaussian scale denominator (see
+    # `laml_objective`). Empty for pure-spline problems, whose code path —
+    # and results — are unchanged.
+    unpen_idx = _unpenalized_indices(offsets, nknots_list, n_p)
+    Mp_null = (n_p - length(unpen_idx)) - total_rank
 
     # ─── Phase 1: Fellner-Schall ────────────────────────────────
     n_fs = min(maxiter, 30)
@@ -308,7 +341,18 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
             r_work = z_work .- J * beta_fs
             RSS = sum(w_data[i] * r_work[i]^2 for i in 1:n)
             pen = dot(beta_fs, S_lambda * beta_fs)
-            profiled = max((RSS + pen) / max(n - Mp, 1), 1e-30)   # REML scale
+            # Restricted dof: rank-based n − Mp for pure-spline problems;
+            # EDF-based for unpenalized (e.g. NN) blocks — counting every NN
+            # weight as a fixed effect can push n − Mp to its floor of 1 and
+            # inflate σ̂² by up to a factor n, driving λ → RHO_MAX.
+            denom = if isempty(unpen_idx)
+                max(n - Mp, 1)
+            else
+                edf_unpen = sum(dot(view(H_inv, i, :), view(JWJ, :, i))
+                                for i in unpen_idx)
+                max(n - Mp_null - edf_unpen, 1.0)
+            end
+            profiled = max((RSS + pen) / denom, 1e-30)   # REML scale
             min(profiled, sigma2_max)
         else
             pearson = sum(w_data[i] * (y[i] - mu[i])^2 /
@@ -456,6 +500,24 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
 end
 
 # ─── Helper functions ─────────────────────────────────────────────
+
+"""
+    _unpenalized_indices(offsets, nknots_list, n_p)
+
+Indices of parameters not covered by any penalty block: approximators whose
+`penalty_matrix` is `nothing` (e.g. `NeuralApproximator` with
+`penalty_weight = 0`) or whose block was dropped for having fewer than 3
+parameters (see `build_penalty_matrices`). Returns an empty vector for
+pure-spline problems.
+"""
+function _unpenalized_indices(offsets::Vector{Int}, nknots_list::Vector{Int},
+                              n_p::Int)
+    covered = falses(n_p)
+    for l in eachindex(offsets)
+        covered[offsets[l]+1:offsets[l]+nknots_list[l]] .= true
+    end
+    findall(!, covered)
+end
 
 """Log of product of positive eigenvalues of symmetric matrix."""
 function _log_det_plus(S::AbstractMatrix)
