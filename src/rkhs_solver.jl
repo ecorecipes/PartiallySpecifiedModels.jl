@@ -369,6 +369,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
     PSMSolution(params, J_final, data_loss, edf, Float64[λ, ρ],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (converged=converged, iterations=final_iter, method=:rkhs,
+                (converged=converged, iterations=final_iter,
+                 reason=(converged ? :converged_tol : :maxiters), method=:rkhs,
                  kernel=alg.kernel, lengthscale=ℓ))
 end

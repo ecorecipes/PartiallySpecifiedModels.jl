@@ -842,6 +842,13 @@ Uses Fellner-Schall + Newton for smoothing parameter estimation.
   the warmup phase the cap is progressively relaxed.  Set to a value reflecting
   your prior belief about observation noise variance (e.g. `sigma2_init=25.0`
   for ±5 measurement error).
+
+# Convergence info
+`sol.convergence` is a NamedTuple `(V_beta, sigma2, converged, iterations,
+reason, laml_failures)`: the posterior covariance and σ̂² used by
+[`confidence_band`](@ref), plus the standard honest-convergence keys (see
+[`PSMSolution`](@ref)) and `laml_failures::Int`, the number of iterations in
+which the LAML smoothing-parameter update failed and θ was kept.
 """
 struct LAML
     maxiters::Int
@@ -883,6 +890,13 @@ changes.  See Fasiolo, Pya & Wood (2016), Statistical Science 31(1).
 - `lambda_ode_end::Float64=1e4`: final ODE compliance penalty
 - `n_continuation::Int=8`: number of log-spaced continuation levels
 - `sigma2_init::Union{Nothing,Float64}=nothing`: σ² cap for Fellner-Schall
+
+# Convergence info
+`sol.convergence` is a NamedTuple `(ode_compliance, lambda_ode_final,
+converged, iterations, reason, iterations_total)`. `converged`/`reason`
+describe the final continuation level's inner loop, `iterations` counts its
+inner iterations, and `iterations_total` accumulates inner iterations across
+all continuation levels (see [`PSMSolution`](@ref) for the key taxonomy).
 """
 struct CollocationLAML
     maxiters::Int
@@ -969,6 +983,15 @@ quadratic roughness penalty `penalty_weight · Σₖ βₖ' Sₖ βₖ` to the l
 - `penalty_weight::Float64=0.0`: fixed weight of the quadratic smoothing
   penalty added to the loss (0 disables)
 - `autodiff::Bool=true`: use ForwardDiff (true) or finite differences (false)
+
+# Convergence info
+`sol.convergence` is a NamedTuple `(optimizer, method, converged, iterations,
+reason, final_grad_norm)` with the standard honest-convergence keys (see
+[`PSMSolution`](@ref)) plus `final_grad_norm::Float64`, the Euclidean norm of
+the last computed gradient. `reason == :plateau` is only reported while the
+cosine-annealed learning rate is still above 5% of the base `lr` — a plateau
+that appears merely because the schedule has driven the step size to zero is
+reported as `:maxiters`, not convergence.
 """
 struct AdamSolver
     maxiters::Int
@@ -1012,6 +1035,13 @@ Advantages over single shooting (AdamSolver):
   `penalty_weight · Σₖ βₖ'Sₖβₖ` added to the training objective (0 = no
   penalty; there is no smoothing-parameter selection here)
 - `verbose::Bool=false`: print iteration details
+
+# Convergence info
+`sol.convergence` is a NamedTuple `(optimizer, method, n_intervals, converged,
+iterations, reason, max_gap, rho_final)` with the standard honest-convergence
+keys (see [`PSMSolution`](@ref); `iterations` counts outer augmented-Lagrangian
+iterations) plus `max_gap::Float64`, the final maximum shooting-gap magnitude,
+and `rho_final::Float64`, the final penalty parameter.
 """
 struct MultipleShootingSolver
     n_intervals::Int
@@ -1290,6 +1320,15 @@ standard deviation.
   non-reproducible)
 - `verbose`: print progress
 
+# Convergence info
+`sol.convergence` carries the standard honest-convergence keys (see
+[`PSMSolution`](@ref)): `converged`/`reason` report the BEST ensemble
+member's outcome (`:plateau` when its loss stagnated, `:maxiters`
+otherwise), `iterations` is the total Adam iterations summed over all
+ensemble members, and `member_converged::Vector{Bool}` records each
+member's plateau flag (alongside the existing `n_ensemble`,
+`member_losses`, `member_weights`, `ensemble_std` keys).
+
 # References
 - Bonnaffé & Coulson (2023), "Fast fitting of neural ordinary
   differential equations by Bayesian neural gradient matching to infer
@@ -1436,6 +1475,11 @@ produces slightly less smooth estimates.
 - `tol`: convergence tolerance (default 1e-6)
 - `gamma`: GCV inflation factor (default 1.4, >1 guards against under-smoothing)
 - `verbose`: print progress
+
+# Convergence info
+`sol.convergence` is a NamedTuple `(converged, iterations, reason, gcv)` with
+the standard honest-convergence keys (see [`PSMSolution`](@ref)) plus
+`gcv::Float64`, the last GCV score (NaN when no smooth terms are present).
 """
 struct GCVSolver
     n_grid::Int
@@ -1468,6 +1512,12 @@ This is the original approach from Wood (2001) / deGradInfer (Macdonald & Husmei
 - `maxiters`: max iterations for parameter matching (default 1000)
 - `lr`: learning rate for Adam optimization in matching step (default 0.01)
 - `verbose`: print progress
+
+# Convergence info
+`sol.convergence` is a NamedTuple `(converged, iterations, reason, method)`
+with the standard honest-convergence keys (see [`PSMSolution`](@ref));
+`converged=true` with `reason=:plateau` when the matching loss stagnated
+over a 30-iteration window, `reason=:maxiters` otherwise.
 """
 struct TwoStageSolver
     n_basis_smooth::Int
@@ -1622,6 +1672,12 @@ against the cumulative trapezoidal integral of f(ŷ(s),p,s).
 - `lr`: learning rate (default 0.01)
 - `verbose`: print progress
 
+# Convergence info
+`sol.convergence` is a NamedTuple `(converged, iterations, reason, method)`
+with the standard honest-convergence keys (see [`PSMSolution`](@ref));
+`converged=true` with `reason=:plateau` when the matching loss stagnated
+over a 30-iteration window, `reason=:maxiters` otherwise.
+
 # References
 - Dattner & Klaassen (2015), EJS 9(2), 1939–1973
 - R package `simode` (Yaari & Dattner)
@@ -1745,6 +1801,15 @@ observed systems are supported.
 - `lr`: Adam learning rate (default 0.01)
 - `verbose`: print progress
 
+# Convergence info
+`sol.convergence` is a NamedTuple `(converged, iterations, reason, method,
+gp_hyperparams)` with the standard honest-convergence keys (see
+[`PSMSolution`](@ref)). `iterations` counts the joint Adam steps actually
+performed (the budget is `20 * maxiters` steps); `converged=true` with
+`reason=:plateau` when the risk stagnated over a 30-step window while the
+cosine-annealed learning rate was still above 5% of the base `lr`,
+`reason=:maxiters` otherwise.
+
 # References
 - Wenk, Abbati et al. (2020), AAAI — ODIN
 - Wenk et al. (2019), AISTATS — FGPGM
@@ -1792,6 +1857,12 @@ unknown-function parameters θ. Continuous-time problems only.
 - `maxiters`: outer alternations; 10 θ Adam steps each (default 200)
 - `lr`: θ learning rate (default 0.01)
 - `verbose`: print progress
+
+# Convergence info
+`sol.convergence` is a NamedTuple `(converged, iterations, reason, method,
+kernel, lengthscale)` with the standard honest-convergence keys (see
+[`PSMSolution`](@ref)); `reason` is `:converged_tol` when the relative
+objective change fell below tolerance, `:maxiters` otherwise.
 
 # References
 - González et al. (2014), Pattern Recognition Letters
@@ -2040,7 +2111,19 @@ Result of fitting a PSM.
 - `smoothing_params`: vector of estimated smoothing parameters λ
 - `fitted_values`: predicted values at data times (n_times × n_obs)
 - `unknown_functions`: Dict of name => callable evaluator
-- `convergence`: convergence information
+- `convergence`: convergence information. For the iterative optimisers
+  (LAML, GCVSolver, CollocationLAML, AdamSolver, MultipleShootingSolver,
+  TwoStageSolver, IntegralMatchingSolver, BNGSolver, ODINSolver, RKHSSolver)
+  this is a NamedTuple containing at least
+  - `converged::Bool` — `true` only when a genuine stopping criterion fired
+    (never when the loop merely exhausted its iteration budget),
+  - `iterations::Int` — iterations actually performed,
+  - `reason::Symbol` — why the loop stopped: `:converged_tol` (tolerance
+    criterion met), `:plateau` (objective stagnated over a window / no
+    improving step existed), `:maxiters` (budget exhausted without a
+    criterion firing), or `:early_break` (internal failure such as a
+    simulation error or singular linear system),
+  plus solver-specific extras documented on each solver type.
 """
 struct PSMSolution
     parameters::ComponentArray

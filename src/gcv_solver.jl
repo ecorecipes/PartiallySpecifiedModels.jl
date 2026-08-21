@@ -270,7 +270,9 @@ For each IRLS iteration:
 6. Step contraction (backtracking)
 7. Repeat until convergence
 
-Returns a `PSMSolution`.
+Returns a `PSMSolution`. `sol.convergence` is a NamedTuple
+`(converged, iterations, reason, gcv)` — see the `GCVSolver` and
+`PSMSolution` docstrings for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     _validate_problem(prob, "GCVSolver")
@@ -366,12 +368,19 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     prev_obj = Inf
     gcv_val  = NaN
 
+    # Honest convergence reporting: defaults describe loop exhaustion.
+    conv_converged = false
+    conv_reason = :maxiters
+    conv_iters = 0
+
     for iter in 0:(maxiters - 1)
+        conv_iters = iter + 1
         # Adapt GP kernel hyperparameters to the evolving fit
         iter >= 2 && _adapt_gp_approximators!(prob, beta)
         # Re-evaluate model + Jacobian
         f_vec_new, _ = try; eval_model(beta); catch e
             if verbose; println("Iter $iter: simulation failed ($e)"); end
+            conv_reason = :early_break
             break
         end
         f_vec .= f_vec_new
@@ -430,6 +439,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
         # Check convergence
         if iter >= 3 && abs(curr_obj - prev_obj) < alg.tol * max(abs(prev_obj), 1.0)
             if verbose; println("Converged at iter $iter (objective stable)"); end
+            conv_converged = true
+            conv_reason = :converged_tol
             break
         end
         prev_obj = curr_obj
@@ -519,5 +530,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
 
     PSMSolution(params, obj_val, data_loss, edf, copy(theta),
                 Float64.(pred), Float64.(prob.data_values),
-                Float64.(prob.data_times), uf_evals, nothing)
+                Float64.(prob.data_times), uf_evals,
+                (converged=conv_converged, iterations=conv_iters,
+                 reason=conv_reason, gcv=gcv_val))
 end

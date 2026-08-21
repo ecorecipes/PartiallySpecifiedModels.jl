@@ -447,7 +447,9 @@ For each IRLS iteration:
 4. Step contraction (backtracking)
 5. Re-estimate smoothing parameters via Fellner-Schall + Newton
 
-Returns a `PSMSolution`.
+Returns a `PSMSolution`. `sol.convergence` is a NamedTuple
+`(V_beta, sigma2, converged, iterations, reason, laml_failures)` — see the
+`LAML` and `PSMSolution` docstrings for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     _validate_problem(prob, "LAML")
@@ -641,7 +643,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     prev_obj = Inf  # Track penalized objective for convergence
     prev_data_loss = Inf  # Track data loss for non-Gaussian convergence
 
+    # Honest convergence reporting (see PSMSolution docs): defaults describe
+    # loop exhaustion; the breaks below overwrite them with the actual outcome.
+    conv_converged = false
+    conv_reason = :maxiters
+    conv_iters = 0
+    laml_failures = 0
+
     for iter in 0:(maxiters-1)
+        conv_iters = iter + 1
         # Adapt GP kernel hyperparameters to the evolving fit (before the
         # model evaluation so f/J/W below are consistent with the new kernel)
         if iter >= alg.warmup
@@ -650,6 +660,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         # Re-evaluate model + Jacobian
         f_vec_new, _ = try; eval_model(beta); catch e
             if verbose; println("Iter $iter: simulation failed ($e)"); end
+            conv_reason = :early_break
             break
         end
         f_vec .= f_vec_new
@@ -751,6 +762,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                         100 * alg.tol * max(prev_data_loss, 1.0)
         if iter >= min_conv_iter && obj_stable && dl_stable
             if verbose; println("Converged at iter $iter (objective stable)"); end
+            conv_converged = true
+            conv_reason = :converged_tol
             break
         end
         prev_obj = curr_obj
@@ -758,6 +771,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
 
         if stop && iter >= min_conv_iter
             if verbose; println("Converged at iter $iter (no improvement)"); end
+            conv_converged = true
+            conv_reason = :plateau
             break
         end
 
@@ -786,6 +801,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                                          verbose=verbose)
             catch e
                 if verbose; println("LAML failed: $e, keeping theta"); end
+                laml_failures += 1
                 (copy(theta), NaN)
             end
             theta .= theta_new
@@ -891,7 +907,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         1.0  # non-Gaussian: V_β already on natural scale
     end
 
-    convergence_info = (V_beta=V_beta, sigma2=sigma2_hat)
+    convergence_info = (V_beta=V_beta, sigma2=sigma2_hat,
+                        converged=conv_converged, iterations=conv_iters,
+                        reason=conv_reason, laml_failures=laml_failures)
 
     PSMSolution(params, obj_val, data_loss, edf, copy(theta),
                 Float64.(pred), Float64.(prob.data_values),

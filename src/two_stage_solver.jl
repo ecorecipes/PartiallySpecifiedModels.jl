@@ -36,6 +36,8 @@ nonlinear least squares against those smoothed derivatives.
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
+`sol.convergence` is a NamedTuple `(converged, iterations, reason, method)`
+— see the `TwoStageSolver` docstring for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
     _validate_problem(prob, "TwoStageSolver")
@@ -189,8 +191,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
     best_loss = Inf
     loss_window = fill(Inf, 30)
     final_iter = alg.maxiters
+    # Honest convergence reporting: converged only when the plateau
+    # criterion actually fires; otherwise the loop exhausted maxiters.
+    conv_converged = false
+    conv_reason = :maxiters
 
     for iter in 1:alg.maxiters
+        final_iter = iter
         # Compute gradient via ForwardDiff
         result = DiffResults.MutableDiffResult(0.0, (zeros(n_beta),))
         ForwardDiff.gradient!(result, twostage_loss, beta)
@@ -225,6 +232,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
             if (recent_max - recent_min) / max(abs(recent_min), 1.0) < 1e-6
                 if verbose; println("  Converged at iter $iter (loss plateau)"); end
                 final_iter = iter
+                conv_converged = true
+                conv_reason = :plateau
                 break
             end
         end
@@ -306,5 +315,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
     PSMSolution(params, best_loss, data_loss, edf, Float64[lambda_smooth],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (converged=true, iterations=final_iter, method=:two_stage))
+                (converged=conv_converged, iterations=final_iter,
+                 reason=conv_reason, method=:two_stage))
 end
