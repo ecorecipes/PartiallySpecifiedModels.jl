@@ -107,6 +107,85 @@ using StableRNGs
         @test PartiallySpecifiedModels._rank_penalty(S_sing) == 1
     end
 
+    @testset "LAML gradient matches finite differences" begin
+        using PartiallySpecifiedModels: laml_objective, laml_gradient,
+                                        build_S_lambda, spline_penalty_matrix,
+                                        _safe_inv
+        # `laml_gradient` is the EXACT ∂V/∂ρ of `laml_objective` holding
+        # (β, μ, J, W) fixed -- which is precisely how the Newton phase of
+        # `estimate_smoothing_params` calls the pair: the objective is
+        # evaluated at the working-model state (β_fs, μ_fs) and the gradient
+        # at the H and σ̂² that same call returned. So the check here is a
+        # central difference of V w.r.t. ρ with the working-model state
+        # frozen, built exactly as the Newton phase builds it:
+        # β̂(λ) = (J'WJ + S_λ)⁻¹J'Wz and μ = Jβ̂.
+        n, nk = 40, 6
+        knots = collect(0.0:1.0:5.0)
+        xs = collect(range(0.0, 5.0, length=n))
+        hat(x, k) = max(0.0, 1.0 - abs(x - k))
+        # Two penalty blocks: a hat-function block and a varying-coefficient
+        # block (the same basis modulated by a smooth covariate). The
+        # modulation matters -- two plain hat blocks BOTH span the constant
+        # function, which lies in the null space of both second-difference
+        # penalties, so H would be exactly singular and the 1e-10 ridge
+        # inside _log_det_pd/_safe_inv (not the analytic term) would dominate
+        # the derivative. As built here cond(J'J) ≈ 1.7e4.
+        g_mod = 1.0 .+ 0.5 .* sin.(2.0 .* xs)
+        J1 = [hat(xs[i], knots[j]) for i in 1:n, j in 1:nk]
+        J2 = [hat(xs[i], knots[j]) * g_mod[i] for i in 1:n, j in 1:nk]
+        J = hcat(J1, J2)
+        S = spline_penalty_matrix(knots)
+        S_list = [S, copy(S)]
+        offsets = [0, nk]; nknots_list = [nk, nk]; n_p = 2nk
+        w = ones(n)
+
+        function fd_vs_analytic(family, y, W, rho)
+            S_lam = build_S_lambda(S_list, offsets, nknots_list, rho, n_p)
+            beta = _safe_inv(J' * Diagonal(W) * J + S_lam) * (J' * (W .* y))
+            mu = J * beta
+            _, H, _, sigma2 = laml_objective(family, beta, J, W, w, y, mu,
+                                             S_list, offsets, nknots_list, rho, n_p)
+            g = laml_gradient(family, beta, S_list, offsets, nknots_list,
+                              rho, n_p, H, sigma2)
+            h = 1e-4
+            gfd = map(eachindex(rho)) do k
+                rp = copy(rho); rp[k] += h
+                rm = copy(rho); rm[k] -= h
+                Vp, = laml_objective(family, beta, J, W, w, y, mu, S_list,
+                                     offsets, nknots_list, rp, n_p)
+                Vm, = laml_objective(family, beta, J, W, w, y, mu, S_list,
+                                     offsets, nknots_list, rm, n_p)
+                (Vp - Vm) / (2h)
+            end
+            (g, collect(gfd))
+        end
+
+        # Tolerance: with h = 1e-4 the observed agreement is ≤ 3e-5 relative
+        # (≤ 1.2e-6 absolute) over every (family, ρ) pair below, the residual
+        # being FD truncation plus the O(1e-10) diagonal ridge that
+        # _log_det_pd and _safe_inv both add. rtol = 1e-3 leaves ~30x
+        # headroom for BLAS/platform variation while still catching any sign
+        # slip, factor-of-two, or dropped term (all O(1) relative).
+        y_g = sin.(xs) .+ 0.3 .* cos.(2.0 .* xs) .+ 0.05 .* sin.(37.0 .* (1:n))
+        for rho in ([-2.0, 1.0], [0.0, 0.0], [3.0, -1.0], [5.0, 4.0])
+            g, gfd = fd_vs_analytic(Gaussian(), y_g, w, rho)
+            @test g ≈ gfd rtol=1e-3 atol=1e-6
+        end
+        # Non-Gaussian branch (unit scale, ℓ(β̂) − ½β̂'S^λβ̂ + …): identity
+        # link ⟹ IRLS weights 1/μ, frozen here at the data as the outer IRLS
+        # loop would supply them.
+        y_p = round.(6.0 .+ 4.0 .* sin.(xs))
+        W_p = 1.0 ./ max.(y_p, 1.0)
+        for rho in ([-1.0, 0.5], [1.0, 1.0], [3.0, 0.0])
+            g, gfd = fd_vs_analytic(Poisson(), y_p, W_p, rho)
+            @test g ≈ gfd rtol=1e-3 atol=1e-6
+        end
+        # Sanity: V is not flat here, so a zero-returning stub gradient would
+        # fail the comparisons above rather than pass them vacuously.
+        g0, _ = fd_vs_analytic(Gaussian(), y_g, w, [0.0, 0.0])
+        @test norm(g0) > 1.0
+    end
+
     @testset "Simple ODE fit" begin
         # Exponential growth: du/dt = r*u, data = u0*exp(r*t)
         # Unknown function: r(u) ≈ constant
@@ -784,6 +863,23 @@ using StableRNGs
         @test haskey(sol_mcmc.unknown_functions, :r)
         r_map = sol_mcmc.unknown_functions[:r](5.0)
         @test abs(r_map - 0.3) < 0.2
+
+        # Reproducibility under a fixed seed (the AGM/BNG `rng_seed` pattern;
+        # MCMCSolver carries no rng_seed field, so seed the global stream its
+        # AdvancedHMC sampler draws from). The stream is saved and restored
+        # around the pair so the rest of this order-coupled suite sees
+        # exactly the draws it saw before.
+        rng_state_mcmc = copy(Random.default_rng())
+        Random.seed!(2718)
+        sol_mcmc_a = solve(prob_mcmc, MCMCSolver(n_samples=50, n_warmup=25,
+                                                 verbose=false))
+        Random.seed!(2718)
+        sol_mcmc_b = solve(prob_mcmc, MCMCSolver(n_samples=50, n_warmup=25,
+                                                 verbose=false))
+        @test Array(sol_mcmc_a.convergence) == Array(sol_mcmc_b.convergence)
+        @test sol_mcmc_a.unknown_functions[:r](5.0) ==
+              sol_mcmc_b.unknown_functions[:r](5.0)
+        copy!(Random.default_rng(), rng_state_mcmc)
     end
 
     @testset "MagiSolver (B-spline)" begin
@@ -1586,6 +1682,33 @@ using StableRNGs
         r_fitted = sol.unknown_functions[:r]
         r_vals = [r_fitted(t) for t in 0.0:2.0:10.0]
         @test all(v -> v > 0, r_vals)  # positive constraint guaranteed
+
+        # Positivity alone is guaranteed by the :positive architecture at ANY
+        # parameters -- including the random initialization -- so it would
+        # pass a do-nothing solver. Assert recovery of the constant truth
+        # r(t) = 0.3 as well. Across 25 random initializations at these
+        # settings (lr = 0.01, 100 Adam steps) max |r̂(t) − 0.3| over
+        # t ∈ {0,2,…,10} ranged 0.052–0.103, so 0.15 is ~1.5x the worst draw.
+        @test maximum(abs(v - 0.3) for v in r_vals) < 0.15
+
+        # ...and that the fit beats its own initialization. Seeded via the
+        # approximator's rng_seed so both the initialization and the fit are
+        # deterministic; a seeded COMONet draws from its own Xoshiro, leaving
+        # this suite's order-coupled global stream untouched.
+        uf_seeded = COMONetApproximator(:r, (0.0, 10.0), (8,), :positive;
+                                        penalty_weight=0.001, rng_seed=3)
+        prob_seeded = PSMProblem(exp_decay!, [1.0], (0.0, 10.0), [uf_seeded];
+            data_times=t_data, data_values=u_data,
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PSM.Gaussian())
+        r_init = PSM.build_comonet_evaluator(uf_seeded, initial_params(uf_seeded))
+        err_init = maximum(abs(r_init(t) - 0.3) for t in 0.0:2.0:10.0)
+        sol_seeded = solve(prob_seeded, AdamSolver(lr=0.01, maxiters=100))
+        r_seeded = sol_seeded.unknown_functions[:r]
+        err_fit = maximum(abs(r_seeded(t) - 0.3) for t in 0.0:2.0:10.0)
+        # Observed: err_init = 0.638, err_fit = 0.093 (ratio 0.15); assert a
+        # 4x improvement, ~1.7x headroom on the observed ratio.
+        @test err_fit < 0.25 * err_init
     end
 
     # ─── New solver tests ─────────────────────────────────────────
@@ -1684,6 +1807,22 @@ using StableRNGs
         @test size(sol_pm.convergence, 1) == 50  # n_samples
         # short chain: generous tolerance, but a do-nothing sampler fails it
         @test abs(sol_pm.unknown_functions[:r](5.0) - 0.25) < 0.25
+
+        # Reproducibility under a fixed seed (see the MCMCSolver testset:
+        # PseudoMarginalSolver has no rng_seed field either, and its
+        # particle/FFBS draws come from Random.default_rng()). Stream saved
+        # and restored so downstream unseeded draws are unchanged.
+        rng_state_pm = copy(Random.default_rng())
+        Random.seed!(31415)
+        sol_pm_a = solve(prob_pm, PseudoMarginalSolver(
+            n_samples=50, n_warmup=25, n_steps=50, verbose=false))
+        Random.seed!(31415)
+        sol_pm_b = solve(prob_pm, PseudoMarginalSolver(
+            n_samples=50, n_warmup=25, n_steps=50, verbose=false))
+        @test Array(sol_pm_a.convergence) == Array(sol_pm_b.convergence)
+        @test sol_pm_a.unknown_functions[:r](5.0) ==
+              sol_pm_b.unknown_functions[:r](5.0)
+        copy!(Random.default_rng(), rng_state_pm)
     end
 
     @testset "DDE support — delay exponential decay" begin
@@ -2198,6 +2337,55 @@ using StableRNGs
             @test length(diag_p.residuals) == length(sol.data_times)
             @test all(isfinite, diag_p.residuals)
         end
+
+        @testset "known-answer checks" begin
+            using PartiallySpecifiedModels: durbin_watson, residual_acf,
+                                            semivariogram
+            # The checks above only bound the diagnostics' ranges (DW ∈ (0,4),
+            # |ACF| ≤ 1, γ ≥ 0), which a constant-returning stub would satisfy.
+            # These pin the values on series whose answers are known in closed
+            # form. Version-stable StableRNGs; no draws from the suite's
+            # order-coupled global stream.
+
+            # (1) White noise ⟹ DW ≈ 2, since DW = 2(1 − ρ̂₁) and ρ̂₁ has
+            # sd ≈ 1/√n. At n = 1000 that is 0.032, so DW has sd ≈ 0.063 and
+            # 0.25 is ~4 sd.
+            rng_wn = StableRNG(2024)
+            wn = randn(rng_wn, 1000)
+            @test abs(durbin_watson(wn) - 2.0) < 0.25
+
+            # (2) AR(1) with φ = 0.8 ⟹ ρ(h) = 0.8ʰ: large-positive at lag 1,
+            # decaying with lag. sd of ρ̂₁ ≈ √((1 − φ²)/n) = 0.03 at n = 400;
+            # 0.12 (4 sd) also covers the O(2φ/n) small-sample bias.
+            rng_ar = StableRNG(2025)
+            n_ar = 400
+            ar = zeros(n_ar); ar[1] = randn(rng_ar)
+            for i in 2:n_ar
+                ar[i] = 0.8 * ar[i-1] + randn(rng_ar)
+            end
+            acf_ar = residual_acf(ar; maxlag=6)
+            @test abs(acf_ar[1] - 0.8) < 0.12
+            @test all(diff(acf_ar) .< 0.0)         # monotone decay
+            @test acf_ar[6] < 0.6 * acf_ar[1]      # ρ(6) = 0.8⁶ = 0.26
+            # ...and DW on the same series is far below 2: 2(1 − 0.8) ≈ 0.4.
+            @test durbin_watson(ar) < 0.8
+
+            # (3) Semivariogram of that correlated series rises with lag:
+            # γ(h) = σ²(1 − φʰ) with σ² = 1/(1 − φ²) = 2.78. Binned at width 2
+            # out to lag 20, the first five bins are strictly increasing and
+            # γ(bin 5) > 2·γ(bin 1) (0.71 → 2.77 for this seed).
+            lags_ar, gam_ar = semivariogram(collect(1.0:n_ar), ar;
+                                            maxlag=20.0, nbins=10)
+            @test length(gam_ar) == 10
+            @test all(diff(gam_ar[1:5]) .> 0.0)
+            @test gam_ar[5] > 2.0 * gam_ar[1]
+            # ...whereas white noise gives a flat semivariogram at σ² = 1
+            # (each bin averages ≳ 1000 pairs, so γ̂ is tight around 1).
+            _, gam_wn = semivariogram(collect(1.0:500.0), wn[1:500];
+                                      maxlag=20.0, nbins=10)
+            @test maximum(gam_wn) / minimum(gam_wn) < 1.3
+            @test all(g -> 0.7 < g < 1.4, gam_wn)
+        end
     end
 
     # ─── TruncatedNormal likelihood tests ─────────────────────────
@@ -2311,6 +2499,16 @@ using StableRNGs
             # sigma2_init tuning or maxiters can fully control from here).
             # 150000 keeps this a meaningful check (still well below a
             # totally-diverged/non-finite fit) while tolerating that.
+            #
+            # Re-examined (T14) before leaving the ceiling alone: across
+            # StableRNG seeds 99/3/17/55/101 the local data_loss is
+            # 755–1480 and λ̂(0.1) is 0.061–0.063 against a truth of 0.0629,
+            # so the seed is NOT the source of the slack -- the ceiling is
+            # sized entirely by the CI-runner basin (worst observed 134523,
+            # deterministic on that hardware). Tightening toward the local
+            # spread would reintroduce that CI failure, so it stands. For
+            # scale, the spline initialization λ(x) = 0.4x gives SS = 3.0e5,
+            # which the ceiling still rules out by 2x.
             @test sol.data_loss < 150000  # reasonable fit
             @test sol.edf > 1.0
             @test haskey(sol.unknown_functions, :λ)
@@ -2624,9 +2822,64 @@ using StableRNGs
         # (well below the 200000+ un-warm-started baseline) while
         # tolerating that legitimate, hard-to-eliminate cross-platform
         # floating-point path sensitivity.
+        #
+        # Re-examined (T14): across StableRNG seeds 11/3/17/55/101 the local
+        # data_loss is 2544–4365 and λ̂(0.1) is 0.060–0.064 (truth 0.0629), so
+        # the slack is not seed-driven -- it is sized by the CI-runner basin
+        # (worst observed 92794, deterministic there). Tightening toward the
+        # local spread would reintroduce that failure, so the ceiling stands;
+        # the un-warm-started baseline is 200000+ and the λ(x) = 0.4x
+        # initialization gives SS = 3.0e5, both of which it still excludes.
         @test sol.data_loss < 120000
         @test sol.edf > 1.5
         @test sol.edf < 8.0
+    end
+
+    @testset "NegativeBinomial LAML — end-to-end recovery" begin
+        using PartiallySpecifiedModels: _sample_gamma, _sample_poisson
+        # NB2 counts (mean μ, variance μ + μ²/θ) from a logistic-growth
+        # trajectory whose per-capita rate r(N) = 0.6(1 − N/400) is the
+        # unknown function. Drawn with the package's own Gamma-Poisson
+        # mixture -- the sampler `_parametric_resample!` uses for
+        # NegativeBinomial -- off a StableRNG so the fixture is
+        # version-stable (see the note on the TruncatedNormal test above).
+        r_nb(N) = 0.6 * (1.0 - N / 400.0)
+        function logistic_nb!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+        end
+        sol_true_nb = OrdinaryDiffEq.solve(
+            ODEProblem((du, u, p, t) -> (du[1] = r_nb(u[1]) * u[1]),
+                       [20.0], (0.0, 20.0)), Tsit5(); saveat=0.5)
+        t_nb = collect(sol_true_nb.t)
+        mu_nb = [sol_true_nb.u[i][1] for i in eachindex(t_nb)]   # 20 → 400
+        theta_nb = 50.0
+        rng_nb = StableRNG(2024)
+        y_nb = [Float64(_sample_poisson(
+                    _sample_gamma(theta_nb, m / theta_nb, rng_nb), rng_nb))
+                for m in mu_nb]
+
+        uf_nb2 = BSplineApproximator(:r, (10.0, 420.0), 6; initial=x -> 0.3)
+        prob_nb2 = PSMProblem(logistic_nb!, [20.0], (0.0, 20.0), [uf_nb2];
+            data_times=t_nb, data_values=reshape(y_nb, :, 1), obs_to_state=[1],
+            known_params=NamedTuple(), likelihood=NegativeBinomial(theta_nb),
+            solver=Tsit5())
+        sol_nb2 = solve(prob_nb2, LAML(maxiters=60, verbose=false))
+
+        @test sol_nb2 isa PSMSolution
+        @test isfinite(sol_nb2.objective)
+        @test sol_nb2.edf > 1.0
+        # Tolerance: at θ = 50 the counts carry sd = √(μ + μ²/50), i.e. ~15%
+        # noise at the μ ≈ 400 plateau. Observed max |r̂ − r| over the five
+        # evaluation points is 0.057 for this seed (0.024 and 0.020 for two
+        # other seeds tried); 0.12 is ~2x the worst. It stays well inside
+        # what a do-nothing fit would give -- the spline initialization
+        # r ≡ 0.3 is off by 0.225 at N = 50 and by 0.27 at N = 380.
+        r_hat_nb = sol_nb2.unknown_functions[:r]
+        for x in (50.0, 100.0, 200.0, 300.0, 380.0)
+            @test abs(r_hat_nb(x) - r_nb(x)) < 0.12
+        end
+        # ...and the recovered response decreases with N, as the truth does.
+        @test r_hat_nb(50.0) > r_hat_nb(380.0)
     end
 
     # ─── Bootstrap confidence intervals ───────────────────────────
