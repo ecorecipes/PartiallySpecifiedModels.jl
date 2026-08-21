@@ -54,6 +54,9 @@ include("likelihoods.jl")
 # LAML smoothing parameter estimation
 include("laml.jl")
 
+# Shared penalized least-squares step (truncated SVD + step contraction)
+include("pcls.jl")
+
 # Main solver (IRLS + LAML)
 include("solver.jl")
 

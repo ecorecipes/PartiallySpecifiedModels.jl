@@ -1550,6 +1550,56 @@ using StableRNGs
         @test abs(r_fitted_gcv(5.0) - 0.25) < 0.12
     end
 
+    @testset "Shared PCLS step (pcls.jl)" begin
+        # The LAML and GCV IRLS loops share _pcls_augmented_solve /
+        # _pcls_step_contract. Verify the two key numerical properties the
+        # truncated SVD provides over a plain QR solve.
+        # (An end-to-end GCV poor-initialization pin was attempted but the
+        # GCV λ-selection floor regularizes the augmented system enough
+        # that the pre-fix QR path did not visibly explode; this unit test
+        # pins the guard directly instead.)
+        PSM = PartiallySpecifiedModels
+        rng_pcls = Random.Xoshiro(3)
+        n, p = 40, 6
+        Jm = randn(rng_pcls, n, p)
+        zv = randn(rng_pcls, n)
+        wv = rand(rng_pcls, n) .+ 0.5
+        Ws = sqrt.(max.(wv, 1e-15))
+
+        # 1) Well-conditioned system: truncated SVD equals plain QR backslash
+        Bpen = Matrix(0.3I, p, p)
+        beta_svd = PSM._pcls_augmented_solve(Jm, zv, Bpen, wv)
+        Cpen = PSM.penalty_sqrt_matrix(Bpen)
+        F_aug = vcat(Diagonal(Ws) * Jm, Cpen)
+        z_aug = vcat(Ws .* zv, zeros(size(Cpen, 1)))
+        beta_qr = F_aug \ z_aug
+        @test norm(beta_svd - beta_qr) / norm(beta_qr) < 1e-10
+
+        # 2) Near-null Jacobian directions (the documented poor-init failure
+        # mode): plain QR returns exploding coefficients along σ≈1e-9
+        # directions; the truncated SVD keeps the step bounded.
+        J2 = copy(Jm)
+        J2[:, 5] .= 1e-9 .* randn(rng_pcls, n)
+        J2[:, 6] .= 1e-9 .* randn(rng_pcls, n)
+        B0 = zeros(p, p)
+        b_svd = PSM._pcls_augmented_solve(J2, zv, B0, wv)
+        F2 = vcat(Diagonal(Ws) * J2, PSM.penalty_sqrt_matrix(B0))
+        b_qr = F2 \ vcat(Ws .* zv, zeros(0))
+        @test norm(b_qr) > 1e6      # plain QR explodes
+        @test norm(b_svd) < 1e2     # truncated SVD stays bounded
+
+        # 3) Step contraction: phase-2 rescue escapes an explosive step where
+        # even α = 2^-15 of the direction is rejected by the objective.
+        # Objective: Inf outside a tiny ball around the origin (mimics ODE
+        # blow-up), quadratic inside; the proposed step is enormous.
+        a_old = zeros(2)
+        a_new = fill(1e9, 2)
+        obj_ball(a, B) = norm(a) < 1e-4 ? sum(abs2, a .- 1e-5) : Inf
+        a_res, f_res = PSM._pcls_step_contract(obj_ball, a_old, a_new, B0[1:2, 1:2])
+        @test f_res < obj_ball(a_old, nothing)   # escaped (improved on f_old)
+        @test 0 < norm(a_res) < 1e-4             # via a phase-2 contracted step
+    end
+
     @testset "TwoStageSolver — logistic growth" begin
         r_ts(N) = 0.5 * (1.0 - N / 10.0)
         function logistic_ts!(du, u, p, t)
