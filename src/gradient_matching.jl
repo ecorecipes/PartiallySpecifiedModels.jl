@@ -346,7 +346,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
 
             # Update smoothing params
             if iter % 5 == 0
-                sigma2 = resid_ss / (T_pts * K)
+                # Divide by the number of residuals actually contributing:
+                # unobserved-state rows are zero-weighted, and counting them
+                # would bias sigma2 low (over-smoothing theta).
+                n_eff = count(!iszero, w)
+                sigma2 = resid_ss / max(n_eff, 1)
                 if alg.sigma2_init !== nothing; sigma2 = min(sigma2, alg.sigma2_init); end
                 for l in 1:m
                     off = uf_offsets[l]; nk = uf_nk[l]

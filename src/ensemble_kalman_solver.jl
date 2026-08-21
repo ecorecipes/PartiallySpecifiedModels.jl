@@ -53,25 +53,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
 
     # ── Forward model: θ → G(θ) (predicted observations) ────────
     function forward_model(theta::Vector{Float64})
-        p = build_param_struct(prob, theta)
         pred = zeros(length(prob.data_times), size(prob.data_values, 2))
 
         try
             if prob.discrete
-                u = Float64.(prob.u0 isa Function ? prob.u0(p) : prob.u0)
-                n_vars = length(u)
-                du = zeros(n_vars)
-                for i in 1:length(prob.data_times)
-                    for j in 1:size(prob.data_values, 2)
-                        sk = prob.obs_to_state[j]
-                        pred[i, j] = u[sk]
-                    end
-                    if i < length(prob.data_times)
-                        prob.dynamics!(du, u, p, prob.data_times[i])
-                        u = copy(du)
-                    end
-                end
+                # Use the package-canonical discrete simulation (unit steps
+                # over tspan, data times snapped to the nearest integer step)
+                # so EKI sees the same trajectory as every other solver even
+                # when data times have gaps.
+                pred = simulate_discrete(prob, theta)
             else
+                p = build_param_struct(prob, theta)
                 ode_u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
                 ode_prob = ODEProblem(prob.dynamics!, ode_u0, prob.tspan, p)
                 solver = prob.ode_solver === nothing ? Tsit5() : prob.ode_solver
@@ -92,6 +84,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
             return nothing
         end
 
+        # Diverged particles (e.g. an exploding discrete map) yield Inf/NaN
+        # without throwing; treat them as failures like any other.
+        all(isfinite, pred) || return nothing
         vec(pred)
     end
 
