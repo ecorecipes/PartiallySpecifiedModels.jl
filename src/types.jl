@@ -352,7 +352,8 @@ end
 
 """
     ShapeConstrainedSPDEApproximator(name, domain, n_basis, constraint;
-                                     nu=1.5, range_param=nothing, initial=nothing)
+                                     nu=1.5, range_param=nothing, initial=nothing,
+                                     penalty=:gamma_matern)
 
 SPDE (Matérn) approximator with a shape constraint enforced via the SCOP-spline
 reparameterization of Pya & Wood (2015).
@@ -376,6 +377,12 @@ reduce overshoot.
 - `nu`: Matérn smoothness parameter (0.5, 1.5, or 2.5)
 - `range_param`: correlation length ρ (default: 1/3 of domain width)
 - `initial`: optional initial function `x -> y` or constant
+- `penalty`: `:gamma_matern` (default) applies the Matérn precision to the
+  unconstrained γ as `Σᵀ P_β Σ`; `:difference` applies the Pya & Wood (2015)
+  SCOP first-difference penalty on γ with the free level/slope in the null
+  space. See the `penalty_matrix(::ShapeConstrainedSPDEApproximator)`
+  docstring for the trade-offs — in particular, the default's λ→∞ limit is NOT a
+  maximally smooth member of the constraint family.
 
 # Example
 ```julia
@@ -395,6 +402,7 @@ struct ShapeConstrainedSPDEApproximator <: AbstractApproximator
     constraint::Symbol
     Sigma::Matrix{Float64}
     initial_func::Function
+    penalty::Symbol
 end
 
 function ShapeConstrainedSPDEApproximator(name::Union{Symbol,String},
@@ -403,7 +411,8 @@ function ShapeConstrainedSPDEApproximator(name::Union{Symbol,String},
                                           constraint::Symbol;
                                           nu::Real=1.5,
                                           range_param::Union{Nothing, Real}=nothing,
-                                          initial=nothing)
+                                          initial=nothing,
+                                          penalty::Symbol=:gamma_matern)
     name_s = Symbol(name)
     d = (Float64(domain[1]), Float64(domain[2]))
     _validate_domain("ShapeConstrainedSPDEApproximator", d)
@@ -412,6 +421,8 @@ function ShapeConstrainedSPDEApproximator(name::Union{Symbol,String},
     n_basis >= 4 || error("n_basis must be ≥ 4 for shape-constrained SPDE, got $n_basis")
     constraint in SHAPE_CONSTRAINTS || throw(ArgumentError(
         "Unknown constraint :$constraint. Must be one of $SHAPE_CONSTRAINTS"))
+    penalty in (:gamma_matern, :difference) || throw(ArgumentError(
+        "Unknown penalty :$penalty. Must be :gamma_matern or :difference"))
 
     ρ = if range_param === nothing
         (d[2] - d[1]) / 3.0
@@ -433,7 +444,7 @@ function ShapeConstrainedSPDEApproximator(name::Union{Symbol,String},
     end
 
     ShapeConstrainedSPDEApproximator(name_s, d, n_basis, ν, κ, ρ, mesh,
-                                     constraint, Sig, init_func)
+                                     constraint, Sig, init_func, penalty)
 end
 
 function nparams(a::ShapeConstrainedSPDEApproximator)

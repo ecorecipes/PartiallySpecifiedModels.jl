@@ -481,6 +481,74 @@ using StableRNGs
         @test size(P_z) == (7, 7)
     end
 
+    @testset "ShapeConstrainedSPDEApproximator — :difference penalty" begin
+        PSM = PartiallySpecifiedModels
+
+        # Construction: keyword stored; invalid mode rejected; default is
+        # :gamma_matern (SPD — no null space)
+        a_def = ShapeConstrainedSPDEApproximator(:f, (0.0, 1.0), 8, :increasing)
+        @test a_def.penalty == :gamma_matern
+        @test_throws ArgumentError ShapeConstrainedSPDEApproximator(
+            :f, (0.0, 1.0), 8, :increasing; penalty=:bogus)
+        S_def = penalty_matrix(a_def)
+        @test minimum(eigvals(Symmetric(S_def))) > 1.0  # SPD, no null space
+
+        # :difference — P&W null space: free level e₁ and the constant
+        # increment shift over the chained indices are exactly annihilated
+        a_diff = ShapeConstrainedSPDEApproximator(:f, (0.0, 1.0), 8, :increasing;
+            penalty=:difference)
+        S_diff = penalty_matrix(a_diff)
+        @test issymmetric(S_diff)
+        @test all(eigvals(Symmetric(S_diff)) .>= -1e-12)
+        @test PSM._rank_penalty(S_diff) == 6      # np=8, null dim 2
+        @test norm(S_diff * [1.0; zeros(7)]) == 0.0        # free level γ₁
+        @test norm(S_diff * [0.0; ones(7)]) == 0.0         # constant slope shift
+
+        # Curvature constraint: skips (1, 2) → null dim 3 (level, slope,
+        # constant curvature)
+        a_cx = ShapeConstrainedSPDEApproximator(:f, (0.0, 1.0), 8, :inc_convex;
+            penalty=:difference)
+        S_cx = penalty_matrix(a_cx)
+        @test PSM._rank_penalty(S_cx) == 5
+        @test norm(S_cx * [1.0; zeros(7)]) == 0.0
+        @test norm(S_cx * [0.0; 1.0; zeros(6)]) == 0.0
+        @test norm(S_cx * [0.0; 0.0; ones(6)]) == 0.0
+
+        # Zero-endpoint constraint keeps the reduced dimension
+        a_z = ShapeConstrainedSPDEApproximator(:f, (0.0, 1.0), 8, :inc_zero_left;
+            penalty=:difference)
+        @test size(penalty_matrix(a_z)) == (7, 7)
+
+        # λ→∞ semantics: minimize ‖y − f(γ)‖² + λ γ'Sγ at λ=1e8. In
+        # :difference mode γ collapses to the null space, whose image under
+        # the constraint map is the straight-line family — NOT the
+        # softplus(0)=log 2 ramp. In the default mode γ→0, giving exactly
+        # the log-2 ramp (slope 7·log 2 on this mesh) with the level shrunk
+        # to 0. Deterministic Nelder-Mead from initial_params.
+        xs = collect(range(0.0, 1.0, length=30))
+        y = @. 2.0 + 0.5 * xs + 0.3 * sin(6 * xs)
+        X = [ones(length(xs)) xs]
+        function fit_big_lambda(a, S)
+            obj = g -> begin
+                ev = PSM.build_constrained_spde_evaluator(a, g)
+                sum(abs2, y .- ev.(xs)) + 1e8 * dot(g, S, g)
+            end
+            res = PSM.Optim.optimize(obj, initial_params(a), PSM.Optim.NelderMead(),
+                PSM.Optim.Options(iterations=20000, g_tol=1e-12))
+            ghat = PSM.Optim.minimizer(res)
+            fitted = [PSM.build_constrained_spde_evaluator(a, ghat)(x) for x in xs]
+            c = X \ fitted
+            (level=c[1], slope=c[2], line_resid=norm(fitted - X * c))
+        end
+        r_diff = fit_big_lambda(a_diff, S_diff)
+        @test r_diff.line_resid < 1e-6            # limit IS a straight line
+        @test abs(r_diff.slope - 7 * log(2)) > 3.0  # and NOT the log-2 ramp
+        @test r_diff.level > 1.5                  # level not shrunk away
+        r_def = fit_big_lambda(a_def, S_def)
+        @test abs(r_def.slope - 7 * log(2)) < 1e-3  # default limit: log-2 ramp
+        @test abs(r_def.level) < 1e-6               # with level shrunk to 0
+    end
+
     @testset "ShapeConstrainedSPDEApproximator — LAML solver" begin
         function growth_scspde!(du, u, p, t)
             du[1] = p.r(u[1]) * u[1]
@@ -509,6 +577,24 @@ using StableRNGs
         mesh_vals = PartiallySpecifiedModels.gamma_to_mesh_values(
             prob.approximators[1], collect(sol.parameters[:r]))
         @test all(mesh_vals .> 0)
+
+        # Same problem with the rank-deficient :difference penalty: LAML's
+        # rank/null-space (Mp) bookkeeping must handle it (the SCBSpline path
+        # already exercises rank-deficient penalties) and recovery should be
+        # comparable to the default mode.
+        prob_d = PSMProblem(growth_scspde!, [1.0], tspan,
+            [ShapeConstrainedSPDEApproximator(:r, (0.5, 5.0), 8, :positive;
+                nu=1.5, initial=x -> 0.2, penalty=:difference)];
+            data_times=data_times, data_values=data_values,
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=Gaussian(), solver=Tsit5(),
+            abstol=1e-8, reltol=1e-8, maxiters=10000)
+        sol_d = solve(prob_d, LAML(maxiters=60, verbose=false))
+        @test sol_d.data_loss < 1.0
+        @test abs(sol_d.unknown_functions[:r](1.0) - true_r) < 0.15
+        mesh_vals_d = PartiallySpecifiedModels.gamma_to_mesh_values(
+            prob_d.approximators[1], collect(sol_d.parameters[:r]))
+        @test all(mesh_vals_d .> 0)
     end
 
     @testset "GradientMatching solver" begin
