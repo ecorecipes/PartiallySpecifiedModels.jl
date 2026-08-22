@@ -161,7 +161,14 @@ function collocation_residual_jacobian(
         sk = prob.obs_to_state[j]
         for i in 1:T
             idx = (j - 1) * T + i
-            data_resid[idx] = sqrt(w_vec[idx]) * (prob.data_values[i, j] - alpha[i, sk])
+            # `sqrt(0) * NaN = NaN`: a masked cell's ZERO weight does not
+            # neutralize a NaN datum, so the residual must be zeroed
+            # explicitly. Left unguarded, one masked cell makes the
+            # Gauss-Newton step all-NaN, the line search rejects every
+            # step, and the solver reports `:plateau` convergence at its
+            # initialization. (The Jacobian row is already a clean 0.)
+            data_resid[idx] = (w_vec[idx] > 0 && !isnan(prob.data_values[i, j])) ?
+                sqrt(w_vec[idx]) * (prob.data_values[i, j] - alpha[i, sk]) : 0.0
         end
     end
 
@@ -387,7 +394,14 @@ function collocation_residual_only(
         sk = prob.obs_to_state[j]
         for i in 1:T
             idx = (j - 1) * T + i
-            data_resid[idx] = sqrt(w_vec[idx]) * (prob.data_values[i, j] - alpha[i, sk])
+            # `sqrt(0) * NaN = NaN`: a masked cell's ZERO weight does not
+            # neutralize a NaN datum, so the residual must be zeroed
+            # explicitly. Left unguarded, one masked cell makes the
+            # Gauss-Newton step all-NaN, the line search rejects every
+            # step, and the solver reports `:plateau` convergence at its
+            # initialization. (The Jacobian row is already a clean 0.)
+            data_resid[idx] = (w_vec[idx] > 0 && !isnan(prob.data_values[i, j])) ?
+                sqrt(w_vec[idx]) * (prob.data_values[i, j] - alpha[i, sk]) : 0.0
         end
     end
 
@@ -483,17 +497,41 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
             # themselves non-negative (a positivity-assuming model);
             # unconditionally forcing ≥ 0.01 corrupted legitimately negative
             # states (log-abundances, anomalies).
-            col = prob.data_values[:, obs_idx]
-            floor_k = all(>=(0.0), col) ? 0.01 : -Inf
-            raw = max.(col, floor_k)
-            if prob.discrete && T_pts >= 4
-                itp = CubicSpline(raw, times;
-                                  extrapolation=ExtrapolationType.Extension)
-                for i in 1:T_pts
-                    alpha[i, k] = max(itp(times[i]), floor_k)
-                end
+            # Seed from the USABLE rows only, interpolating across masked
+            # gaps. Two distinct failures otherwise: `all(>=(0.0), col)` is
+            # false whenever the column holds a NaN (NaN >= 0 is false), so
+            # the positivity floor silently switches off for any partially
+            # masked non-negative series; and the NaN itself lands in
+            # `alpha`, making the whole state block NaN from step one.
+            keep = usable_rows(prob, obs_idx)
+            if isempty(keep)
+                alpha[:, k] .= prob.u0[k]
             else
-                alpha[:, k] .= raw
+                col = Float64.(prob.data_values[keep, obs_idx])
+                floor_k = all(>=(0.0), col) ? 0.01 : -Inf
+                raw = max.(col, floor_k)
+                if prob.discrete && T_pts >= 4 && length(keep) >= 4
+                    # Unchanged discrete path: spline through the kept rows
+                    # (all rows when nothing is masked).
+                    itp = CubicSpline(raw, times[keep];
+                                      extrapolation=ExtrapolationType.Extension)
+                    for i in 1:T_pts
+                        alpha[i, k] = max(itp(times[i]), floor_k)
+                    end
+                elseif length(keep) == T_pts
+                    # Unchanged continuous path.
+                    alpha[:, k] .= raw
+                elseif length(keep) >= 4
+                    # Continuous with masked rows: interpolate the kept rows
+                    # onto the full grid rather than dropping the state.
+                    itp = CubicSpline(raw, times[keep];
+                                      extrapolation=ExtrapolationType.Extension)
+                    for i in 1:T_pts
+                        alpha[i, k] = max(itp(times[i]), floor_k)
+                    end
+                else
+                    alpha[:, k] .= raw[1]
+                end
             end
         else
             alpha[:, k] .= prob.u0[k]
@@ -519,15 +557,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
         theta = Float64[]
     end
 
-    # Data weights (flattened: T × n_obs)
+    # Data weights (flattened: T × n_obs), with masked cells forced to weight
+    # 0 so the residual and Jacobian rows they generate are identically zero.
     w_vec = zeros(T_pts * n_obs)
     for j in 1:n_obs, i in 1:T_pts
-        w_vec[(j - 1) * T_pts + i] = prob.data_weights[i, j]
+        w_vec[(j - 1) * T_pts + i] = usable_cell(prob, i, j) ?
+                                     prob.data_weights[i, j] : 0.0
     end
-    y_vec = zeros(T_pts * n_obs)
-    for j in 1:n_obs, i in 1:T_pts
-        y_vec[(j - 1) * T_pts + i] = prob.data_values[i, j]
-    end
+    n_usable_cells = count(>(0), w_vec)
+    n_usable_cells == 0 && error("CollocationLAML: every observation is " *
+        "masked (all data_weights are 0 or all data_values are NaN); there " *
+        "is nothing to fit.")
 
     # Continuation schedule for λ_ode
     # For discrete models, cap λ_ode_end at 100: the compliance penalty
@@ -688,9 +728,23 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                 end
             else
                 y_vec2 = ord(prob.data_values)
+                # Zero the weights of masked cells so they drop out of both
+                # JWJ and the σ̂² numerator. Weight-aware is not enough on its
+                # own: `w * NaN^2 = NaN` even when w = 0, and a NaN σ̂² then
+                # survives `clamp` into theta, poisoning the penalty for every
+                # subsequent continuation level.
                 w_vec2 = ord(prob.data_weights)
+                for k in eachindex(y_vec2)
+                    (w_vec2[k] > 0 && !isnan(y_vec2[k])) || (w_vec2[k] = 0.0;
+                                                             y_vec2[k] = 0.0)
+                end
                 mu_base = ord(μ_pred)
-                n_data = length(y_vec2)
+                n_data = length(y_vec2)          # row count for Jb
+                # σ̂²'s denominator is a per-observation residual dof and must
+                # count USABLE cells; `n_data` counts the masked ones too,
+                # biasing σ̂² low and hence the smoothing parameters. Equal to
+                # `n_data` for complete data.
+                n_eff_cells = count(>(0), w_vec2)
                 Jb = zeros(n_data, n_beta)
                 for b in 1:n_beta
                     step = max(1e-6, abs(beta[b]) * 1e-6)
@@ -715,7 +769,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                 H_inv = try; inv(cholesky(Symmetric(H))); catch; pinv(H); end
                 edf_total = clamp(tr(H_inv * JWJ), 1.0, Float64(n_beta))
                 sigma2_est = sum(w_vec2 .* (y_vec2 .- mu_base).^2) /
-                             max(n_data - edf_total, 1.0)
+                             max(n_eff_cells - edf_total, 1.0)
                 if alg.sigma2_init !== nothing
                     sigma2_est = min(sigma2_est, alg.sigma2_init)
                 end

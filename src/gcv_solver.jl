@@ -49,8 +49,17 @@ function _gcv_score(J::AbstractMatrix, W_irls::AbstractVector,
     end
 
     # Weighted RSS: ||W^½(z - Jβ̂)||²
+    # Iterate over the FULL residual vector (`n` is now the count of usable
+    # cells, which is smaller than `length(r)` under masking and would
+    # silently truncate the sum), and skip rows whose working weight is 0.
+    # Skipping — rather than relying on the multiply — is what keeps a masked
+    # row's pseudo-datum `z[i]` from contributing `0 * NaN = NaN`.
     r = z .- J * beta_hat
-    rss_w = sum(W_irls[i] * r[i]^2 for i in 1:n)
+    rss_w = 0.0
+    for i in eachindex(r)
+        W_irls[i] > 0 || continue
+        rss_w += W_irls[i] * r[i]^2
+    end
 
     # tr(A) where A = J (J'WJ + S^λ)⁻¹ J'W
     H_inv = try
@@ -294,15 +303,31 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     # Initialize λ (moderate default)
     theta = ones(m)
 
-    # Flatten data into vectors (obs-major order: obs 1 times, obs 2 times, …)
+    # Flatten data into vectors (obs-major order: obs 1 times, obs 2 times, …),
+    # enforcing the package masking convention exactly as the LAML solver
+    # does: usable iff weight > 0 AND datum non-NaN; masked cells get weight
+    # 0 and a finite placeholder. Every downstream use (penalized_objective →
+    # log_likelihood, the IRLS pseudo-data, the GCV score) multiplies by the
+    # weight, and IEEE `0 * NaN = NaN` would otherwise poison all of them.
     y_vec = zeros(n_data)
     w_vec = zeros(n_data)
     k = 1
     for oi in 1:n_obs, ti in 1:n_times
-        y_vec[k] = prob.data_values[ti, oi]
-        w_vec[k] = prob.data_weights[ti, oi]
+        y = prob.data_values[ti, oi]
+        wv = prob.data_weights[ti, oi]
+        if wv > 0 && !isnan(y)
+            y_vec[k] = y
+            w_vec[k] = wv
+        end   # else keep the 0.0 placeholder with weight 0.0
         k += 1
     end
+    # The GCV score's sample size must count USABLE cells only. GCV(λ) =
+    # n·RSS_w/(n − γ·tr(A))² is a per-observation criterion: counting masked
+    # cells in n inflates the residual dof and systematically undersmooths.
+    # Equals n_data for complete data, so complete-data fits are unchanged.
+    n_gcv = count(>(0), w_vec)
+    n_gcv == 0 && error("GCVSolver: every observation is masked (all " *
+        "data_weights are 0 or all data_values are NaN); there is nothing to fit.")
 
     # Evaluate model → flattened predictions
     function eval_model(p_eval)
@@ -397,7 +422,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
             best_rho, beta_gcv, gcv_val, trA = _grid_then_refine_gcv(
                 J, w_irls, z_pseudo,
                 S_list, uf_offsets, uf_nk,
-                n_p, n_data, gamma,
+                n_p, n_gcv, gamma,
                 n_grid, tol)
 
             if m == 1
@@ -409,7 +434,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
                 rho_vec, beta_gcv, gcv_val, trA = _coordinate_gcv(
                     J, w_irls, z_pseudo,
                     S_list, uf_offsets, uf_nk,
-                    n_p, n_data, gamma,
+                    n_p, n_gcv, gamma,
                     fill(best_rho, m), tol)
                 theta .= exp.(rho_vec)
             end

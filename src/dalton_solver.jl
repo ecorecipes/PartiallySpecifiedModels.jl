@@ -249,6 +249,7 @@ marginal pass's by the ODE alone.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
     _validate_problem(prob, "DaltonSolver"; require_continuous=true)
+    _reject_masked_data(prob, "DaltonSolver")
     verbose = alg.verbose
     n_vars = length(prob.u0)
     n_obs = size(prob.data_values, 2)

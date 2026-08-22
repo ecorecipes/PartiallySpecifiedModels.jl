@@ -99,23 +99,45 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
 
     obs_states = sort(collect(keys(obs_of_state)))
     for sk in obs_states
-        y_k = prob.data_values[:, obs_of_state[sk][1]]
+        # Stage 1 (GP smoothing) must see only USABLE rows: `mean` over a
+        # column holding a NaN is NaN, and that NaN propagates through the
+        # hyperparameter search, the state initialization and every matrix
+        # derived from it. `keep_k` is every row for complete data, so the
+        # values below are then unchanged.
+        jc = obs_of_state[sk][1]
+        keep_k = usable_rows(prob, jc)
+        isempty(keep_k) && error("ODINSolver: observation column $jc is " *
+            "entirely masked; state $sk has no usable data.")
+        y_k = Float64.(prob.data_values[keep_k, jc])
         m_center[sk] = mean(y_k)
         yc = y_k .- m_center[sk]
+        times_k = times[keep_k]
         # Fixed-hyperparameter path assumes 1% observation noise; with
         # several data columns per state, hyperparameters and the center
         # come from the first column (replicates enter only the data term).
         σ², ℓ, σn² = if alg.gp_lengthscale !== nothing && alg.gp_variance !== nothing
             (alg.gp_variance, alg.gp_lengthscale, 0.01 * alg.gp_variance)
         else
-            optimize_gp_hyperparams(times, yc, :rbf; verbose=verbose)
+            optimize_gp_hyperparams(times_k, yc, :rbf; verbose=verbose)
         end
         hyper[sk] = (σ²=σ², ℓ=ℓ, σn²=σn², observed=true)
         data_w[sk] = 1.0 / σn²
         P[sk], D[sk], Ainv[sk] = state_matrices(σ², ℓ, σn²)
-        # Initialise at the GP posterior mean
-        K, _, _ = rbf_kernel_with_derivs(times, σ², ℓ)
-        x_init[:, sk] = m_center[sk] .+ K * (cholesky(Symmetric(K + σn² * I)) \ yc)
+        # Initialise at the GP posterior mean, conditioned on the usable rows
+        # and evaluated on the FULL time grid via the cross-covariance
+        # K(t, t_keep). Reduces to the previous K(t,t)-based expression when
+        # every row is usable.
+        K_full, _, _ = rbf_kernel_with_derivs(times, σ², ℓ)
+        if length(keep_k) == n_times
+            # Unmasked: the original expression, unchanged bit-for-bit.
+            x_init[:, sk] = m_center[sk] .+
+                            K_full * (cholesky(Symmetric(K_full + σn² * I)) \ yc)
+        else
+            K_cross = K_full[:, keep_k]
+            K_kk = K_full[keep_k, keep_k]
+            x_init[:, sk] = m_center[sk] .+
+                            K_cross * (cholesky(Symmetric(K_kk + σn² * I)) \ yc)
+        end
     end
 
     # Unobserved states: free variables with a borrowed GP prior centered
@@ -143,6 +165,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
         end
     end
     n_beta = length(beta)
+    # Usable row indices per observation column, precomputed once for the
+    # risk closure (see the data term inside `odin_risk`).
+    data_rows = Dict{Int,Vector{Int}}(j => usable_rows(prob, j)
+                                      for j in 1:size(prob.data_values, 2))
+    any(!isempty, values(data_rows)) || error("ODINSolver: every " *
+        "observation is masked; there is nothing to fit.")
+
     n_state = n_times * n_vars
 
     if verbose
@@ -178,8 +207,29 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
             loss += ode_weight * dot(resid, Ainv[k] * resid)
             if haskey(obs_of_state, k)                              # data terms
                 for j in obs_of_state[k]
-                    r = @view(prob.data_values[:, j]) .- @view(X[:, k])
-                    loss += data_w[k] * sum(abs2, r)
+                    # Accumulate over usable rows only. The whole-column form
+                    # `sum(abs2, data[:, j] .- X[:, k])` turns NaN on one
+                    # masked cell, and there is no finiteness sentinel in this
+                    # risk: the NaN reaches the Adam moments, every parameter
+                    # becomes NaN, `loss_val < best_loss` is false forever, and
+                    # the solver returns its initialization as if converged.
+                    # (Per-cell `data_weights` magnitudes remain unapplied here
+                    # — ODIN weights by state via `data_w[k] = 1/σn²`; only the
+                    # zero/NaN mask is honored.)
+                    rows = data_rows[j]
+                    if length(rows) == n_times
+                        # Unmasked: the original vectorized expression, whose
+                        # pairwise summation order this loop would otherwise
+                        # perturb at the 1e-16 level.
+                        r = @view(prob.data_values[:, j]) .- @view(X[:, k])
+                        loss += data_w[k] * sum(abs2, r)
+                    else
+                        acc = zero(eltype(X))
+                        for i in rows
+                            acc += (prob.data_values[i, j] - X[i, k])^2
+                        end
+                        loss += data_w[k] * acc
+                    end
                 end
             end
         end
@@ -251,7 +301,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
         pred[:, j] .= X_fit[:, prob.obs_to_state[j]]
     end
 
-    data_loss = sum(prob.data_weights .* abs2.(prob.data_values .- pred))
+    # Masked cells are skipped — `0 * NaN = NaN` would otherwise make the
+    # reported loss NaN. Every other solver reports via this helper.
+    data_loss = weighted_data_loss(prob, pred)
 
     uf_evals = Dict{Symbol, Any}()
     offset = 0

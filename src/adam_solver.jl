@@ -175,6 +175,13 @@ function adam_loss_mse(prob::PSMProblem, beta, penalty_w::Float64=0.0)
         n_t = length(prob.data_times)
         for j in 1:n_obs
             for i in 1:n_t
+                # Masked cells (zero weight or NaN datum) contribute
+                # nothing: `0 * NaN = NaN`, and the `_all_finite`
+                # sentinel below would then turn the objective into
+                # the CONSTANT 1e10 for every beta — a flat surface
+                # with zero gradient, so Adam never moves and the
+                # solver silently returns its initialization.
+                usable_cell(prob, i, j) || continue
                 loss += prob.data_weights[i, j] * (pred[i, j] - prob.data_values[i, j])^2
             end
         end
@@ -217,6 +224,13 @@ function adam_loss_mse(prob::PSMProblem, beta, penalty_w::Float64=0.0)
     for j in 1:n_obs
         sk = prob.obs_to_state[j]
         for i in 1:min(n_t, length(sol.t))
+            # Masked cells (zero weight or NaN datum) contribute
+            # nothing: `0 * NaN = NaN`, and the `_all_finite`
+            # sentinel below would then turn the objective into
+            # the CONSTANT 1e10 for every beta — a flat surface
+            # with zero gradient, so Adam never moves and the
+            # solver silently returns its initialization.
+            usable_cell(prob, i, j) || continue
             pred = sol[sk, i]
             obs = prob.data_values[i, j]
             loss += prob.data_weights[i, j] * (pred - obs)^2
@@ -237,6 +251,13 @@ function adam_loss_poisson(prob::PSMProblem, beta, penalty_w::Float64=0.0)
         n_t = length(prob.data_times)
         for j in 1:n_obs
             for i in 1:n_t
+                # Masked cells (zero weight or NaN datum) contribute
+                # nothing: `0 * NaN = NaN`, and the `_all_finite`
+                # sentinel below would then turn the objective into
+                # the CONSTANT 1e10 for every beta — a flat surface
+                # with zero gradient, so Adam never moves and the
+                # solver silently returns its initialization.
+                usable_cell(prob, i, j) || continue
                 mu = max(pred[i, j], T(1e-10))
                 y = prob.data_values[i, j]
                 loss -= prob.data_weights[i, j] * (y * log(mu) - mu)
@@ -281,6 +302,13 @@ function adam_loss_poisson(prob::PSMProblem, beta, penalty_w::Float64=0.0)
     for j in 1:n_obs
         sk = prob.obs_to_state[j]
         for i in 1:min(n_t, length(sol.t))
+            # Masked cells (zero weight or NaN datum) contribute
+            # nothing: `0 * NaN = NaN`, and the `_all_finite`
+            # sentinel below would then turn the objective into
+            # the CONSTANT 1e10 for every beta — a flat surface
+            # with zero gradient, so Adam never moves and the
+            # solver silently returns its initialization.
+            usable_cell(prob, i, j) || continue
             mu = max(sol[sk, i], T(1e-10))
             y = prob.data_values[i, j]
             loss -= prob.data_weights[i, j] * (y * log(mu) - mu)

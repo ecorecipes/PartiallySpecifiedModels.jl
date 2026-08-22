@@ -138,6 +138,80 @@ function weighted_data_loss(prob::PSMProblem, pred::AbstractMatrix)
 end
 
 """
+    usable_cell(prob, i, j) -> Bool
+
+Whether data cell `(i, j)` participates in objectives. The single
+package-wide convention: positive weight AND non-NaN value. Solvers that
+accumulate a data term cell-by-cell should gate on this rather than
+relying on the weight alone — `0 * NaN = NaN`, so a zero weight does NOT
+neutralize a NaN datum.
+"""
+@inline usable_cell(prob::PSMProblem, i::Int, j::Int) =
+    prob.data_weights[i, j] > 0 && !isnan(prob.data_values[i, j])
+
+"""
+    usable_rows(prob, j) -> Vector{Int}
+
+Row indices of column `j` that carry a usable observation. Used by the
+solvers that pre-smooth a data column (`_smoothing_spline`, `CubicSpline`,
+GP smoothers): those fits solve normal equations in which a single NaN
+makes EVERY coefficient NaN, so the masked rows must be dropped from the
+fit rather than merely down-weighted afterwards.
+"""
+usable_rows(prob::PSMProblem, j::Int) =
+    [i for i in axes(prob.data_values, 1) if usable_cell(prob, i, j)]
+
+"""
+    n_usable(prob) -> Int
+
+Total number of usable data cells — the sample size any denominator over
+observations (σ̂²'s `n − edf`, a GCV `n`, a marginal-likelihood
+normalizer) must use. Equals `length(prob.data_values)` for complete data.
+"""
+n_usable(prob::PSMProblem) =
+    count(k -> prob.data_weights[k] > 0 && !isnan(prob.data_values[k]),
+          eachindex(prob.data_values))
+
+"""
+    _reject_masked_data(prob, solver_name)
+
+Raise a clear error if any data cell is masked, for solvers that do NOT
+yet support masking.
+
+These are the probabilistic-numerics and ensemble solvers whose data term
+lives inside a Kalman/particle recursion (`probsolve.jl`'s `basic_loglik`
+and Fenrir `condition!`, `_dalton_joint_evidence`'s `assimilate_data!`,
+`_pm_loglik_hat`, and the EKI innovation update). Honoring the mask there
+means threading a weight matrix through those signatures AND skipping the
+filter update — not just the density term — for masked cells; that is a
+structural change, deliberately out of scope here.
+
+Failing loudly is the point. Left unguarded these solvers do not merely
+report NaN: `dalton_solver.jl`'s `!isfinite(ll) && return 1e10` flattens
+the objective to a constant, `pseudo_marginal_solver.jl` rejects every MH
+proposal (α = 0), and the EKI update turns every ensemble member NaN on
+the first iteration — each of which returns the initialization while
+looking like an ordinary, converged fit.
+"""
+function _reject_masked_data(prob::PSMProblem, solver_name::String)
+    n_masked = count(k -> !(prob.data_weights[k] > 0 &&
+                            !isnan(prob.data_values[k])),
+                     eachindex(prob.data_values))
+    n_masked == 0 && return nothing
+    error("$solver_name does not support masked observations, and $n_masked " *
+          "of $(length(prob.data_values)) data cells are masked (weight 0 " *
+          "or NaN value). Its likelihood is evaluated inside a Kalman / " *
+          "particle recursion that has no per-cell mask, so masked cells " *
+          "would silently corrupt the filter state rather than being " *
+          "skipped. Use LAML, GCVSolver, CollocationLAML, GradientMatching, " *
+          "TwoStageSolver, BNGSolver, ODINSolver, RKHSSolver, " *
+          "IntegralMatchingSolver, AdamSolver, MultipleShootingSolver, " *
+          "DerivativeFreeSolver, MCMCSolver, MagiSolver, VariationalSolver, " *
+          "ABCSolver or ProfileLikelihoodSolver for masked data, or drop " *
+          "the masked rows from data_times/data_values before calling.")
+end
+
+"""
     _is_program_error(e)
 
 Classify an exception caught inside a solver objective. Programming

@@ -2703,7 +2703,7 @@ using StableRNGs
             # Derivative w.r.t. the input x (needed for autodiff Jacobians
             # in stiff ODE solvers) — threw a MethodError before the
             # Float32/Lux.apply evaluator was replaced
-            d = ForwardDiff.derivative(x -> p.g(x), 0.5)
+            d = PartiallySpecifiedModels.ForwardDiff.derivative(x -> p.g(x), 0.5)
             @test isfinite(d)
 
             # Gradient w.r.t. β through build_param_struct — also threw
@@ -4430,6 +4430,268 @@ using StableRNGs
             # numerical failure at ~20 rethrow sites.
             @test _is_program_error(InterruptException())
             @test !_is_program_error(DomainError(-1.0, "sqrt"))
+        end
+    end
+
+    @testset "NaN-safe optimized objectives (masked data)" begin
+        # The campaign made the REPORTED data_loss mask-aware; these tests
+        # cover the OPTIMIZED objective. `0 * NaN = NaN` in IEEE arithmetic,
+        # so a masked cell (weight 0) whose value is NaN — or whose value was
+        # left corrupted precisely BECAUSE it is masked — used to poison the
+        # objective itself, not merely the number reported at the end.
+        #
+        # Each test compares fits on the same underlying data:
+        #   masked — 3 rows masked in place (2 NaN, 1 corrupted at weight 0)
+        #   pruned — the same 3 rows physically deleted
+        # A correct masking implementation makes `masked` ≈ `pruned`.
+
+        function nan_growth!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+        end
+        true_r_nan = 0.15
+        tspan_nan = (0.0, 10.0)
+        times_nan = collect(0.0:0.5:10.0)
+        rng_nan = Random.Xoshiro(4242)
+        clean_nan = exp.(true_r_nan .* times_nan) .+
+                    0.01 .* randn(rng_nan, length(times_nan))
+
+        mask_idx = [5, 12, 17]          # rows to mask / prune
+        vals_masked = reshape(copy(clean_nan), :, 1)
+        w_masked = ones(length(times_nan), 1)
+        vals_masked[mask_idx[1], 1] = NaN;  w_masked[mask_idx[1], 1] = 0.0
+        vals_masked[mask_idx[2], 1] = NaN;  w_masked[mask_idx[2], 1] = 0.0
+        # A CORRUPTED value at weight 0: the package treats weight 0 as
+        # "excluded", so a wildly wrong finite number here must be ignored
+        # exactly like the NaNs. This catches implementations that guard
+        # `isnan` but forget the weight.
+        vals_masked[mask_idx[3], 1] = 1.0e6; w_masked[mask_idx[3], 1] = 0.0
+
+        keep_idx = setdiff(1:length(times_nan), mask_idx)
+        times_pruned = times_nan[keep_idx]
+        vals_pruned = reshape(clean_nan[keep_idx], :, 1)
+
+        mk_nan(ts, vs, ws) = PSMProblem(
+            nan_growth!, [1.0], tspan_nan,
+            [BSplineApproximator(:r, (0.0, 5.0), 5; initial=x -> 0.05)];
+            data_times=ts, data_values=vs, obs_to_state=[1],
+            data_weights=ws, likelihood=Gaussian(), solver=Tsit5())
+
+        prob_nan_masked = mk_nan(times_nan, vals_masked, w_masked)
+        prob_nan_pruned = mk_nan(times_pruned, vals_pruned,
+                                 ones(length(times_pruned), 1))
+
+        @testset "LAML (Gaussian)" begin
+            # NOTE ON PRE-FIX BEHAVIOR: LAML alone already passed this — an
+            # earlier round of the campaign had made its data FLATTEN mask
+            # (masked cells get weight 0 and a finite placeholder), so
+            # `log_likelihood` never saw the NaN from this path. This block
+            # is therefore a REGRESSION GUARD on that flatten, plus coverage
+            # of laml.jl's `n` (now the usable-cell count, which sets the
+            # REML scale). The sibling solvers below — GCVSolver and
+            # CollocationLAML, the same penalized-likelihood family — did NOT
+            # have a masked flatten and DO fail pre-fix.
+            sol_m = solve(prob_nan_masked, LAML(maxiters=30, verbose=false))
+            sol_p = solve(prob_nan_pruned, LAML(maxiters=30, verbose=false))
+
+            # (a) the fit succeeds and reports finite numbers
+            @test isfinite(sol_m.objective)
+            @test isfinite(sol_m.data_loss)
+            @test isfinite(sol_m.edf)
+            @test all(isfinite, collect(sol_m.parameters))
+
+            # (b) it recovers the unknown function. Tolerance 0.02 on a true
+            # value of 0.15 (13%): the LAML testset above asserts 0.05 on 21
+            # clean points, and dropping 3 of 21 widens that only modestly.
+            for x in (1.0, 2.0, 3.0)
+                @test abs(sol_m.unknown_functions[:r](x) - true_r_nan) < 0.02
+            end
+
+            # (c) masked ≈ pruned. Both objectives now see the identical 18
+            # usable cells with identical weights, and `n` in laml.jl counts
+            # usable cells, so the REML scale matches too. The residual gap is
+            # the different Jacobian row count and ODE save grid — genuine
+            # differences between the two problem specifications.
+            for x in (1.0, 2.0, 3.0)
+                @test abs(sol_m.unknown_functions[:r](x) -
+                          sol_p.unknown_functions[:r](x)) < 5e-3
+            end
+            @test isapprox(sol_m.data_loss, sol_p.data_loss; rtol=0.25)
+
+            # The corrupted 1e6 cell at weight 0 must be fully excluded: one
+            # such cell would otherwise dominate data_loss outright.
+            @test sol_m.data_loss < 1.0
+        end
+
+        @testset "GCVSolver (penalized likelihood, sibling of LAML)" begin
+            # PRE-FIX FAILURE MODE (measured): the GCV flatten copied
+            # data_values verbatim, so `log_likelihood` — and the IRLS
+            # pseudo-data built from it — were NaN. Every PCLS step was
+            # rejected and the solver returned its initialization:
+            # r(1.0) = r(2.0) = 0.05 exactly (the `initial=` value), with a
+            # finite-looking objective 16.877 and data_loss 33.755 (the
+            # reported loss is computed by `weighted_data_loss`, which was
+            # already masked, so nothing looked wrong). Silent wrong answer.
+            sol_m = solve(prob_nan_masked, GCVSolver(maxiters=25, verbose=false))
+            sol_p = solve(prob_nan_pruned, GCVSolver(maxiters=25, verbose=false))
+
+            @test isfinite(sol_m.objective)
+            @test all(isfinite, collect(sol_m.parameters))
+            # Must have MOVED off the initialization (the pre-fix failure).
+            @test abs(sol_m.unknown_functions[:r](1.0) - 0.05) > 1e-6
+            for x in (1.0, 2.0, 3.0)
+                @test abs(sol_m.unknown_functions[:r](x) - true_r_nan) < 0.02
+                @test abs(sol_m.unknown_functions[:r](x) -
+                          sol_p.unknown_functions[:r](x)) < 5e-3
+            end
+            @test sol_m.data_loss < 1.0
+        end
+
+        @testset "CollocationLAML (penalized likelihood, sibling of LAML)" begin
+            # PRE-FIX FAILURE MODE (measured): the collocation data residual
+            # is `sqrt(w) * (y - alpha)`, and `sqrt(0) * NaN = NaN` — a zero
+            # weight does NOT neutralize a NaN datum, though the matching
+            # JACOBIAN row was already a clean 0, which is what made this so
+            # easy to miss. The Gauss-Newton step went all-NaN, the line
+            # search rejected every step, and the solver reported
+            # `:plateau` convergence at its initialization with
+            # r(1.0) = 0.05 and a FABRICATED objective of -1.35e-19 and
+            # data_loss 0.0 — i.e. it claimed a perfect fit.
+            cl = CollocationLAML(maxiters=20, verbose=false,
+                                 lambda_ode_start=0.01, lambda_ode_end=100.0,
+                                 n_continuation=4)
+            sol_m = solve(prob_nan_masked, cl)
+
+            @test isfinite(sol_m.objective)
+            @test all(isfinite, collect(sol_m.parameters))
+            # A real fit has a nonzero data loss; the pre-fix code reported
+            # exactly 0.0 because it never moved off a zeroed residual.
+            @test sol_m.data_loss > 0.0
+            @test abs(sol_m.unknown_functions[:r](1.0) - 0.05) > 1e-6
+            for x in (1.0, 2.0, 3.0)
+                @test abs(sol_m.unknown_functions[:r](x) - true_r_nan) < 0.05
+            end
+        end
+
+        @testset "DerivativeFreeSolver" begin
+            # PRE-FIX FAILURE MODE: the flatten copied data_values verbatim,
+            # so `w_vec[k] * (y_vec[k] - pred)^2` was NaN. The guard
+            # `!isfinite(data_loss) && return 1e20` then made the loss a
+            # CONSTANT for every beta — Nelder-Mead saw a flat surface, never
+            # moved, and returned its initialization with a normal-looking
+            # convergence report. A silent no-op.
+            dfs = DerivativeFreeSolver(maxiters=3000, verbose=false)
+            sol_m = solve(prob_nan_masked, dfs)
+            sol_p = solve(prob_nan_pruned, dfs)
+
+            @test isfinite(sol_m.objective)
+            @test isfinite(sol_m.data_loss)
+            @test all(isfinite, collect(sol_m.parameters))
+            # Not the 1e20 sentinel, and not the flat constant the pre-fix
+            # code produced.
+            @test sol_m.objective < 1e19
+
+            for x in (1.0, 2.0, 3.0)
+                @test abs(sol_m.unknown_functions[:r](x) - true_r_nan) < 0.05
+            end
+            for x in (1.0, 2.0, 3.0)
+                @test abs(sol_m.unknown_functions[:r](x) -
+                          sol_p.unknown_functions[:r](x)) < 0.03
+            end
+            @test sol_m.data_loss < 1.0
+        end
+
+        @testset "GradientMatching / TwoStageSolver" begin
+            # PRE-FIX FAILURE MODE (both): `_smoothing_spline` solves
+            # `BtB \ Bty`; one NaN in the column makes every coefficient NaN,
+            # and because `gcv < best_gcv` is false for a NaN score at every
+            # lambda, the lambda loop never replaces it. Both returned
+            # callables were then NaN for ALL inputs, so dydt was all-NaN.
+            # GradientMatching's Gauss-Newton stopped at iteration 1 ("no
+            # improvement"); TwoStageSolver's Adam drove beta to NaN and
+            # returned `best_beta` = the initialization with objective Inf.
+            sol_gm_m = solve(prob_nan_masked, GradientMatching(verbose=false))
+            sol_gm_p = solve(prob_nan_pruned, GradientMatching(verbose=false))
+
+            @test isfinite(sol_gm_m.objective)
+            @test all(isfinite, collect(sol_gm_m.parameters))
+            for x in (1.0, 2.0, 3.0)
+                @test abs(sol_gm_m.unknown_functions[:r](x) - true_r_nan) < 0.05
+            end
+            # Gradient matching fits a SMOOTHER through the usable points and
+            # matches derivatives, so masked-vs-pruned agreement is governed
+            # by that smoother, which now sees the identical 18 points in
+            # both problems. The remaining gap is the match-point grid.
+            for x in (1.0, 2.0, 3.0)
+                @test abs(sol_gm_m.unknown_functions[:r](x) -
+                          sol_gm_p.unknown_functions[:r](x)) < 0.05
+            end
+
+            sol_ts_m = solve(prob_nan_masked, TwoStageSolver(verbose=false))
+            @test isfinite(sol_ts_m.objective)
+            @test all(isfinite, collect(sol_ts_m.parameters))
+            for x in (1.0, 2.0, 3.0)
+                @test abs(sol_ts_m.unknown_functions[:r](x) - true_r_nan) < 0.05
+            end
+        end
+
+        @testset "likelihood families mask at the choke point" begin
+            y_ok  = [1.0, 2.0, 3.0, 4.0]
+            mu_ok = [1.1, 2.1, 2.9, 4.2]
+            # Cell 2 masked as a NaN datum, cell 4 masked by zero weight but
+            # left holding a corrupted value.
+            y_bad = [1.0, NaN, 3.0, 1.0e9]
+            w_bad = [1.0, 0.0, 1.0, 0.0]
+            # The same problem with those two cells genuinely removed.
+            y_ref  = [1.0, 3.0]
+            mu_ref = [1.1, 2.9]
+            w_ref  = [1.0, 1.0]
+
+            fams = (Gaussian(), Poisson(), NegativeBinomial(5.0),
+                    TruncatedNormal(0.0, 0.7),
+                    CustomLikelihood((a, b) -> -0.6 * (a - b)^2))
+            for fam in fams
+                ll_bad = PartiallySpecifiedModels.log_likelihood(
+                    fam, y_bad, mu_ok, w_bad)
+                ll_ref = PartiallySpecifiedModels.log_likelihood(
+                    fam, y_ref, mu_ref, w_ref)
+                @test isfinite(ll_bad)
+                # Masked cells contribute exactly nothing, so the total must
+                # equal the total over the surviving cells alone.
+                @test ll_bad ≈ ll_ref
+
+                wt = PartiallySpecifiedModels.irls_weights(
+                    fam, y_bad, mu_ok, w_bad)
+                @test all(isfinite, wt)
+                @test wt[2] == 0.0     # NaN datum
+                @test wt[4] == 0.0     # zero weight
+            end
+
+            # Pointwise: a NaN datum contributes zero and stays AD-safe —
+            # zero gradient rather than a NaN one.
+            for fam in fams
+                @test PartiallySpecifiedModels.loglik_pointwise(fam, NaN, 2.0) == 0.0
+                d = PartiallySpecifiedModels.ForwardDiff.derivative(
+                    m -> PartiallySpecifiedModels.loglik_pointwise(fam, NaN, m), 2.0)
+                @test d == 0.0
+            end
+        end
+
+        @testset "solvers without masking support fail loudly" begin
+            # These evaluate their likelihood inside a Kalman/particle
+            # recursion with no per-cell mask, so masked cells would corrupt
+            # the filter state rather than be skipped. They must say so
+            # instead of silently returning their initialization.
+            for alg in (RodeoSolver(n_steps=20, maxiters=2, verbose=false),
+                        EnsembleKalmanSolver(n_ensemble=5, n_iterations=2,
+                                             verbose=false))
+                err = try
+                    solve(prob_nan_masked, alg); nothing
+                catch e
+                    e
+                end
+                @test err isa ErrorException
+                @test occursin("does not support masked observations", err.msg)
+            end
         end
     end
 

@@ -65,8 +65,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             push!(observed_states, sk)
-            val, _ = _smoothing_spline(times, prob.data_values[:, j];
-                                       max_basis=alg.n_basis_smooth)
+            val, _ = _smoothing_spline_masked(times, Float64.(prob.data_values[:, j]),
+                                              @view(prob.data_weights[:, j]);
+                                              max_basis=alg.n_basis_smooth)
             for i in 1:n_times
                 y_smooth[i, sk] = val(times[i])
             end
@@ -83,8 +84,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             push!(observed_states, sk)
-            val, der = _smoothing_spline(times, prob.data_values[:, j];
-                                         max_basis=alg.n_basis_smooth)
+            val, der = _smoothing_spline_masked(times, Float64.(prob.data_values[:, j]),
+                                                @view(prob.data_weights[:, j]);
+                                                max_basis=alg.n_basis_smooth)
             for i in 1:n_times
                 y_smooth[i, sk] = val(times[i])
                 dydt[i, sk] = der(times[i])
@@ -125,6 +127,23 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
     # Number of time points used for matching
     n_match = prob.discrete ? n_times - 1 : n_times
 
+    # Per-(time, state) usability. The smoother above now drops masked cells
+    # from its fit, so `y_smooth`/`dydt` at a masked time are extrapolations
+    # rather than data; matching against them would invent information. A
+    # (time, state) pair counts if ANY observation column mapping to that
+    # state is usable at that time. All-true for complete data, so the loss
+    # below is unchanged there.
+    match_usable = falses(n_times, n_vars)
+    for j in 1:n_obs
+        sk = prob.obs_to_state[j]
+        for i in 1:n_times
+            usable_cell(prob, i, j) && (match_usable[i, sk] = true)
+        end
+    end
+    any(match_usable) || error("TwoStageSolver: every observation is masked " *
+        "(all data_weights are 0 or all data_values are NaN); there is " *
+        "nothing to fit.")
+
     if verbose
         println("TwoStageSolver Stage 2: Derivative matching — $n_beta params, " *
                 "$n_match match points, $n_vars states")
@@ -153,6 +172,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
                 # were filled with a constant state and zero derivative,
                 # and matching those fabricated values biases the fit.
                 k in observed_states || continue
+                # …and only at times where that state actually has a usable
+                # observation (see `match_usable`).
+                match_usable[i, k] || continue
                 loss_val += (dydt[i, k] - du[k])^2
             end
         end

@@ -75,8 +75,48 @@ function _smoothing_spline(t::AbstractVector{Float64}, y::AbstractVector{Float64
 end
 
 """
+    _smoothing_spline_masked(t, y, w; max_basis=15)
+
+`_smoothing_spline` restricted to the USABLE rows of `(y, w)` — those with
+positive weight and a non-NaN value.
+
+Masked rows must be DROPPED from the fit, not merely down-weighted after
+it. `_smoothing_spline` solves the normal equations `BtB \\ Bty` with
+`Bty = B'y`; a single NaN in `y` makes every coefficient NaN, and because
+`gcv < best_gcv` is false for a NaN gcv at every λ, the λ loop never
+replaces that NaN β — so BOTH returned callables evaluate to NaN
+everywhere, for every input. Every gradient-matching-family solver then
+matches derivatives against an all-NaN target.
+
+The returned callables clamp to the usable range, so evaluating them on
+the full time grid extends the edge values across masked spans — the
+right behavior for interior gaps and honest at the ends.
+
+When every row is usable this delegates unchanged, so complete-data fits
+are bit-for-bit identical to calling `_smoothing_spline` directly.
+"""
+function _smoothing_spline_masked(t::AbstractVector{Float64},
+                                  y::AbstractVector{Float64},
+                                  w::Union{Nothing,AbstractVector}=nothing;
+                                  max_basis::Int=15)
+    keep = if w === nothing
+        [i for i in eachindex(y) if !isnan(y[i])]
+    else
+        [i for i in eachindex(y) if w[i] > 0 && !isnan(y[i])]
+    end
+    length(keep) == length(y) && return _smoothing_spline(t, y; max_basis=max_basis)
+    isempty(keep) && error("_smoothing_spline: an observation column is " *
+        "entirely masked (every weight is 0 or every value is NaN); there " *
+        "is nothing to smooth.")
+    _smoothing_spline(Float64.(t[keep]), Float64.(y[keep]); max_basis=max_basis)
+end
+
+"""
 Smooth observed data with a penalized (GCV) smoothing spline and compute
 time derivatives — see [`_smoothing_spline`](@ref).
+
+`weights`, when supplied, is the `data_weights` matrix; masked cells are
+dropped from each column's fit (see [`_smoothing_spline_masked`](@ref)).
 
 Returns:
 - `y_smooth`: smoothed state values (n_times × K)
@@ -85,7 +125,8 @@ Returns:
 function smooth_and_differentiate(times::Vector{Float64},
                                   data::Matrix{Float64},
                                   obs_to_state::Vector{Int},
-                                  K::Int)
+                                  K::Int;
+                                  weights::Union{Nothing,AbstractMatrix}=nothing)
     T = length(times)
     n_obs = size(data, 2)
     y_smooth = zeros(T, K)
@@ -102,7 +143,9 @@ function smooth_and_differentiate(times::Vector{Float64},
 
     for j in 1:n_obs
         sk = obs_to_state[j]
-        val, der = _smoothing_spline(times, data[:, j])
+        val, der = _smoothing_spline_masked(times, data[:, j],
+                                            weights === nothing ? nothing :
+                                            @view(weights[:, j]))
         for i in 1:T
             y_smooth[i, sk] = val(times[i])
             dydt[i, sk] = der(times[i])
@@ -225,7 +268,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
         y_smooth = zeros(T_pts, K)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
-            sval, _ = _smoothing_spline(times, Float64.(prob.data_values[:, j]))
+            sval, _ = _smoothing_spline_masked(times,
+                                               Float64.(prob.data_values[:, j]),
+                                               @view(prob.data_weights[:, j]))
             for i in 1:T_pts
                 y_smooth[i, sk] = sval(times[i])
             end
@@ -240,7 +285,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
         end
     else
         y_smooth, dydt = smooth_and_differentiate(times, Float64.(prob.data_values),
-                                                   prob.obs_to_state, K)
+                                                   prob.obs_to_state, K;
+                                                   weights=prob.data_weights)
     end
 
     # Initialize unknown function parameters
@@ -285,6 +331,22 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
     for k in 1:K
         k in obs_set && continue
         for i in 1:n_match
+            w[(k - 1) * n_match + i] = 0.0
+        end
+    end
+    # Masked observations carry fabricated targets for the same reason: the
+    # smoother now excludes them (see `_smoothing_spline_masked`), so
+    # `y_smooth`/`dydt` at a masked time are an EXTRAPOLATION, not data.
+    # Zeroing their weight keeps them out of the loss, the Gauss-Newton
+    # residuals, and — via `n_eff = count(!iszero, w)` below — out of the σ̂²
+    # denominator that drives the smoothing-parameter update. A match point
+    # counts if ANY observation column mapping to that state is usable there.
+    # No-op when every cell is usable, so complete-data fits are unchanged.
+    for k in 1:K
+        k in obs_set || continue
+        cols = [j for j in 1:n_obs if prob.obs_to_state[j] == k]
+        for i in 1:n_match
+            any(j -> usable_cell(prob, i, j), cols) && continue
             w[(k - 1) * n_match + i] = 0.0
         end
     end
