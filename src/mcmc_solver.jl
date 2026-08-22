@@ -298,7 +298,20 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     # Initial point: beta0 + optional log_sigma + optional log_lambda
     theta0 = copy(beta0)
     if estimate_sigma
-        sig_init = std(prob.data_values) * 0.1
+        # Usable cells only. Over ALL cells a single masked/NaN datum made
+        # std() NaN → log(max(NaN, 0.01)) = NaN → NaN in theta0 → the whole
+        # chain NaN, reported as objective=NaN, data_loss=NaN, no error.
+        usable_vals = [prob.data_values[i, j]
+                       for j in 1:size(prob.data_values, 2)
+                       for i in 1:size(prob.data_values, 1)
+                       if prob.data_weights[i, j] > 0 &&
+                          !isnan(prob.data_values[i, j])]
+        isempty(usable_vals) &&
+            error("MCMCSolver: every observation is masked (data_weights " *
+                  "zero) or NaN, so the observation noise σ cannot be " *
+                  "initialized and there is nothing to fit.")
+        sig_init = length(usable_vals) >= 2 ? std(usable_vals) * 0.1 : 0.0
+        isfinite(sig_init) || (sig_init = 0.0)
         push!(theta0, log(max(sig_init, 0.01)))
     end
     if alg.sample_smoothing && n_smooths > 0
@@ -388,7 +401,14 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
         end
     end
 
-    data_loss = sum(prob.data_weights .* (prob.data_values .- pred) .^ 2)
+    # Masked/NaN cells are skipped (0 * NaN = NaN would make data_loss NaN).
+    data_loss = 0.0
+    for j in 1:n_obs, i in 1:n_t
+        w = prob.data_weights[i, j]
+        y = prob.data_values[i, j]
+        (w > 0 && !isnan(y)) || continue
+        data_loss += w * (y - pred[i, j])^2
+    end
 
     # Build evaluators from MAP params
     uf_evals = Dict{Symbol, Any}()

@@ -466,12 +466,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     m = length(S_list)
 
     # Mixed-approximator dof advisory: parameters without a penalty block
-    # (e.g. NeuralApproximator weights with penalty_weight = 0) are not REML
-    # fixed effects in any useful sense when they rival the data size. The
-    # LAML scale estimate replaces the rank-based restricted dof n − Mp with
-    # an EDF-based count in that case (see laml.jl); warn when the rank-based
-    # count would have been (nearly) exhausted so users know the model is
-    # heavily over-parameterized relative to the data.
+    # (e.g. NeuralApproximator weights with penalty_weight = 0) are REML
+    # fixed effects, and when they rival the data size they exhaust the
+    # restricted residual dof that the Gaussian scale σ̂² = (RSS+pen)/(n−Mp)
+    # is estimated from. `laml.jl` charges them by design rank rather than
+    # raw count (see `_restricted_dof_Mp`) and warns again if even that
+    # exhausts the dof; warn here so the over-parameterization is visible
+    # before any fitting happens.
     n_unpenalized = n_p - sum(uf_nk; init=0)
     if m > 0 && n_unpenalized > 0
         total_rank = sum(_rank_penalty(S_list[l]) for l in 1:m)
@@ -479,8 +480,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             @warn "LAML: $n_unpenalized unpenalized parameters (e.g. neural network " *
                   "weights) leave at most $(n_data - (n_p - total_rank)) rank-based " *
                   "residual degrees of freedom for the n=$n_data data points. The " *
-                  "Gaussian scale σ̂² uses the EDF-based restricted dof instead; " *
-                  "consider more data, a smaller network, or penalty_weight > 0."
+                  "Gaussian scale σ̂² charges them by design rank instead, but the " *
+                  "model is heavily over-parameterized: consider more data, a " *
+                  "smaller network, or penalty_weight > 0."
         end
     end
 

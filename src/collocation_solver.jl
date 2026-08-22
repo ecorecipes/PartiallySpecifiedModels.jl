@@ -59,28 +59,45 @@ end
 
 # ─── ODE/Discrete RHS evaluation at collocation points ────────────
 
-# Failure-sentinel convention: when the dynamics throw a genuinely
-# numerical error (domain error, NaN/Inf conversion, ...) at a collocation
-# point, the RHS is replaced by _COLLOC_FAIL_SENTINEL everywhere it is
-# used — both in the residual and as the base point of finite-difference
-# Jacobians — so the linearization is consistent with the residual it
-# linearizes. A perturbed evaluation that fails falls back to the base
-# value, giving a zero FD derivative: the sentinel is locally constant.
-# Programming errors (see `_is_program_error`) are always rethrown.
+# Failure-sentinel convention (note the deliberate asymmetry between the
+# residual and the Jacobian):
+#
+#   RESIDUAL path — when the dynamics throw a genuinely numerical error
+#   (domain error, NaN/Inf conversion, ...) at a collocation point, the RHS
+#   is replaced by _COLLOC_FAIL_SENTINEL. That is a LARGE residual, which is
+#   what we want: the optimizer is pushed away from infeasible points.
+#
+#   JACOBIAN path — the FD slope at a failed point is forced to ZERO, not
+#   differenced against the sentinel. Differencing is only valid when the
+#   base and perturbed evaluations live on the same branch: at a domain
+#   boundary (e.g. `sqrt(u)`/`log(u)` with u dipping just below zero) the
+#   base can fail while the perturbation succeeds, and
+#   (f(u+ε) − sentinel)/ε ≈ −1e12 poisons J'J with ~1e24 entries and makes
+#   the Gauss–Newton solve return garbage without erroring. A zero column
+#   simply says "no reliable local linearization here"; the large residual
+#   still supplies the pressure to move away.
+#
+# So: large residual, zero Jacobian. Programming errors (see
+# `_is_program_error`) are always rethrown.
 const _COLLOC_FAIL_SENTINEL = 1e6
 
 """
-Evaluate the dynamics right-hand side at all collocation points.
+Evaluate the dynamics right-hand side at all collocation points, also
+returning a per-point failure mask.
 
 For continuous models: returns `f(x(t), p, t)` (derivatives).
 For discrete models: returns `f(x(t), p, t)` (next-state map).
 
-Returns a (T × K) matrix where entry [i,k] = f_k(x(t_i), p, t_i).
+Returns `(F, failed)` where `F` is a (T × K) matrix with entry
+[i,k] = f_k(x(t_i), p, t_i) and `failed[i]` is `true` when the dynamics
+evaluation at point `i` raised a numerical error and `F[i, :]` therefore
+holds the failure sentinel rather than a real derivative.
 """
-function eval_ode_rhs(prob::PSMProblem, times::Vector{Float64},
-                      alpha::Matrix{Float64}, beta::Vector{Float64})
+function eval_ode_rhs_masked(prob::PSMProblem, times::Vector{Float64},
+                             alpha::Matrix{Float64}, beta::Vector{Float64})
     T, K = size(alpha)
     F = zeros(T, K)
+    failed = fill(false, T)
     p = build_param_struct(prob, beta)
     du = zeros(K)
 
@@ -91,10 +108,23 @@ function eval_ode_rhs(prob::PSMProblem, times::Vector{Float64},
         catch e
             _is_program_error(e) && rethrow()
             du .= _COLLOC_FAIL_SENTINEL  # numerical failure → large residual
+            failed[i] = true
         end
         F[i, :] .= du
     end
-    F
+    F, failed
+end
+
+"""
+Evaluate the dynamics right-hand side at all collocation points.
+
+Returns a (T × K) matrix where entry [i,k] = f_k(x(t_i), p, t_i).
+See [`eval_ode_rhs_masked`](@ref) for the variant that also reports which
+points fell back to the failure sentinel.
+"""
+function eval_ode_rhs(prob::PSMProblem, times::Vector{Float64},
+                      alpha::Matrix{Float64}, beta::Vector{Float64})
+    first(eval_ode_rhs_masked(prob, times, alpha, beta))
 end
 
 # ─── Combined residual and Jacobian ───────────────────────────────
@@ -136,7 +166,7 @@ function collocation_residual_jacobian(
     end
 
     # --- ODE/Discrete compliance residual ---
-    F = eval_ode_rhs(prob, times, alpha, beta)
+    F, F_failed = eval_ode_rhs_masked(prob, times, alpha, beta)
     ode_resid = zeros(T * K)
 
     if prob.discrete
@@ -205,23 +235,30 @@ function collocation_residual_jacobian(
         # ∂/∂alpha[i,k_pert]: -sqrt_lode * ∂F[i,k_eq]/∂x[k_pert]
         for i in 1:(T-1)
             u = alpha[i, :]
+            base_failed = false
             try
                 prob.dynamics!(du0, u, p, times[i])
             catch e
                 _is_program_error(e) && rethrow()
                 du0 .= _COLLOC_FAIL_SENTINEL  # match the residual sentinel
+                base_failed = true
             end
 
             for k_pert in 1:K
                 u_p = copy(u)
                 u_p[k_pert] += eps_x
+                pert_failed = false
                 try
                     prob.dynamics!(du_p, u_p, p, times[i])
                 catch e
                     _is_program_error(e) && rethrow()
-                    du_p .= du0  # sentinel is locally constant → zero FD slope
+                    du_p .= du0
+                    pert_failed = true
                 end
-                dF_dx = (du_p .- du0) ./ eps_x
+                # Zero Jacobian at failed points — never difference against
+                # the sentinel (see the sentinel convention above).
+                dF_dx = (base_failed || pert_failed) ? zeros(K) :
+                        (du_p .- du0) ./ eps_x
 
                 col_i = (k_pert - 1) * T + i  # alpha[i, k_pert]
                 col_ip1 = (k_pert - 1) * T + (i + 1)  # alpha[i+1, k_pert]
@@ -242,23 +279,30 @@ function collocation_residual_jacobian(
         # ∂F/∂x is the state Jacobian of the ODE RHS, computed by pointwise FD
         for i in 1:T
             u = alpha[i, :]
+            base_failed = false
             try
                 prob.dynamics!(du0, u, p, times[i])
             catch e
                 _is_program_error(e) && rethrow()
                 du0 .= _COLLOC_FAIL_SENTINEL  # match the residual sentinel
+                base_failed = true
             end
 
             for k_pert in 1:K
                 u_p = copy(u)
                 u_p[k_pert] += eps_x
+                pert_failed = false
                 try
                     prob.dynamics!(du_p, u_p, p, times[i])
                 catch e
                     _is_program_error(e) && rethrow()
-                    du_p .= du0  # sentinel is locally constant → zero FD slope
+                    du_p .= du0
+                    pert_failed = true
                 end
-                dF_dx = (du_p .- du0) ./ eps_x  # ∂f/∂x_k at time i
+                # Zero Jacobian at failed points — never difference against
+                # the sentinel (see the sentinel convention above).
+                dF_dx = (base_failed || pert_failed) ? zeros(K) :
+                        (du_p .- du0) ./ eps_x  # ∂f/∂x_k at time i
 
                 col = (k_pert - 1) * T + i  # alpha parameter index
                 for k_eq in 1:K
@@ -290,11 +334,15 @@ function collocation_residual_jacobian(
         beta_p = copy(beta)
         step = max(eps_beta, abs(beta[b]) * eps_beta)
         beta_p[b] += step
-        F_p = eval_ode_rhs(prob, times, alpha, beta_p)
+        F_p, Fp_failed = eval_ode_rhs_masked(prob, times, alpha, beta_p)
         for k in 1:K
             for i in 1:T
                 row_ode = n_data + (k - 1) * T + i
-                J[row_ode, col] = -sqrt_lode * (F_p[i, k] - F[i, k]) / step
+                # Zero Jacobian at failed points (see sentinel convention):
+                # differencing a real value against the sentinel — in either
+                # direction — fabricates a ~1e12 slope.
+                J[row_ode, col] = (F_failed[i] || Fp_failed[i]) ? 0.0 :
+                    -sqrt_lode * (F_p[i, k] - F[i, k]) / step
             end
         end
     end
