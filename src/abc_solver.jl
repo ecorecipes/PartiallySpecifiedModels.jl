@@ -7,13 +7,14 @@
 # ── helpers (module-private) ─────────────────────────────────────────
 
 """
-    _abc_weighted_sample(weights) → Int
+    _abc_weighted_sample(rng, weights) → Int
 
 Sample an index from `weights` using inverse-CDF (no StatsBase dependency).
 """
-function _abc_weighted_sample(weights::AbstractVector{Float64})
+function _abc_weighted_sample(rng::Random.AbstractRNG,
+                              weights::AbstractVector{Float64})
     cumw = cumsum(weights)
-    r = rand() * cumw[end]
+    r = rand(rng) * cumw[end]
     for i in eachindex(cumw)
         r <= cumw[i] && return i
     end
@@ -143,6 +144,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
     beta0 = build_initial_params(prob)
     N = alg.n_particles
 
+    # Solver-owned RNG stream (AGM/BNG convention): seeded when rng_seed is
+    # given, otherwise randomly seeded — never the global RNG.
+    rng = alg.rng_seed === nothing ? Random.Xoshiro(rand(UInt32)) :
+          Random.Xoshiro(alg.rng_seed)
+
     # ── summary statistic ────────────────────────────────────────────
     # :auto is a weighted RMS distance over the USABLE cells only: cells
     # with zero weight or a non-finite observation are skipped, matching
@@ -194,12 +200,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
         end
         P ./= alg.prior_scale^2
         Lp = cholesky(Symmetric(P)).L
-        prior_sample = () -> beta0 .+ (Lp' \ randn(n_p))
+        prior_sample = () -> beta0 .+ (Lp' \ randn(rng, n_p))
         prior_logpdf = β -> (d = β .- beta0; -0.5 * dot(d, P * d))
         in_support   = β -> true
     else
         prior_volume = prod(prior_hi .- prior_lo)
-        prior_sample = () -> prior_lo .+ (prior_hi .- prior_lo) .* rand(n_p)
+        prior_sample = () -> prior_lo .+ (prior_hi .- prior_lo) .* rand(rng, n_p)
         prior_logpdf = β -> (prior_volume > 0 ? -log(prior_volume) : 0.0)
         in_support   = β -> !(any(β .< prior_lo) || any(β .> prior_hi))
     end
@@ -249,9 +255,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
             found = false
             for _attempt in 1:1000
                 # (a) resample from previous generation
-                j = _abc_weighted_sample(weights)
+                j = _abc_weighted_sample(rng, weights)
                 # (b) perturb with Gaussian kernel
-                theta_star = particles[j] .+ kernel_std .* randn(n_p)
+                theta_star = particles[j] .+ kernel_std .* randn(rng, n_p)
 
                 # check prior support (no-op for the Gaussian prior)
                 in_support(theta_star) || continue
@@ -295,7 +301,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
             continue
         end
         for i in failed_slots
-            src = accepted_slots[rand(1:length(accepted_slots))]
+            src = accepted_slots[rand(rng, 1:length(accepted_slots))]
             new_particles[i] = copy(new_particles[src])
             new_distances[i] = new_distances[src]
         end

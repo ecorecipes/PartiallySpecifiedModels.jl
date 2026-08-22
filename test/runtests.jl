@@ -899,22 +899,16 @@ using StableRNGs
         r_map = sol_mcmc.unknown_functions[:r](5.0)
         @test abs(r_map - 0.3) < 0.2
 
-        # Reproducibility under a fixed seed (the AGM/BNG `rng_seed` pattern;
-        # MCMCSolver carries no rng_seed field, so seed the global stream its
-        # AdvancedHMC sampler draws from). The stream is saved and restored
-        # around the pair so the rest of this order-coupled suite sees
-        # exactly the draws it saw before.
-        rng_state_mcmc = copy(Random.default_rng())
-        Random.seed!(2718)
+        # Reproducibility under the solver's own rng_seed field (AGM/BNG
+        # convention): same seed → identical chains, and the global stream
+        # is never touched, so this order-coupled suite is unaffected.
         sol_mcmc_a = solve(prob_mcmc, MCMCSolver(n_samples=50, n_warmup=25,
-                                                 verbose=false))
-        Random.seed!(2718)
+                                                 rng_seed=2718, verbose=false))
         sol_mcmc_b = solve(prob_mcmc, MCMCSolver(n_samples=50, n_warmup=25,
-                                                 verbose=false))
+                                                 rng_seed=2718, verbose=false))
         @test Array(sol_mcmc_a.convergence) == Array(sol_mcmc_b.convergence)
         @test sol_mcmc_a.unknown_functions[:r](5.0) ==
               sol_mcmc_b.unknown_functions[:r](5.0)
-        copy!(Random.default_rng(), rng_state_mcmc)
 
         # The masked-data solves below also draw from the global stream, so
         # save and restore it too — the rest of this suite is order-coupled.
@@ -1896,21 +1890,18 @@ using StableRNGs
         # short chain: generous tolerance, but a do-nothing sampler fails it
         @test abs(sol_pm.unknown_functions[:r](5.0) - 0.25) < 0.25
 
-        # Reproducibility under a fixed seed (see the MCMCSolver testset:
-        # PseudoMarginalSolver has no rng_seed field either, and its
-        # particle/FFBS draws come from Random.default_rng()). Stream saved
-        # and restored so downstream unseeded draws are unchanged.
-        rng_state_pm = copy(Random.default_rng())
-        Random.seed!(31415)
+        # Reproducibility under the solver's own rng_seed field (AGM/BNG
+        # convention): same seed → identical chains, and the global stream
+        # is never touched, so this order-coupled suite is unaffected.
         sol_pm_a = solve(prob_pm, PseudoMarginalSolver(
-            n_samples=50, n_warmup=25, n_steps=50, verbose=false))
-        Random.seed!(31415)
+            n_samples=50, n_warmup=25, n_steps=50, rng_seed=31415,
+            verbose=false))
         sol_pm_b = solve(prob_pm, PseudoMarginalSolver(
-            n_samples=50, n_warmup=25, n_steps=50, verbose=false))
+            n_samples=50, n_warmup=25, n_steps=50, rng_seed=31415,
+            verbose=false))
         @test Array(sol_pm_a.convergence) == Array(sol_pm_b.convergence)
         @test sol_pm_a.unknown_functions[:r](5.0) ==
               sol_pm_b.unknown_functions[:r](5.0)
-        copy!(Random.default_rng(), rng_state_pm)
     end
 
     @testset "DDE support — delay exponential decay" begin
@@ -2195,6 +2186,50 @@ using StableRNGs
             n_generations=6, prior=:box, verbose=false))
         @test abs(sol_abc_box.unknown_functions[:f](3.0) - 1.5) < 0.6
         @test_throws ErrorException solve(prob_abc, ABCSolver(prior=:bogus))
+
+        # rng_seed parity (W1): the sampler owns its stream, so a fixed
+        # seed reproduces the run exactly without touching the global RNG.
+        sol_abc_s1 = solve(prob_abc, ABCSolver(n_particles=40,
+            n_generations=3, rng_seed=11, verbose=false))
+        sol_abc_s2 = solve(prob_abc, ABCSolver(n_particles=40,
+            n_generations=3, rng_seed=11, verbose=false))
+        @test sol_abc_s1.parameters == sol_abc_s2.parameters
+    end
+
+    @testset "rng_seed parity — VI and EKI" begin
+        # VariationalSolver/EnsembleKalmanSolver historically hard-coded
+        # Xoshiro(42); the new rng_seed field must default to 42 (behavior
+        # preserved) while making the stream controllable.
+        @test VariationalSolver().rng_seed == 42
+        @test EnsembleKalmanSolver().rng_seed == 42
+
+        decay_seed!(du, u, p, t) = (du[1] = -p.f(u[1]))
+        t_sd = collect(0.0:1.0:8.0)
+        data_sd = reshape(5.0 .* exp.(-0.5 .* t_sd) .+ 0.02, :, 1)
+        uf_sd = BSplineApproximator(:f, (0.0, 6.0), 5)
+        prob_sd = PSMProblem(decay_seed!, [5.0], (0.0, 8.0), [uf_sd];
+            data_times=t_sd, data_values=data_sd, obs_to_state=[1],
+            known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+
+        # same seed → identical; explicit 42 ≡ the default
+        eki = (seed; kw...) -> solve(prob_sd, EnsembleKalmanSolver(
+            n_ensemble=20, n_iterations=5, rng_seed=seed); kw...)
+        sol_e1 = eki(7); sol_e2 = eki(7)
+        @test sol_e1.parameters == sol_e2.parameters
+        sol_e42 = eki(42)
+        sol_edef = solve(prob_sd, EnsembleKalmanSolver(n_ensemble=20,
+            n_iterations=5))
+        @test sol_e42.parameters == sol_edef.parameters
+        # a different seed draws a different ensemble
+        @test eki(8).parameters != sol_e1.parameters
+
+        vi = seed -> solve(prob_sd, VariationalSolver(maxiters=100,
+            rng_seed=seed, verbose=false))
+        sol_v1 = vi(7); sol_v2 = vi(7)
+        @test sol_v1.parameters == sol_v2.parameters
+        sol_vdef = solve(prob_sd, VariationalSolver(maxiters=100, verbose=false))
+        @test vi(42).parameters == sol_vdef.parameters
     end
 
     @testset "ABCSolver — NaN-masked observation" begin

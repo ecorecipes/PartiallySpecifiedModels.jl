@@ -1243,7 +1243,8 @@ end
 
 """
     MCMCSolver(; n_samples=1000, n_warmup=500, n_chains=1, target_accept=0.8,
-                 prior_scale=1.0, obs_sigma=nothing, sample_smoothing=false, verbose=false)
+                 prior_scale=1.0, obs_sigma=nothing, sample_smoothing=false,
+                 rng_seed=nothing, verbose=false)
 
 Full Bayesian inference via Hamiltonian Monte Carlo (NUTS).
 Uses LogDensityProblems.jl + AdvancedHMC.jl.
@@ -1262,6 +1263,9 @@ Uses LogDensityProblems.jl + AdvancedHMC.jl.
 - `sample_smoothing`: if `true`, jointly sample log(λ) for each smooth term
   with a weakly informative N(log(λ_init), 2²) hyperprior. This gives wider,
   more honest credible intervals for the unknown functions. Default: `false`.
+- `rng_seed`: seed for the sampler's own RNG stream (default `nothing` =
+  non-reproducible). Matches the `rng_seed` convention of
+  `AdaptiveGradientMatching`/`BNGSolver`; does not touch the global RNG.
 - `verbose`: print progress
 """
 struct MCMCSolver
@@ -1272,6 +1276,7 @@ struct MCMCSolver
     prior_scale::Float64
     obs_sigma::Union{Nothing, Float64}
     sample_smoothing::Bool
+    rng_seed::Union{Nothing, Int}
     verbose::Bool
 end
 
@@ -1279,9 +1284,10 @@ MCMCSolver(; n_samples::Int=1000, n_warmup::Int=500, n_chains::Int=1,
              target_accept::Float64=0.8, prior_scale::Float64=1.0,
              obs_sigma::Union{Nothing, Float64}=nothing,
              sample_smoothing::Bool=false,
+             rng_seed::Union{Nothing, Int}=nothing,
              verbose::Bool=false) =
     MCMCSolver(n_samples, n_warmup, n_chains, target_accept, prior_scale,
-               obs_sigma, sample_smoothing, verbose)
+               obs_sigma, sample_smoothing, rng_seed, verbose)
 
 """
     MagiSolver(; n_samples=1000, n_warmup=500, n_gridpoints=200,
@@ -1499,6 +1505,9 @@ adaptive random-walk Metropolis (the proposal scale is tuned toward
   (deterministic Fenrir evidence; the chain is then plain adaptive RWM on
   an approximate likelihood), or `:dalton` (deterministic DALTON
   data-adaptive likelihood, likewise plain RWM)
+- `rng_seed`: seed for the chain's own RNG stream (default `nothing` =
+  non-reproducible). Matches the `rng_seed` convention of
+  `AdaptiveGradientMatching`/`BNGSolver`; does not touch the global RNG.
 - `verbose`: print progress
 """
 struct PseudoMarginalSolver
@@ -1512,6 +1521,7 @@ struct PseudoMarginalSolver
     prior_scale::Float64
     inner_method::Symbol
     initial_params::Union{Nothing, Vector{Float64}}
+    rng_seed::Union{Nothing, Int}
     verbose::Bool
 end
 
@@ -1522,6 +1532,7 @@ function PseudoMarginalSolver(; n_samples::Int=1000, n_warmup::Int=500,
                                 target_accept::Float64=0.8, prior_scale::Float64=1.0,
                                 inner_method::Symbol=:ffbs,
                                 initial_params::Union{Nothing, Vector{Float64}}=nothing,
+                                rng_seed::Union{Nothing, Int}=nothing,
                                 verbose::Bool=false)
     # See RodeoSolver: n_deriv=1 BoundsErrors in the Kalman selectors.
     n_deriv >= 2 ||
@@ -1529,7 +1540,7 @@ function PseudoMarginalSolver(; n_samples::Int=1000, n_warmup::Int=500,
                             "(got $n_deriv)"))
     PseudoMarginalSolver(n_samples, n_warmup, n_steps, n_deriv, sigma, obs_var,
                           target_accept, prior_scale, inner_method,
-                          initial_params, verbose)
+                          initial_params, rng_seed, verbose)
 end
 
 # ─── GCV solver (Wood 2001 / ddefit504) ────────────────────────────
@@ -1683,6 +1694,9 @@ providing uncertainty estimates.
 - `obs_noise_var`: Gaussian observation-noise variance (default `nothing`
   = estimate from the data). Gaussian likelihoods only; errors otherwise.
   Non-Gaussian families use their own pointwise log-likelihood in the ELBO.
+- `rng_seed`: seed for the ELBO Monte-Carlo draws (default `42`, which
+  reproduces the historical hard-coded behavior; `nothing` = fresh
+  non-reproducible stream). Does not touch the global RNG.
 - `verbose`: print progress
 
 !!! note "Reported EDF"
@@ -1699,14 +1713,20 @@ struct VariationalSolver
     n_elbo_samples::Int
     prior_scale::Float64
     obs_noise_var::Union{Nothing, Float64}
+    rng_seed::Union{Nothing, Int}
     verbose::Bool
 end
 
+# rng_seed defaults to 42, NOT nothing: the solver historically hard-coded
+# Xoshiro(42) for its ELBO Monte-Carlo draws, and the default must keep
+# reproducing that. `nothing` opts into a fresh non-reproducible stream.
 VariationalSolver(; maxiters::Int=2000, lr::Float64=0.01,
                     n_elbo_samples::Int=10, prior_scale::Float64=1.0,
                     obs_noise_var::Union{Nothing, Float64}=nothing,
+                    rng_seed::Union{Nothing, Int}=42,
                     verbose::Bool=false) =
-    VariationalSolver(maxiters, lr, n_elbo_samples, prior_scale, obs_noise_var, verbose)
+    VariationalSolver(maxiters, lr, n_elbo_samples, prior_scale, obs_noise_var,
+                      rng_seed, verbose)
 
 # ─── ABC solver (Approximate Bayesian Computation) ─────────────────
 
@@ -1734,6 +1754,9 @@ initialization; treat as approximate).
 - `prior`: `:smoothness` (default, GMRF) or `:box` (legacy uniform)
 - `prior_scale`: prior spread — GMRF scale, or box half-width (default 2.0)
 - `quantile_eps`: quantile for tolerance schedule (default 0.5)
+- `rng_seed`: seed for the sampler's own RNG stream (default `nothing` =
+  non-reproducible). Matches the `rng_seed` convention of
+  `AdaptiveGradientMatching`/`BNGSolver`; does not touch the global RNG.
 - `verbose`: print progress
 """
 struct ABCSolver
@@ -1743,6 +1766,7 @@ struct ABCSolver
     prior::Symbol
     prior_scale::Float64
     quantile_eps::Float64
+    rng_seed::Union{Nothing, Int}
     verbose::Bool
 end
 
@@ -1750,9 +1774,10 @@ ABCSolver(; n_particles::Int=500, n_generations::Int=10,
             summary_fn::Union{Symbol, Function}=:auto,
             prior::Symbol=:smoothness,
             prior_scale::Float64=2.0, quantile_eps::Float64=0.5,
+            rng_seed::Union{Nothing, Int}=nothing,
             verbose::Bool=false) =
     ABCSolver(n_particles, n_generations, summary_fn, prior, prior_scale,
-              quantile_eps, verbose)
+              quantile_eps, rng_seed, verbose)
 
 # ─── Integral matching solver (Dattner & Klaassen 2015) ────────────
 
@@ -1866,6 +1891,9 @@ sees the same trajectory as every other solver.
   relative to the magnitude of your observations (e.g. roughly the
   expected noise std). The default suits data of order 1; for data of
   order 1000 use a correspondingly larger value.
+- `rng_seed`: seed for the solver's own RNG stream (default `42`, which
+  reproduces the historical hard-coded behavior; `nothing` = fresh
+  non-reproducible stream). Does not touch the global RNG.
 - `verbose`: print progress
 
 # References
@@ -1876,12 +1904,18 @@ struct EnsembleKalmanSolver
     n_ensemble::Int
     n_iterations::Int
     noise_scale::Float64
+    rng_seed::Union{Nothing, Int}
     verbose::Bool
 end
 
+# rng_seed defaults to 42, NOT nothing: the solver historically hard-coded
+# Xoshiro(42) for ensemble initialization and perturbations, and the default
+# must keep reproducing that. `nothing` opts into a fresh stream.
 EnsembleKalmanSolver(; n_ensemble::Int=50, n_iterations::Int=30,
-                       noise_scale::Float64=0.1, verbose::Bool=false) =
-    EnsembleKalmanSolver(n_ensemble, n_iterations, noise_scale, verbose)
+                       noise_scale::Float64=0.1,
+                       rng_seed::Union{Nothing, Int}=42,
+                       verbose::Bool=false) =
+    EnsembleKalmanSolver(n_ensemble, n_iterations, noise_scale, rng_seed, verbose)
 
 # ─── ODIN solver (ODE-Informed regression) ─────────────────────────
 

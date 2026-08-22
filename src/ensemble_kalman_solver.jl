@@ -121,7 +121,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
     end
 
     # ── Initialise ensemble ──────────────────────────────────────
-    rng = Random.Xoshiro(42)
+    # rng_seed defaults to 42 (historical hard-coded stream); nothing = fresh.
+    rng = alg.rng_seed === nothing ? Random.Xoshiro(rand(UInt32)) :
+          Random.Xoshiro(alg.rng_seed)
     ensemble = Matrix{Float64}(undef, n_beta, J)
     for j in 1:J
         ensemble[:, j] = beta0 .+ 0.5 .* randn(rng, n_beta) .* max.(abs.(beta0), 0.1)

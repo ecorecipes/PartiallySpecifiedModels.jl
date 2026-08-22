@@ -329,6 +329,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     # Set up NUTS sampler with target acceptance rate
     nuts = NUTS(alg.target_accept)
 
+    # Solver-owned RNG stream (AGM/BNG convention): seeded when rng_seed is
+    # given, otherwise randomly seeded — never the global RNG.
+    rng = alg.rng_seed === nothing ? Random.Xoshiro(rand(UInt32)) :
+          Random.Xoshiro(alg.rng_seed)
+
     # Run sampler via AbstractMCMC. n_adapts must equal n_warmup: without it
     # AdvancedHMC adapts for only min(N/10, 1000) steps, so the retained
     # draws could include iterations taken while step size and mass matrix
@@ -339,10 +344,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     for c in 1:n_ch
         # Overdisperse the later chains' starts slightly so R̂-style
         # diagnostics on the returned Chains object are meaningful.
-        θ0c = c == 1 ? theta0 : theta0 .+ 0.1 .* randn(length(theta0))
+        θ0c = c == 1 ? theta0 : theta0 .+ 0.1 .* randn(rng, length(theta0))
         chain_raw = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
             AbstractMCMC.sample(
-                ld_ad, nuts, alg.n_warmup + alg.n_samples;
+                rng, ld_ad, nuts, alg.n_warmup + alg.n_samples;
                 n_adapts=alg.n_warmup,
                 initial_params=θ0c,
                 progress=verbose, verbose=false)
