@@ -5527,4 +5527,175 @@ struct NotAnApproximator end
         @test !haskey(res.ci_uf, :g)
     end
 
+    @testset "ShapeConstrainedGPApproximator — construction" begin
+        a = ShapeConstrainedGPApproximator(:f, (0.0, 5.0), 8, :increasing)
+        @test a.name == :f
+        @test nparams(a) == 8
+        @test a.constraint == :increasing
+        @test a.adapt                     # no lengthscale supplied → adaptive
+        @test length(a.inducing_points) == 8
+        @test length(initial_params(a)) == 8
+
+        # Explicit hyperparameters are fixed for the whole fit (never adapted)
+        a_fix = ShapeConstrainedGPApproximator(:g, (0.0, 5.0), 8, :decreasing;
+                                               lengthscale=1.0, kernel=:matern52)
+        @test !a_fix.adapt
+        @test a_fix.lengthscale == 1.0
+        @test a_fix.kernel == :matern52
+
+        # Zero-at-endpoint constraints drop one parameter, like the SCOP
+        # B-spline/SPDE siblings
+        a_z = ShapeConstrainedGPApproximator(:h, (0.0, 1.0), 8, :inc_zero_left)
+        @test nparams(a_z) == 7
+
+        # Penalty: P&W first-difference penalty on γ with the free level in
+        # the null space (PSD, rank-deficient)
+        S = penalty_matrix(a)
+        @test size(S) == (8, 8)
+        @test all(e -> e > -1e-10, eigvals(Symmetric(S)))
+        @test all(iszero, S[1, :])        # free level γ₁ unpenalized
+
+        # Validation
+        @test_throws ArgumentError ShapeConstrainedGPApproximator(
+            :f, (0.0, 1.0), 8, :bad_constraint)
+        @test_throws ArgumentError ShapeConstrainedGPApproximator(
+            :f, (1.0, 0.0), 8, :increasing)
+        @test_throws ArgumentError ShapeConstrainedGPApproximator(
+            :f, (0.0, 1.0), 3, :increasing)
+    end
+
+    @testset "ShapeConstrainedGPApproximator — constraint by construction" begin
+        # For ANY parameter vector the reparameterized evaluator satisfies its
+        # constraint: exactly at the inducing values (β = Σ·d(γ) is built to)
+        # and on a fine grid up to the small between-point wiggle of kernel
+        # interpolation (the SCOP-SPDE cubic has the same caveat; observed
+        # ≤ 0.6% of the function range for the N(0,1) draws used here;
+        # the margin grows with the draw scale, so the 1% tolerance below
+        # is calibrated to THESE seeded draws, not a universal bound).
+        rng = StableRNG(7)
+        grid = collect(range(0.0, 2.0, length=401))
+        for c in (:increasing, :decreasing, :convex, :concave)
+            ac = ShapeConstrainedGPApproximator(:f, (0.0, 2.0), 8, c)
+            for trial in 1:5
+                γ = randn(rng, nparams(ac))
+                β = PartiallySpecifiedModels.gamma_to_inducing_values(ac, γ)
+                f = build_evaluator(ac, γ)
+                vals = [f(x) for x in grid]
+                rangev = maximum(vals) - minimum(vals)
+                if c == :increasing
+                    @test all(diff(β) .>= 0)              # exact at nodes
+                    @test all(diff(vals) .>= -0.01 * rangev)
+                elseif c == :decreasing
+                    @test all(diff(β) .<= 0)
+                    @test all(diff(vals) .<= 0.01 * rangev)
+                elseif c == :convex
+                    @test all(diff(diff(β)) .>= -1e-10)
+                    @test all(diff(diff(vals)) .>= -2e-3 * rangev)
+                else # :concave
+                    @test all(diff(diff(β)) .<= 1e-10)
+                    @test all(diff(diff(vals)) .<= 2e-3 * rangev)
+                end
+            end
+        end
+
+        # Zero-at-endpoint: pinned exactly (constant centering shift) and
+        # still monotone
+        a_z = ShapeConstrainedGPApproximator(:f, (0.0, 2.0), 8, :inc_zero_left)
+        γz = randn(rng, nparams(a_z))
+        fz = build_evaluator(a_z, γz)
+        @test abs(fz(0.0)) < 1e-10
+        valz = [fz(x) for x in grid]
+        @test all(diff(valz) .>= -0.01 * (maximum(valz) - minimum(valz)))
+    end
+
+    @testset "ShapeConstrainedGPApproximator — Dual-safety" begin
+        import ForwardDiff
+        a = ShapeConstrainedGPApproximator(:f, (0.0, 2.0), 6, :increasing)
+        γ = randn(StableRNG(3), nparams(a))
+        # Gradient w.r.t. the parameters (autodiff solvers differentiate the
+        # objective through build_evaluator)
+        g = ForwardDiff.gradient(
+            p -> sum(build_evaluator(a, p)(x) for x in 0.0:0.5:2.0), γ)
+        @test all(isfinite, g)
+        @test any(!iszero, g)
+        # Derivative w.r.t. the input (stiff-solver Jacobians pass Dual x),
+        # covering both extrapolation branches and the interior
+        f = build_evaluator(a, γ)
+        for x in (-0.5, 1.0, 2.5)
+            @test isfinite(ForwardDiff.derivative(f, x))
+        end
+        @test ForwardDiff.derivative(f, 1.0) >= -1e-8  # monotone increasing
+    end
+
+    @testset "ShapeConstrainedGPApproximator — monotone recovery (LAML/Adam)" begin
+        # Saturating uptake du = -f(u), f(u) = u/(1+u): monotone increasing
+        # truth with sparse noisy data. The discriminating pair: the
+        # UNCONSTRAINED GP fit chases the noise into a non-monotone f (assert
+        # it does — otherwise this test proves nothing), while the constrained
+        # fit cannot violate monotonicity by construction AND recovers the
+        # truth more accurately.
+        f_true_gp(u) = u / (1 + u)
+        function uptake_gp!(du, u, p, t)
+            du[1] = -p.f(u[1])
+        end
+        ode_gp = ODEProblem((du, u, p, t) -> (du[1] = -f_true_gp(u[1])),
+                            [2.0], (0.0, 8.0))
+        traj_gp = OrdinaryDiffEq.solve(ode_gp, Tsit5(); abstol=1e-10, reltol=1e-10)
+        rng = StableRNG(5)
+        ts_gp = collect(range(0.0, 8.0, length=12))
+        data_gp = reshape([traj_gp(t)[1] for t in ts_gp] .+
+                          0.10 .* randn(rng, 12), :, 1)
+
+        mk_gp(approx) = PSMProblem(uptake_gp!, [2.0], (0.0, 8.0), [approx];
+            data_times=ts_gp, data_values=data_gp, obs_to_state=[1],
+            known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+
+        grid = collect(range(0.05, 2.0, length=200))
+        # Worst decrease as a fraction of the fitted range (positive ⇒ the
+        # fit is non-monotone somewhere on the grid)
+        function viol_frac(fh)
+            vals = [fh(x) for x in grid]
+            -minimum(diff(vals)) / (maximum(vals) - minimum(vals))
+        end
+
+        sol_u = solve(mk_gp(GPApproximator(:f, (0.0, 2.2), 8;
+                                           initial=x -> 0.3 * x)),
+                      LAML(maxiters=40, verbose=false))
+        prob_c = mk_gp(ShapeConstrainedGPApproximator(:f, (0.0, 2.2), 8,
+                           :increasing; initial=x -> 0.3 * x))
+        sol_c = solve(prob_c, LAML(maxiters=40, verbose=false))
+        fu = sol_u.unknown_functions[:f]
+        fc = sol_c.unknown_functions[:f]
+
+        # Unconstrained fit genuinely violates monotonicity (observed 0.0079)
+        @test viol_frac(fu) > 0.003
+        # Constrained fit is monotone (observed strictly increasing,
+        # viol_frac ≈ -0.001; tolerance covers between-point kernel wiggle)
+        @test viol_frac(fc) < 1e-3
+        # ...and recovers the truth (observed maxerr 0.107, meanerr 0.054 on
+        # a truth range of ≈ 0.65)
+        errs_c = [abs(fc(x) - f_true_gp(x)) for x in grid]
+        @test maximum(errs_c) < 0.15
+        @test sum(errs_c) / length(errs_c) < 0.08
+        # ...more accurately than the unconstrained fit (0.054 vs 0.104 mean)
+        errs_u = [abs(fu(x) - f_true_gp(x)) for x in grid]
+        @test sum(errs_c) < sum(errs_u)
+
+        # Confidence band treats the constrained GP like its SCOP siblings
+        # (finite-difference ∂f/∂γ through _eval_approx_at)
+        bands = confidence_band(sol_c, prob_c)
+        @test haskey(bands, :f)
+        @test all(isfinite, bands[:f].se)
+        @test all(bands[:f].lower .<= bands[:f].upper)
+
+        # AdamSolver end-to-end through the same build_evaluator protocol
+        # (observed maxerr 0.117, monotone)
+        sol_a = solve(mk_gp(ShapeConstrainedGPApproximator(:f, (0.0, 2.2), 8,
+                                :increasing; initial=x -> 0.3 * x)),
+                      AdamSolver(maxiters=300, lr=0.05))
+        fa = sol_a.unknown_functions[:f]
+        @test viol_frac(fa) < 1e-3
+        @test maximum(abs(fa(x) - f_true_gp(x)) for x in grid) < 0.2
+    end
+
 end

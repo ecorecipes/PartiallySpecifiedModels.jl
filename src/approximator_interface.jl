@@ -35,7 +35,7 @@ vector of `ForwardDiff.Dual` numbers, so the evaluator must be eltype-generic
 (`AdamSolver`, `MultipleShootingSolver`, `TwoStageSolver`, `BNGSolver`,
 `IntegralMatchingSolver`, …).
 
-Methods are provided for the eight built-in types:
+Methods are provided for the nine built-in types:
 
 | Approximator | Evaluator |
 |:---|:---|
@@ -43,6 +43,7 @@ Methods are provided for the eight built-in types:
 | `TensorBSplineApproximator` | `build_tensor_bspline_evaluator` (bivariate tensor product of the univariate construction; the callable takes TWO arguments, `f(x, y)`) |
 | `NeuralApproximator` | `build_neural_evaluator` (Dual-safe MLP path + Lux fallback) |
 | `GPApproximator` | `build_gp_evaluator` (kernel interpolation) |
+| `ShapeConstrainedGPApproximator` | `build_constrained_gp_evaluator` (SCOP reparameterization + kernel interpolation) |
 | `ShapeConstrainedBSplineApproximator` | `build_constrained_bspline_evaluator` (SCOP reparameterization) |
 | `COMONetApproximator` | `build_comonet_evaluator` (constrained monotone net) |
 | `SPDEApproximator` | `build_spde_evaluator` on `mesh_points` |
@@ -79,6 +80,9 @@ build_evaluator(approx::NeuralApproximator, params_k) =
 
 build_evaluator(approx::GPApproximator, params_k) =
     build_gp_evaluator(approx, params_k)
+
+build_evaluator(approx::ShapeConstrainedGPApproximator, params_k) =
+    build_constrained_gp_evaluator(approx, params_k)
 
 build_evaluator(approx::ShapeConstrainedBSplineApproximator, params_k) =
     build_constrained_bspline_evaluator(approx, params_k)

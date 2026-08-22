@@ -308,6 +308,9 @@ function agm_loss(prob::PSMProblem, beta::AbstractVector,
             elseif approx isa ShapeConstrainedSPDEApproximator
                 S = penalty_matrix(approx)
                 total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
+            elseif approx isa ShapeConstrainedGPApproximator
+                S = penalty_matrix(approx)
+                total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
             end
         end
     end

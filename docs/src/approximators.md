@@ -161,6 +161,20 @@ approx_gp = GPApproximator(:f, (0.0, 10.0), 20)
 GPApproximator
 ```
 
+## ShapeConstrainedGPApproximator
+
+Combines the GP predictive-mean interpolation of [`GPApproximator`](@ref) with the SCOP-spline reparameterization to enforce shape constraints at the inducing points. Supports all 14 constraint types (same as [`ShapeConstrainedBSplineApproximator`](@ref)).
+
+```@example approx
+approx_scgp = ShapeConstrainedGPApproximator(:f, (0.0, 10.0), 10, :increasing)
+```
+
+Constraints are enforced at the inducing-point values via a cumulative-sum reparameterization through `softplus`; the kernel interpolation between points may slightly overshoot — use more inducing points to reduce this. Kernel hyperparameters adapt during LAML/GCV fits exactly as for `GPApproximator` (pass an explicit `lengthscale` to fix them).
+
+```@docs
+ShapeConstrainedGPApproximator
+```
+
 ## COMONetApproximator
 
 Constrained Monotone Network — a neural network architecture that guarantees shape constraints by construction. Each constraint uses the architecture matching its function class: monotone constraints use positive (`exp(W)`) weights with saturating tanh hidden units, curvature-only constraints use a two-branch input-convex form (twice the parameters), and `:positive` exponentiates an unconstrained MLP.

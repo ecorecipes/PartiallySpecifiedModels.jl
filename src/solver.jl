@@ -223,7 +223,10 @@ _is_program_error(e) = e isa Union{MethodError, BoundsError, UndefVarError,
     _adapt_gp_approximators!(prob, beta) -> Bool
 
 Run the empirical-Bayes hyperparameter update for every `GPApproximator`
-with `adapt=true`, using its slice of the current coefficient vector.
+and `ShapeConstrainedGPApproximator` with `adapt=true`, using its slice of
+the current coefficient vector. The constrained type stores unconstrained
+γ, so its slice is mapped to the implied inducing values β = Σ·d(γ) first —
+the marginal likelihood is over function values.
 Returns whether any kernel changed (callers should re-evaluate the model).
 """
 function _adapt_gp_approximators!(prob::PSMProblem, beta::AbstractVector)
@@ -233,6 +236,9 @@ function _adapt_gp_approximators!(prob::PSMProblem, beta::AbstractVector)
         np = nparams(a)
         if a isa GPApproximator && a.adapt
             changed |= _adapt_gp_hyperparams!(a, Float64.(beta[off+1:off+np]))
+        elseif a isa ShapeConstrainedGPApproximator && a.adapt
+            changed |= _adapt_gp_hyperparams!(
+                a, gamma_to_inducing_values(a, Float64.(beta[off+1:off+np])))
         end
         off += np
     end
