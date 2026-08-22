@@ -315,7 +315,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     for oi in 1:n_obs, ti in 1:n_times
         y = prob.data_values[ti, oi]
         wv = prob.data_weights[ti, oi]
-        if wv > 0 && !isnan(y)
+        if _usable(y, wv)
             y_vec[k] = y
             w_vec[k] = wv
         end   # else keep the 0.0 placeholder with weight 0.0

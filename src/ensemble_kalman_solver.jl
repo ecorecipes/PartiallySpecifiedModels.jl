@@ -42,6 +42,23 @@ values `NaN` and `data_loss` `Inf` — reports
 Note the discrete-time convention: discrete problems are propagated with
 `simulate_discrete` (unit steps over `tspan`, data times snapped to the
 nearest integer step), the same trajectory every other solver sees.
+
+# Masked data
+
+This solver does NOT support masked observations and raises an error if
+any data cell is masked (`data_weights == 0` or a non-finite
+`data_values` entry). Its likelihood is evaluated inside a Kalman /
+particle recursion with no per-cell mask: honouring a mask means skipping
+the FILTER UPDATE, not merely the density term, for the masked cells.
+Left unguarded the masked cells corrupt the filter state while the run
+still looks like an ordinary converged fit, so it fails loudly instead.
+Drop the masked rows from `data_times`/`data_values`, or use one of the
+masking-capable solvers (`LAML`, `GCVSolver`, `CollocationLAML`,
+`GradientMatching`, `TwoStageSolver`, `BNGSolver`, `ODINSolver`,
+`RKHSSolver`, `IntegralMatchingSolver`, `AdamSolver`,
+`MultipleShootingSolver`, `DerivativeFreeSolver`, `MCMCSolver`,
+`MagiSolver`, `VariationalSolver`, `ABCSolver`,
+`ProfileLikelihoodSolver`).
 """
 function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
     _validate_problem(prob, "EnsembleKalmanSolver")

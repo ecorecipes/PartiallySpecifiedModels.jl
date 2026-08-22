@@ -84,11 +84,38 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
         end
     end
 
-    # Trajectory increments: Δ[i,k] = ŷ_k(t_i) - ŷ_k(t_1)
+    # Which (time, state) cells carry a usable observation, and which row
+    # each observed state measures its increment FROM. Masked rows are
+    # dropped from the smoother above, so `y_smooth` there is a pure
+    # interpolation with no data behind it: including it in the loss would
+    # fit the model to the smoother's own extrapolation. The three sibling
+    # gradient-matching solvers (TwoStage, BNG, ODIN) all gate; this one
+    # ran over every time index ungated.
+    match_usable = falses(n_times, n_vars)
+    base_row = ones(Int, n_vars)          # baseline row per state
+    for j in 1:n_obs
+        sk = prob.obs_to_state[j]
+        for i in 1:n_times
+            usable_cell(prob, i, j) && (match_usable[i, sk] = true)
+        end
+    end
+    for k in 1:n_vars
+        k in observed_states || continue
+        # The baseline ŷ_k(t_b) must itself be anchored on data: with row 1
+        # masked, `y_smooth[1, k]` is an extrapolation and every increment
+        # in the column inherits its error.
+        b = findfirst(@view match_usable[:, k])
+        b === nothing && error("IntegralMatchingSolver: state $k has no " *
+            "usable observation (every cell is masked — zero weight or " *
+            "non-finite value); there is nothing to match.")
+        base_row[k] = b
+    end
+
+    # Trajectory increments: Δ[i,k] = ŷ_k(t_i) - ŷ_k(t_b(k))
     delta = zeros(n_times, n_vars)
     for k in 1:n_vars
-        for i in 2:n_times
-            delta[i, k] = y_smooth[i, k] - y_smooth[1, k]
+        for i in 1:n_times
+            delta[i, k] = y_smooth[i, k] - y_smooth[base_row[k], k]
         end
     end
 
@@ -149,14 +176,21 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
             end
         end
 
-        # Loss: ||delta - I_cum||² over OBSERVED states only (unobserved
-        # states hold a fabricated constant, so their delta ≡ 0 would push
-        # the unknown functions to zero the RHS along a fictitious path)
+        # Loss over OBSERVED states (unobserved states hold a fabricated
+        # constant, so their delta ≡ 0 would push the unknown functions to
+        # zero the RHS along a fictitious path) and USABLE rows only.
+        #
+        # `I_cum` is still cumulative from t_1, so the increment matching
+        # the baseline-shifted `delta[i,k] = ŷ(t_i) − ŷ(t_b)` is
+        # `I_cum[i,k] − I_cum[b,k]`. For complete data b = 1 and
+        # `I_cum[1,k] = 0`, so this is bit-for-bit the previous expression.
         loss_val = zero(T_el)
         for k in 1:n_vars
             k in observed_states || continue
-            for i in 2:n_times
-                loss_val += (delta[i, k] - I_cum[i, k])^2
+            b = base_row[k]
+            for i in 1:n_times
+                (i != b && match_usable[i, k]) || continue
+                loss_val += (delta[i, k] - (I_cum[i, k] - I_cum[b, k]))^2
             end
         end
 
@@ -229,7 +263,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
         # Plateau convergence, guarded against the cosine lr schedule
         # manufacturing a plateau as lr_t → 0 near maxiters: only trust the
         # criterion while the step size is still meaningful.
-        if iter > 60 && lr_t > 0.05 * lr
+        # `best_loss < 1e9` is AdamSolver's failure-sentinel guard: the
+        # dynamics fall back to `du .= 1e6` when the RHS throws, so a run
+        # pinned at that sentinel is a stuck solver, not a converged one.
+        if iter > 60 && best_loss < 1e9 && lr_t > 0.05 * lr
             recent_min = minimum(loss_window)
             recent_max = maximum(loss_window)
             if (recent_max - recent_min) / max(abs(recent_min), 1.0) < 1e-6

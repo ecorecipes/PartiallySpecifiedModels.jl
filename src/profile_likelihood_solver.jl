@@ -82,7 +82,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
 
     # ── Step 1: Full LAML fit for MLE ────────────────────────────
     if verbose; println("ProfileLikelihoodSolver: Running initial LAML fit..."); end
-    base_sol = SciMLBase.solve(prob, LAML(verbose=false))
+    base_sol = SciMLBase.solve(prob, alg.base_alg)
     beta_mle = Float64.(collect(base_sol.parameters))
     n_beta = length(beta_mle)
     mle_obj = base_sol.objective
@@ -107,8 +107,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
 
     # Effective number of scalar observations: only weight-carrying finite
     # cells enter both the objective and the σ̂² denominator.
-    n_obs = count(i -> prob.data_weights[i] > 0 && !isnan(prob.data_values[i]),
-                  eachindex(prob.data_values))
+    n_obs = n_usable(prob)
 
     profiles = Dict{Int, NamedTuple}()
 
@@ -137,7 +136,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
                 for j in 1:size(prob.data_values, 2)
                     w = prob.data_weights[i, j]
                     y = prob.data_values[i, j]
-                    (w > 0 && !isnan(y)) || continue
+                    _usable(y, w) || continue
                     total_loss += w * (y - pred[i, j])^2
                 end
             end

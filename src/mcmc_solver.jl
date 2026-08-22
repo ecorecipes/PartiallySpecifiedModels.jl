@@ -116,7 +116,7 @@ function _psm_logdensity(ld::PSMLogDensity, theta)
         for i in 1:n_t
             w = prob.data_weights[i, j]
             y = prob.data_values[i, j]
-            (w > 0 && !isnan(y)) || continue
+            _usable(y, w) || continue
             n_eff += 1
             pred_ij = if prob.discrete
                 pred[i, j]
@@ -303,8 +303,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
         usable_vals = [prob.data_values[i, j]
                        for j in 1:size(prob.data_values, 2)
                        for i in 1:size(prob.data_values, 1)
-                       if prob.data_weights[i, j] > 0 &&
-                          !isnan(prob.data_values[i, j])]
+                       if usable_cell(prob, i, j)]
         isempty(usable_vals) &&
             error("MCMCSolver: every observation is masked (data_weights " *
                   "zero) or NaN, so the observation noise σ cannot be " *

@@ -90,6 +90,39 @@ function deviance_residuals(::AbstractLikelihood, y::AbstractVector, mu::Abstrac
     y .- mu
 end
 
+# ─── Cell mask for the diagnostics ───────────────────────────────────
+
+"""
+    _diag_usable(sol) -> BitMatrix
+
+Which data cells participate in a residual diagnostic. `true` where the
+stored observation is finite.
+
+This is the diagnostics-side reading of the package-wide masking
+convention (`usable_cell` in `solver.jl`: positive weight AND a usable
+datum). `PSMSolution` stores `data_values` but NOT `data_weights`, so the
+weight half of the predicate is not recoverable here; the value half is,
+and it is the half that actually poisons the arithmetic — `NaN`
+propagates through every mean, `std`, sum-of-squares and denominator
+below, which is why a single masked cell used to turn EVERY standardized
+residual, the Durbin–Watson statistic and the whole ACF into `NaN`.
+
+LIMITATION (deliberate): a cell masked purely by a ZERO WEIGHT while
+carrying a finite value cannot be detected from a `PSMSolution` and is
+still counted by these diagnostics. Detecting it would require threading
+`data_weights` into the solution struct — a change to a public type, out
+of scope here. Every masking test and example in this package marks a
+masked cell BOTH ways (`data_values[i,j] = NaN` and
+`data_weights[i,j] = 0`), and marking the value is what these functions
+key on; follow that convention if a cell must also drop out of the
+residual diagnostics.
+"""
+_diag_usable(sol::PSMSolution) = isfinite.(sol.data_values)
+
+"""Row indices of column `j` whose observation is usable (see `_diag_usable`)."""
+_diag_rows(keep::AbstractMatrix{Bool}, j::Int) =
+    [i for i in axes(keep, 1) if keep[i, j]]
+
 # ─── Appraise (4-panel diagnostic data) ──────────────────────────────
 
 """
@@ -105,6 +138,15 @@ Returns a named tuple with fields:
 - `qq_theoretical`: theoretical normal quantiles
 - `qq_sample`: sorted standardized residuals
 - `durbin_watson`: DW statistic per observed state
+- `usable`: the cell mask actually used (see `_diag_usable`)
+
+Masked observations (a `NaN`/non-finite stored value) are dropped BEFORE
+every statistic and every denominator, so `residuals`, `fitted`,
+`observed` and the QQ vectors have length equal to the number of usable
+cells rather than `length(sol.data_values)`. Without this a single masked
+cell made the `std` — and hence every standardized residual — `NaN`. See
+`_diag_usable` for the one masking case that cannot be detected from a
+`PSMSolution`.
 
 ## Example
 
@@ -120,8 +162,11 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2,2))
 ```
 """
 function appraise(sol::PSMSolution; family::Union{Nothing, AbstractLikelihood}=nothing)
-    y = vec(sol.data_values)
-    mu = vec(sol.fitted_values)
+    keep = _diag_usable(sol)
+    # `vec` is column-major, and so is `vec(keep)` — the linear indices line up.
+    idx = findall(vec(keep))
+    y = vec(sol.data_values)[idx]
+    mu = vec(sol.fitted_values)[idx]
 
     if family !== nothing && !(family isa Gaussian)
         r = deviance_residuals(family, y, mu)
@@ -140,18 +185,21 @@ function appraise(sol::PSMSolution; family::Union{Nothing, AbstractLikelihood}=n
         r_std = σ > 1e-10 ? r ./ σ : copy(r)
     end
 
-    # QQ data: sorted standardized residuals vs normal quantiles
+    # QQ data: sorted standardized residuals vs normal quantiles.
+    # `n` is the USABLE-cell count — the plotting-position denominator must
+    # not count cells that contribute no residual.
     n = length(r_std)
     sorted = sort(r_std)
     theoretical = [_qnorm((i - 0.5) / n) for i in 1:n]
 
-    # DW per observed state
+    # DW per observed state, over that state's usable rows only.
     resid_mat = sol.data_values .- sol.fitted_values
-    dw = durbin_watson(resid_mat)
+    dw = [durbin_watson(resid_mat[_diag_rows(keep, j), j])
+          for j in axes(resid_mat, 2)]
 
     (residuals=r_std, fitted=mu, observed=y,
      qq_theoretical=theoretical, qq_sample=sorted,
-     durbin_watson=dw)
+     durbin_watson=dw, usable=keep)
 end
 
 """Median of absolute values (robust scale estimator, avoids StatsBase dependency)."""
@@ -256,24 +304,51 @@ end
 Compute a suite of residual diagnostics for a PSM solution.
 
 Returns a named tuple with:
-- `residuals`: raw residuals (observed - fitted)
+- `residuals`: raw residuals (observed - fitted), full `(time × state)` shape
+- `usable`: cell mask; `residuals` is non-finite exactly where this is `false`
 - `durbin_watson`: DW statistic per observed state (2.0 = no autocorrelation)
-- `acf`: autocorrelation at lags 1:10 per state
+- `acf`: autocorrelation at lags 1:maxlag per state
 - `semivariogram`: `(lags, gamma)` per observed state
-"""
-function residual_diagnostics(sol::PSMSolution)
-    resid = sol.data_values .- sol.fitted_values
-    dw = durbin_watson(resid)
-    acf = residual_acf(resid)
-    times = sol.data_times
 
-    svgs = [(lags=Float64[], gamma=Float64[]) for _ in axes(resid, 2)]
-    for j in axes(resid, 2)
-        c, g = semivariogram(times, resid[:, j])
+Masked observations are excluded from every statistic and every
+denominator: each column's DW, ACF and semivariogram are computed over
+that column's usable rows only (with the matching `data_times` subset for
+the semivariogram lags). `residuals` keeps its rectangular shape, so a
+masked cell shows up there as the `NaN` it is — read it through `usable`.
+Before this, one masked cell made `durbin_watson`, the whole `acf` and
+the semivariogram `NaN`. See `_diag_usable` for the masking case that
+cannot be detected from a `PSMSolution`.
+"""
+function residual_diagnostics(sol::PSMSolution; maxlag::Int=10)
+    resid = sol.data_values .- sol.fitted_values
+    keep = _diag_usable(sol)
+    times = sol.data_times
+    ncol = size(resid, 2)
+
+    rows_per_col = [_diag_rows(keep, j) for j in 1:ncol]
+
+    # One common lag count so `acf` stays a matrix. `residual_acf` already
+    # caps at `n - 1`; with masking the columns can have different usable
+    # counts, so cap at the SHORTEST usable column rather than padding the
+    # rest with NaN (which would put the poison straight back).
+    n_min = ncol == 0 ? 0 : minimum(length.(rows_per_col))
+    maxlag_eff = max(min(maxlag, n_min - 1), 0)
+
+    dw = Float64[]
+    acf_cols = Vector{Vector{Float64}}(undef, ncol)
+    svgs = [(lags=Float64[], gamma=Float64[]) for _ in 1:ncol]
+    for j in 1:ncol
+        rows = rows_per_col[j]
+        rj = resid[rows, j]
+        push!(dw, durbin_watson(rj))
+        acf_cols[j] = residual_acf(rj; maxlag=maxlag_eff)
+        c, g = semivariogram(times[rows], rj)
         svgs[j] = (lags=c, gamma=g)
     end
+    acf = ncol == 0 ? zeros(0, 0) : hcat(acf_cols...)
 
-    (residuals=resid, durbin_watson=dw, acf=acf, semivariogram=svgs)
+    (residuals=resid, usable=keep, durbin_watson=dw, acf=acf,
+     semivariogram=svgs)
 end
 
 # ─── Bayesian confidence bands from LAML posterior ────────────────

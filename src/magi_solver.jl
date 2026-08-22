@@ -192,7 +192,7 @@ function _magi_logposterior(ld::MAGILogDensity, v::AbstractVector{T}) where T
         for j in 1:size(prob.data_values, 2)
             y = prob.data_values[i, j]
             w = prob.data_weights[i, j]
-            (w > 0 && !isnan(y)) || continue
+            _usable(y, w) || continue
             sk = prob.obs_to_state[j]
             r = T(y) - X[gi, sk]
             lp += -T(w) / (2 * ld.obs_var[sk]) * r^2
@@ -250,6 +250,17 @@ weight-zero entries are excluded like NaN.
 
 # Returns
 `PSMSolution`; `convergence.chains` holds the posterior samples of θ.
+`objective` is minus the mean log-posterior over the retained draws (the
+only scalar objective a sampler has; negated for the package-wide
+lower-is-better convention) and `data_loss` is the usual mask-aware
+`weighted_data_loss` at the posterior-mean trajectory. `convergence`
+also carries `converged`/`reason`; NUTS runs a fixed budget with no
+stopping criterion, so these are always `false`/`:maxiters` — judge the
+sampler by the R̂ and ESS of `convergence.chains`.
+
+Masked observations (`NaN` value and/or zero weight) are supported: they
+are dropped from the data term, the GP hyperparameter fit and the state
+initialization.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     _validate_problem(prob, "MagiSolver"; require_continuous=true)
@@ -304,7 +315,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
         for j in 1:size(prob.data_values, 2)
             y = Float64.(prob.data_values[:, j])
             # weight-0 points are masked: exclude them like NaN
-            keep = (.!isnan.(y)) .& (prob.data_weights[:, j] .> 0)
+            keep = _usable.(y, prob.data_weights[:, j])
             yv = y[keep]; tv = t_all[keep]
             n = length(yv)
             n >= 4 || continue
@@ -340,7 +351,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
             yobs = Float64.(prob.data_values[:, ocol])
             # weight-0 points are masked: keep them out of the GP
             # hyperparameter fit and the state initialization too
-            keep = (.!isnan.(yobs)) .& (prob.data_weights[:, ocol] .> 0)
+            keep = _usable.(yobs, prob.data_weights[:, ocol])
             td = data_times[keep]; yv = yobs[keep]
             ℓ, σ2 = _magi_fit_hyperparams(td, yv, obs_var_vec[d])
             ybar = Statistics.mean(yv)
@@ -412,10 +423,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     n_keep = alg.n_samples
     sample_matrix = zeros(n_keep, n_params)       # θ samples only
     state_mean = zeros(n_grid, n_vars)
+    # Mean log-posterior over the retained draws. This is the only scalar
+    # objective MAGI actually has: the sampler targets the joint posterior
+    # over (θ, x) and there is no penalized-likelihood value to report.
+    # Reported NEGATED below, so `sol.objective` keeps the package-wide
+    # "lower is better" convention (MCMCSolver reports −log p likewise).
+    mean_logpost = 0.0
     for i in 1:n_keep
         z = chain_raw[alg.n_warmup + i].z.θ
         sample_matrix[i, :] = z[1:n_params]
         state_mean .+= reshape(z[n_params+1:end], n_grid, n_vars) ./ n_keep
+        mean_logpost += _magi_logposterior(ld, z) / n_keep
     end
 
     param_names = String[]
@@ -471,8 +489,24 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     end
 
     verbose && println("MAGI: sampling complete.")
-    PSMSolution(params, 0.0, 0.0, Float64(n_params), Float64[],
+
+    # Reported loss: the SAME weighted, mask-aware residual sum of squares
+    # every other solver reports (`weighted_data_loss`), evaluated at the
+    # posterior-mean state trajectory. A hard-coded 0.0 here claimed a
+    # perfect fit for every MAGI run, which no diagnostic could distinguish
+    # from a genuinely perfect one.
+    data_loss = weighted_data_loss(prob, pred)
+
+    # NUTS has no stopping criterion: it runs the requested budget and
+    # stops. Reporting `converged = true` would be a fabrication, so this
+    # is loop exhaustion — `:maxiters`, the same taxonomy the iterative
+    # solvers use. Assess the sampler with the R̂/ESS diagnostics of
+    # `convergence.chains`, not with this flag.
+    PSMSolution(params, -mean_logpost, data_loss, Float64(n_params), Float64[],
                 pred, Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (method=:magi, chains=chains, state_mean=state_mean))
+                (method=:magi, chains=chains, state_mean=state_mean,
+                 mean_logposterior=mean_logpost,
+                 converged=false, reason=:maxiters,
+                 iterations=n_total))
 end

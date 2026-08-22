@@ -129,10 +129,9 @@ observation turn the whole reported loss into `NaN`.
 function weighted_data_loss(prob::PSMProblem, pred::AbstractMatrix)
     dl = 0.0
     for k in eachindex(prob.data_values)
-        w = prob.data_weights[k]
-        y = prob.data_values[k]
-        (w > 0 && isfinite(y)) || continue
-        dl += w * (pred[k] - y)^2
+        # Same predicate as `usable_cell` / `_usable` — see `_usable`.
+        _usable(prob.data_values[k], prob.data_weights[k]) || continue
+        dl += prob.data_weights[k] * (pred[k] - prob.data_values[k])^2
     end
     dl
 end
@@ -141,13 +140,14 @@ end
     usable_cell(prob, i, j) -> Bool
 
 Whether data cell `(i, j)` participates in objectives. The single
-package-wide convention: positive weight AND non-NaN value. Solvers that
+package-wide convention: positive weight AND FINITE value — the same
+predicate as `_usable(y, w)` and `weighted_data_loss`. Solvers that
 accumulate a data term cell-by-cell should gate on this rather than
 relying on the weight alone — `0 * NaN = NaN`, so a zero weight does NOT
 neutralize a NaN datum.
 """
 @inline usable_cell(prob::PSMProblem, i::Int, j::Int) =
-    prob.data_weights[i, j] > 0 && !isnan(prob.data_values[i, j])
+    _usable(prob.data_values[i, j], prob.data_weights[i, j])
 
 """
     usable_rows(prob, j) -> Vector{Int}
@@ -169,7 +169,7 @@ observations (σ̂²'s `n − edf`, a GCV `n`, a marginal-likelihood
 normalizer) must use. Equals `length(prob.data_values)` for complete data.
 """
 n_usable(prob::PSMProblem) =
-    count(k -> prob.data_weights[k] > 0 && !isnan(prob.data_values[k]),
+    count(k -> _usable(prob.data_values[k], prob.data_weights[k]),
           eachindex(prob.data_values))
 
 """
@@ -194,13 +194,13 @@ the first iteration — each of which returns the initialization while
 looking like an ordinary, converged fit.
 """
 function _reject_masked_data(prob::PSMProblem, solver_name::String)
-    n_masked = count(k -> !(prob.data_weights[k] > 0 &&
-                            !isnan(prob.data_values[k])),
-                     eachindex(prob.data_values))
+    # `n_usable` is the package-wide count, so the rejection predicate can
+    # never drift from the predicate the masking solvers actually apply.
+    n_masked = length(prob.data_values) - n_usable(prob)
     n_masked == 0 && return nothing
     error("$solver_name does not support masked observations, and $n_masked " *
           "of $(length(prob.data_values)) data cells are masked (weight 0 " *
-          "or NaN value). Its likelihood is evaluated inside a Kalman / " *
+          "or non-finite value). Its likelihood is evaluated inside a Kalman / " *
           "particle recursion that has no per-cell mask, so masked cells " *
           "would silently corrupt the filter state rather than being " *
           "skipped. Use LAML, GCVSolver, CollocationLAML, GradientMatching, " *
@@ -628,7 +628,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     for oi in 1:n_obs, ti in 1:n_times
         y = prob.data_values[ti, oi]
         wv = prob.data_weights[ti, oi]
-        if wv > 0 && !isnan(y)
+        if _usable(y, wv)
             y_vec[k] = y
             w_vec[k] = wv
         end   # else keep the 0.0 placeholder with weight 0.0
@@ -944,7 +944,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     for j in 1:n_obs, i in 1:n_times
         wv = prob.data_weights[i,j]
         y = prob.data_values[i,j]
-        (wv > 0 && !isnan(y)) || continue
+        _usable(y, wv) || continue
         data_loss += wv * (y - pred[i,j])^2
         n_used += 1
     end

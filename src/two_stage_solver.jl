@@ -253,7 +253,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
         # lr_t → 0, so the loss stops moving no matter how far from an
         # optimum we are. Only declare plateau-convergence while the step
         # size is still meaningful (lr_t > 5% of the base lr).
-        if iter > 60 && lr_t > 0.05 * lr
+        # `best_loss < 1e9` is AdamSolver's failure-sentinel guard: the
+        # dynamics fall back to `du .= 1e6` when the RHS throws, so a run
+        # pinned at that sentinel is a stuck solver, not a converged one.
+        if iter > 60 && best_loss < 1e9 && lr_t > 0.05 * lr
             recent_min = minimum(loss_window)
             recent_max = maximum(loss_window)
             if (recent_max - recent_min) / max(abs(recent_min), 1.0) < 1e-6
