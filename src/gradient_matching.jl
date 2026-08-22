@@ -100,9 +100,9 @@ function _smoothing_spline_masked(t::AbstractVector{Float64},
                                   w::Union{Nothing,AbstractVector}=nothing;
                                   max_basis::Int=15)
     keep = if w === nothing
-        [i for i in eachindex(y) if !isnan(y[i])]
+        [i for i in eachindex(y) if isfinite(y[i])]
     else
-        [i for i in eachindex(y) if w[i] > 0 && !isnan(y[i])]
+        [i for i in eachindex(y) if _usable(y[i], w[i])]
     end
     length(keep) == length(y) && return _smoothing_spline(t, y; max_basis=max_basis)
     isempty(keep) && error("_smoothing_spline: an observation column is " *
@@ -376,10 +376,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
         loss_val
     end
 
+    # Honest convergence reporting, same taxonomy as the sibling
+    # gradient-matching solvers: `converged` only when a criterion actually
+    # fired; otherwise the loop exhausted its iteration budget.
+    conv_converged = false
+    conv_reason = :maxiters
+    conv_iters = 0
+
     if m > 0
         # ─── Gauss-Newton for penalized approximators (B-spline, GP) ───
         prev_obj = Inf
         for iter in 1:alg.maxiters
+            conv_iters = iter
             resid, J = gm_residual_jacobian(prob, times, y_smooth, dydt, beta, w)
 
             B = zeros(n_beta, n_beta)
@@ -399,13 +407,26 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
 
             if iter > 1 && abs(obj - prev_obj) < alg.tol * max(abs(prev_obj), 1.0)
                 if verbose; println("  Converged at iter $iter"); end
+                conv_converged = true
+                conv_reason = :objective_tol
                 break
             end
             prev_obj = obj
 
             JtJ = J' * J + B
             neg_Jtr = -(J' * resid)
-            delta = try; JtJ \ neg_Jtr; catch; try; (JtJ + 1e-6 * I) \ neg_Jtr; catch; break; end; end
+            delta = try
+                JtJ \ neg_Jtr
+            catch
+                try
+                    (JtJ + 1e-6 * I) \ neg_Jtr
+                catch
+                    # Even the ridged normal equations are unsolvable — a
+                    # numerical failure, not a converged fit.
+                    conv_reason = :singular_system
+                    break
+                end
+            end
 
             best_obj = obj; best_step = 0.0
             for k in 0:8
@@ -414,7 +435,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
                 obj_new = gm_loss(beta_new)
                 if obj_new < best_obj; best_obj = obj_new; best_step = ss; end
             end
-            if best_step == 0.0; if verbose; println("  No improvement, stopping"); end; break; end
+            if best_step == 0.0
+                if verbose; println("  No improvement, stopping"); end
+                # No step of any length improved the objective. That is a
+                # stalled line search, not a satisfied criterion.
+                conv_reason = :line_search_failure
+                break
+            end
             beta .= beta .+ best_step .* delta
 
             # Update smoothing params
@@ -469,6 +496,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
         loss_window = fill(Inf, 20)
 
         for iter in 1:alg.maxiters
+            conv_iters = iter
             grad = ForwardDiff.gradient(gm_loss_ad, beta)
             loss_val = gm_loss_ad(beta)
 
@@ -492,12 +520,27 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
                 println("  Adam iter $iter: loss=$(round(loss_val, sigdigits=5)) lr=$(round(lr_t, sigdigits=3))")
             end
 
-            # Convergence: check if loss plateau (relative change < tol over window)
-            if iter > 50
+            # Convergence: loss plateau (relative change < tol over window).
+            #
+            # `best_loss < 1e9` is AdamSolver's failure-sentinel guard: the
+            # dynamics fall back to `du .= 1e6` when the RHS throws, and a
+            # run pinned at that sentinel is a stuck solver, not a converged
+            # one. AdamSolver explicitly refuses to call that `:plateau`.
+            #
+            # `lr_t > 0.05 * lr` is the siblings' cosine-schedule guard,
+            # written out for consistency even though it is DORMANT here:
+            # this schedule has a 10% floor — `lr_t = lr*(0.1 + 0.45*(1 +
+            # cos(...)))` never falls below `0.1*lr` — so the clause is
+            # always true today. It is kept so the family reads the same
+            # way and so lowering that floor cannot silently reintroduce
+            # spurious end-of-schedule "convergence".
+            if iter > 50 && best_loss < 1e9 && lr_t > 0.05 * lr
                 recent_min = minimum(loss_window)
                 recent_max = maximum(loss_window)
                 if (recent_max - recent_min) / max(abs(recent_min), 1.0) < alg.tol
                     if verbose; println("  Converged at iter $iter (loss plateau)"); end
+                    conv_converged = true
+                    conv_reason = :plateau
                     break
                 end
             end
@@ -634,5 +677,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
     PSMSolution(params, obj_val, data_loss, edf, copy(theta),
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (deriv_loss=deriv_loss, method=:gradient_matching))
+                (deriv_loss=deriv_loss, method=:gradient_matching,
+                 converged=conv_converged, reason=conv_reason,
+                 iterations=conv_iters))
 end

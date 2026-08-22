@@ -68,7 +68,7 @@ function _gaussian_loglik(pred, data, weights, obs_noise_var)
         for i in 1:n_t
             w = weights[i, j]
             y = data[i, j]
-            (w > 0 && !isnan(y)) || continue
+            _usable(y, w) || continue
             ll -= w * (pred[i, j] - y)^2 / (2 * obs_noise_var)
         end
     end
@@ -95,7 +95,7 @@ function _vi_loglik(fam::AbstractLikelihood, pred, data, weights, obs_noise_var)
         for i in 1:n_t
             w = weights[i, j]
             y = data[i, j]
-            (w > 0 && !isnan(y)) || continue
+            _usable(y, w) || continue
             ll += w * loglik_pointwise(fam, y, pred[i, j])
         end
     end
@@ -183,12 +183,27 @@ end
 
 Effective degrees of freedom of the Gaussian (Laplace) approximation at the
 variational posterior mean: `tr((H + Λ)⁻¹ H)` with the Gauss–Newton
-information `H = JᵀWJ / σ²_obs`, `J = ∂μ̂/∂β` by forward finite
-differences, and `Λ` the variational prior precision.
+information `H = JᵀWJ`, `J = ∂μ̂/∂β` by forward finite differences, and
+`Λ` the variational prior precision.
 
-Only usable observation cells (`weight > 0`, non-NaN) enter `W`. Returns
-`NaN` when the model cannot be simulated at `mu_opt` or the linear system
-is singular — an honest missing value rather than a fabricated constant.
+`W` is the FAMILY's Gauss–Newton weight for the identity link, matching
+`irls_weights` and the LAML/GCV curvature:
+
+- Gaussian: `W = w / σ²_obs` (`obs_noise_var`), the classical form.
+- everything else: `W = w / V(μ̂)` with `V` the family's variance function
+  (`_variance_function`), evaluated at the fitted mean.
+
+`obs_noise_var` is read for Gaussian data ONLY. Non-Gaussian families
+carry their dispersion in the family object and `obs_noise_var` is
+hard-set to 1.0 by the caller, so the old unconditional `H = JᵀWJ/σ²_obs`
+silently reported a Poisson/NB/TruncatedNormal EDF computed with unit
+observation variance — a curvature off by the factor `V(μ̂)`, which for a
+Poisson fit with counts in the hundreds is two orders of magnitude.
+
+Only usable observation cells (`usable_cell`: positive weight, finite
+value) enter `W`. Returns `NaN` when the model cannot be simulated at
+`mu_opt` or the linear system is singular — an honest missing value
+rather than a fabricated constant.
 """
 function _vi_edf(prob::PSMProblem, mu_opt::Vector{Float64},
                  Λ::Matrix{Float64}, obs_noise_var::Float64, n_p::Int)
@@ -196,7 +211,7 @@ function _vi_edf(prob::PSMProblem, mu_opt::Vector{Float64},
     n_obs = size(prob.data_values, 2)
 
     keep = [(i, j) for j in 1:n_obs for i in 1:n_t
-            if prob.data_weights[i, j] > 0 && !isnan(prob.data_values[i, j])]
+            if usable_cell(prob, i, j)]
     isempty(keep) && return NaN
 
     base = try
@@ -223,8 +238,18 @@ function _vi_edf(prob::PSMProblem, mu_opt::Vector{Float64},
         end
     end
 
-    W = Diagonal([Float64(prob.data_weights[i, j]) for (i, j) in keep])
-    H = (J' * W * J) ./ obs_noise_var
+    fam = prob.likelihood
+    w_gn = if fam isa Gaussian
+        [Float64(prob.data_weights[i, j]) / obs_noise_var for (i, j) in keep]
+    else
+        # Same μ ≤ 0 regularization (`abs`) and variance floor as
+        # `laml.jl`'s Pearson dispersion, so the two curvatures agree.
+        [Float64(prob.data_weights[i, j]) /
+         max(_variance_function(fam, abs(base[i, j])), 1e-10)
+         for (i, j) in keep]
+    end
+    all(isfinite, w_gn) || return NaN
+    H = J' * Diagonal(w_gn) * J
     edf = try
         tr((H .+ Λ) \ H)
     catch
@@ -298,8 +323,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
         n_t = size(prob.data_values, 1)
         n_obs = size(prob.data_values, 2)
         # Usable cells only: a masked/NaN datum must not poison σ̂².
-        usable(i, j) = prob.data_weights[i, j] > 0 &&
-                       !isnan(prob.data_values[i, j])
+        usable(i, j) = usable_cell(prob, i, j)
         total_var = 0.0
         n_dd = 0
         if n_t >= 3
@@ -423,7 +447,14 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
         # against the cosine lr schedule manufacturing a plateau: near
         # maxiters lr_t → 0, so the ELBO stops moving however far from the
         # optimum φ still is. Only stop while the step is meaningful.
-        if iter > 100 && lr_t > 0.05 * lr
+        #
+        # `best_elbo > -1e9` is AdamSolver's failure-sentinel guard in ELBO
+        # (maximization) form: `_vi_elbo` returns −1e10 when the dynamics
+        # cannot be evaluated, and a run pinned at that sentinel is a stuck
+        # solver, not a converged one — it must keep iterating rather than
+        # stop early on the flat sentinel.
+        if iter > 100 && isfinite(best_elbo) && best_elbo > -1e9 &&
+           lr_t > 0.05 * lr
             window = max(1, length(elbo_history) - 49):length(elbo_history)
             recent = elbo_history[window]
             recent_range = maximum(recent) - minimum(recent)
@@ -484,7 +515,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     #     edf = tr((H + Λ)⁻¹ H),
     #
     # with H the Gauss–Newton observed information of the data term,
-    # H = JᵀWJ/σ²_obs and J = ∂μ̂/∂β by finite differences, and Λ the SAME
+    # H = JᵀWJ (W = w/σ²_obs for Gaussian data, w/V(μ̂) for every other
+    # family — see `_vi_edf`) and J = ∂μ̂/∂β by finite differences, and Λ the SAME
     # prior precision (ridge + S/prior_scale) that defines the variational
     # prior above. This is the standard penalized-regression EDF and, being
     # built from the model Jacobian rather than from q's scale parameters,

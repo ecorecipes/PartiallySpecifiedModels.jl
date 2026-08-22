@@ -246,6 +246,23 @@ marginal pass's by the ODE alone.
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
+
+# Masked data
+
+This solver does NOT support masked observations and raises an error if
+any data cell is masked (`data_weights == 0` or a non-finite
+`data_values` entry). Its likelihood is evaluated inside a Kalman /
+particle recursion with no per-cell mask: honouring a mask means skipping
+the FILTER UPDATE, not merely the density term, for the masked cells.
+Left unguarded the masked cells corrupt the filter state while the run
+still looks like an ordinary converged fit, so it fails loudly instead.
+Drop the masked rows from `data_times`/`data_values`, or use one of the
+masking-capable solvers (`LAML`, `GCVSolver`, `CollocationLAML`,
+`GradientMatching`, `TwoStageSolver`, `BNGSolver`, `ODINSolver`,
+`RKHSSolver`, `IntegralMatchingSolver`, `AdamSolver`,
+`MultipleShootingSolver`, `DerivativeFreeSolver`, `MCMCSolver`,
+`MagiSolver`, `VariationalSolver`, `ABCSolver`,
+`ProfileLikelihoodSolver`).
 """
 function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
     _validate_problem(prob, "DaltonSolver"; require_continuous=true)

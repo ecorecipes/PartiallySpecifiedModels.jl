@@ -110,9 +110,16 @@ end
     _usable(y, w) -> Bool
 
 A data cell counts toward an objective iff its weight is strictly
-positive AND its value is not NaN. This is the single convention shared
-by `weighted_data_loss`, the LAML/GCV data flattening, the bootstrap,
-ABC, MAGI, VI and MCMC.
+positive AND its value is FINITE. This is the single convention shared by
+`weighted_data_loss`, `usable_cell`, `n_usable`, `_reject_masked_data`,
+the LAML/GCV data flattening, the bootstrap, ABC, MAGI, VI and MCMC.
+
+`isfinite`, not `!isnan`: `±Inf` is no more usable as an observation than
+`NaN` is. The two predicates coexisted for a while — `weighted_data_loss`
+gated on `isfinite` while the cell predicates gated on `!isnan` — so an
+`Inf` datum was counted in every denominator, excluded from every
+numerator, and waved through by `_reject_masked_data` into the Kalman
+solvers that cannot mask at all.
 
 Enforcing it *inside* the likelihood families is what makes the
 convention hold for the OPTIMIZED objective and not merely the reported
@@ -125,7 +132,7 @@ return its initialization without raising an error.
 For complete data (every weight positive, every value finite) the guard
 never fires, so all values below are bit-for-bit unchanged.
 """
-@inline _usable(y::Real, w::Real) = w > 0 && !isnan(y)
+@inline _usable(y::Real, w::Real) = w > 0 && isfinite(y)
 
 """
     _n_usable(y, w) -> Int
@@ -148,7 +155,7 @@ end
     log_likelihood(fam, y, mu, w)
 
 Total weighted log-likelihood: Σ_i w_i ℓ(y_i, μ_i), summed over the
-USABLE cells only (`w_i > 0` and `y_i` not NaN — see `_usable`).
+USABLE cells only (`w_i > 0` and `y_i` finite — see `_usable`).
 
 Poisson, NegativeBinomial, and TruncatedNormal include their full
 normalizing constants and are mutually comparable (e.g. for AIC). The
@@ -237,8 +244,8 @@ y_i, μ_i)` reproduces `log_likelihood(fam, y, mu, w)` exactly. The
 parameter handled by each solver), matching the `log_likelihood`
 convention. AD-safe: `μ` may be a `ForwardDiff.Dual`.
 
-A NaN `y` is a masked (missing) observation and contributes exactly
-zero, matching `log_likelihood`'s `_usable` guard. The zero is built as
+A non-finite `y` (NaN or ±Inf) is a masked (missing) observation and
+contributes exactly zero, matching `log_likelihood`'s `_usable` guard. The zero is built as
 `zero(y * mu)` so it carries `μ`'s type — a `ForwardDiff.Dual` stays a
 Dual (with zero partials), keeping the accumulation type-stable and the
 gradient contribution correctly zero rather than NaN. Zero-weight cells
@@ -246,10 +253,10 @@ need no guard here: the caller multiplies by `w = 0`, and the value
 returned for a finite `y` is finite.
 """
 loglik_pointwise(::Gaussian, y::Real, mu::Real) =
-    isnan(y) ? zero(y * mu) : -0.5 * (y - mu)^2
+    !isfinite(y) ? zero(y * mu) : -0.5 * (y - mu)^2
 
 function loglik_pointwise(::Poisson, y::Real, mu::Real)
-    isnan(y) && return zero(y * mu)
+    !isfinite(y) && return zero(y * mu)
     # Same μ ≤ 0 convention as log_likelihood/irls_weights: max(|μ|, 1e-6).
     mu_c = max(abs(mu), 1e-6)
     kern = y > 0 ? y * log(mu_c) - mu_c : -mu_c
@@ -257,7 +264,7 @@ function loglik_pointwise(::Poisson, y::Real, mu::Real)
 end
 
 function loglik_pointwise(fam::NegativeBinomial, y::Real, mu::Real)
-    isnan(y) && return zero(y * mu)
+    !isfinite(y) && return zero(y * mu)
     θ = fam.theta
     mu_c = max(mu, 1e-10)
     kern = y * log(mu_c / (mu_c + θ)) + θ * log(θ / (mu_c + θ))
@@ -265,7 +272,7 @@ function loglik_pointwise(fam::NegativeBinomial, y::Real, mu::Real)
 end
 
 function loglik_pointwise(fam::TruncatedNormal, y::Real, mu::Real)
-    isnan(y) && return zero(y * mu)
+    !isfinite(y) && return zero(y * mu)
     σ = fam.sigma
     a = fam.lower
     z = (y - mu) / σ
@@ -273,7 +280,7 @@ function loglik_pointwise(fam::TruncatedNormal, y::Real, mu::Real)
 end
 
 loglik_pointwise(fam::CustomLikelihood, y::Real, mu::Real) =
-    isnan(y) ? zero(y * mu) : fam.loglik_scalar(y, mu)
+    !isfinite(y) ? zero(y * mu) : fam.loglik_scalar(y, mu)
 
 # ─── IRLS working weights ──────────────────────────────────────────
 
@@ -285,7 +292,7 @@ Compute IRLS working weights W̃ = w / V(μ) for identity-link Fisher scoring.
 The PSM solver operates on the response scale (identity link), so
 the working weight is the inverse variance: W̃_i = w_i / V(μ_i).
 
-Unusable cells (`_usable` false: zero weight or NaN datum) get working
+Unusable cells (`_usable` false: zero weight or non-finite datum) get working
 weight exactly 0, so they drop out of `J'W̃J`, out of the EDF trace and
 out of every PCLS step. For a zero-weight cell that is already what the
 formulae give whenever `y` is finite; the guard matters when `y` is NaN

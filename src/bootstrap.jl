@@ -128,7 +128,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
     # coefficients and all CIs silently collapsed to zero width.
     valid = BitMatrix(undef, n_times, n_obs)
     for j in 1:n_obs, i in 1:n_times
-        valid[i, j] = prob.data_weights[i, j] > 0 && !isnan(sol.data_values[i, j])
+        valid[i, j] = _usable(sol.data_values[i, j], prob.data_weights[i, j])
     end
 
     # Residual scale per observed state, over usable cells only and with

@@ -167,7 +167,7 @@ function collocation_residual_jacobian(
             # Gauss-Newton step all-NaN, the line search rejects every
             # step, and the solver reports `:plateau` convergence at its
             # initialization. (The Jacobian row is already a clean 0.)
-            data_resid[idx] = (w_vec[idx] > 0 && !isnan(prob.data_values[i, j])) ?
+            data_resid[idx] = usable_cell(prob, i, j) ?
                 sqrt(w_vec[idx]) * (prob.data_values[i, j] - alpha[i, sk]) : 0.0
         end
     end
@@ -400,7 +400,7 @@ function collocation_residual_only(
             # Gauss-Newton step all-NaN, the line search rejects every
             # step, and the solver reports `:plateau` convergence at its
             # initialization. (The Jacobian row is already a clean 0.)
-            data_resid[idx] = (w_vec[idx] > 0 && !isnan(prob.data_values[i, j])) ?
+            data_resid[idx] = usable_cell(prob, i, j) ?
                 sqrt(w_vec[idx]) * (prob.data_values[i, j] - alpha[i, sk]) : 0.0
         end
     end
@@ -564,9 +564,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
         w_vec[(j - 1) * T_pts + i] = usable_cell(prob, i, j) ?
                                      prob.data_weights[i, j] : 0.0
     end
-    n_usable_cells = count(>(0), w_vec)
+    # The package-wide count (`solver.jl`), not a re-derived one, so
+    # this can never drift from the predicate the flatten applied.
+    n_usable_cells = n_usable(prob)
     n_usable_cells == 0 && error("CollocationLAML: every observation is " *
-        "masked (all data_weights are 0 or all data_values are NaN); there " *
+        "masked (every weight is 0 or every value is non-finite); there " *
         "is nothing to fit.")
 
     # Continuation schedule for λ_ode
@@ -735,7 +737,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                 # subsequent continuation level.
                 w_vec2 = ord(prob.data_weights)
                 for k in eachindex(y_vec2)
-                    (w_vec2[k] > 0 && !isnan(y_vec2[k])) || (w_vec2[k] = 0.0;
+                    _usable(y_vec2[k], w_vec2[k]) || (w_vec2[k] = 0.0;
                                                              y_vec2[k] = 0.0)
                 end
                 mu_base = ord(μ_pred)

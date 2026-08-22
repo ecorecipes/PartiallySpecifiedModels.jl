@@ -85,7 +85,7 @@ function init_shooting_vars(data_times::Vector{Float64}, data_values::Matrix{Flo
         # independently of any masking in the loss. Complete data keeps every
         # row, so the interpolant is bit-for-bit the same.
         keep = [i for i in axes(data_values, 1)
-                if !isnan(data_values[i, j]) &&
+                if isfinite(data_values[i, j]) &&
                    (data_weights === nothing || data_weights[i, j] > 0)]
         length(keep) < 2 && continue   # leave this state at 0.0; too little data
         itp = CubicSpline(data_values[keep, j], data_times[keep];

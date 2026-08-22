@@ -282,7 +282,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
         end
         # Plateau convergence, guarded against the cosine lr schedule
         # manufacturing a plateau as lr_t → 0 near n_total.
-        if step > 60 && lr_t > 0.05 * lr
+        # `best_loss < 1e9` is AdamSolver's failure-sentinel guard: the
+        # dynamics fall back to `du .= 1e6` when the RHS throws, so a run
+        # pinned at that sentinel is a stuck solver, not a converged one.
+        if step > 60 && best_loss < 1e9 && lr_t > 0.05 * lr
             rmin, rmax = extrema(loss_window)
             if (rmax - rmin) / max(abs(rmin), 1.0) < 1e-6
                 if verbose; println("  Converged at step $step (loss plateau)"); end

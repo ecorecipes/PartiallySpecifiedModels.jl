@@ -64,15 +64,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::DerivativeFreeSolver)
     for oi in 1:n_obs, ti in 1:n_times
         y = prob.data_values[ti, oi]
         wv = prob.data_weights[ti, oi]
-        if wv > 0 && !isnan(y)
+        if _usable(y, wv)
             y_vec[k] = y
             w_vec[k] = wv
         end   # else keep the 0.0 placeholder with weight 0.0
         k += 1
     end
-    n_usable_cells = count(>(0), w_vec)
+    # The package-wide count (`solver.jl`), not a re-derived one, so
+    # this can never drift from the predicate the flatten applied.
+    n_usable_cells = n_usable(prob)
     n_usable_cells == 0 && error("DerivativeFreeSolver: every observation is " *
-        "masked (all data_weights are 0 or all data_values are NaN); there " *
+        "masked (every weight is 0 or every value is non-finite); there " *
         "is nothing to fit.")
 
     # Build penalty matrices for optional regularization

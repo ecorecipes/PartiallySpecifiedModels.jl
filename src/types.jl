@@ -1815,6 +1815,11 @@ warm-started from the previous grid point. Gaussian likelihoods only.
 - `ci_level`: confidence level for LR-based CI (default 0.95)
 - `param_indices`: which parameter indices to profile (default `nothing` = all)
 - `verbose`: print progress
+- `base_alg`: the `LAML` fit the profile is taken around (default
+  `LAML(verbose=false)`). The returned solution reports THIS fit's
+  convergence keys, so a deliberately truncated base — e.g.
+  `LAML(maxiters=1)` — surfaces as `converged = false` rather than being
+  laundered into a converged profile-likelihood result.
 
 # References
 - Simpson & Maclaren (2023), PLOS Comp Biol
@@ -1824,12 +1829,15 @@ struct ProfileLikelihoodSolver
     ci_level::Float64
     param_indices::Union{Nothing, Vector{Int}}
     verbose::Bool
+    base_alg::LAML
 end
 
 ProfileLikelihoodSolver(; n_profile_points::Int=20, ci_level::Float64=0.95,
                            param_indices::Union{Nothing, Vector{Int}}=nothing,
-                           verbose::Bool=false) =
-    ProfileLikelihoodSolver(n_profile_points, ci_level, param_indices, verbose)
+                           verbose::Bool=false,
+                           base_alg::LAML=LAML(verbose=false)) =
+    ProfileLikelihoodSolver(n_profile_points, ci_level, param_indices, verbose,
+                            base_alg)
 
 # ─── Ensemble Kalman inversion solver ──────────────────────────────
 

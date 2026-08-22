@@ -332,7 +332,13 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
     # pure-spline problems, whose code path — and results — are unchanged.
     Mp_eff = _restricted_dof_Mp(J, W_irls, offsets, nknots_list, n_p, total_rank)
     n_eff = max(n - Mp_eff, 1.0)
-    if Mp_eff >= n
+    # Gated on the Gaussian branch: `n_eff` is read ONLY by the Gaussian
+    # REML scale below. Non-Gaussian families take the Pearson dispersion
+    # path, whose denominator is `n − sum(ranks)` and never touches
+    # `n_eff` — so warning there described a quantity the fit does not
+    # use, and a healthy Poisson fit could emit an alarming irrelevant
+    # message about an unidentified σ̂².
+    if family isa Gaussian && Mp_eff >= n
         @warn "LAML: the unpenalized (fixed-effect) part of the model has " *
               "rank $(Mp_eff) ≥ n = $n data points, so the restricted " *
               "residual degrees of freedom are exhausted and the REML " *

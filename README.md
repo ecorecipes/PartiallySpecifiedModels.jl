@@ -131,6 +131,26 @@ PartiallySpecifiedModels.jl provides 22 solvers spanning penalized likelihood, g
 - **`TruncatedNormal()`** — Continuous data bounded below (e.g. non-negative densities)
 - **`CustomLikelihood(loglik_scalar)`** — User-defined likelihood
 
+### Missing / Masked Observations
+
+Mark a missing cell as `NaN` in `data_values` **and** `0.0` in `data_weights`:
+
+```julia
+data_values[3, 1]  = NaN
+data_weights[3, 1] = 0.0
+```
+
+Masked cells are excluded from the objective, the reported loss, the scale
+estimate, every denominator and the residual diagnostics — no reshaping of
+`data_times`/`data_values` needed. Marking both ways matters: `0 * NaN = NaN`,
+so a zero weight alone does not neutralise a `NaN` value.
+
+All solvers support masking **except** `RodeoSolver`, `DaltonSolver`,
+`PseudoMarginalSolver` and `EnsembleKalmanSolver`, whose likelihood lives
+inside a Kalman/particle recursion with no per-cell mask; they raise a clear
+error rather than silently corrupting the filter. Drop the masked rows before
+building the problem to use those four.
+
 ### Dynamical System Support
 
 - **Continuous-time**: ODEs via `OrdinaryDiffEq.jl`, DDEs via `DelayDiffEq.jl`

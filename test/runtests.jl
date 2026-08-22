@@ -4403,6 +4403,22 @@ using StableRNGs
             @test s_pl.convergence.iterations == base.convergence.iterations
             @test s_pl.convergence.method == :profile_likelihood
             @test haskey(s_pl.convergence, :profiles)
+
+            # A NON-converged base must propagate as non-converged. The
+            # assertions above pass identically on the pre-fix hard-coded
+            # `converged=true` because THIS base fit converges — only a
+            # truncated base discriminates.
+            base_trunc = solve(prob_pl, LAML(maxiters=1, verbose=false))
+            @test base_trunc.convergence.converged == false
+            s_trunc = solve(prob_pl,
+                ProfileLikelihoodSolver(n_profile_points=5, param_indices=[1],
+                                        base_alg=LAML(maxiters=1, verbose=false)))
+            # PRE-FIX this was `true` regardless; now it tracks the base.
+            @test s_trunc.convergence.converged == false
+            @test s_trunc.convergence.converged == base_trunc.convergence.converged
+            @test s_trunc.convergence.reason == base_trunc.convergence.reason
+            @test s_trunc.convergence.iterations == base_trunc.convergence.iterations
+            @test s_trunc.convergence.method == :profile_likelihood
         end
 
         @testset "weighted_data_loss — weighted and NaN-safe" begin
@@ -4490,6 +4506,14 @@ using StableRNGs
             # REML scale). The sibling solvers below — GCVSolver and
             # CollocationLAML, the same penalized-likelihood family — did NOT
             # have a masked flatten and DO fail pre-fix.
+            #
+            # HONEST LABEL: every assertion in THIS block passes on pre-fix
+            # code. It is a REGRESSION GUARD, not a discriminating test. The
+            # discriminating coverage of `n = _n_usable` and of
+            # `estimate_smoothing_params` lives in the
+            # "LAML sample size n counts usable cells only" block below,
+            # which fails pre-fix both as a unit test (λ 29% off) and
+            # end-to-end (λ 85% off, EDF 22% off).
             sol_m = solve(prob_nan_masked, LAML(maxiters=30, verbose=false))
             sol_p = solve(prob_nan_pruned, LAML(maxiters=30, verbose=false))
 
@@ -4682,6 +4706,9 @@ using StableRNGs
             # the filter state rather than be skipped. They must say so
             # instead of silently returning their initialization.
             for alg in (RodeoSolver(n_steps=20, maxiters=2, verbose=false),
+                        DaltonSolver(n_steps=20, maxiters=2, verbose=false),
+                        PseudoMarginalSolver(n_samples=5, n_warmup=2,
+                                             n_steps=20, verbose=false),
                         EnsembleKalmanSolver(n_ensemble=5, n_iterations=2,
                                              verbose=false))
                 err = try
@@ -4692,6 +4719,391 @@ using StableRNGs
                 @test err isa ErrorException
                 @test occursin("does not support masked observations", err.msg)
             end
+        end
+
+        # ── D4: ONE usability predicate everywhere ────────────────────
+        @testset "usability predicate is isfinite, consistently" begin
+            using PartiallySpecifiedModels: _usable, usable_cell, n_usable,
+                                            weighted_data_loss
+            # PRE-FIX: `weighted_data_loss` gated on `isfinite(y)` while
+            # `_usable`/`usable_cell`/`n_usable`/`_reject_masked_data` gated
+            # on `!isnan(y)`. An Inf datum was therefore EXCLUDED from the
+            # numerator but COUNTED in every denominator, and sailed past
+            # the Kalman-solver rejection into a filter that cannot mask.
+            @test !_usable(Inf, 1.0)
+            @test !_usable(-Inf, 1.0)
+            @test !_usable(NaN, 1.0)
+            @test !_usable(1.0, 0.0)
+            @test _usable(1.0, 1.0)
+
+            ts_inf = collect(0.0:1.0:5.0)
+            vals_inf = reshape(collect(1.0:6.0), :, 1)
+            vals_inf[3, 1] = Inf
+            prob_inf = mk_nan(ts_inf, vals_inf, ones(6, 1))
+
+            @test !usable_cell(prob_inf, 3, 1)
+            @test usable_cell(prob_inf, 2, 1)
+            # Numerator and denominator now agree: 5 usable cells, and the
+            # Inf row contributes nothing to the loss.
+            @test n_usable(prob_inf) == 5
+            @test isfinite(weighted_data_loss(prob_inf, zeros(6, 1)))
+            @test weighted_data_loss(prob_inf, zeros(6, 1)) ≈
+                  sum(x^2 for x in [1.0, 2.0, 4.0, 5.0, 6.0])
+            # ...and the rejection predicate no longer waves it through.
+            err_inf = try
+                solve(prob_inf, RodeoSolver(n_steps=10, maxiters=2,
+                                            verbose=false)); nothing
+            catch e; e end
+            @test err_inf isa ErrorException
+            @test occursin("does not support masked observations", err_inf.msg)
+
+            # Pointwise likelihoods treat ±Inf like NaN: zero contribution,
+            # zero gradient, rather than an Inf/NaN that poisons the sum.
+            for fam in (Gaussian(), Poisson(), NegativeBinomial(5.0),
+                        TruncatedNormal())
+                @test PartiallySpecifiedModels.loglik_pointwise(fam, Inf, 2.0) == 0.0
+            end
+        end
+
+        # ── D1: residual diagnostics are mask-aware ───────────────────
+        @testset "residual diagnostics are mask-aware" begin
+            using PartiallySpecifiedModels: residual_diagnostics, appraise
+            # PRE-FIX FAILURE MODE (measured on this exact fit): the LAML
+            # fit itself was clean, but `diagnostics.jl` never saw the mask.
+            #   residual_diagnostics: durbin_watson = [NaN], acf = all NaN,
+            #     semivariogram gamma = all NaN
+            #   appraise: residuals/observed/qq_sample all NaN — the `std`
+            #     over a vector containing one NaN is NaN, so EVERY
+            #     standardized residual was NaN, not just the masked one.
+            # The comparison fit (masked rows physically pruned) was fine
+            # throughout, so each assertion below discriminates.
+            ts_d = collect(0.0:0.5:10.0)
+            # Deterministic structured "noise": residuals must be dominated
+            # by signal, not by ODE round-off, or DW/ACF compare pure noise.
+            noise_d = [0.05 * sin(3.1 * i) + 0.03 * cos(7.7 * i)
+                       for i in 1:length(ts_d)]
+            clean_d = exp.(0.15 .* ts_d) .+ noise_d
+            mask_d = [4, 9, 15]
+            keep_d = setdiff(1:length(ts_d), mask_d)
+
+            vals_d = reshape(copy(clean_d), :, 1)
+            w_d = ones(length(ts_d), 1)
+            for i in mask_d
+                vals_d[i, 1] = NaN
+                w_d[i, 1] = 0.0
+            end
+
+            sol_dm = solve(mk_nan(ts_d, vals_d, w_d),
+                           LAML(maxiters=30, verbose=false))
+            sol_dp = solve(mk_nan(ts_d[keep_d],
+                                  reshape(clean_d[keep_d], :, 1),
+                                  ones(length(keep_d), 1)),
+                           LAML(maxiters=30, verbose=false))
+
+            rd = residual_diagnostics(sol_dm)
+            rp = residual_diagnostics(sol_dp)
+
+            # (a) every STATISTIC is finite
+            @test all(isfinite, rd.durbin_watson)
+            @test all(isfinite, rd.acf)
+            @test all(isfinite, rd.semivariogram[1].gamma)
+            @test all(isfinite, rd.semivariogram[1].lags)
+            # `residuals` keeps its rectangular shape; the mask says which
+            # cells carry a residual at all.
+            @test size(rd.residuals) == size(sol_dm.data_values)
+            @test rd.usable == isfinite.(sol_dm.data_values)
+            @test count(rd.usable) == length(keep_d)
+            @test all(isfinite, rd.residuals[rd.usable])
+            @test all(!isfinite, rd.residuals[.!rd.usable])
+
+            # (b) they MATCH the fit with the masked rows genuinely removed
+            @test isapprox(rd.durbin_watson[1], rp.durbin_watson[1]; rtol=1e-4)
+            @test size(rd.acf) == size(rp.acf)
+            @test isapprox(rd.acf, rp.acf; rtol=1e-4)
+            @test isapprox(rd.semivariogram[1].gamma,
+                           rp.semivariogram[1].gamma; rtol=1e-3)
+
+            ad = appraise(sol_dm)
+            ap = appraise(sol_dp)
+            @test length(ad.residuals) == length(keep_d)
+            @test length(ad.observed) == length(keep_d)
+            @test length(ad.fitted) == length(keep_d)
+            @test length(ad.qq_theoretical) == length(keep_d)
+            @test all(isfinite, ad.residuals)
+            @test all(isfinite, ad.observed)
+            @test all(isfinite, ad.fitted)
+            @test all(isfinite, ad.qq_sample)
+            @test all(isfinite, ad.qq_theoretical)
+            @test all(isfinite, ad.durbin_watson)
+            @test issorted(ad.qq_sample)
+            @test isapprox(ad.residuals, ap.residuals; rtol=1e-3)
+            @test isapprox(ad.observed, ap.observed; rtol=1e-10)
+            @test isapprox(ad.durbin_watson[1], ap.durbin_watson[1]; rtol=1e-4)
+
+            # Non-Gaussian path (deviance residuals + robust scale) is
+            # masked too — pre-fix `median_abs` over a NaN-bearing vector
+            # made every standardized residual NaN.
+            ad_p = appraise(sol_dm; family=Poisson())
+            @test length(ad_p.residuals) == length(keep_d)
+            @test all(isfinite, ad_p.residuals)
+
+            # DOCUMENTED LIMITATION: `PSMSolution` carries no data_weights,
+            # so a cell masked ONLY by a zero weight (finite value) is not
+            # detectable and is still counted. `prob_nan_masked` has exactly
+            # such a cell (1e6 at weight 0) plus two NaN cells.
+            sol_lim = solve(prob_nan_masked, LAML(maxiters=20, verbose=false))
+            rl = residual_diagnostics(sol_lim)
+            @test count(rl.usable) == length(times_nan) - 2   # NaNs only
+            @test all(isfinite, rl.durbin_watson)             # still finite
+        end
+
+        # ── D5 / D6: IntegralMatchingSolver gates like its siblings ───
+        @testset "IntegralMatchingSolver masks its loss" begin
+            # PRE-FIX: the smoother dropped the masked rows, but the loss ran
+            # over EVERY time index ungated and anchored the increments on
+            # `y_smooth[1, k]` even when row 1 was masked — so masked rows
+            # were fitted against the smoother's own interpolation and, with
+            # row 1 masked, against its extrapolation.
+            ts_i = collect(0.0:0.5:8.0)
+            clean_i = exp.(0.15 .* ts_i)
+            mask_i = [1, 6, 11]        # row 1 masked ⇒ baseline must move
+            keep_i = setdiff(1:length(ts_i), mask_i)
+            vals_i = reshape(copy(clean_i), :, 1)
+            w_i = ones(length(ts_i), 1)
+            for i in mask_i
+                vals_i[i, 1] = NaN
+                w_i[i, 1] = 0.0
+            end
+
+            s_im = solve(mk_nan(ts_i, vals_i, w_i),
+                         IntegralMatchingSolver(maxiters=120, verbose=false))
+            @test isfinite(s_im.objective)
+            @test isfinite(s_im.data_loss)
+            @test all(isfinite, collect(s_im.parameters))
+            @test abs(s_im.unknown_functions[:r](2.0) - 0.15) < 0.06
+
+            # Every cell masked ⇒ nothing to match; say so instead of
+            # optimizing against a pure interpolation.
+            all_masked = fill(NaN, length(ts_i), 1)
+            err_im = try
+                solve(mk_nan(ts_i, all_masked, zeros(length(ts_i), 1)),
+                      IntegralMatchingSolver(maxiters=5, verbose=false))
+                nothing
+            catch e; e end
+            @test err_im isa ErrorException
+            # The smoother refuses first (`_smoothing_spline`); the
+            # baseline guard added here is defence-in-depth behind it.
+            @test occursin("masked", err_im.msg)
+        end
+
+        # ── D2: MagiSolver reports a real objective and data_loss ─────
+        @testset "MagiSolver reports objective and data_loss" begin
+            # PRE-FIX: `PSMSolution(params, 0.0, 0.0, …)` — the objective AND
+            # the data loss were hard-coded zero, so every MAGI run claimed
+            # a perfect fit no diagnostic could distinguish from a real one.
+            ts_mg = collect(0.0:1.0:8.0)
+            vals_mg = reshape(exp.(-0.3 .* ts_mg), :, 1)
+            prob_mg = PSMProblem((du, u, p, t) -> (du[1] = -p.r(t) * u[1]),
+                [1.0], (0.0, 8.0),
+                [BSplineApproximator(:r, (0.0, 8.0), 5; initial=0.2)];
+                data_times=ts_mg, data_values=vals_mg, obs_to_state=[1],
+                known_params=NamedTuple(), likelihood=Gaussian(),
+                solver=Tsit5())
+            s_mg = solve(prob_mg, MagiSolver(n_samples=30, n_warmup=30,
+                                             n_gridpoints=17, verbose=false))
+            @test isfinite(s_mg.objective)
+            @test isfinite(s_mg.data_loss)
+            @test s_mg.data_loss >= 0.0
+            # It is the SAME mask-aware weighted RSS every other solver
+            # reports, evaluated at the posterior-mean trajectory.
+            @test s_mg.data_loss ≈
+                  PartiallySpecifiedModels.weighted_data_loss(prob_mg,
+                                                              s_mg.fitted_values)
+            @test isfinite(s_mg.convergence.mean_logposterior)
+            @test s_mg.objective ≈ -s_mg.convergence.mean_logposterior
+            # NUTS has no stopping criterion: loop exhaustion, reported honestly.
+            @test haskey(s_mg.convergence, :converged)
+            @test haskey(s_mg.convergence, :reason)
+            @test s_mg.convergence.converged == false
+            @test s_mg.convergence.reason == :maxiters
+        end
+
+        # ── D2: GradientMatching reports converged/reason ─────────────
+        @testset "GradientMatching reports convergence keys" begin
+            # PRE-FIX: its convergence NamedTuple was
+            # `(deriv_loss=…, method=:gradient_matching)` — no `converged`,
+            # no `reason`, unlike every sibling solver.
+            ts_g = collect(0.0:0.5:10.0)
+            vals_g = reshape(exp.(0.15 .* ts_g), :, 1)
+            prob_g = mk_nan(ts_g, vals_g, ones(length(ts_g), 1))
+            s_g = solve(prob_g, GradientMatching(maxiters=40, verbose=false))
+            @test haskey(s_g.convergence, :converged)
+            @test haskey(s_g.convergence, :reason)
+            @test haskey(s_g.convergence, :iterations)
+            @test s_g.convergence.converged isa Bool
+            @test s_g.convergence.reason isa Symbol
+            @test s_g.convergence.reason in
+                  (:objective_tol, :maxiters, :plateau,
+                   :line_search_failure, :singular_system)
+            @test 1 <= s_g.convergence.iterations <= 40
+            # `converged` is only ever true alongside a criterion reason.
+            @test !s_g.convergence.converged ||
+                  s_g.convergence.reason in (:objective_tol, :plateau)
+        end
+
+        # ── D3: _vi_edf uses the family's curvature ───────────────────
+        @testset "_vi_edf uses the family variance function" begin
+            using PartiallySpecifiedModels: _vi_edf
+            # PRE-FIX: `H = J'WJ / obs_noise_var` unconditionally, and
+            # `obs_noise_var` is hard-set to 1.0 for non-Gaussian families —
+            # so a Poisson/NB EDF was computed with UNIT observation
+            # variance instead of V(μ̂). With counts in the hundreds that is
+            # a curvature wrong by two orders of magnitude.
+            ts_v = collect(0.0:1.0:10.0)
+            mu_v = 200.0 .* exp.(0.05 .* ts_v)
+            counts = round.(mu_v)
+            prob_pois = PSMProblem((du, u, p, t) -> (du[1] = p.r(u[1]) * u[1]),
+                [200.0], (0.0, 10.0),
+                [BSplineApproximator(:r, (150.0, 400.0), 5; initial=x -> 0.05)];
+                data_times=ts_v, data_values=reshape(counts, :, 1),
+                obs_to_state=[1], likelihood=Poisson(), solver=Tsit5())
+
+            beta_v = PartiallySpecifiedModels.build_initial_params(prob_pois)
+            n_pv = length(beta_v)
+            # Λ large enough that neither EDF saturates at the n_p clamp,
+            # so the two curvatures are cleanly separated.
+            Λ = Matrix(1.0e4 * I, n_pv, n_pv)
+
+            edf_fam = _vi_edf(prob_pois, Float64.(beta_v), Λ, 1.0, n_pv)
+            @test isfinite(edf_fam)
+            @test 0.0 <= edf_fam <= n_pv
+
+            # The pre-fix curvature is exactly what `_vi_edf` computes for a
+            # GAUSSIAN problem with the same data and σ²_obs = 1 — the unit
+            # observation variance. Reconstruct it and show the two differ:
+            # if they agreed, the fix would be a no-op.
+            prob_gauss = PSMProblem((du, u, p, t) -> (du[1] = p.r(u[1]) * u[1]),
+                [200.0], (0.0, 10.0),
+                [BSplineApproximator(:r, (150.0, 400.0), 5; initial=x -> 0.05)];
+                data_times=ts_v, data_values=reshape(counts, :, 1),
+                obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+            edf_prefix = _vi_edf(prob_gauss, Float64.(beta_v), Λ, 1.0, n_pv)
+            @test isfinite(edf_prefix)
+            # MEASURED: Poisson curvature gives EDF 1.180, the pre-fix
+            # unit-variance form gives 2.990 — a factor of 2.5.
+            @test !isapprox(edf_fam, edf_prefix; rtol=1e-2)
+            @test edf_fam < edf_prefix
+
+            # Gaussian data is untouched by the change: still w/σ²_obs.
+            @test _vi_edf(prob_gauss, Float64.(beta_v), Λ, 4.0, n_pv) <
+                  edf_prefix        # more observation noise ⇒ fewer dof
+        end
+
+        # ── D7: the Mp_eff ≥ n warning is Gaussian-only ───────────────
+        @testset "LAML Mp_eff warning is gated to the Gaussian branch" begin
+            using PartiallySpecifiedModels: estimate_smoothing_params
+            # PRE-FIX: the warning fired for every family, but only the
+            # Gaussian branch reads `n_eff = n − Mp_eff`; the non-Gaussian
+            # branch uses `n − sum(ranks)`. A healthy Poisson fit could
+            # therefore emit an alarming, irrelevant "σ̂² is NOT identified"
+            # warning about a quantity it never computes.
+            # n = 2 with an 8-column basis: the penalty null space has
+            # dimension 2, so Mp_eff = 2 ≥ n = 2 and the Gaussian REML
+            # scale denominator is genuinely exhausted.
+            n_w, p_w = 2, 8
+            xw = range(0.0, 1.0, length=n_w)
+            Jw = [xi^(k - 1) for xi in xw, k in 1:p_w]
+            Dw = zeros(p_w - 2, p_w)
+            for i in 1:(p_w - 2)
+                Dw[i, i] = 1.0; Dw[i, i+1] = -2.0; Dw[i, i+2] = 1.0
+            end
+            Sw = Dw' * Dw
+            bw = fill(0.1, p_w)
+            yw = fill(5.0, n_w)
+            muw = fill(5.0, n_w)
+            ww = ones(n_w)
+
+            call(fam) = estimate_smoothing_params(Jw, ww, ww, yw, muw, bw,
+                        [Sw], [0], [p_w], p_w; family=fam, maxiter=3,
+                        verbose=false)
+            # Gaussian: the warning is relevant and still fires.
+            @test_logs (:warn, r"unpenalized \(fixed-effect\) part") match_mode=:any call(Gaussian())
+            # Poisson: no such warning (its scale comes from n − sum(ranks)).
+            # `Base.CoreLogging.Warn` avoids adding a Logging test dep.
+            @test_logs min_level=Base.CoreLogging.Warn call(Poisson())
+        end
+
+        # ── D8a: the LAML denominator genuinely counts usable cells ───
+        @testset "LAML sample size n counts usable cells only" begin
+            using PartiallySpecifiedModels: estimate_smoothing_params, _n_usable
+
+            # (i) DIRECT unit test of the denominator. The LAML flatten
+            # already masks the VALUES (masked cells arrive as a finite
+            # placeholder at weight 0), so the only thing `n = _n_usable`
+            # changes is the SAMPLE SIZE. Half the sample masked makes that
+            # visible: n = 21 vs the pre-fix n = 40.
+            n_u, p_u = 40, 8
+            xu = range(0.0, 1.0, length=n_u)
+            Ju = [xi^(k - 1) for xi in xu, k in 1:p_u]
+            Ju = Ju ./ maximum(abs, Ju)
+            Du = zeros(p_u - 2, p_u)
+            for i in 1:(p_u - 2)
+                Du[i, i] = 1.0; Du[i, i+1] = -2.0; Du[i, i+2] = 1.0
+            end
+            Su = Du' * Du
+            beta_u = [0.3, -0.5, 0.8, 0.1, -0.2, 0.05, 0.0, 0.0]
+            yu = Ju * beta_u .+ [0.05 * sin(3.7 * i) for i in 1:n_u]
+            mask_u = collect(3:2:39)             # 19 of 40 cells masked
+            keep_u = setdiff(1:n_u, mask_u)
+            y_um = copy(yu); w_um = ones(n_u)
+            y_um[mask_u] .= 0.0                  # LAML flatten convention:
+            w_um[mask_u] .= 0.0                  # placeholder + weight 0
+
+            @test _n_usable(y_um, w_um) == length(keep_u)
+            @test _n_usable(yu, ones(n_u)) == n_u
+
+            run_u(J, w, y) = estimate_smoothing_params(J, w, w, y, J * beta_u,
+                                copy(beta_u), [Su], [0], [p_u], p_u;
+                                family=Gaussian(), maxiter=50, verbose=false)
+            lam_um, edf_um = run_u(Ju, w_um, y_um)
+            lam_up, edf_up = run_u(Ju[keep_u, :], ones(length(keep_u)),
+                                   yu[keep_u])
+            # PRE-FIX (measured with `n = length(y)`): λ = 5.05e-3 against
+            # the pruned 7.13e-3 — 29% off — and EDF 4.010 vs 3.941.
+            # POST-FIX both agree to ~1e-13.
+            @test isapprox(lam_um[1], lam_up[1]; rtol=1e-6)
+            @test isapprox(edf_um, edf_up; rtol=1e-6)
+
+            # (ii) END-TO-END. Heavy masking (20 of 41 rows) makes the same
+            # denominator bias reach the reported λ and EDF.
+            ts_n = collect(0.0:0.25:10.0)
+            noise_n = [0.04 * sin(3.1 * i) + 0.02 * cos(7.7 * i)
+                       for i in 1:length(ts_n)]
+            clean_n = exp.(0.15 .* ts_n) .+ noise_n
+            mask_n = collect(2:2:40)
+            keep_n = setdiff(1:length(ts_n), mask_n)
+            vals_n = reshape(copy(clean_n), :, 1)
+            w_n = ones(length(ts_n), 1)
+            vals_n[mask_n, 1] .= NaN
+            w_n[mask_n, 1] .= 0.0
+
+            mk_n(t, v, w) = PSMProblem(nan_growth!, [1.0], tspan_nan,
+                [BSplineApproximator(:r, (0.0, 5.0), 6; initial=x -> 0.05)];
+                data_times=t, data_values=v, obs_to_state=[1],
+                data_weights=w, likelihood=Gaussian(), solver=Tsit5())
+
+            s_nm = solve(mk_n(ts_n, vals_n, w_n), LAML(maxiters=40, verbose=false))
+            s_np = solve(mk_n(ts_n[keep_n], reshape(clean_n[keep_n], :, 1),
+                              ones(length(keep_n), 1)),
+                         LAML(maxiters=40, verbose=false))
+            # PRE-FIX (measured): λ 0.0867 (masked) vs 0.5658 (pruned) —
+            # 85% relative error — and EDF 2.691 vs 2.199 (22%).
+            # POST-FIX: 2.7e-4 and 1.7e-5.
+            @test isapprox(s_nm.smoothing_params[1], s_np.smoothing_params[1];
+                           rtol=0.02)
+            @test isapprox(s_nm.edf, s_np.edf; rtol=0.02)
+            @test isapprox(s_nm.convergence.sigma2, s_np.convergence.sigma2;
+                           rtol=0.02)
         end
     end
 
