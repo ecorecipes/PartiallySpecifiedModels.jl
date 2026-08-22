@@ -82,7 +82,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
 
     # ── Step 1: Full LAML fit for MLE ────────────────────────────
     if verbose; println("ProfileLikelihoodSolver: Running initial LAML fit..."); end
-    base_sol = SciMLBase.solve(prob, LAML(verbose=false))
+    base_sol = SciMLBase.solve(prob, alg.base_alg)
     beta_mle = Float64.(collect(base_sol.parameters))
     n_beta = length(beta_mle)
     mle_obj = base_sol.objective
@@ -107,8 +107,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
 
     # Effective number of scalar observations: only weight-carrying finite
     # cells enter both the objective and the σ̂² denominator.
-    n_obs = count(i -> prob.data_weights[i] > 0 && !isnan(prob.data_values[i]),
-                  eachindex(prob.data_values))
+    n_obs = n_usable(prob)
 
     profiles = Dict{Int, NamedTuple}()
 
@@ -137,7 +136,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
                 for j in 1:size(prob.data_values, 2)
                     w = prob.data_weights[i, j]
                     y = prob.data_values[i, j]
-                    (w > 0 && !isnan(y)) || continue
+                    _usable(y, w) || continue
                     total_loss += w * (y - pred[i, j])^2
                 end
             end
@@ -323,11 +322,20 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
         end
     end
 
-    # Return solution with profiles in convergence field
+    # Return solution with profiles in convergence field. The profiles are
+    # taken at the base LAML fit, so this solution is only as converged as
+    # that fit: propagate its honest convergence keys instead of hard-coding
+    # converged=true (a non-converged base fit was previously reported as a
+    # converged profile-likelihood solution). The base NamedTuple also
+    # carries V_beta/sigma2, which downstream CI code expects.
+    base_conv = base_sol.convergence
+    base_keys = base_conv isa NamedTuple ? base_conv :
+                (converged=false, reason=:unknown_base_convergence)
     PSMSolution(base_sol.parameters, base_sol.objective, base_sol.data_loss,
                 base_sol.edf, base_sol.smoothing_params,
                 base_sol.fitted_values, base_sol.data_values,
                 base_sol.data_times, base_sol.unknown_functions,
-                (converged=true, method=:profile_likelihood,
-                 profiles=profiles, mle_objective=mle_obj))
+                merge(base_keys,
+                      (method=:profile_likelihood,
+                       profiles=profiles, mle_objective=mle_obj)))
 end

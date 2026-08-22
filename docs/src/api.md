@@ -23,6 +23,15 @@ AbstractApproximator
 - [`GPApproximator`](@ref)
 - [`COMONetApproximator`](@ref)
 
+### Shape-Constraint Constants
+
+The supported constraint symbols for the shape-constrained approximators:
+
+```@docs
+SHAPE_CONSTRAINTS
+COMONET_CONSTRAINTS
+```
+
 ## Solver Types
 
 Detailed documentation for each solver is on the [Solvers](solvers.md) page.

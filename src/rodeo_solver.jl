@@ -17,8 +17,9 @@
 """
     solve(prob::PSMProblem, alg::RodeoSolver)
 
-Fit a partially specified model using the RODEO (Reverse-mode ODE
-Observation) probabilistic numerics solver. An integrated Brownian motion
+Fit a partially specified model using the RODEO probabilistic-numerics
+solver (named after Wu & Lysy's `rodeo` package, the algorithmic
+reference for this implementation). An integrated Brownian motion
 (IBM) prior is placed over the state and Kalman filtering/smoothing is
 used to condition on both the observations and the ODE constraints.
 
@@ -37,9 +38,27 @@ used to condition on both the observations and the ODE constraints.
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
+
+# Masked data
+
+This solver does NOT support masked observations and raises an error if
+any data cell is masked (`data_weights == 0` or a non-finite
+`data_values` entry). Its likelihood is evaluated inside a Kalman /
+particle recursion with no per-cell mask: honouring a mask means skipping
+the FILTER UPDATE, not merely the density term, for the masked cells.
+Left unguarded the masked cells corrupt the filter state while the run
+still looks like an ordinary converged fit, so it fails loudly instead.
+Drop the masked rows from `data_times`/`data_values`, or use one of the
+masking-capable solvers (`LAML`, `GCVSolver`, `CollocationLAML`,
+`GradientMatching`, `TwoStageSolver`, `BNGSolver`, `ODINSolver`,
+`RKHSSolver`, `IntegralMatchingSolver`, `AdamSolver`,
+`MultipleShootingSolver`, `DerivativeFreeSolver`, `MCMCSolver`,
+`MagiSolver`, `VariationalSolver`, `ABCSolver`,
+`ProfileLikelihoodSolver`).
 """
 function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
     _validate_problem(prob, "RodeoSolver"; require_continuous=true)
+    _reject_masked_data(prob, "RodeoSolver")
     verbose = alg.verbose
     n_vars = length(prob.u0)
     n_obs = size(prob.data_values, 2)
@@ -344,7 +363,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
                                            interrogate=alg.interrogate)
 
     # Extract solution at data times and compute data loss
-    data_loss = 0.0
     pred = zeros(n_t, n_obs)
     for i in 1:n_t
         idx = _nearest_grid_index(times, prob.data_times[i])
@@ -352,9 +370,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             pred[i, j] = μ_smooth[idx][sk][1]
-            data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
         end
     end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Build evaluators
     uf_evals = Dict{Symbol, Any}()
@@ -368,23 +386,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            _, st = Lux.setup(rng, approx.model)
-            rng2 = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            ps_ca = Float64.(ComponentArray(Lux.initialparameters(rng2, approx.model)))
-            ps_final = similar(ps_ca)
-            ps_final .= params_k
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            uf_evals[approx.name] = x -> begin
-                xn = if lo !== nothing && span !== nothing && span > 0
-                    (Float64(x isa AbstractArray ? x[1] : x) - lo) / span
-                else
-                    Float64(x isa AbstractArray ? x[1] : x)
-                end
-                out, _ = Lux.apply(approx.model, Float32.(reshape([xn], :, 1)), ps_final, st)
-                length(out) == 1 ? Float64(out[1]) : Float64.(out)
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator

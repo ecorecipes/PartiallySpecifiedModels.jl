@@ -33,6 +33,70 @@ function _abc_quantile(v::AbstractVector{<:Real}, q::Float64)
 end
 
 """
+    _abc_importance_weights(new_particles, prev_particles, prev_weights,
+                            kernel_std, lps; gen=0) → (weights, ess)
+
+Compute normalized ABC-SMC importance weights
+
+    w_i ∝ π(θ_i) / Σ_j w_j^{t-1} K(θ_i | θ_j^{t-1})
+
+with the proposal-mixture denominator evaluated fully in log space:
+
+    log_denom_i = logsumexp_j( log w_j^{t-1} + log K(θ_i | θ_j^{t-1}) ).
+
+A particle far from every previous-generation particle has a tiny
+proposal density; in linear arithmetic `Σ wⱼ exp(log_k)` underflows to
+exactly 0, and the old code then set the particle's weight to 0 — the
+exact opposite of the correct limit (weight ∝ π/denominator should be
+LARGE when the denominator is small).  `lps[i]` is the (unnormalized)
+log prior density of `new_particles[i]`, `-Inf` if outside support.
+
+Also returns the effective sample size `ESS = 1/Σ wᵢ²` of the
+normalized weights and warns (once per call, i.e. once per generation)
+when ESS < N/2, signalling weight degeneracy.
+"""
+function _abc_importance_weights(new_particles::AbstractVector,
+                                 prev_particles::AbstractVector,
+                                 prev_weights::AbstractVector{Float64},
+                                 kernel_std::AbstractVector{Float64},
+                                 lps::AbstractVector{Float64};
+                                 gen::Int=0)
+    N = length(new_particles)
+    M = length(prev_particles)
+    log_wprev = log.(prev_weights)          # zero weights → -Inf (dropped below)
+    new_log_w = fill(-Inf, N)
+    log_terms = Vector{Float64}(undef, M)
+    for i in 1:N
+        isfinite(lps[i]) || continue
+        m = -Inf
+        for j in 1:M
+            diff = new_particles[i] .- prev_particles[j]
+            lt = log_wprev[j] - 0.5 * sum(abs2, diff ./ kernel_std)
+            log_terms[j] = lt
+            lt > m && (m = lt)
+        end
+        # prev_weights sum to 1, so at least one term is finite and m > -Inf
+        log_denom = m + log(sum(t -> exp(t - m), log_terms))
+        new_log_w[i] = lps[i] - log_denom
+    end
+
+    lw_max = maximum(new_log_w)
+    weights = if isfinite(lw_max)
+        w = [isfinite(lw) ? exp(lw - lw_max) : 0.0 for lw in new_log_w]
+        w ./ sum(w)
+    else
+        fill(1.0 / N, N)
+    end
+
+    ess = 1.0 / sum(abs2, weights)
+    if ess < N / 2
+        @warn "ABC-SMC gen $gen: effective sample size $(round(ess, digits=1)) " *
+              "< N/2 = $(N / 2); importance weights are highly concentrated"
+    end
+    return weights, ess
+end
+
+"""
     _abc_build_uf_dict(prob, beta) → Dict{Symbol, Any}
 
 Build a dictionary mapping each approximator name to its evaluator
@@ -80,8 +144,29 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
     N = alg.n_particles
 
     # ── summary statistic ────────────────────────────────────────────
+    # :auto is a weighted RMS distance over the USABLE cells only: cells
+    # with zero weight or a non-finite observation are skipped, matching
+    # the masking convention used across the package.  (Previously one
+    # NaN observation made every particle's distance NaN; NaN is never
+    # `< ε`, so nothing was ever accepted and the solver returned the
+    # untouched prior population.)  Normalizing by the total weight of
+    # the cells used keeps the scale comparable to the old
+    # all-cells RMS when weights are unit and data complete.
     summary_fn = if alg.summary_fn === :auto
-        (sim_data, obs_data) -> sqrt(sum((sim_data .- obs_data).^2) / length(obs_data))
+        let W = prob.data_weights
+            (sim_data, obs_data) -> begin
+                ss = 0.0
+                wsum = 0.0
+                @inbounds for k in eachindex(obs_data)
+                    w = W[k]
+                    y = obs_data[k]
+                    (w > 0 && isfinite(y)) || continue
+                    ss += w * (sim_data[k] - y)^2
+                    wsum += w
+                end
+                wsum > 0 ? sqrt(ss / wsum) : Inf
+            end
+        end
     else
         alg.summary_fn
     end
@@ -216,31 +301,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
         end
 
         # ── (f) importance weights ───────────────────────────────────
-        # w_i ∝ π(θ_i) / Σ_j w_j^{t-1} K(θ_i | θ_j^{t-1})
-        new_weights = zeros(N)
-        # Common constants in π(θ) cancel after normalization; shift by the
-        # max log-density to avoid underflow of exp().
-        lps = [in_support(new_particles[i]) ? prior_logpdf(new_particles[i]) :
-               -Inf for i in 1:N]
-        lp_max = maximum(lps)
-        for i in 1:N
-            isfinite(lps[i]) || continue
-            kernel_sum = 0.0
-            for j in 1:N
-                diff = new_particles[i] .- particles[j]
-                log_k = -0.5 * sum((diff ./ kernel_std).^2)
-                kernel_sum += weights[j] * exp(log_k)
-            end
-            new_weights[i] = kernel_sum > 0.0 ?
-                exp(lps[i] - lp_max) / kernel_sum : 0.0
-        end
-
-        wsum = sum(new_weights)
-        if wsum > 0.0
-            new_weights ./= wsum
-        else
-            new_weights .= 1.0 / N
-        end
+        # w_i ∝ π(θ_i) / Σ_j w_j^{t-1} K(θ_i | θ_j^{t-1}), computed fully
+        # in log space by _abc_importance_weights (which also monitors the
+        # effective sample size).  Common constants in π(θ) cancel after
+        # normalization.
+        lps = Float64[in_support(new_particles[i]) ?
+                      prior_logpdf(new_particles[i]) : -Inf for i in 1:N]
+        new_weights, _ = _abc_importance_weights(new_particles, particles,
+                                                 weights, kernel_std, lps;
+                                                 gen=gen)
 
         # ── update state for next generation ─────────────────────────
         particles = new_particles
@@ -278,8 +347,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
         fill(NaN, size(prob.data_values))
     end
 
-    # Sum of squares, matching the data_loss convention of the other solvers
-    data_loss = sum((pred .- prob.data_values).^2)
+    # Weighted sum of squares over usable cells, matching the data_loss
+    # convention of the other solvers (masked / NaN cells are skipped so
+    # one missing observation does not turn the reported loss into NaN)
+    data_loss = weighted_data_loss(prob, pred)
 
     uf_evals = _abc_build_uf_dict(prob, mean_beta)
 

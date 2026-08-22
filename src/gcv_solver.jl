@@ -49,8 +49,17 @@ function _gcv_score(J::AbstractMatrix, W_irls::AbstractVector,
     end
 
     # Weighted RSS: ||W^½(z - Jβ̂)||²
+    # Iterate over the FULL residual vector (`n` is now the count of usable
+    # cells, which is smaller than `length(r)` under masking and would
+    # silently truncate the sum), and skip rows whose working weight is 0.
+    # Skipping — rather than relying on the multiply — is what keeps a masked
+    # row's pseudo-datum `z[i]` from contributing `0 * NaN = NaN`.
     r = z .- J * beta_hat
-    rss_w = sum(W_irls[i] * r[i]^2 for i in 1:n)
+    rss_w = 0.0
+    for i in eachindex(r)
+        W_irls[i] > 0 || continue
+        rss_w += W_irls[i] * r[i]^2
+    end
 
     # tr(A) where A = J (J'WJ + S^λ)⁻¹ J'W
     H_inv = try
@@ -270,7 +279,9 @@ For each IRLS iteration:
 6. Step contraction (backtracking)
 7. Repeat until convergence
 
-Returns a `PSMSolution`.
+Returns a `PSMSolution`. `sol.convergence` is a NamedTuple
+`(converged, iterations, reason, gcv)` — see the `GCVSolver` and
+`PSMSolution` docstrings for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     _validate_problem(prob, "GCVSolver")
@@ -292,15 +303,31 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     # Initialize λ (moderate default)
     theta = ones(m)
 
-    # Flatten data into vectors (obs-major order: obs 1 times, obs 2 times, …)
+    # Flatten data into vectors (obs-major order: obs 1 times, obs 2 times, …),
+    # enforcing the package masking convention exactly as the LAML solver
+    # does: usable iff weight > 0 AND datum non-NaN; masked cells get weight
+    # 0 and a finite placeholder. Every downstream use (penalized_objective →
+    # log_likelihood, the IRLS pseudo-data, the GCV score) multiplies by the
+    # weight, and IEEE `0 * NaN = NaN` would otherwise poison all of them.
     y_vec = zeros(n_data)
     w_vec = zeros(n_data)
     k = 1
     for oi in 1:n_obs, ti in 1:n_times
-        y_vec[k] = prob.data_values[ti, oi]
-        w_vec[k] = prob.data_weights[ti, oi]
+        y = prob.data_values[ti, oi]
+        wv = prob.data_weights[ti, oi]
+        if _usable(y, wv)
+            y_vec[k] = y
+            w_vec[k] = wv
+        end   # else keep the 0.0 placeholder with weight 0.0
         k += 1
     end
+    # The GCV score's sample size must count USABLE cells only. GCV(λ) =
+    # n·RSS_w/(n − γ·tr(A))² is a per-observation criterion: counting masked
+    # cells in n inflates the residual dof and systematically undersmooths.
+    # Equals n_data for complete data, so complete-data fits are unchanged.
+    n_gcv = count(>(0), w_vec)
+    n_gcv == 0 && error("GCVSolver: every observation is masked (all " *
+        "data_weights are 0 or all data_values are NaN); there is nothing to fit.")
 
     # Evaluate model → flattened predictions
     function eval_model(p_eval)
@@ -334,36 +361,21 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
         neg_ll + 0.5 * dot(p_eval, B * p_eval)
     end
 
-    # PCLS step: augmented system [W^½J; C] β = [W^½z; 0]
+    # PCLS step: truncated-SVD solve of the augmented system
+    # [W^½J; C] β = [W^½z; 0] — see _pcls_augmented_solve in pcls.jl.
+    # (Shared with the LAML solver; the SVD truncation guards against
+    # exploding coefficients along numerically-null Jacobian directions
+    # at poor initializations, and equals the plain QR solve when the
+    # system is well-conditioned.)
     function pcls_step(J_mat, z_pseudo, th, w_irls)
         B = build_B(th)
-        C = penalty_sqrt_matrix(B)
-        n_pen = size(C, 1)
-        W_sqrt = sqrt.(max.(w_irls, 1e-15))
-        F_aug = vcat(Diagonal(W_sqrt) * J_mat, C)
-        z_aug = vcat(W_sqrt .* z_pseudo, zeros(n_pen))
-        F_aug \ z_aug, B
+        _pcls_augmented_solve(J_mat, z_pseudo, B, w_irls), B
     end
 
-    # Step contraction: backtracking line search
-    function step_contract(a_old, a_new, B)
-        f_old = penalized_objective(a_old, B)
-        direction = a_new .- a_old
-
-        best_f = f_old
-        best_a = copy(a_old)
-
-        for k in 0:15
-            α = 2.0^(-k)
-            a_try = a_old .+ α .* direction
-            f_try = penalized_objective(a_try, B)
-            if f_try < best_f
-                best_f = f_try
-                best_a = copy(a_try)
-            end
-        end
-        best_a, best_f
-    end
+    # Step contraction: backtracking with explosive-step rescue — see
+    # _pcls_step_contract in pcls.jl.
+    step_contract(a_old, a_new, B) =
+        _pcls_step_contract(penalized_objective, a_old, a_new, B)
 
     # Initialize
     beta  = build_initial_params(prob)
@@ -381,12 +393,19 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     prev_obj = Inf
     gcv_val  = NaN
 
+    # Honest convergence reporting: defaults describe loop exhaustion.
+    conv_converged = false
+    conv_reason = :maxiters
+    conv_iters = 0
+
     for iter in 0:(maxiters - 1)
+        conv_iters = iter + 1
         # Adapt GP kernel hyperparameters to the evolving fit
         iter >= 2 && _adapt_gp_approximators!(prob, beta)
         # Re-evaluate model + Jacobian
         f_vec_new, _ = try; eval_model(beta); catch e
             if verbose; println("Iter $iter: simulation failed ($e)"); end
+            conv_reason = :early_break
             break
         end
         f_vec .= f_vec_new
@@ -403,7 +422,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
             best_rho, beta_gcv, gcv_val, trA = _grid_then_refine_gcv(
                 J, w_irls, z_pseudo,
                 S_list, uf_offsets, uf_nk,
-                n_p, n_data, gamma,
+                n_p, n_gcv, gamma,
                 n_grid, tol)
 
             if m == 1
@@ -415,7 +434,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
                 rho_vec, beta_gcv, gcv_val, trA = _coordinate_gcv(
                     J, w_irls, z_pseudo,
                     S_list, uf_offsets, uf_nk,
-                    n_p, n_data, gamma,
+                    n_p, n_gcv, gamma,
                     fill(best_rho, m), tol)
                 theta .= exp.(rho_vec)
             end
@@ -427,12 +446,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
             end
         end
 
-        # PCLS step at current θ
+        # PCLS step at current θ; step_contract already returns the
+        # penalized objective at the accepted point (a full ODE solve),
+        # so reuse it for convergence tracking instead of recomputing.
         beta_new_pcls, B_new = pcls_step(J, z_pseudo, theta, w_irls)
-        beta_new, obj_new = step_contract(beta, beta_new_pcls, B_new)
-
-        # Track penalized objective for convergence
-        curr_obj = penalized_objective(beta_new, B_new)
+        beta_new, curr_obj = step_contract(beta, beta_new_pcls, B_new)
 
         if verbose && (iter <= 4 || iter % 10 == 0)
             data_ss = sum(w_vec[i] * (y_vec[i] - f_vec[i])^2 for i in 1:n_data)
@@ -446,6 +464,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
         # Check convergence
         if iter >= 3 && abs(curr_obj - prev_obj) < alg.tol * max(abs(prev_obj), 1.0)
             if verbose; println("Converged at iter $iter (objective stable)"); end
+            conv_converged = true
+            conv_reason = :converged_tol
             break
         end
         prev_obj = curr_obj
@@ -456,10 +476,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     pred  = simulate(prob, p_opt)
 
     # Data loss (weighted SS)
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:n_times
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Final EDF via hat matrix
     k = 1
@@ -509,23 +526,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            _, st = Lux.setup(rng, approx.model)
-            rng2 = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            ps_ca = Float64.(ComponentArray(Lux.initialparameters(rng2, approx.model)))
-            ps_final = similar(ps_ca)
-            ps_final .= params_k
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            uf_evals[approx.name] = x -> begin
-                xn = if lo !== nothing && span !== nothing && span > 0
-                    (Float64(x isa AbstractArray ? x[1] : x) - lo) / span
-                else
-                    Float64(x isa AbstractArray ? x[1] : x)
-                end
-                out, _ = Lux.apply(approx.model, Float32.(reshape([xn], :, 1)), ps_final, st)
-                length(out) == 1 ? Float64(out[1]) : Float64.(out)
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator
@@ -551,5 +552,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
 
     PSMSolution(params, obj_val, data_loss, edf, copy(theta),
                 Float64.(pred), Float64.(prob.data_values),
-                Float64.(prob.data_times), uf_evals, nothing)
+                Float64.(prob.data_times), uf_evals,
+                (converged=conv_converged, iterations=conv_iters,
+                 reason=conv_reason, gcv=gcv_val))
 end

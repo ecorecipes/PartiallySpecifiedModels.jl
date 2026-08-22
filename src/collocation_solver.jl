@@ -59,18 +59,45 @@ end
 
 # ─── ODE/Discrete RHS evaluation at collocation points ────────────
 
+# Failure-sentinel convention (note the deliberate asymmetry between the
+# residual and the Jacobian):
+#
+#   RESIDUAL path — when the dynamics throw a genuinely numerical error
+#   (domain error, NaN/Inf conversion, ...) at a collocation point, the RHS
+#   is replaced by _COLLOC_FAIL_SENTINEL. That is a LARGE residual, which is
+#   what we want: the optimizer is pushed away from infeasible points.
+#
+#   JACOBIAN path — the FD slope at a failed point is forced to ZERO, not
+#   differenced against the sentinel. Differencing is only valid when the
+#   base and perturbed evaluations live on the same branch: at a domain
+#   boundary (e.g. `sqrt(u)`/`log(u)` with u dipping just below zero) the
+#   base can fail while the perturbation succeeds, and
+#   (f(u+ε) − sentinel)/ε ≈ −1e12 poisons J'J with ~1e24 entries and makes
+#   the Gauss–Newton solve return garbage without erroring. A zero column
+#   simply says "no reliable local linearization here"; the large residual
+#   still supplies the pressure to move away.
+#
+# So: large residual, zero Jacobian. Programming errors (see
+# `_is_program_error`) are always rethrown.
+const _COLLOC_FAIL_SENTINEL = 1e6
+
 """
-Evaluate the dynamics right-hand side at all collocation points.
+Evaluate the dynamics right-hand side at all collocation points, also
+returning a per-point failure mask.
 
 For continuous models: returns `f(x(t), p, t)` (derivatives).
 For discrete models: returns `f(x(t), p, t)` (next-state map).
 
-Returns a (T × K) matrix where entry [i,k] = f_k(x(t_i), p, t_i).
+Returns `(F, failed)` where `F` is a (T × K) matrix with entry
+[i,k] = f_k(x(t_i), p, t_i) and `failed[i]` is `true` when the dynamics
+evaluation at point `i` raised a numerical error and `F[i, :]` therefore
+holds the failure sentinel rather than a real derivative.
 """
-function eval_ode_rhs(prob::PSMProblem, times::Vector{Float64},
-                      alpha::Matrix{Float64}, beta::Vector{Float64})
+function eval_ode_rhs_masked(prob::PSMProblem, times::Vector{Float64},
+                             alpha::Matrix{Float64}, beta::Vector{Float64})
     T, K = size(alpha)
     F = zeros(T, K)
+    failed = fill(false, T)
     p = build_param_struct(prob, beta)
     du = zeros(K)
 
@@ -78,12 +105,26 @@ function eval_ode_rhs(prob::PSMProblem, times::Vector{Float64},
         u = alpha[i, :]
         try
             prob.dynamics!(du, u, p, times[i])
-        catch
-            du .= 1e6  # Large residual for failed evaluations
+        catch e
+            _is_program_error(e) && rethrow()
+            du .= _COLLOC_FAIL_SENTINEL  # numerical failure → large residual
+            failed[i] = true
         end
         F[i, :] .= du
     end
-    F
+    F, failed
+end
+
+"""
+Evaluate the dynamics right-hand side at all collocation points.
+
+Returns a (T × K) matrix where entry [i,k] = f_k(x(t_i), p, t_i).
+See [`eval_ode_rhs_masked`](@ref) for the variant that also reports which
+points fell back to the failure sentinel.
+"""
+function eval_ode_rhs(prob::PSMProblem, times::Vector{Float64},
+                      alpha::Matrix{Float64}, beta::Vector{Float64})
+    first(eval_ode_rhs_masked(prob, times, alpha, beta))
 end
 
 # ─── Combined residual and Jacobian ───────────────────────────────
@@ -120,12 +161,19 @@ function collocation_residual_jacobian(
         sk = prob.obs_to_state[j]
         for i in 1:T
             idx = (j - 1) * T + i
-            data_resid[idx] = sqrt(w_vec[idx]) * (prob.data_values[i, j] - alpha[i, sk])
+            # `sqrt(0) * NaN = NaN`: a masked cell's ZERO weight does not
+            # neutralize a NaN datum, so the residual must be zeroed
+            # explicitly. Left unguarded, one masked cell makes the
+            # Gauss-Newton step all-NaN, the line search rejects every
+            # step, and the solver reports `:plateau` convergence at its
+            # initialization. (The Jacobian row is already a clean 0.)
+            data_resid[idx] = usable_cell(prob, i, j) ?
+                sqrt(w_vec[idx]) * (prob.data_values[i, j] - alpha[i, sk]) : 0.0
         end
     end
 
     # --- ODE/Discrete compliance residual ---
-    F = eval_ode_rhs(prob, times, alpha, beta)
+    F, F_failed = eval_ode_rhs_masked(prob, times, alpha, beta)
     ode_resid = zeros(T * K)
 
     if prob.discrete
@@ -194,13 +242,30 @@ function collocation_residual_jacobian(
         # ∂/∂alpha[i,k_pert]: -sqrt_lode * ∂F[i,k_eq]/∂x[k_pert]
         for i in 1:(T-1)
             u = alpha[i, :]
-            try; prob.dynamics!(du0, u, p, times[i]); catch; du0 .= 0; end
+            base_failed = false
+            try
+                prob.dynamics!(du0, u, p, times[i])
+            catch e
+                _is_program_error(e) && rethrow()
+                du0 .= _COLLOC_FAIL_SENTINEL  # match the residual sentinel
+                base_failed = true
+            end
 
             for k_pert in 1:K
                 u_p = copy(u)
                 u_p[k_pert] += eps_x
-                try; prob.dynamics!(du_p, u_p, p, times[i]); catch; du_p .= du0; end
-                dF_dx = (du_p .- du0) ./ eps_x
+                pert_failed = false
+                try
+                    prob.dynamics!(du_p, u_p, p, times[i])
+                catch e
+                    _is_program_error(e) && rethrow()
+                    du_p .= du0
+                    pert_failed = true
+                end
+                # Zero Jacobian at failed points — never difference against
+                # the sentinel (see the sentinel convention above).
+                dF_dx = (base_failed || pert_failed) ? zeros(K) :
+                        (du_p .- du0) ./ eps_x
 
                 col_i = (k_pert - 1) * T + i  # alpha[i, k_pert]
                 col_ip1 = (k_pert - 1) * T + (i + 1)  # alpha[i+1, k_pert]
@@ -221,13 +286,30 @@ function collocation_residual_jacobian(
         # ∂F/∂x is the state Jacobian of the ODE RHS, computed by pointwise FD
         for i in 1:T
             u = alpha[i, :]
-            try; prob.dynamics!(du0, u, p, times[i]); catch; du0 .= 0; end
+            base_failed = false
+            try
+                prob.dynamics!(du0, u, p, times[i])
+            catch e
+                _is_program_error(e) && rethrow()
+                du0 .= _COLLOC_FAIL_SENTINEL  # match the residual sentinel
+                base_failed = true
+            end
 
             for k_pert in 1:K
                 u_p = copy(u)
                 u_p[k_pert] += eps_x
-                try; prob.dynamics!(du_p, u_p, p, times[i]); catch; du_p .= du0; end
-                dF_dx = (du_p .- du0) ./ eps_x  # ∂f/∂x_k at time i
+                pert_failed = false
+                try
+                    prob.dynamics!(du_p, u_p, p, times[i])
+                catch e
+                    _is_program_error(e) && rethrow()
+                    du_p .= du0
+                    pert_failed = true
+                end
+                # Zero Jacobian at failed points — never difference against
+                # the sentinel (see the sentinel convention above).
+                dF_dx = (base_failed || pert_failed) ? zeros(K) :
+                        (du_p .- du0) ./ eps_x  # ∂f/∂x_k at time i
 
                 col = (k_pert - 1) * T + i  # alpha parameter index
                 for k_eq in 1:K
@@ -259,11 +341,15 @@ function collocation_residual_jacobian(
         beta_p = copy(beta)
         step = max(eps_beta, abs(beta[b]) * eps_beta)
         beta_p[b] += step
-        F_p = eval_ode_rhs(prob, times, alpha, beta_p)
+        F_p, Fp_failed = eval_ode_rhs_masked(prob, times, alpha, beta_p)
         for k in 1:K
             for i in 1:T
                 row_ode = n_data + (k - 1) * T + i
-                J[row_ode, col] = -sqrt_lode * (F_p[i, k] - F[i, k]) / step
+                # Zero Jacobian at failed points (see sentinel convention):
+                # differencing a real value against the sentinel — in either
+                # direction — fabricates a ~1e12 slope.
+                J[row_ode, col] = (F_failed[i] || Fp_failed[i]) ? 0.0 :
+                    -sqrt_lode * (F_p[i, k] - F[i, k]) / step
             end
         end
     end
@@ -308,7 +394,14 @@ function collocation_residual_only(
         sk = prob.obs_to_state[j]
         for i in 1:T
             idx = (j - 1) * T + i
-            data_resid[idx] = sqrt(w_vec[idx]) * (prob.data_values[i, j] - alpha[i, sk])
+            # `sqrt(0) * NaN = NaN`: a masked cell's ZERO weight does not
+            # neutralize a NaN datum, so the residual must be zeroed
+            # explicitly. Left unguarded, one masked cell makes the
+            # Gauss-Newton step all-NaN, the line search rejects every
+            # step, and the solver reports `:plateau` convergence at its
+            # initialization. (The Jacobian row is already a clean 0.)
+            data_resid[idx] = usable_cell(prob, i, j) ?
+                sqrt(w_vec[idx]) * (prob.data_values[i, j] - alpha[i, sk]) : 0.0
         end
     end
 
@@ -373,9 +466,17 @@ soft constraint.
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
+`sol.convergence` is a NamedTuple `(ode_compliance, lambda_ode_final,
+converged, iterations, reason, iterations_total)` — see the
+`CollocationLAML` docstring for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     _validate_problem(prob, "CollocationLAML")
+    isempty(prob.delays) ||
+        error("CollocationLAML does not support DDE problems: " *
+              "the collocation residual evaluates the dynamics with the " *
+              "4-argument ODE signature and cannot supply the delayed " *
+              "history. Use LAML for DDEs.")
     times = Float64.(prob.data_times)
     T_pts = length(times)
     n_obs = size(prob.data_values, 2)
@@ -396,17 +497,41 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
             # themselves non-negative (a positivity-assuming model);
             # unconditionally forcing ≥ 0.01 corrupted legitimately negative
             # states (log-abundances, anomalies).
-            col = prob.data_values[:, obs_idx]
-            floor_k = all(>=(0.0), col) ? 0.01 : -Inf
-            raw = max.(col, floor_k)
-            if prob.discrete && T_pts >= 4
-                itp = CubicSpline(raw, times;
-                                  extrapolation=ExtrapolationType.Extension)
-                for i in 1:T_pts
-                    alpha[i, k] = max(itp(times[i]), floor_k)
-                end
+            # Seed from the USABLE rows only, interpolating across masked
+            # gaps. Two distinct failures otherwise: `all(>=(0.0), col)` is
+            # false whenever the column holds a NaN (NaN >= 0 is false), so
+            # the positivity floor silently switches off for any partially
+            # masked non-negative series; and the NaN itself lands in
+            # `alpha`, making the whole state block NaN from step one.
+            keep = usable_rows(prob, obs_idx)
+            if isempty(keep)
+                alpha[:, k] .= prob.u0[k]
             else
-                alpha[:, k] .= raw
+                col = Float64.(prob.data_values[keep, obs_idx])
+                floor_k = all(>=(0.0), col) ? 0.01 : -Inf
+                raw = max.(col, floor_k)
+                if prob.discrete && T_pts >= 4 && length(keep) >= 4
+                    # Unchanged discrete path: spline through the kept rows
+                    # (all rows when nothing is masked).
+                    itp = CubicSpline(raw, times[keep];
+                                      extrapolation=ExtrapolationType.Extension)
+                    for i in 1:T_pts
+                        alpha[i, k] = max(itp(times[i]), floor_k)
+                    end
+                elseif length(keep) == T_pts
+                    # Unchanged continuous path.
+                    alpha[:, k] .= raw
+                elseif length(keep) >= 4
+                    # Continuous with masked rows: interpolate the kept rows
+                    # onto the full grid rather than dropping the state.
+                    itp = CubicSpline(raw, times[keep];
+                                      extrapolation=ExtrapolationType.Extension)
+                    for i in 1:T_pts
+                        alpha[i, k] = max(itp(times[i]), floor_k)
+                    end
+                else
+                    alpha[:, k] .= raw[1]
+                end
             end
         else
             alpha[:, k] .= prob.u0[k]
@@ -432,15 +557,19 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
         theta = Float64[]
     end
 
-    # Data weights (flattened: T × n_obs)
+    # Data weights (flattened: T × n_obs), with masked cells forced to weight
+    # 0 so the residual and Jacobian rows they generate are identically zero.
     w_vec = zeros(T_pts * n_obs)
     for j in 1:n_obs, i in 1:T_pts
-        w_vec[(j - 1) * T_pts + i] = prob.data_weights[i, j]
+        w_vec[(j - 1) * T_pts + i] = usable_cell(prob, i, j) ?
+                                     prob.data_weights[i, j] : 0.0
     end
-    y_vec = zeros(T_pts * n_obs)
-    for j in 1:n_obs, i in 1:T_pts
-        y_vec[(j - 1) * T_pts + i] = prob.data_values[i, j]
-    end
+    # The package-wide count (`solver.jl`), not a re-derived one, so
+    # this can never drift from the predicate the flatten applied.
+    n_usable_cells = n_usable(prob)
+    n_usable_cells == 0 && error("CollocationLAML: every observation is " *
+        "masked (every weight is 0 or every value is non-finite); there " *
+        "is nothing to fit.")
 
     # Continuation schedule for λ_ode
     # For discrete models, cap λ_ode_end at 100: the compliance penalty
@@ -461,14 +590,27 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
 
     # ─── Continuation loop ────────────────────────────────────────
     edf_final = Float64(sum(uf_nk))   # updated by the Fellner–Schall step
+    fs_skip_warned = false            # warn once if the FS step never runs
+    # Honest convergence reporting: converged/reason describe the FINAL
+    # continuation level's inner loop; iterations counts its inner iterations
+    # (iterations_total accumulates across all levels).
+    conv_converged = false
+    conv_reason = :maxiters
+    conv_iters = 0
+    conv_iters_total = 0
     for (level, lambda_ode) in enumerate(lambda_ode_schedule)
         if verbose
             println("\n=== Continuation level $level: λ_ode = $(round(lambda_ode, sigdigits=4)) ===")
         end
 
         prev_obj = Inf
+        conv_converged = false
+        conv_reason = :maxiters
+        conv_iters = 0
 
         for iter in 1:alg.maxiters
+            conv_iters = iter
+            conv_iters_total += 1
             # Compute combined residual and Jacobian
             resid, J_full = collocation_residual_jacobian(
                 prob, times, alpha, beta, D, lambda_ode, w_vec)
@@ -501,6 +643,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
             # Check convergence
             if iter > 1 && abs(curr_obj - prev_obj) < alg.tol * max(abs(prev_obj), 1.0)
                 if verbose; println("  Converged at iter $iter"); end
+                conv_converged = true
+                conv_reason = :converged_tol
                 break
             end
             prev_obj = curr_obj
@@ -523,6 +667,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                     (JtJ + 1e-6 * I) \ neg_Jtr
                 catch
                     if verbose; println("  Singular system, breaking"); end
+                    conv_reason = :early_break
                     break
                 end
             end
@@ -549,6 +694,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
 
             if best_step == 0.0
                 if verbose; println("  No improvement, stopping"); end
+                conv_converged = true
+                conv_reason = :plateau
                 break
             end
 
@@ -569,19 +716,47 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
             ord(M) = Float64[M[i, j] for j in 1:n_obs for i in 1:T_pts]
             μ_pred = try
                 simulate(prob, beta)
-            catch
+            catch e
+                _is_program_error(e) && rethrow()
                 nothing
             end
-            if μ_pred !== nothing
+            if μ_pred === nothing
+                if !fs_skip_warned
+                    @warn "CollocationLAML: model simulation failed during " *
+                          "the Fellner–Schall step; smoothing parameters " *
+                          "remain at their initialization and the reported " *
+                          "EDF is an upper bound from initialization."
+                    fs_skip_warned = true
+                end
+            else
                 y_vec2 = ord(prob.data_values)
+                # Zero the weights of masked cells so they drop out of both
+                # JWJ and the σ̂² numerator. Weight-aware is not enough on its
+                # own: `w * NaN^2 = NaN` even when w = 0, and a NaN σ̂² then
+                # survives `clamp` into theta, poisoning the penalty for every
+                # subsequent continuation level.
                 w_vec2 = ord(prob.data_weights)
+                for k in eachindex(y_vec2)
+                    _usable(y_vec2[k], w_vec2[k]) || (w_vec2[k] = 0.0;
+                                                             y_vec2[k] = 0.0)
+                end
                 mu_base = ord(μ_pred)
-                n_data = length(y_vec2)
+                n_data = length(y_vec2)          # row count for Jb
+                # σ̂²'s denominator is a per-observation residual dof and must
+                # count USABLE cells; `n_data` counts the masked ones too,
+                # biasing σ̂² low and hence the smoothing parameters. Equal to
+                # `n_data` for complete data.
+                n_eff_cells = count(>(0), w_vec2)
                 Jb = zeros(n_data, n_beta)
                 for b in 1:n_beta
                     step = max(1e-6, abs(beta[b]) * 1e-6)
                     bp = copy(beta); bp[b] += step
-                    pp = try; simulate(prob, bp); catch; μ_pred; end
+                    pp = try
+                        simulate(prob, bp)
+                    catch e
+                        _is_program_error(e) && rethrow()
+                        μ_pred  # zero FD column on numerical failure
+                    end
                     Jb[:, b] .= (ord(pp) .- mu_base) ./ step
                 end
                 JWJ = Jb' * Diagonal(w_vec2) * Jb
@@ -596,7 +771,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                 H_inv = try; inv(cholesky(Symmetric(H))); catch; pinv(H); end
                 edf_total = clamp(tr(H_inv * JWJ), 1.0, Float64(n_beta))
                 sigma2_est = sum(w_vec2 .* (y_vec2 .- mu_base).^2) /
-                             max(n_data - edf_total, 1.0)
+                             max(n_eff_cells - edf_total, 1.0)
                 if alg.sigma2_init !== nothing
                     sigma2_est = min(sigma2_est, alg.sigma2_init)
                 end
@@ -612,8 +787,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                     # null space (rank + nullity − θtr(H⁻¹S)) and bias θ up.
                     r_k = _rank_penalty(S_list[l])
                     trHS = tr(H_inv[idx, idx] * S_list[l])
-                    fs_num = clamp(r_k - theta[l] * trHS, 0.01, Float64(uf_nk[l]))
-                    if bSb > 1e-30
+                    # Keep θ_k unchanged when the effective numerator is ≤ 0
+                    # (matching estimate_smoothing_params in laml.jl): a
+                    # non-positive numerator means the FS update prescribes
+                    # keeping/decreasing λ, and flooring it at 0.01 would
+                    # manufacture a spurious increase. Preserve the upper cap.
+                    fs_num = min(r_k - theta[l] * trHS, Float64(uf_nk[l]))
+                    if bSb > 1e-30 && fs_num > 0
                         theta[l] = clamp(sigma2_est * fs_num / bSb, 1e-20, 1e20)
                     end
                 end
@@ -634,10 +814,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     end
 
     # Compute data loss
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:T_pts
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Compute ODE compliance
     F = eval_ode_rhs(prob, times, alpha, beta)
@@ -691,5 +868,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     PSMSolution(params, obj_val, data_loss, edf, copy(theta),
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (ode_compliance=ode_loss, lambda_ode_final=alg.lambda_ode_end))
+                (ode_compliance=ode_loss, lambda_ode_final=alg.lambda_ode_end,
+                 converged=conv_converged, iterations=conv_iters,
+                 reason=conv_reason, iterations_total=conv_iters_total))
 end

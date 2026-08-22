@@ -49,7 +49,9 @@ Fit a partially specified model by ensemble Bayesian gradient matching
 
 # Returns
 `PSMSolution`. Fitted values re-simulate the ODE/map with the best
-member's parameters.
+member's parameters. `sol.convergence` carries the honest-convergence keys
+`(converged, iterations, reason)` plus per-member `member_converged` — see
+the `BNGSolver` docstring for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     _validate_problem(prob, "BNGSolver")
@@ -69,11 +71,20 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     base_fit = zeros(n_times, n_obs)             # smoother fit per data column
     resid = zeros(n_times, n_obs)                # residuals for the bootstrap
     for j in 1:n_obs
-        val, _ = _smoothing_spline(times, Float64.(prob.data_values[:, j]))
+        val, _ = _smoothing_spline_masked(times,
+                                          Float64.(prob.data_values[:, j]),
+                                          @view(prob.data_weights[:, j]))
         for i in 1:n_times
             base_fit[i, j] = val(times[i])
         end
-        resid[:, j] = prob.data_values[:, j] .- base_fit[:, j]
+        # Residual bootstrap pool: only usable cells yield real residuals.
+        # A masked cell's "residual" is NaN (or a fabricated number at
+        # weight 0) and would be resampled into random rows of every
+        # replicate, spreading the contamination across the ensemble.
+        for i in 1:n_times
+            resid[i, j] = usable_cell(prob, i, j) ?
+                          prob.data_values[i, j] - base_fit[i, j] : 0.0
+        end
     end
 
     # Smooth a data matrix into (states, derivative targets)
@@ -82,7 +93,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
         dydt = zeros(n_times, n_vars)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
-            val, der = _smoothing_spline(times, data_matrix[:, j])
+            # `data_matrix` is the raw data on the first pass and a
+            # bootstrap resample of base_fit + resid afterwards; the
+            # former can hold NaN, so mask by the original weights.
+            val, der = _smoothing_spline_masked(times,
+                                                Float64.(data_matrix[:, j]),
+                                                @view(prob.data_weights[:, j]))
             for i in 1:n_times
                 y_smooth[i, sk] = val(times[i])
                 if !prob.discrete
@@ -112,12 +128,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     end
 
     # ── Parameter initialisation ─────────────────────────────────
-    mlp_specs = Dict{Symbol, MLPSpec}()
-    for approx in prob.approximators
-        approx isa NeuralApproximator &&
-            (mlp_specs[approx.name] = mlp_spec_from_lux(approx.model))
-    end
-
     # kp = 1 uses the default initialisation (a seeded neural approximator
     # keeps its own seed; unseeded ones draw fresh weights); kp > 1 perturbs
     # it — fresh random weights for neural approximators, jittered
@@ -129,7 +139,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
             if approx isa NeuralApproximator
                 r = kp == 1 && approx.rng_seed !== nothing ?
                     Random.Xoshiro(approx.rng_seed) : rng
-                append!(beta, init_mlp_params(mlp_specs[approx.name], r))
+                append!(beta, neural_init_params(approx, r))
             else
                 b0 = Float64.(initial_params(approx))
                 kp > 1 && (b0 .+= 0.2 .* (abs.(b0) .+ 1.0) .* randn(rng, length(b0)))
@@ -141,7 +151,24 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     n_beta = length(init_beta(1))
 
     n_match = prob.discrete ? n_times - 1 : n_times
-    n_resid = n_match * length(observed_states)
+    # Per-(time, state) usability, mirroring TwoStageSolver: a match point
+    # counts if ANY observation column mapping to that state is usable
+    # there. All-true for complete data.
+    match_usable = falses(n_times, n_vars)
+    for j in 1:n_obs
+        sk = prob.obs_to_state[j]
+        for i in 1:n_times
+            usable_cell(prob, i, j) && (match_usable[i, sk] = true)
+        end
+    end
+    # n_resid is the effective sample size in the variance-marginalized
+    # log-posterior below, `(n_resid/2)*log1p(ssr/2)`. Counting masked
+    # cells over-weights the data term against the parameter prior and
+    # breaks the self-balancing property this solver advertises. Equals
+    # n_match * |observed_states| for complete data.
+    n_resid = count(match_usable[i, k] for i in 1:n_match, k in 1:n_vars)
+    n_resid == 0 && error("BNGSolver: every observation is masked; " *
+        "there is nothing to fit.")
     lambda_smooth = alg.lambda_smooth
     prior_sd = alg.prior_sd
     K_total = alg.k_obs * alg.k_proc
@@ -170,6 +197,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
                 # Match only observed states (unobserved targets are
                 # fabricated constants — see two_stage_solver.jl).
                 k in observed_states || continue
+                # …and only where that state has a usable observation:
+                # the smoother now excludes masked rows, so the target
+                # there is an extrapolation rather than data.
+                match_usable[i, k] || continue
                 ssr += (dydt[i, k] - du[k])^2
             end
         end
@@ -203,6 +234,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
         loss_fn = β -> bng_loss(β, y_smooth, dydt)
         result = DiffResults.MutableDiffResult(0.0, (zeros(n_beta),))
         iters_used = alg.maxiters
+        plateaued = false
         for iter in 1:alg.maxiters
             ForwardDiff.gradient!(result, loss_fn, beta)
             loss_val = DiffResults.value(result)
@@ -218,20 +250,27 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
             m_hat = m_adam ./ (1 - β1_adam^iter)
             v_hat = v_adam ./ (1 - β2_adam^iter)
             beta .-= lr_t .* m_hat ./ (sqrt.(v_hat) .+ eps_adam)
-            if iter > 60
+            # Plateau convergence, guarded against the cosine lr schedule
+            # manufacturing a plateau as lr_t → 0 near maxiters.
+            # `best_loss < 1e9` is AdamSolver's failure-sentinel guard:
+            # the dynamics fall back to `du .= 1e6` when the RHS throws,
+            # so a run pinned at that sentinel is stuck, not converged.
+            if iter > 60 && best_loss < 1e9 && lr_t > 0.05 * alg.lr
                 rmin, rmax = extrema(loss_window)
                 if (rmax - rmin) / max(abs(rmin), 1.0) < 1e-6
                     iters_used = iter
+                    plateaued = true
                     break
                 end
             end
         end
-        best_beta, best_loss, iters_used
+        best_beta, best_loss, iters_used, plateaued
     end
 
     # ── Step 2/3: the K_o × K_p ensemble ─────────────────────────
     member_betas = Vector{Vector{Float64}}()
     member_losses = Float64[]
+    member_plateaued = Bool[]
     total_iters = 0
     for ko in 1:alg.k_obs
         data_ko = if ko == 1
@@ -245,9 +284,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
         end
         y_smooth, dydt = smooth_targets(data_ko)
         for kp in 1:alg.k_proc
-            beta_fit, loss_fit, it = fit_member(init_beta(kp), y_smooth, dydt)
+            beta_fit, loss_fit, it, plat = fit_member(init_beta(kp), y_smooth, dydt)
             push!(member_betas, beta_fit)
             push!(member_losses, loss_fit)
+            push!(member_plateaued, plat)
             total_iters += it
             if verbose
                 println("  member (obs $ko, proc $kp): " *
@@ -317,10 +357,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     end
 
     # Data loss against original observations
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:n_times
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Per-member evaluators for one approximator's parameter block
     function build_eval(approx, params_k)
@@ -329,19 +366,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
                                     length=approx.nknots))
             build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_specs[approx.name]
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                x -> begin
-                    xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
-                        (Float64(x isa AbstractArray ? x[1] : x) - lo_) / span_
-                    else
-                        Float64(x isa AbstractArray ? x[1] : x)
-                    end
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator
@@ -417,7 +442,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     PSMSolution(params, best_loss, data_loss, edf, Float64[],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (converged=true, iterations=total_iters, method=:bng,
+                (converged=member_plateaued[best_idx], iterations=total_iters,
+                 reason=(member_plateaued[best_idx] ? :plateau : :maxiters),
+                 method=:bng,
                  n_ensemble=K_total, member_losses=member_losses,
-                 member_weights=w_members, ensemble_std=ensemble_std))
+                 member_weights=w_members, member_converged=member_plateaued,
+                 ensemble_std=ensemble_std))
 end

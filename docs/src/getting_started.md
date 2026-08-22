@@ -151,6 +151,29 @@ A [`PSMProblem`](@ref) combines:
 | `likelihood`    | Error distribution ([`Gaussian`](@ref), [`Poisson`](@ref), etc.) |
 | `solver`        | ODE solver from OrdinaryDiffEq.jl                       |
 
+### Missing observations
+
+Incomplete data does not need reshaping. Mark a missing cell in `data_values`
+as `NaN` **and** give it weight `0.0` in `data_weights`:
+
+```julia
+data_values[3, 1]  = NaN
+data_weights[3, 1] = 0.0
+```
+
+Such a **masked** cell is dropped from the objective, the reported loss, the
+scale estimate, every denominator, and the residual diagnostics. Marking it
+both ways matters: `0 * NaN = NaN` in IEEE arithmetic, so a zero weight on its
+own does not neutralise a `NaN` value.
+
+Most solvers support masking. Four — [`RodeoSolver`](@ref),
+[`DaltonSolver`](@ref), [`PseudoMarginalSolver`](@ref) and
+[`EnsembleKalmanSolver`](@ref) — evaluate their likelihood inside a
+Kalman/particle recursion with no per-cell mask and raise an error instead of
+silently corrupting the filter. See
+[Missing and Masked Observations](solvers.md#Missing-and-Masked-Observations)
+for the full list and the reasoning.
+
 ### Smoothing and EDF
 
 The **effective degrees of freedom (EDF)** measures model complexity. With 8 knots, the maximum EDF is 8 (unpenalized). LAML estimates ``\lambda`` to balance fit and smoothness:

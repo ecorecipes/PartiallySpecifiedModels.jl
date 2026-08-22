@@ -38,6 +38,8 @@ integration, providing a robust and computationally efficient estimator.
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
+`sol.convergence` is a NamedTuple `(converged, iterations, reason, method)`
+— see the `IntegralMatchingSolver` docstring for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
     _validate_problem(prob, "IntegralMatchingSolver"; require_continuous=true)
@@ -59,7 +61,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
     for j in 1:n_obs
         sk = prob.obs_to_state[j]
         push!(observed_states, sk)
-        sval, _ = _smoothing_spline(times, Float64.(prob.data_values[:, j]))
+        # Masked rows must be dropped from the smoother's normal equations,
+        # not merely ignored afterwards: one NaN makes every spline
+        # coefficient NaN, so `y_smooth` — and hence the integral-matching
+        # residual `delta` — is NaN everywhere. There is no finiteness
+        # sentinel in `integral_loss`, so the NaN reaches the Adam moments
+        # and the solver silently returns its initial parameters.
+        sval, _ = _smoothing_spline_masked(times,
+                                           Float64.(prob.data_values[:, j]),
+                                           @view(prob.data_weights[:, j]))
         for i in 1:n_times
             y_smooth[i, sk] = sval(times[i])
         end
@@ -74,11 +84,38 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
         end
     end
 
-    # Trajectory increments: Δ[i,k] = ŷ_k(t_i) - ŷ_k(t_1)
+    # Which (time, state) cells carry a usable observation, and which row
+    # each observed state measures its increment FROM. Masked rows are
+    # dropped from the smoother above, so `y_smooth` there is a pure
+    # interpolation with no data behind it: including it in the loss would
+    # fit the model to the smoother's own extrapolation. The three sibling
+    # gradient-matching solvers (TwoStage, BNG, ODIN) all gate; this one
+    # ran over every time index ungated.
+    match_usable = falses(n_times, n_vars)
+    base_row = ones(Int, n_vars)          # baseline row per state
+    for j in 1:n_obs
+        sk = prob.obs_to_state[j]
+        for i in 1:n_times
+            usable_cell(prob, i, j) && (match_usable[i, sk] = true)
+        end
+    end
+    for k in 1:n_vars
+        k in observed_states || continue
+        # The baseline ŷ_k(t_b) must itself be anchored on data: with row 1
+        # masked, `y_smooth[1, k]` is an extrapolation and every increment
+        # in the column inherits its error.
+        b = findfirst(@view match_usable[:, k])
+        b === nothing && error("IntegralMatchingSolver: state $k has no " *
+            "usable observation (every cell is masked — zero weight or " *
+            "non-finite value); there is nothing to match.")
+        base_row[k] = b
+    end
+
+    # Trajectory increments: Δ[i,k] = ŷ_k(t_i) - ŷ_k(t_b(k))
     delta = zeros(n_times, n_vars)
     for k in 1:n_vars
-        for i in 2:n_times
-            delta[i, k] = y_smooth[i, k] - y_smooth[1, k]
+        for i in 1:n_times
+            delta[i, k] = y_smooth[i, k] - y_smooth[base_row[k], k]
         end
     end
 
@@ -89,14 +126,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
     # ── Stage 2: Integral matching via Adam ──────────────────────
     # Initialize parameters
     beta = Float64[]
-    mlp_specs = Dict{Symbol, MLPSpec}()
 
     for approx in prob.approximators
         if approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            mlp_specs[approx.name] = spec
             rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            append!(beta, init_mlp_params(spec, rng))
+            append!(beta, neural_init_params(approx, rng))
         else
             append!(beta, initial_params(approx))
         end
@@ -142,14 +176,21 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
             end
         end
 
-        # Loss: ||delta - I_cum||² over OBSERVED states only (unobserved
-        # states hold a fabricated constant, so their delta ≡ 0 would push
-        # the unknown functions to zero the RHS along a fictitious path)
+        # Loss over OBSERVED states (unobserved states hold a fabricated
+        # constant, so their delta ≡ 0 would push the unknown functions to
+        # zero the RHS along a fictitious path) and USABLE rows only.
+        #
+        # `I_cum` is still cumulative from t_1, so the increment matching
+        # the baseline-shifted `delta[i,k] = ŷ(t_i) − ŷ(t_b)` is
+        # `I_cum[i,k] − I_cum[b,k]`. For complete data b = 1 and
+        # `I_cum[1,k] = 0`, so this is bit-for-bit the previous expression.
         loss_val = zero(T_el)
         for k in 1:n_vars
             k in observed_states || continue
-            for i in 2:n_times
-                loss_val += (delta[i, k] - I_cum[i, k])^2
+            b = base_row[k]
+            for i in 1:n_times
+                (i != b && match_usable[i, k]) || continue
+                loss_val += (delta[i, k] - (I_cum[i, k] - I_cum[b, k]))^2
             end
         end
 
@@ -188,8 +229,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
     best_loss = Inf
     loss_window = fill(Inf, 30)
     final_iter = alg.maxiters
+    # Honest convergence reporting: converged only when the plateau
+    # criterion actually fires; otherwise the loop exhausted maxiters.
+    conv_converged = false
+    conv_reason = :maxiters
 
     for iter in 1:alg.maxiters
+        final_iter = iter
         result = DiffResults.MutableDiffResult(0.0, (zeros(n_beta),))
         ForwardDiff.gradient!(result, integral_loss, beta)
         loss_val = DiffResults.value(result)
@@ -214,12 +260,20 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
                     "lr=$(round(lr_t, sigdigits=3))")
         end
 
-        if iter > 60
+        # Plateau convergence, guarded against the cosine lr schedule
+        # manufacturing a plateau as lr_t → 0 near maxiters: only trust the
+        # criterion while the step size is still meaningful.
+        # `best_loss < 1e9` is AdamSolver's failure-sentinel guard: the
+        # dynamics fall back to `du .= 1e6` when the RHS throws, so a run
+        # pinned at that sentinel is a stuck solver, not a converged one.
+        if iter > 60 && best_loss < 1e9 && lr_t > 0.05 * lr
             recent_min = minimum(loss_window)
             recent_max = maximum(loss_window)
             if (recent_max - recent_min) / max(abs(recent_min), 1.0) < 1e-6
                 if verbose; println("  Converged at iter $iter (loss plateau)"); end
                 final_iter = iter
+                conv_converged = true
+                conv_reason = :plateau
                 break
             end
         end
@@ -235,10 +289,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
         pred[:, j] .= y_smooth[:, sk]
     end
 
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:n_times
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     uf_evals = Dict{Symbol, Any}()
     offset = 0
@@ -251,19 +302,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_specs[approx.name]
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                uf_evals[approx.name] = x -> begin
-                    xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
-                        (Float64(x isa AbstractArray ? x[1] : x) - lo_) / span_
-                    else
-                        Float64(x isa AbstractArray ? x[1] : x)
-                    end
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator
@@ -291,5 +330,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
     PSMSolution(params, best_loss, data_loss, edf, Float64[lambda_smooth],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (converged=true, iterations=final_iter, method=:integral_matching))
+                (converged=conv_converged, iterations=final_iter,
+                 reason=conv_reason, method=:integral_matching))
 end

@@ -32,13 +32,55 @@ function _normcdf(x::Real)
     end
 end
 
-"""Standard normal log-CDF log Φ(x), stable for large negative x."""
+"""
+Standard normal log-CDF log Φ(x), stable and accurate in BOTH tails.
+
+Replaces a truncated asymptotic expansion that dropped the Mills-series
+correction, causing a ~0.022 jump at the old x = −6 branch switch and
+0.3–0.7% log error across the tail (the A&S rational `_normcdf` is accurate
+ABSOLUTELY to 7.5e-8, so its log error also grows in the tail). All
+branches below are accurate to ~1e-15 relative, so the seams are smooth to
+machine precision — second differences across them (e.g. finite-difference
+information checks) stay clean.
+
+The positive half is computed from the negative half by complement,
+`log Φ(x) = log1p(−Φ(−x))`: `log(0.5 + φ(x)Σ…)` loses all relative
+precision as Φ → 1 (only ~7 correct digits at x = 6, none past x ≈ 9,
+where it returns exactly 0), and a branch switch there made the function
+DECREASE by 3.5e-12 across x = 6 — the only non-monotone point of the
+whole function. Going through the (tiny, fully accurate) upper tail
+instead keeps ~1e-16 relative accuracy for every x > 0.
+"""
 function _normlogcdf(x::Real)
-    if x > -6.0
-        log(_normcdf(x))
+    if x > 0.0
+        # Φ(x) = 1 − Φ(−x) with Φ(−x) ≤ ½ computed to full relative
+        # precision by the branches below; log1p is exact for tiny inputs.
+        log1p(-exp(_normlogcdf(-x)))
+    elseif x > -1.0
+        # Exact small-|x| series (Abramowitz & Stegun 26.2.11):
+        #   Φ(x) = ½ + φ(x) Σ_{n≥0} x^{2n+1}/(2n+1)!!
+        # All terms share x's sign — no cancellation for x > −1 — and the
+        # ratio x²/(2n+3) → 0 guarantees fast convergence on this range.
+        term = x
+        s = x
+        n = 0
+        while abs(term) > 1e-17 * abs(s) && n < 200
+            n += 1
+            term *= x * x / (2n + 1)
+            s += term
+        end
+        log(0.5 + _normpdf(x) * s)
     else
-        # Asymptotic expansion: log Φ(x) ≈ -½x² - log(-x√(2π))
-        -0.5 * x^2 - log(-x) - 0.5 * log(2π)
+        # Mills-ratio Laplace continued fraction: for t = −x ≥ 1,
+        #   Φ(x) = φ(t)·R(t),  R(t) = 1/(t + 1/(t + 2/(t + 3/(t + ⋯)))),
+        # evaluated by backward recurrence (depth 400: machine precision
+        # for t ≥ 1, and trivially cheap).
+        t = -x
+        r = zero(t)
+        for k in 400:-1:1
+            r = k / (t + r)
+        end
+        -0.5 * x^2 - 0.5 * log(2π) - log(t + r)
     end
 end
 
@@ -62,12 +104,58 @@ function _loggamma(x::Real)
     0.5 * log(2π) + (x + 0.5) * log(t) - t + log(a)
 end
 
+# ─── Cell usability (the package-wide masking convention) ───────────
+
+"""
+    _usable(y, w) -> Bool
+
+A data cell counts toward an objective iff its weight is strictly
+positive AND its value is FINITE. This is the single convention shared by
+`weighted_data_loss`, `usable_cell`, `n_usable`, `_reject_masked_data`,
+the LAML/GCV data flattening, the bootstrap, ABC, MAGI, VI and MCMC.
+
+`isfinite`, not `!isnan`: `±Inf` is no more usable as an observation than
+`NaN` is. The two predicates coexisted for a while — `weighted_data_loss`
+gated on `isfinite` while the cell predicates gated on `!isnan` — so an
+`Inf` datum was counted in every denominator, excluded from every
+numerator, and waved through by `_reject_masked_data` into the Kalman
+solvers that cannot mask at all.
+
+Enforcing it *inside* the likelihood families is what makes the
+convention hold for the OPTIMIZED objective and not merely the reported
+one. `w = 0` is not sufficient protection on its own: IEEE arithmetic
+gives `0 * NaN = NaN`, so a single masked-out missing observation would
+otherwise turn the whole log-likelihood — and every gradient derived
+from it — into NaN, and the optimizer would reject every step and
+return its initialization without raising an error.
+
+For complete data (every weight positive, every value finite) the guard
+never fires, so all values below are bit-for-bit unchanged.
+"""
+@inline _usable(y::Real, w::Real) = w > 0 && isfinite(y)
+
+"""
+    _n_usable(y, w) -> Int
+
+Number of usable cells in a flattened `(y, w)` pair — the sample size
+that every per-observation denominator (REML `n`, GCV `n`, σ̂²'s
+`n − edf`) must use. Equals `length(y)` for complete data.
+"""
+function _n_usable(y::AbstractVector, w::AbstractVector)
+    c = 0
+    for i in eachindex(y)
+        _usable(y[i], w[i]) && (c += 1)
+    end
+    c
+end
+
 # ─── Log-likelihood functions ───────────────────────────────────────
 
 """
     log_likelihood(fam, y, mu, w)
 
-Total weighted log-likelihood: Σ_i w_i ℓ(y_i, μ_i).
+Total weighted log-likelihood: Σ_i w_i ℓ(y_i, μ_i), summed over the
+USABLE cells only (`w_i > 0` and `y_i` finite — see `_usable`).
 
 Poisson, NegativeBinomial, and TruncatedNormal include their full
 normalizing constants and are mutually comparable (e.g. for AIC). The
@@ -79,6 +167,7 @@ function log_likelihood(::Gaussian, y::AbstractVector,
                         mu::AbstractVector, w::AbstractVector)
     ll = 0.0
     for i in eachindex(y)
+        _usable(y[i], w[i]) || continue
         ll -= 0.5 * w[i] * (y[i] - mu[i])^2
     end
     ll
@@ -88,7 +177,14 @@ function log_likelihood(::Poisson, y::AbstractVector,
                         mu::AbstractVector, w::AbstractVector)
     ll = 0.0
     for i in eachindex(y)
-        mu_i = max(mu[i], 1e-10)
+        _usable(y[i], w[i]) || continue
+        # Convention (shared with irls_weights): μ ≤ 0 is regularized as
+        # max(|μ|, 1e-6) so the objective and the IRLS curvature see the
+        # SAME effective mean when identity-link iterates transiently go
+        # nonpositive. (Flooring at 1e-10 here while the weights used
+        # max(|μ|, 1e-6) put a flat cliff in the objective exactly where
+        # the curvature was still finite.) Identity for healthy μ > 1e-6.
+        mu_i = max(abs(mu[i]), 1e-6)
         kern = y[i] > 0 ? y[i] * log(mu_i) - mu_i : -mu_i
         ll += w[i] * (kern - _loggamma(y[i] + 1))   # − log(y!)
     end
@@ -101,6 +197,7 @@ function log_likelihood(fam::NegativeBinomial, y::AbstractVector,
     lgθ = _loggamma(θ)
     ll = 0.0
     for i in eachindex(y)
+        _usable(y[i], w[i]) || continue
         mu_i = max(mu[i], 1e-10)
         kern = y[i] * log(mu_i / (mu_i + θ)) + θ * log(θ / (mu_i + θ))
         norm = _loggamma(y[i] + θ) - lgθ - _loggamma(y[i] + 1)
@@ -115,6 +212,7 @@ function log_likelihood(fam::TruncatedNormal, y::AbstractVector,
     a = fam.lower
     ll = 0.0
     for i in eachindex(y)
+        _usable(y[i], w[i]) || continue
         z = (y[i] - mu[i]) / σ
         # log f(y|μ,σ,a) = -½z² - log(σ) - ½log(2π) - log Φ((μ-a)/σ)
         ll += w[i] * (-0.5 * z^2 - log(σ) - 0.5 * log(2π) -
@@ -127,10 +225,62 @@ function log_likelihood(fam::CustomLikelihood, y::AbstractVector,
                         mu::AbstractVector, w::AbstractVector)
     ll = 0.0
     for i in eachindex(y)
+        _usable(y[i], w[i]) || continue
         ll += w[i] * fam.loglik_scalar(y[i], mu[i])
     end
     ll
 end
+
+# ─── Pointwise log-likelihood (single observation) ──────────────────
+
+"""
+    loglik_pointwise(fam, y, mu)
+
+Pointwise log-likelihood ℓ(y, μ) for a single observation; the caller
+multiplies in any observation weight. Term-for-term identical to what
+`log_likelihood` accumulates, so summing `w_i · loglik_pointwise(fam,
+y_i, μ_i)` reproduces `log_likelihood(fam, y, mu, w)` exactly. The
+**Gaussian** method is the σ-free kernel −½(y−μ)² (σ² is a nuisance
+parameter handled by each solver), matching the `log_likelihood`
+convention. AD-safe: `μ` may be a `ForwardDiff.Dual`.
+
+A non-finite `y` (NaN or ±Inf) is a masked (missing) observation and
+contributes exactly zero, matching `log_likelihood`'s `_usable` guard. The zero is built as
+`zero(y * mu)` so it carries `μ`'s type — a `ForwardDiff.Dual` stays a
+Dual (with zero partials), keeping the accumulation type-stable and the
+gradient contribution correctly zero rather than NaN. Zero-weight cells
+need no guard here: the caller multiplies by `w = 0`, and the value
+returned for a finite `y` is finite.
+"""
+loglik_pointwise(::Gaussian, y::Real, mu::Real) =
+    !isfinite(y) ? zero(y * mu) : -0.5 * (y - mu)^2
+
+function loglik_pointwise(::Poisson, y::Real, mu::Real)
+    !isfinite(y) && return zero(y * mu)
+    # Same μ ≤ 0 convention as log_likelihood/irls_weights: max(|μ|, 1e-6).
+    mu_c = max(abs(mu), 1e-6)
+    kern = y > 0 ? y * log(mu_c) - mu_c : -mu_c
+    kern - _loggamma(y + 1)
+end
+
+function loglik_pointwise(fam::NegativeBinomial, y::Real, mu::Real)
+    !isfinite(y) && return zero(y * mu)
+    θ = fam.theta
+    mu_c = max(mu, 1e-10)
+    kern = y * log(mu_c / (mu_c + θ)) + θ * log(θ / (mu_c + θ))
+    kern + _loggamma(y + θ) - _loggamma(θ) - _loggamma(y + 1)
+end
+
+function loglik_pointwise(fam::TruncatedNormal, y::Real, mu::Real)
+    !isfinite(y) && return zero(y * mu)
+    σ = fam.sigma
+    a = fam.lower
+    z = (y - mu) / σ
+    -0.5 * z^2 - log(σ) - 0.5 * log(2π) - _normlogcdf((mu - a) / σ)
+end
+
+loglik_pointwise(fam::CustomLikelihood, y::Real, mu::Real) =
+    !isfinite(y) ? zero(y * mu) : fam.loglik_scalar(y, mu)
 
 # ─── IRLS working weights ──────────────────────────────────────────
 
@@ -141,10 +291,22 @@ Compute IRLS working weights W̃ = w / V(μ) for identity-link Fisher scoring.
 
 The PSM solver operates on the response scale (identity link), so
 the working weight is the inverse variance: W̃_i = w_i / V(μ_i).
+
+Unusable cells (`_usable` false: zero weight or non-finite datum) get working
+weight exactly 0, so they drop out of `J'W̃J`, out of the EDF trace and
+out of every PCLS step. For a zero-weight cell that is already what the
+formulae give whenever `y` is finite; the guard matters when `y` is NaN
+— notably for `CustomLikelihood`, whose curvature is obtained by
+differentiating `loglik_scalar(y, ·)`, which returns NaN for a NaN `y`
+and would then be multiplied by `w = 0` to give NaN, not 0.
 """
 function irls_weights(::Gaussian, y::AbstractVector,
                       mu::AbstractVector, w::AbstractVector)
-    copy(w)
+    wt = copy(w)
+    for i in eachindex(wt)
+        _usable(y[i], w[i]) || (wt[i] = zero(eltype(wt)))
+    end
+    wt
 end
 
 function irls_weights(::Poisson, y::AbstractVector,
@@ -152,6 +314,9 @@ function irls_weights(::Poisson, y::AbstractVector,
     # Identity link, V(μ) = μ → W̃ = w / μ
     wt = similar(w)
     for i in eachindex(w)
+        if !_usable(y[i], w[i])
+            wt[i] = zero(eltype(wt)); continue
+        end
         mu_i = max(abs(mu[i]), 1e-6)
         wt[i] = w[i] / mu_i
     end
@@ -164,6 +329,9 @@ function irls_weights(fam::NegativeBinomial, y::AbstractVector,
     θ = fam.theta
     wt = similar(w)
     for i in eachindex(w)
+        if !_usable(y[i], w[i])
+            wt[i] = zero(eltype(wt)); continue
+        end
         mu_i = max(abs(mu[i]), 1e-6)
         wt[i] = w[i] / (mu_i + mu_i^2 / θ)
     end
@@ -182,6 +350,9 @@ function irls_weights(fam::TruncatedNormal, y::AbstractVector,
     a = fam.lower
     wt = similar(w)
     for i in eachindex(w)
+        if !_usable(y[i], w[i])
+            wt[i] = zero(eltype(wt)); continue
+        end
         ξ = (mu[i] - a) / σ
         Φξ = max(_normcdf(ξ), 1e-15)
         λξ = _normpdf(ξ) / Φξ          # inverse Mills ratio
@@ -196,6 +367,9 @@ function irls_weights(fam::CustomLikelihood, y::AbstractVector,
     # Derive via ForwardDiff: w̃_i = w_i × (-∂²ℓ/∂μ²)
     wt = similar(w)
     for i in eachindex(w)
+        if !_usable(y[i], w[i])
+            wt[i] = zero(eltype(wt)); continue
+        end
         yi = y[i]
         neg_d2l = -ForwardDiff.derivative(
             μ -> ForwardDiff.derivative(μ2 -> fam.loglik_scalar(yi, μ2), μ),

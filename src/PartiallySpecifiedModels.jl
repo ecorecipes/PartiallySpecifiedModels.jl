@@ -44,11 +44,18 @@ include("types.jl")
 # B-spline approximator and penalty matrices
 include("approximators.jl")
 
+# Shared neural-network evaluator (Dual-safe MLP path + Lux fallback);
+# must precede solver.jl, which uses build_neural_evaluator
+include("neural_evaluator.jl")
+
 # Likelihood families
 include("likelihoods.jl")
 
 # LAML smoothing parameter estimation
 include("laml.jl")
+
+# Shared penalized least-squares step (truncated SVD + step contraction)
+include("pcls.jl")
 
 # Main solver (IRLS + LAML)
 include("solver.jl")

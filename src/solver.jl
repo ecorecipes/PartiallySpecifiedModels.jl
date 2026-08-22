@@ -86,23 +86,10 @@ function build_param_struct(prob::PSMProblem, beta::AbstractVector)
             evaluator = build_bspline_evaluator(knots_x, params_k)
             push!(uf_entries, approx.name => evaluator)
         elseif approx isa NeuralApproximator
-            rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            _, st = Lux.setup(rng, approx.model)
-            rng2 = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            ps_ca = Float64.(ComponentArray(Lux.initialparameters(rng2, approx.model)))
-            ps_vec = similar(ps_ca)
-            ps_vec .= params_k
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            evaluator = x -> begin
-                xn = if lo !== nothing && span !== nothing && span > 0
-                    (Float64(x isa AbstractArray ? x[1] : x) - lo) / span
-                else
-                    Float64(x isa AbstractArray ? x[1] : x)
-                end
-                out, _ = Lux.apply(approx.model, Float32.(reshape([xn], :, 1)), ps_vec, st)
-                length(out) == 1 ? Float64(out[1]) : Float64.(out)
-            end
+            # Dual-safe, eltype-generic (see neural_evaluator.jl) — required
+            # for autodiff Jacobians in stiff ODE solvers and for gradients
+            # of any objective w.r.t. β.
+            evaluator = build_neural_evaluator(approx, params_k)
             push!(uf_entries, approx.name => evaluator)
         elseif approx isa GPApproximator
             evaluator = build_gp_evaluator(approx, params_k)
@@ -128,6 +115,103 @@ function build_param_struct(prob::PSMProblem, beta::AbstractVector)
 end
 
 """
+    weighted_data_loss(prob, pred) -> Float64
+
+The reported `PSMSolution.data_loss`: the weighted residual sum of
+squares `Σ wᵢⱼ (yᵢⱼ − ŷᵢⱼ)²` taken over the USABLE data cells only.
+
+A cell is usable when its weight is positive and its datum is finite.
+Skipping the rest matters twice over: an unweighted sum silently ignores
+`data_weights` (so a masked or down-weighted observation still counts),
+and `0 * NaN = NaN` would otherwise let a single masked-out missing
+observation turn the whole reported loss into `NaN`.
+"""
+function weighted_data_loss(prob::PSMProblem, pred::AbstractMatrix)
+    dl = 0.0
+    for k in eachindex(prob.data_values)
+        # Same predicate as `usable_cell` / `_usable` — see `_usable`.
+        _usable(prob.data_values[k], prob.data_weights[k]) || continue
+        dl += prob.data_weights[k] * (pred[k] - prob.data_values[k])^2
+    end
+    dl
+end
+
+"""
+    usable_cell(prob, i, j) -> Bool
+
+Whether data cell `(i, j)` participates in objectives. The single
+package-wide convention: positive weight AND FINITE value — the same
+predicate as `_usable(y, w)` and `weighted_data_loss`. Solvers that
+accumulate a data term cell-by-cell should gate on this rather than
+relying on the weight alone — `0 * NaN = NaN`, so a zero weight does NOT
+neutralize a NaN datum.
+"""
+@inline usable_cell(prob::PSMProblem, i::Int, j::Int) =
+    _usable(prob.data_values[i, j], prob.data_weights[i, j])
+
+"""
+    usable_rows(prob, j) -> Vector{Int}
+
+Row indices of column `j` that carry a usable observation. Used by the
+solvers that pre-smooth a data column (`_smoothing_spline`, `CubicSpline`,
+GP smoothers): those fits solve normal equations in which a single NaN
+makes EVERY coefficient NaN, so the masked rows must be dropped from the
+fit rather than merely down-weighted afterwards.
+"""
+usable_rows(prob::PSMProblem, j::Int) =
+    [i for i in axes(prob.data_values, 1) if usable_cell(prob, i, j)]
+
+"""
+    n_usable(prob) -> Int
+
+Total number of usable data cells — the sample size any denominator over
+observations (σ̂²'s `n − edf`, a GCV `n`, a marginal-likelihood
+normalizer) must use. Equals `length(prob.data_values)` for complete data.
+"""
+n_usable(prob::PSMProblem) =
+    count(k -> _usable(prob.data_values[k], prob.data_weights[k]),
+          eachindex(prob.data_values))
+
+"""
+    _reject_masked_data(prob, solver_name)
+
+Raise a clear error if any data cell is masked, for solvers that do NOT
+yet support masking.
+
+These are the probabilistic-numerics and ensemble solvers whose data term
+lives inside a Kalman/particle recursion (`probsolve.jl`'s `basic_loglik`
+and Fenrir `condition!`, `_dalton_joint_evidence`'s `assimilate_data!`,
+`_pm_loglik_hat`, and the EKI innovation update). Honoring the mask there
+means threading a weight matrix through those signatures AND skipping the
+filter update — not just the density term — for masked cells; that is a
+structural change, deliberately out of scope here.
+
+Failing loudly is the point. Left unguarded these solvers do not merely
+report NaN: `dalton_solver.jl`'s `!isfinite(ll) && return 1e10` flattens
+the objective to a constant, `pseudo_marginal_solver.jl` rejects every MH
+proposal (α = 0), and the EKI update turns every ensemble member NaN on
+the first iteration — each of which returns the initialization while
+looking like an ordinary, converged fit.
+"""
+function _reject_masked_data(prob::PSMProblem, solver_name::String)
+    # `n_usable` is the package-wide count, so the rejection predicate can
+    # never drift from the predicate the masking solvers actually apply.
+    n_masked = length(prob.data_values) - n_usable(prob)
+    n_masked == 0 && return nothing
+    error("$solver_name does not support masked observations, and $n_masked " *
+          "of $(length(prob.data_values)) data cells are masked (weight 0 " *
+          "or non-finite value). Its likelihood is evaluated inside a Kalman / " *
+          "particle recursion that has no per-cell mask, so masked cells " *
+          "would silently corrupt the filter state rather than being " *
+          "skipped. Use LAML, GCVSolver, CollocationLAML, GradientMatching, " *
+          "TwoStageSolver, BNGSolver, ODINSolver, RKHSSolver, " *
+          "IntegralMatchingSolver, AdamSolver, MultipleShootingSolver, " *
+          "DerivativeFreeSolver, MCMCSolver, MagiSolver, VariationalSolver, " *
+          "ABCSolver or ProfileLikelihoodSolver for masked data, or drop " *
+          "the masked rows from data_times/data_values before calling.")
+end
+
+"""
     _is_program_error(e)
 
 Classify an exception caught inside a solver objective. Programming
@@ -149,7 +233,14 @@ function _is_program_error(e::InexactError)
 end
 _is_program_error(e) = e isa Union{MethodError, BoundsError, UndefVarError,
                                    TypeError, KeyError, DimensionMismatch,
-                                   UndefRefError}
+                                   UndefRefError,
+                                   # Not a "program error" as such, but it
+                                   # must escape for the same reason: a
+                                   # Ctrl-C landing inside user dynamics was
+                                   # otherwise swallowed as a numerical
+                                   # failure at ~20 rethrow sites, making
+                                   # long solves uninterruptible.
+                                   InterruptException}
 
 """
     _adapt_gp_approximators!(prob, beta) -> Bool
@@ -460,7 +551,9 @@ For each IRLS iteration:
 4. Step contraction (backtracking)
 5. Re-estimate smoothing parameters via Fellner-Schall + Newton
 
-Returns a `PSMSolution`.
+Returns a `PSMSolution`. `sol.convergence` is a NamedTuple
+`(V_beta, sigma2, converged, iterations, reason, laml_failures)` — see the
+`LAML` and `PSMSolution` docstrings for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     _validate_problem(prob, "LAML")
@@ -475,6 +568,27 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     # Build penalty matrices per approximator
     S_list, uf_offsets, uf_nk = build_penalty_matrices(prob)
     m = length(S_list)
+
+    # Mixed-approximator dof advisory: parameters without a penalty block
+    # (e.g. NeuralApproximator weights with penalty_weight = 0) are REML
+    # fixed effects, and when they rival the data size they exhaust the
+    # restricted residual dof that the Gaussian scale σ̂² = (RSS+pen)/(n−Mp)
+    # is estimated from. `laml.jl` charges them by design rank rather than
+    # raw count (see `_restricted_dof_Mp`) and warns again if even that
+    # exhausts the dof; warn here so the over-parameterization is visible
+    # before any fitting happens.
+    n_unpenalized = n_p - sum(uf_nk; init=0)
+    if m > 0 && n_unpenalized > 0
+        total_rank = sum(_rank_penalty(S_list[l]) for l in 1:m)
+        if n_data - (n_p - total_rank) < 10
+            @warn "LAML: $n_unpenalized unpenalized parameters (e.g. neural network " *
+                  "weights) leave at most $(n_data - (n_p - total_rank)) rank-based " *
+                  "residual degrees of freedom for the n=$n_data data points. The " *
+                  "Gaussian scale σ̂² charges them by design rank instead, but the " *
+                  "model is heavily over-parameterized: consider more data, a " *
+                  "smaller network, or penalty_weight > 0."
+        end
+    end
 
     # Initialize smoothing: user-specified or data-driven default.
     # The penalty matrices are computed on a normalised [0,1] domain,
@@ -501,13 +615,23 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         B
     end
 
-    # Flatten data
+    # Flatten data, enforcing the package's masking convention: a cell is
+    # usable only if its weight is positive AND its datum is non-NaN.
+    # Masked cells get weight 0 and a finite placeholder value — every
+    # downstream use multiplies by the weight, but IEEE `0 * NaN = NaN`,
+    # so leaving a NaN datum in y_vec would silently poison the objective
+    # (the optimizer would then reject every step and return the initial
+    # coefficients unchanged, without any error).
     y_vec = zeros(n_data)
     w_vec = zeros(n_data)
     k = 1
     for oi in 1:n_obs, ti in 1:n_times
-        y_vec[k] = prob.data_values[ti, oi]
-        w_vec[k] = prob.data_weights[ti, oi]
+        y = prob.data_values[ti, oi]
+        wv = prob.data_weights[ti, oi]
+        if _usable(y, wv)
+            y_vec[k] = y
+            w_vec[k] = wv
+        end   # else keep the 0.0 placeholder with weight 0.0
         k += 1
     end
 
@@ -532,65 +656,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         neg_ll + 0.5 * dot(p_eval, B * p_eval)
     end
 
-    # PCLS step: augmented system [W^½J; C] β = [W^½z; 0]
+    # PCLS step: truncated-SVD solve of the augmented system
+    # [W^½J; C] β = [W^½z; 0] — see _pcls_augmented_solve in pcls.jl.
     # Uses IRLS weights that depend on the current predictions.
     function pcls_step(J_mat, z_pseudo, th, w_irls)
         B = build_B(th)
-        C = penalty_sqrt_matrix(B)
-        n_pen = size(C, 1)
-        W_sqrt = sqrt.(max.(w_irls, 1e-15))
-        F_aug = vcat(Diagonal(W_sqrt) * J_mat, C)
-        z_aug = vcat(W_sqrt .* z_pseudo, zeros(n_pen))
-        # Truncated-SVD least squares. The FD Jacobian is trajectory-local:
-        # at a poor initialization (e.g. the x -> 0 default, where the
-        # trajectory sits at u0) most basis columns are numerically null,
-        # and a plain QR solve returns O(1e9) coefficients along those
-        # directions — a step no contraction can rescue. Zeroing components
-        # with σ < 1e-7·σ_max keeps the step inside the identified subspace;
-        # for well-conditioned systems the result matches backslash to 1e-7.
-        F = svd(F_aug)
-        σmax = F.S[1]
-        d = [σ > 1e-7 * σmax ? 1.0 / σ : 0.0 for σ in F.S]
-        a = F.V * (d .* (F.U' * z_aug))
-        a, B
+        _pcls_augmented_solve(J_mat, z_pseudo, B, w_irls), B
     end
 
-    # Step contraction: backtracking line search with exponential step sizes.
-    # Phase 1 tries α = 1, 0.5, ..., 2^(-15) and keeps the best (unchanged
-    # legacy behavior for sane steps). Phase 2 rescues EXPLOSIVE steps: when
-    # the trajectory-localized Jacobian is numerically rank-deficient (e.g.
-    # every coefficient at the x -> 0 default initialization), the PCLS
-    # solution can be O(1e9) along near-null directions and even 2^(-15) of
-    # it still blows up the ODE; continue halving with a first-improvement
-    # exit so the fit can escape instead of silently rejecting every step.
-    function step_contract(a_old, a_new, B)
-        f_old = penalized_objective(a_old, B)
-        direction = a_new .- a_old
-
-        best_f = f_old
-        best_a = copy(a_old)
-
-        for k in 0:15
-            α = 2.0^(-k)
-            a_try = a_old .+ α .* direction
-            f_try = penalized_objective(a_try, B)
-            if f_try < best_f
-                best_f = f_try
-                best_a = copy(a_try)
-            end
-        end
-        if best_f >= f_old
-            for k in 16:50
-                α = 2.0^(-k)
-                a_try = a_old .+ α .* direction
-                f_try = penalized_objective(a_try, B)
-                if f_try < f_old
-                    return a_try, f_try
-                end
-            end
-        end
-        best_a, best_f
-    end
+    # Step contraction: backtracking with explosive-step rescue — see
+    # _pcls_step_contract in pcls.jl.
+    step_contract(a_old, a_new, B) =
+        _pcls_step_contract(penalized_objective, a_old, a_new, B)
 
     # Initialize
     beta = build_initial_params(prob)
@@ -691,7 +768,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     prev_obj = Inf  # Track penalized objective for convergence
     prev_data_loss = Inf  # Track data loss for non-Gaussian convergence
 
+    # Honest convergence reporting (see PSMSolution docs): defaults describe
+    # loop exhaustion; the breaks below overwrite them with the actual outcome.
+    conv_converged = false
+    conv_reason = :maxiters
+    conv_iters = 0
+    laml_failures = 0
+
     for iter in 0:(maxiters-1)
+        conv_iters = iter + 1
         # Adapt GP kernel hyperparameters to the evolving fit (before the
         # model evaluation so f/J/W below are consistent with the new kernel)
         if iter >= alg.warmup
@@ -700,6 +785,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         # Re-evaluate model + Jacobian
         f_vec_new, _ = try; eval_model(beta); catch e
             if verbose; println("Iter $iter: simulation failed ($e)"); end
+            conv_reason = :early_break
             break
         end
         f_vec .= f_vec_new
@@ -801,6 +887,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                         100 * alg.tol * max(prev_data_loss, 1.0)
         if iter >= min_conv_iter && obj_stable && dl_stable
             if verbose; println("Converged at iter $iter (objective stable)"); end
+            conv_converged = true
+            conv_reason = :converged_tol
             break
         end
         prev_obj = curr_obj
@@ -808,6 +896,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
 
         if stop && iter >= min_conv_iter
             if verbose; println("Converged at iter $iter (no improvement)"); end
+            conv_converged = true
+            conv_reason = :plateau
             break
         end
 
@@ -836,6 +926,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                                          verbose=verbose)
             catch e
                 if verbose; println("LAML failed: $e, keeping theta"); end
+                laml_failures += 1
                 (copy(theta), NaN)
             end
             theta .= theta_new
@@ -846,10 +937,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     p_opt = copy(beta)
     pred = simulate(prob, p_opt)
 
-    # Compute data loss
+    # Compute data loss (masked cells — zero weight or NaN datum — are
+    # skipped; `0 * NaN = NaN` would otherwise contaminate the total)
     data_loss = 0.0
+    n_used = 0          # cells that actually contributed to data_loss
     for j in 1:n_obs, i in 1:n_times
-        data_loss += prob.data_weights[i,j] * (prob.data_values[i,j] - pred[i,j])^2
+        wv = prob.data_weights[i,j]
+        y = prob.data_values[i,j]
+        _usable(y, wv) || continue
+        data_loss += wv * (y - pred[i,j])^2
+        n_used += 1
     end
 
     # EDF from hat matrix
@@ -900,23 +997,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            _, st = Lux.setup(rng, approx.model)
-            rng2 = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            ps_ca = Float64.(ComponentArray(Lux.initialparameters(rng2, approx.model)))
-            ps_final = similar(ps_ca)
-            ps_final .= params_k
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            uf_evals[approx.name] = x -> begin
-                xn = if lo !== nothing && span !== nothing && span > 0
-                    (Float64(x isa AbstractArray ? x[1] : x) - lo) / span
-                else
-                    Float64(x isa AbstractArray ? x[1] : x)
-                end
-                out, _ = Lux.apply(approx.model, Float32.(reshape([xn], :, 1)), ps_final, st)
-                length(out) == 1 ? Float64(out[1]) : Float64.(out)
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator
@@ -948,12 +1029,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
 
     # Estimate σ² for Gaussian (needed for CI scaling)
     sigma2_hat = if prob.likelihood isa Gaussian
-        data_loss / max(n_data - edf, 1.0)
+        # Divide the MASKED data_loss by the number of cells that actually
+        # contributed to it, not by every cell in the data matrix: using
+        # n_data biased σ̂² low (and CIs narrow) in proportion to the amount
+        # of missing/zero-weight data. Matches profile_likelihood_solver.jl.
+        data_loss / max(n_used - edf, 1.0)
     else
         1.0  # non-Gaussian: V_β already on natural scale
     end
 
-    convergence_info = (V_beta=V_beta, sigma2=sigma2_hat)
+    convergence_info = (V_beta=V_beta, sigma2=sigma2_hat,
+                        converged=conv_converged, iterations=conv_iters,
+                        reason=conv_reason, laml_failures=laml_failures)
 
     PSMSolution(params, obj_val, data_loss, edf, copy(theta),
                 Float64.(pred), Float64.(prob.data_values),

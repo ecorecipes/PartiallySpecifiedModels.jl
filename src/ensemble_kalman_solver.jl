@@ -30,9 +30,39 @@ and naturally handles non-smooth or stiff forward models.
 # Returns
 `PSMSolution` with fitted parameters and `convergence` containing
 `:ensemble_spread` (final ensemble std) and `:ensemble_history`.
+
+`sol.convergence.converged` is honest: it is `true` only when the
+ensemble actually collapsed (mean particle std fell to 1e-3 of its
+initial value, `reason = :ensemble_collapse`). Exhausting
+`n_iterations` reports `converged = false, reason = :maxiters`, and a
+failed forward solve at the ensemble mean — which makes the fitted
+values `NaN` and `data_loss` `Inf` — reports
+`reason = :final_solve_failed`.
+
+Note the discrete-time convention: discrete problems are propagated with
+`simulate_discrete` (unit steps over `tspan`, data times snapped to the
+nearest integer step), the same trajectory every other solver sees.
+
+# Masked data
+
+This solver does NOT support masked observations and raises an error if
+any data cell is masked (`data_weights == 0` or a non-finite
+`data_values` entry). Its likelihood is evaluated inside a Kalman /
+particle recursion with no per-cell mask: honouring a mask means skipping
+the FILTER UPDATE, not merely the density term, for the masked cells.
+Left unguarded the masked cells corrupt the filter state while the run
+still looks like an ordinary converged fit, so it fails loudly instead.
+Drop the masked rows from `data_times`/`data_values`, or use one of the
+masking-capable solvers (`LAML`, `GCVSolver`, `CollocationLAML`,
+`GradientMatching`, `TwoStageSolver`, `BNGSolver`, `ODINSolver`,
+`RKHSSolver`, `IntegralMatchingSolver`, `AdamSolver`,
+`MultipleShootingSolver`, `DerivativeFreeSolver`, `MCMCSolver`,
+`MagiSolver`, `VariationalSolver`, `ABCSolver`,
+`ProfileLikelihoodSolver`).
 """
 function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
     _validate_problem(prob, "EnsembleKalmanSolver")
+    _reject_masked_data(prob, "EnsembleKalmanSolver")
     verbose = alg.verbose
 
     J = alg.n_ensemble
@@ -53,25 +83,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
 
     # ── Forward model: θ → G(θ) (predicted observations) ────────
     function forward_model(theta::Vector{Float64})
-        p = build_param_struct(prob, theta)
         pred = zeros(length(prob.data_times), size(prob.data_values, 2))
 
         try
             if prob.discrete
-                u = Float64.(prob.u0 isa Function ? prob.u0(p) : prob.u0)
-                n_vars = length(u)
-                du = zeros(n_vars)
-                for i in 1:length(prob.data_times)
-                    for j in 1:size(prob.data_values, 2)
-                        sk = prob.obs_to_state[j]
-                        pred[i, j] = u[sk]
-                    end
-                    if i < length(prob.data_times)
-                        prob.dynamics!(du, u, p, prob.data_times[i])
-                        u = copy(du)
-                    end
-                end
+                # Use the package-canonical discrete simulation (unit steps
+                # over tspan, data times snapped to the nearest integer step)
+                # so EKI sees the same trajectory as every other solver even
+                # when data times have gaps.
+                pred = simulate_discrete(prob, theta)
             else
+                p = build_param_struct(prob, theta)
                 ode_u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
                 ode_prob = ODEProblem(prob.dynamics!, ode_u0, prob.tspan, p)
                 solver = prob.ode_solver === nothing ? Tsit5() : prob.ode_solver
@@ -92,6 +114,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
             return nothing
         end
 
+        # Diverged particles (e.g. an exploding discrete map) yield Inf/NaN
+        # without throwing; treat them as failures like any other.
+        all(isfinite, pred) || return nothing
         vec(pred)
     end
 
@@ -107,8 +132,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
 
     spread_history = Float64[]
 
+    # Honest convergence reporting: EKI has a real stopping test (ensemble
+    # collapse); exhausting n_iterations is NOT convergence.
+    conv_converged = false
+    conv_reason = :maxiters
+    iters_used = n_iter
+
     # ── EKI iterations ───────────────────────────────────────────
     for iter in 1:n_iter
+        iters_used = iter
         # Evaluate forward model for each particle; failures return nothing.
         # (A 1e6 sentinel column would inflate the ensemble covariances by
         # ~1e12 and drag the whole ensemble in a single update.)
@@ -162,6 +194,22 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
             println("  iter $iter: misfit=$(round(misfit, sigdigits=4)) " *
                     "spread=$(round(spread, sigdigits=4))")
         end
+
+        # Stopping test: ensemble collapse. EKI contracts the ensemble
+        # geometrically; once the mean particle std is a thousandth of its
+        # initial value the particles agree and further iterations only
+        # shrink an already degenerate ensemble. Without this test the
+        # solver had NO stopping criterion at all, yet reported
+        # converged=true unconditionally.
+        if spread <= 1e-3 * spread_history[1]
+            conv_converged = true
+            conv_reason = :ensemble_collapse
+            if verbose
+                println("  Ensemble collapsed at iter $iter " *
+                        "(spread=$(round(spread, sigdigits=3)))")
+            end
+            break
+        end
     end
 
     # ── Build solution from ensemble mean ────────────────────────
@@ -177,8 +225,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
     pred = pred_vec === nothing ? fill(NaN, n_times, n_obs) :
                                   reshape(pred_vec, n_times, n_obs)
 
-    data_loss = pred_vec === nothing ? Inf :
-                sum(abs2, prob.data_values .- pred)
+    # NaN fitted values and an infinite loss are a failed fit, not a
+    # converged one — override whatever the iteration reported.
+    if pred_vec === nothing
+        conv_converged = false
+        conv_reason = :final_solve_failed
+    end
+
+    # Weighted sum of squares over usable cells, matching the data_loss
+    # convention of the other solvers (masked / NaN cells are skipped so
+    # one missing observation does not turn the reported loss into NaN).
+    data_loss = pred_vec === nothing ? Inf : weighted_data_loss(prob, pred)
 
     # Build UF evaluators
     uf_evals = Dict{Symbol, Any}()
@@ -202,23 +259,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
         elseif approx isa COMONetApproximator
             uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
         elseif approx isa NeuralApproximator
-            rng_nn = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            _, st = Lux.setup(rng_nn, approx.model)
-            rng_nn2 = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            ps_ca = Float64.(ComponentArray(Lux.initialparameters(rng_nn2, approx.model)))
-            ps_vec = similar(ps_ca)
-            ps_vec .= params_k
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            uf_evals[approx.name] = x -> begin
-                xn = if lo !== nothing && span !== nothing && span > 0
-                    (Float64(x isa AbstractArray ? x[1] : x) - lo) / span
-                else
-                    Float64(x isa AbstractArray ? x[1] : x)
-                end
-                out, _ = Lux.apply(approx.model, Float32.(reshape([xn], :, 1)), ps_vec, st)
-                length(out) == 1 ? Float64(out[1]) : Float64.(out)
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         end
     end
 
@@ -237,7 +278,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
     PSMSolution(params, data_loss, data_loss, edf, Float64[alg.noise_scale],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (converged=true, iterations=n_iter, method=:ensemble_kalman,
+                (converged=conv_converged, iterations=iters_used,
+                 reason=conv_reason, method=:ensemble_kalman,
                  ensemble_spread=spread_history,
                  ensemble_std=ensemble_std))
 end

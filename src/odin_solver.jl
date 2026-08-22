@@ -40,7 +40,9 @@ initial condition, and are identified through the ODE terms alone.
 # Returns
 `PSMSolution` with fitted parameters, the jointly optimised trajectory,
 and unknown functions. `sol.convergence.gp_hyperparams` records the
-per-state `(σ², ℓ, σ_n²)`.
+per-state `(σ², ℓ, σ_n²)`; `sol.convergence` also carries the honest
+convergence keys `(converged, iterations, reason)` — see the `ODINSolver`
+docstring.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
     _validate_problem(prob, "ODINSolver"; require_continuous=true)
@@ -97,23 +99,45 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
 
     obs_states = sort(collect(keys(obs_of_state)))
     for sk in obs_states
-        y_k = prob.data_values[:, obs_of_state[sk][1]]
+        # Stage 1 (GP smoothing) must see only USABLE rows: `mean` over a
+        # column holding a NaN is NaN, and that NaN propagates through the
+        # hyperparameter search, the state initialization and every matrix
+        # derived from it. `keep_k` is every row for complete data, so the
+        # values below are then unchanged.
+        jc = obs_of_state[sk][1]
+        keep_k = usable_rows(prob, jc)
+        isempty(keep_k) && error("ODINSolver: observation column $jc is " *
+            "entirely masked; state $sk has no usable data.")
+        y_k = Float64.(prob.data_values[keep_k, jc])
         m_center[sk] = mean(y_k)
         yc = y_k .- m_center[sk]
+        times_k = times[keep_k]
         # Fixed-hyperparameter path assumes 1% observation noise; with
         # several data columns per state, hyperparameters and the center
         # come from the first column (replicates enter only the data term).
         σ², ℓ, σn² = if alg.gp_lengthscale !== nothing && alg.gp_variance !== nothing
             (alg.gp_variance, alg.gp_lengthscale, 0.01 * alg.gp_variance)
         else
-            optimize_gp_hyperparams(times, yc, :rbf; verbose=verbose)
+            optimize_gp_hyperparams(times_k, yc, :rbf; verbose=verbose)
         end
         hyper[sk] = (σ²=σ², ℓ=ℓ, σn²=σn², observed=true)
         data_w[sk] = 1.0 / σn²
         P[sk], D[sk], Ainv[sk] = state_matrices(σ², ℓ, σn²)
-        # Initialise at the GP posterior mean
-        K, _, _ = rbf_kernel_with_derivs(times, σ², ℓ)
-        x_init[:, sk] = m_center[sk] .+ K * (cholesky(Symmetric(K + σn² * I)) \ yc)
+        # Initialise at the GP posterior mean, conditioned on the usable rows
+        # and evaluated on the FULL time grid via the cross-covariance
+        # K(t, t_keep). Reduces to the previous K(t,t)-based expression when
+        # every row is usable.
+        K_full, _, _ = rbf_kernel_with_derivs(times, σ², ℓ)
+        if length(keep_k) == n_times
+            # Unmasked: the original expression, unchanged bit-for-bit.
+            x_init[:, sk] = m_center[sk] .+
+                            K_full * (cholesky(Symmetric(K_full + σn² * I)) \ yc)
+        else
+            K_cross = K_full[:, keep_k]
+            K_kk = K_full[keep_k, keep_k]
+            x_init[:, sk] = m_center[sk] .+
+                            K_cross * (cholesky(Symmetric(K_kk + σn² * I)) \ yc)
+        end
     end
 
     # Unobserved states: free variables with a borrowed GP prior centered
@@ -131,19 +155,23 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
 
     # ── Initialise unknown-function parameters ───────────────────
     beta = Float64[]
-    mlp_specs = Dict{Symbol, MLPSpec}()
 
     for approx in prob.approximators
         if approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            mlp_specs[approx.name] = spec
             rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            append!(beta, init_mlp_params(spec, rng))
+            append!(beta, neural_init_params(approx, rng))
         else
             append!(beta, initial_params(approx))
         end
     end
     n_beta = length(beta)
+    # Usable row indices per observation column, precomputed once for the
+    # risk closure (see the data term inside `odin_risk`).
+    data_rows = Dict{Int,Vector{Int}}(j => usable_rows(prob, j)
+                                      for j in 1:size(prob.data_values, 2))
+    any(!isempty, values(data_rows)) || error("ODINSolver: every " *
+        "observation is masked; there is nothing to fit.")
+
     n_state = n_times * n_vars
 
     if verbose
@@ -179,8 +207,29 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
             loss += ode_weight * dot(resid, Ainv[k] * resid)
             if haskey(obs_of_state, k)                              # data terms
                 for j in obs_of_state[k]
-                    r = @view(prob.data_values[:, j]) .- @view(X[:, k])
-                    loss += data_w[k] * sum(abs2, r)
+                    # Accumulate over usable rows only. The whole-column form
+                    # `sum(abs2, data[:, j] .- X[:, k])` turns NaN on one
+                    # masked cell, and there is no finiteness sentinel in this
+                    # risk: the NaN reaches the Adam moments, every parameter
+                    # becomes NaN, `loss_val < best_loss` is false forever, and
+                    # the solver returns its initialization as if converged.
+                    # (Per-cell `data_weights` magnitudes remain unapplied here
+                    # — ODIN weights by state via `data_w[k] = 1/σn²`; only the
+                    # zero/NaN mask is honored.)
+                    rows = data_rows[j]
+                    if length(rows) == n_times
+                        # Unmasked: the original vectorized expression, whose
+                        # pairwise summation order this loop would otherwise
+                        # perturb at the 1e-16 level.
+                        r = @view(prob.data_values[:, j]) .- @view(X[:, k])
+                        loss += data_w[k] * sum(abs2, r)
+                    else
+                        acc = zero(eltype(X))
+                        for i in rows
+                            acc += (prob.data_values[i, j] - X[i, k])^2
+                        end
+                        loss += data_w[k] * acc
+                    end
                 end
             end
         end
@@ -204,10 +253,19 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
     m_adam = zeros(n_z); v_adam = zeros(n_z)
     n_total = alg.maxiters * 20
     result = DiffResults.MutableDiffResult(0.0, (zeros(n_z),))
+    # Honest convergence reporting: objective-plateau check following the
+    # gradient-matching family convention (30-step window, relative range
+    # < 1e-6 after step 60). Defaults describe loop exhaustion.
+    conv_converged = false
+    conv_reason = :maxiters
+    conv_iters = 0
+    loss_window = fill(Inf, 30)
     for step in 1:n_total
+        conv_iters = step
         ForwardDiff.gradient!(result, odin_risk, z)
         loss_val = DiffResults.value(result)
         grad = DiffResults.gradient(result)
+        loss_window[mod1(step, 30)] = loss_val
         lr_t = lr * 0.5 * (1 + cos(π * step / n_total))
         m_adam .= β1_adam .* m_adam .+ (1 - β1_adam) .* grad
         v_adam .= β2_adam .* v_adam .+ (1 - β2_adam) .* grad .^ 2
@@ -222,6 +280,20 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
         if verbose && (step <= 3 || step % 100 == 0 || step == n_total)
             println("  step $step: risk=$(round(loss_val, sigdigits=5))")
         end
+        # Plateau convergence, guarded against the cosine lr schedule
+        # manufacturing a plateau as lr_t → 0 near n_total.
+        # `best_loss < 1e9` is AdamSolver's failure-sentinel guard: the
+        # dynamics fall back to `du .= 1e6` when the RHS throws, so a run
+        # pinned at that sentinel is a stuck solver, not a converged one.
+        if step > 60 && best_loss < 1e9 && lr_t > 0.05 * lr
+            rmin, rmax = extrema(loss_window)
+            if (rmax - rmin) / max(abs(rmin), 1.0) < 1e-6
+                if verbose; println("  Converged at step $step (loss plateau)"); end
+                conv_converged = true
+                conv_reason = :plateau
+                break
+            end
+        end
     end
     X_fit = reshape(best_z[1:n_state], n_times, n_vars)
     beta = best_z[n_state+1:end]
@@ -232,7 +304,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
         pred[:, j] .= X_fit[:, prob.obs_to_state[j]]
     end
 
-    data_loss = sum(abs2, prob.data_values .- pred)
+    # Masked cells are skipped — `0 * NaN = NaN` would otherwise make the
+    # reported loss NaN. Every other solver reports via this helper.
+    data_loss = weighted_data_loss(prob, pred)
 
     uf_evals = Dict{Symbol, Any}()
     offset = 0
@@ -245,19 +319,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_specs[approx.name]
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                uf_evals[approx.name] = x -> begin
-                    xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
-                        (Float64(x isa AbstractArray ? x[1] : x) - lo_) / span_
-                    else
-                        Float64(x isa AbstractArray ? x[1] : x)
-                    end
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator
@@ -285,6 +347,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
     PSMSolution(params, best_loss, data_loss, edf, Float64[ode_weight],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (converged=true, iterations=alg.maxiters, method=:odin,
+                (converged=conv_converged, iterations=conv_iters,
+                 reason=conv_reason, method=:odin,
                  gp_hyperparams=[hyper[k] for k in 1:n_vars]))
 end

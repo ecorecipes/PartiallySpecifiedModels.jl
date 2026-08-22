@@ -72,6 +72,16 @@ For Gaussian (profiled REML):
 For non-Gaussian:
   V = ℓ(β̂) - ½ β̂'S^λ β̂ + ½ log|S^λ|_+ - ½ log|H| + Mp/2 log(2π)
 
+For mixed problems containing unpenalized approximator blocks (e.g. a
+`NeuralApproximator` with `penalty_weight = 0`), the Gaussian restricted dof
+counts those blocks by the RANK of their (weighted) design columns rather
+than by their raw parameter count: `n − Mp_null − rank(√W·J[:, U])`. This is
+the classical REML restricted dof `n − rank(X)`; it discounts columns that
+carry no independent information (the raw count charges a full dof to a
+column that is identically zero or an exact copy of another). It is a
+function of the design only — NOT of ρ — so `laml_gradient` remains the
+exact derivative of this objective. Pure-spline problems are unaffected.
+
 Returns `(V, H, S_lambda, sigma2)`.
 """
 function laml_objective(family::AbstractLikelihood,
@@ -81,7 +91,13 @@ function laml_objective(family::AbstractLikelihood,
                         S_list::Vector{Matrix{Float64}},
                         offsets::Vector{Int}, nknots_list::Vector{Int},
                         rho::AbstractVector, n_p::Int)
-    n = length(y)
+    # n is the REML sample size and must count USABLE cells only (positive
+    # weight, non-NaN datum) — masked cells carry no information, so
+    # counting them inflates n_eff = n − Mp and biases σ̂² = (RSS+pen)/n_eff
+    # low, which in turn biases λ. `length(y)` counts the masked
+    # placeholders the callers leave in the flattened vectors.
+    # Identical to `length(y)` for complete data.
+    n = _n_usable(y, w_data)
 
     S_lambda = build_S_lambda(S_list, offsets, nknots_list, rho, n_p)
 
@@ -107,15 +123,46 @@ function laml_objective(family::AbstractLikelihood,
     # Number of unpenalized parameters
     total_rank = sum(_rank_penalty(S_list[l]) for l in eachindex(S_list))
     Mp = n_p - total_rank
+    # …and the same count with unpenalized blocks charged by design rank
+    # (equals Mp whenever those columns are of full rank; see below).
+    Mp_eff = _restricted_dof_Mp(J, W_irls, offsets, nknots_list, n_p, total_rank)
 
     if family isa Gaussian
-        RSS = sum(w_data[i] * (y[i] - mu[i])^2 for i in 1:n)
-        n_eff = n - Mp
+        RSS = 0.0
+        for i in eachindex(y)
+            _usable(y[i], w_data[i]) || continue
+            RSS += w_data[i] * (y[i] - mu[i])^2
+        end
         # Profiled REML scale uses the restricted dof (n − Mp), NOT n. Using
         # /n (the ML scale) leaves the analytic gradient inconsistent with V
         # by a factor (n−Mp)/n on the penalty term and biases toward
         # undersmoothing. (Wood 2011, "Fast stable REML".)
-        sigma2 = max((RSS + pen) / max(n_eff, 1), 1e-30)
+        #
+        # Mixed-approximator correction: Mp = n_p − total_rank counts EVERY
+        # parameter without a penalty block (e.g. NeuralApproximator weights
+        # with penalty_weight = 0) as a REML fixed effect, including columns
+        # that carry no independent information. Count the unpenalized block
+        # by the rank of its weighted design instead — the classical REML
+        # n − rank(X). See `_restricted_dof_Mp`.
+        #
+        # An EDF-based count, Σ_unpen diag(H⁻¹J'WJ), was tried and reverted:
+        # `build_S_lambda` leaves the unpenalized columns of S_λ identically
+        # zero, so H⁻¹J'WJ = I − H⁻¹S_λ has EXACTLY 1 on those diagonals and
+        # the whole expression collapses to n − Mp in exact arithmetic. Any
+        # departure from that came solely from the 1e-10 ridge inside
+        # `_safe_inv` acting on a near-singular H — a numerical artifact,
+        # not a dof — and it made n_eff a function of ρ, which
+        # `laml_gradient` (which omits −½·(dn_eff/dρ)·(log σ̂² − 1)) does not
+        # account for. The rank form is ρ-independent, so objective and
+        # gradient stay consistent.
+        #
+        # The floor is applied ONCE and shared by σ̂² and V. Previously V used
+        # the raw `n − Mp` while σ̂² used `max(n − Mp, 1)`; when the raw value
+        # dropped below 1 the two disagreed and `laml_gradient` (which is
+        # exact only when the two coincide) silently became wrong by their
+        # ratio.
+        n_eff = max(n - Mp_eff, 1.0)
+        sigma2 = max((RSS + pen) / n_eff, 1e-30)
         V = -0.5 * n_eff * log(sigma2) + 0.5 * log_det_S_plus - 0.5 * log_det_H
     else
         ll = log_likelihood(family, y, mu, w_data)
@@ -253,7 +300,11 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
                                    maxiter::Int=50, tol::Float64=1e-6,
                                    verbose::Bool=false)
     m = length(S_list)
-    n = length(y)
+    # USABLE-cell count, not `length(y)` — see the note in `laml_objective`.
+    # The two functions must agree exactly: `laml_objective` computes the
+    # Newton-phase V from n − Mp_eff and this function computes the
+    # Fellner–Schall scale from the same denominator.
+    n = _n_usable(y, w_data)
 
     # Initialize ρ.  Fellner-Schall can converge to under-smoothing local
     # minima when started from very negative ρ (tiny λ). Clamp to a floor
@@ -273,7 +324,29 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
 
     ranks = [_rank_penalty(S_list[k]) for k in 1:m]
     total_rank = sum(ranks)
-    Mp = n_p - total_rank
+    # Parameters outside every penalty block (e.g. unpenalized NN weights)
+    # are charged to the REML fixed-effect count by the RANK of their design
+    # columns, not by their raw number (see `_restricted_dof_Mp`). This is
+    # ρ-independent, so the FS scale here and the Newton objective in
+    # `laml_objective` use the identical constant denominator. Equals Mp for
+    # pure-spline problems, whose code path — and results — are unchanged.
+    Mp_eff = _restricted_dof_Mp(J, W_irls, offsets, nknots_list, n_p, total_rank)
+    n_eff = max(n - Mp_eff, 1.0)
+    # Gated on the Gaussian branch: `n_eff` is read ONLY by the Gaussian
+    # REML scale below. Non-Gaussian families take the Pearson dispersion
+    # path, whose denominator is `n − sum(ranks)` and never touches
+    # `n_eff` — so warning there described a quantity the fit does not
+    # use, and a healthy Poisson fit could emit an alarming irrelevant
+    # message about an unidentified σ̂².
+    if family isa Gaussian && Mp_eff >= n
+        @warn "LAML: the unpenalized (fixed-effect) part of the model has " *
+              "rank $(Mp_eff) ≥ n = $n data points, so the restricted " *
+              "residual degrees of freedom are exhausted and the REML " *
+              "scale denominator is held at its floor of 1. σ̂² is NOT " *
+              "identified here and the resulting smoothing parameters are " *
+              "not trustworthy; reduce the number of unpenalized " *
+              "parameters, add data, or set penalty_weight > 0." maxlog=1
+    end
 
     # ─── Phase 1: Fellner-Schall ────────────────────────────────
     n_fs = min(maxiter, 30)
@@ -306,14 +379,23 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
         # When sigma2_max is finite, cap to prevent oversmoothing.
         sigma2 = if family isa Gaussian
             r_work = z_work .- J * beta_fs
-            RSS = sum(w_data[i] * r_work[i]^2 for i in 1:n)
+            RSS = 0.0
+            for i in eachindex(y)
+                _usable(y[i], w_data[i]) || continue
+                RSS += w_data[i] * r_work[i]^2
+            end
             pen = dot(beta_fs, S_lambda * beta_fs)
-            profiled = max((RSS + pen) / max(n - Mp, 1), 1e-30)   # REML scale
+            # Restricted dof n − Mp_eff, the SAME constant the Newton-phase
+            # objective uses (see `laml_objective`).
+            profiled = max((RSS + pen) / n_eff, 1e-30)   # REML scale
             min(profiled, sigma2_max)
         else
-            pearson = sum(w_data[i] * (y[i] - mu[i])^2 /
-                          max(_variance_function(family, abs(mu[i])), 1e-10)
-                          for i in 1:n)
+            pearson = 0.0
+            for i in eachindex(y)
+                _usable(y[i], w_data[i]) || continue
+                pearson += w_data[i] * (y[i] - mu[i])^2 /
+                           max(_variance_function(family, abs(mu[i])), 1e-10)
+            end
             phi = max(pearson / max(n - sum(ranks), 1), 1.0)
             min(phi, sigma2_max)
         end
@@ -371,11 +453,18 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
     V_prev = -Inf
     n_newton = family isa Gaussian ? max(0, maxiter - n_fs) : 0
 
+    # The Gaussian objective's RSS must use the SAME coefficients β̂_fs as
+    # its penalty term: passing the stale outer-loop μ paired RSS(β_outer)
+    # with pen(β_fs). Shift μ to the working-model fit so that
+    # y − μ_fs = z_work − J β̂_fs, exactly the FS phase's working residuals.
+    # (Only the Gaussian family reaches Newton, and it reads μ only via RSS.)
+    mu_fs = mu .+ J * (beta_fs .- beta)
+
     for iter in 1:min(n_newton, 20)
         # Evaluate at the working-model optimum β̂(λ) from the FS phase —
         # not the stale outer-loop β. (Within Newton the β̂ is held fixed:
         # a small approximation, polished by the outer IRLS re-linearization.)
-        V, H, S_lambda, sigma2 = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu,
+        V, H, S_lambda, sigma2 = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu_fs,
                                                  S_list, offsets, nknots_list, rho, n_p)
         if !isfinite(V)
             if verbose; println("LAML-Newton: non-finite V, stopping"); end
@@ -418,7 +507,7 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
         step = 1.0
         rho_new = clamp.(rho .+ step .* delta, RHO_MIN, RHO_MAX)
         V_new = try
-            v, _, _, _ = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu,
+            v, _, _, _ = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu_fs,
                                          S_list, offsets, nknots_list, rho_new, n_p)
             v
         catch; -Inf end
@@ -428,7 +517,7 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
             step *= 0.5
             rho_new = clamp.(rho .+ step .* delta, RHO_MIN, RHO_MAX)
             V_new = try
-                v, _, _, _ = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu,
+                v, _, _, _ = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu_fs,
                                              S_list, offsets, nknots_list, rho_new, n_p)
                 v
             catch; -Inf end
@@ -449,6 +538,59 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
 end
 
 # ─── Helper functions ─────────────────────────────────────────────
+
+"""
+    _unpenalized_indices(offsets, nknots_list, n_p)
+
+Indices of parameters not covered by any penalty block: approximators whose
+`penalty_matrix` is `nothing` (e.g. `NeuralApproximator` with
+`penalty_weight = 0`) or whose block was dropped for having fewer than 3
+parameters (see `build_penalty_matrices`). Returns an empty vector for
+pure-spline problems.
+"""
+function _unpenalized_indices(offsets::Vector{Int}, nknots_list::Vector{Int},
+                              n_p::Int)
+    covered = falses(n_p)
+    for l in eachindex(offsets)
+        covered[offsets[l]+1:offsets[l]+nknots_list[l]] .= true
+    end
+    findall(!, covered)
+end
+
+"""
+    _restricted_dof_Mp(J, W_irls, offsets, nknots_list, n_p, total_rank) → Int
+
+REML fixed-effect count used in the Gaussian restricted dof `n − Mp`.
+
+`Mp = n_p − total_rank` charges one degree of freedom to EVERY parameter
+outside a penalty block, including design columns that carry no independent
+information (an identically-zero column, or an exact copy of another). This
+returns instead
+
+    Mp_eff = (penalty null-space dimension)  +  rank(√W · J[:, U]),
+
+with `U` the unpenalized indices — the classical REML `n − rank(X)`. It
+equals `Mp` exactly whenever the unpenalized columns are of full rank, so
+pure-spline problems and well-conditioned mixed problems are unaffected.
+
+Being a function of the design and the IRLS weights only, it does NOT depend
+on ρ; `laml_gradient` is therefore the exact derivative of the objective that
+uses it.
+"""
+function _restricted_dof_Mp(J::AbstractMatrix, W_irls::AbstractVector,
+                            offsets::Vector{Int}, nknots_list::Vector{Int},
+                            n_p::Int, total_rank::Int)
+    unpen = _unpenalized_indices(offsets, nknots_list, n_p)
+    isempty(unpen) && return n_p - total_rank
+    Mp_null = (n_p - length(unpen)) - total_rank
+    JU = Diagonal(sqrt.(max.(W_irls, 0.0))) * view(J, :, unpen)
+    rank_U = try
+        rank(JU)
+    catch
+        length(unpen)
+    end
+    Mp_null + rank_U
+end
 
 """Log of product of positive eigenvalues of symmetric matrix."""
 function _log_det_plus(S::AbstractMatrix)

@@ -16,26 +16,28 @@ using Statistics
 # ─── Step 1: Data smoothing ──────────────────────────────────────
 
 """
-    _smoothing_spline(t, y) -> (value, derivative)
+    _smoothing_spline(t, y; max_basis=15) -> (value, derivative)
 
 Fit a penalized cubic regression spline (P-spline: cubic B-spline basis +
 second-order difference penalty) to `(t, y)` with the smoothing parameter
 chosen by Generalized Cross-Validation, and return callables for the fitted
-value and its first derivative.
+value and its first derivative. The basis size is `clamp(n − 2, 4, max_basis)`
+(`max_basis ≥ 4`; `TwoStageSolver` wires its `n_basis_smooth` field here).
 
 This is a genuine SMOOTHER (it does not interpolate the noisy data), which
 is what gradient matching requires: differentiating an interpolant amplifies
 observation noise, whereas the penalized fit suppresses it (Wood 2001;
 Varah 1982). Shared by the gradient-matching, two-stage, and BNG solvers.
 """
-function _smoothing_spline(t::AbstractVector{Float64}, y::AbstractVector{Float64})
+function _smoothing_spline(t::AbstractVector{Float64}, y::AbstractVector{Float64};
+                           max_basis::Int=15)
     n = length(t)
     a, b = minimum(t), maximum(t)
     if b <= a || n < 4
         ȳ = sum(y) / max(n, 1)
         return (x -> ȳ), (x -> 0.0)
     end
-    q = clamp(n - 2, 4, 15)                     # number of B-spline coefficients
+    q = clamp(n - 2, 4, max(max_basis, 4))      # number of B-spline coefficients
     knots = _scam_knot_vector((a, b), q)
     B = zeros(n, q)
     for i in 1:n
@@ -73,8 +75,48 @@ function _smoothing_spline(t::AbstractVector{Float64}, y::AbstractVector{Float64
 end
 
 """
+    _smoothing_spline_masked(t, y, w; max_basis=15)
+
+`_smoothing_spline` restricted to the USABLE rows of `(y, w)` — those with
+positive weight and a non-NaN value.
+
+Masked rows must be DROPPED from the fit, not merely down-weighted after
+it. `_smoothing_spline` solves the normal equations `BtB \\ Bty` with
+`Bty = B'y`; a single NaN in `y` makes every coefficient NaN, and because
+`gcv < best_gcv` is false for a NaN gcv at every λ, the λ loop never
+replaces that NaN β — so BOTH returned callables evaluate to NaN
+everywhere, for every input. Every gradient-matching-family solver then
+matches derivatives against an all-NaN target.
+
+The returned callables clamp to the usable range, so evaluating them on
+the full time grid extends the edge values across masked spans — the
+right behavior for interior gaps and honest at the ends.
+
+When every row is usable this delegates unchanged, so complete-data fits
+are bit-for-bit identical to calling `_smoothing_spline` directly.
+"""
+function _smoothing_spline_masked(t::AbstractVector{Float64},
+                                  y::AbstractVector{Float64},
+                                  w::Union{Nothing,AbstractVector}=nothing;
+                                  max_basis::Int=15)
+    keep = if w === nothing
+        [i for i in eachindex(y) if isfinite(y[i])]
+    else
+        [i for i in eachindex(y) if _usable(y[i], w[i])]
+    end
+    length(keep) == length(y) && return _smoothing_spline(t, y; max_basis=max_basis)
+    isempty(keep) && error("_smoothing_spline: an observation column is " *
+        "entirely masked (every weight is 0 or every value is NaN); there " *
+        "is nothing to smooth.")
+    _smoothing_spline(Float64.(t[keep]), Float64.(y[keep]); max_basis=max_basis)
+end
+
+"""
 Smooth observed data with a penalized (GCV) smoothing spline and compute
 time derivatives — see [`_smoothing_spline`](@ref).
+
+`weights`, when supplied, is the `data_weights` matrix; masked cells are
+dropped from each column's fit (see [`_smoothing_spline_masked`](@ref)).
 
 Returns:
 - `y_smooth`: smoothed state values (n_times × K)
@@ -83,15 +125,27 @@ Returns:
 function smooth_and_differentiate(times::Vector{Float64},
                                   data::Matrix{Float64},
                                   obs_to_state::Vector{Int},
-                                  K::Int)
+                                  K::Int;
+                                  weights::Union{Nothing,AbstractMatrix}=nothing)
     T = length(times)
     n_obs = size(data, 2)
     y_smooth = zeros(T, K)
     dydt = zeros(T, K)
 
+    # KNOWN LIMITATION: when several observation columns map to the same
+    # state, each later column overwrites the earlier one's smooth below —
+    # only the LAST column mapped to a state is used (no averaging).
+    if length(unique(@view obs_to_state[1:n_obs])) < n_obs
+        @warn "smooth_and_differentiate: multiple observation columns map to " *
+              "the same state; only the last column per state is used in the " *
+              "smoothing path (earlier columns are ignored, not averaged)." maxlog=1
+    end
+
     for j in 1:n_obs
         sk = obs_to_state[j]
-        val, der = _smoothing_spline(times, data[:, j])
+        val, der = _smoothing_spline_masked(times, data[:, j],
+                                            weights === nothing ? nothing :
+                                            @view(weights[:, j]))
         for i in 1:T
             y_smooth[i, sk] = val(times[i])
             dydt[i, sk] = der(times[i])
@@ -214,7 +268,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
         y_smooth = zeros(T_pts, K)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
-            sval, _ = _smoothing_spline(times, Float64.(prob.data_values[:, j]))
+            sval, _ = _smoothing_spline_masked(times,
+                                               Float64.(prob.data_values[:, j]),
+                                               @view(prob.data_weights[:, j]))
             for i in 1:T_pts
                 y_smooth[i, sk] = sval(times[i])
             end
@@ -229,7 +285,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
         end
     else
         y_smooth, dydt = smooth_and_differentiate(times, Float64.(prob.data_values),
-                                                   prob.obs_to_state, K)
+                                                   prob.obs_to_state, K;
+                                                   weights=prob.data_weights)
     end
 
     # Initialize unknown function parameters
@@ -277,6 +334,22 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
             w[(k - 1) * n_match + i] = 0.0
         end
     end
+    # Masked observations carry fabricated targets for the same reason: the
+    # smoother now excludes them (see `_smoothing_spline_masked`), so
+    # `y_smooth`/`dydt` at a masked time are an EXTRAPOLATION, not data.
+    # Zeroing their weight keeps them out of the loss, the Gauss-Newton
+    # residuals, and — via `n_eff = count(!iszero, w)` below — out of the σ̂²
+    # denominator that drives the smoothing-parameter update. A match point
+    # counts if ANY observation column mapping to that state is usable there.
+    # No-op when every cell is usable, so complete-data fits are unchanged.
+    for k in 1:K
+        k in obs_set || continue
+        cols = [j for j in 1:n_obs if prob.obs_to_state[j] == k]
+        for i in 1:n_match
+            any(j -> usable_cell(prob, i, j), cols) && continue
+            w[(k - 1) * n_match + i] = 0.0
+        end
+    end
 
     if verbose
         println("Step 2: Gradient matching — $(n_beta) params, $(n_match) match points, $(K) states")
@@ -303,10 +376,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
         loss_val
     end
 
+    # Honest convergence reporting, same taxonomy as the sibling
+    # gradient-matching solvers: `converged` only when a criterion actually
+    # fired; otherwise the loop exhausted its iteration budget.
+    conv_converged = false
+    conv_reason = :maxiters
+    conv_iters = 0
+
     if m > 0
         # ─── Gauss-Newton for penalized approximators (B-spline, GP) ───
         prev_obj = Inf
         for iter in 1:alg.maxiters
+            conv_iters = iter
             resid, J = gm_residual_jacobian(prob, times, y_smooth, dydt, beta, w)
 
             B = zeros(n_beta, n_beta)
@@ -326,13 +407,26 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
 
             if iter > 1 && abs(obj - prev_obj) < alg.tol * max(abs(prev_obj), 1.0)
                 if verbose; println("  Converged at iter $iter"); end
+                conv_converged = true
+                conv_reason = :objective_tol
                 break
             end
             prev_obj = obj
 
             JtJ = J' * J + B
             neg_Jtr = -(J' * resid)
-            delta = try; JtJ \ neg_Jtr; catch; try; (JtJ + 1e-6 * I) \ neg_Jtr; catch; break; end; end
+            delta = try
+                JtJ \ neg_Jtr
+            catch
+                try
+                    (JtJ + 1e-6 * I) \ neg_Jtr
+                catch
+                    # Even the ridged normal equations are unsolvable — a
+                    # numerical failure, not a converged fit.
+                    conv_reason = :singular_system
+                    break
+                end
+            end
 
             best_obj = obj; best_step = 0.0
             for k in 0:8
@@ -341,12 +435,22 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
                 obj_new = gm_loss(beta_new)
                 if obj_new < best_obj; best_obj = obj_new; best_step = ss; end
             end
-            if best_step == 0.0; if verbose; println("  No improvement, stopping"); end; break; end
+            if best_step == 0.0
+                if verbose; println("  No improvement, stopping"); end
+                # No step of any length improved the objective. That is a
+                # stalled line search, not a satisfied criterion.
+                conv_reason = :line_search_failure
+                break
+            end
             beta .= beta .+ best_step .* delta
 
             # Update smoothing params
             if iter % 5 == 0
-                sigma2 = resid_ss / (T_pts * K)
+                # Divide by the number of residuals actually contributing:
+                # unobserved-state rows are zero-weighted, and counting them
+                # would bias sigma2 low (over-smoothing theta).
+                n_eff = count(!iszero, w)
+                sigma2 = resid_ss / max(n_eff, 1)
                 if alg.sigma2_init !== nothing; sigma2 = min(sigma2, alg.sigma2_init); end
                 for l in 1:m
                     off = uf_offsets[l]; nk = uf_nk[l]
@@ -392,6 +496,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
         loss_window = fill(Inf, 20)
 
         for iter in 1:alg.maxiters
+            conv_iters = iter
             grad = ForwardDiff.gradient(gm_loss_ad, beta)
             loss_val = gm_loss_ad(beta)
 
@@ -415,12 +520,27 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
                 println("  Adam iter $iter: loss=$(round(loss_val, sigdigits=5)) lr=$(round(lr_t, sigdigits=3))")
             end
 
-            # Convergence: check if loss plateau (relative change < tol over window)
-            if iter > 50
+            # Convergence: loss plateau (relative change < tol over window).
+            #
+            # `best_loss < 1e9` is AdamSolver's failure-sentinel guard: the
+            # dynamics fall back to `du .= 1e6` when the RHS throws, and a
+            # run pinned at that sentinel is a stuck solver, not a converged
+            # one. AdamSolver explicitly refuses to call that `:plateau`.
+            #
+            # `lr_t > 0.05 * lr` is the siblings' cosine-schedule guard,
+            # written out for consistency even though it is DORMANT here:
+            # this schedule has a 10% floor — `lr_t = lr*(0.1 + 0.45*(1 +
+            # cos(...)))` never falls below `0.1*lr` — so the clause is
+            # always true today. It is kept so the family reads the same
+            # way and so lowering that floor cannot silently reintroduce
+            # spurious end-of-schedule "convergence".
+            if iter > 50 && best_loss < 1e9 && lr_t > 0.05 * lr
                 recent_min = minimum(loss_window)
                 recent_max = maximum(loss_window)
                 if (recent_max - recent_min) / max(abs(recent_min), 1.0) < alg.tol
                     if verbose; println("  Converged at iter $iter (loss plateau)"); end
+                    conv_converged = true
+                    conv_reason = :plateau
                     break
                 end
             end
@@ -502,10 +622,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
     end
 
     # Data loss (against original data, not derivatives)
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:T_pts
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Derivative matching loss
     F_final = eval_rhs_at_smooth(prob, times, y_smooth, beta)
@@ -524,23 +641,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            _, st = Lux.setup(rng, approx.model)
-            rng2 = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            ps_ca = Float64.(ComponentArray(Lux.initialparameters(rng2, approx.model)))
-            ps_final = similar(ps_ca)
-            ps_final .= params_k
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            uf_evals[approx.name] = x -> begin
-                xn = if lo !== nothing && span !== nothing && span > 0
-                    (Float64(x isa AbstractArray ? x[1] : x) - lo) / span
-                else
-                    Float64(x isa AbstractArray ? x[1] : x)
-                end
-                out, _ = Lux.apply(approx.model, Float32.(reshape([xn], :, 1)), ps_final, st)
-                length(out) == 1 ? Float64(out[1]) : Float64.(out)
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator
@@ -576,5 +677,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
     PSMSolution(params, obj_val, data_loss, edf, copy(theta),
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (deriv_loss=deriv_loss, method=:gradient_matching))
+                (deriv_loss=deriv_loss, method=:gradient_matching,
+                 converged=conv_converged, reason=conv_reason,
+                 iterations=conv_iters))
 end

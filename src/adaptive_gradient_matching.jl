@@ -155,13 +155,35 @@ Also returns the smoothed state: x = K (K + σ_n² I)⁻¹ y
 """
 function gp_gradient_inference(times::Vector{Float64}, y::Vector{Float64},
                                 σ²::Float64, ℓ::Float64, σn²::Float64,
-                                kernel::Symbol)
+                                kernel::Symbol;
+                                keep::Union{Nothing,AbstractVector{Int}}=nothing)
     n = length(times)
 
     K, Kstar, Kstarstar = if kernel == :matern32
         matern32_kernel_with_derivs(times, σ², ℓ)
     else
         rbf_kernel_with_derivs(times, σ², ℓ)
+    end
+
+    # `keep` restricts the CONDITIONING set to the usable observations while
+    # the prediction grid stays the full `times`: x = K(t, t_keep) (K(t_keep,
+    # t_keep) + σ_n² I)⁻¹ y_keep. Passing the raw column instead would put a
+    # NaN into α and make the smoothed state, the gradient mean and the
+    # gradient covariance NaN everywhere (or throw from `cholesky`/`eigen`).
+    # `nothing` (or a full index set) takes the original code path unchanged.
+    if keep !== nothing && length(keep) < n
+        Kkk = K[keep, keep]
+        C = cholesky(Symmetric(Kkk + σn² * I(length(keep)) + 1e-10 * I(length(keep))))
+        α = C \ y
+        x_smooth = K[:, keep] * α
+        grad_mean = Kstar[:, keep] * α
+        V = C.L \ Kstar[:, keep]'
+        grad_cov = Kstarstar - V' * V
+        grad_cov = Symmetric(grad_cov)
+        eig = eigen(grad_cov)
+        eig_vals = max.(eig.values, 1e-10)
+        return x_smooth, grad_mean,
+               Symmetric(eig.vectors * Diagonal(eig_vals) * eig.vectors')
     end
 
     # K_y = K + σ_n² I
@@ -347,19 +369,33 @@ function _agm_population_mcmc(prob::PSMProblem, alg::AdaptiveGradientMatching)
 
     obs_states = sort(collect(keys(obs_of_state)))
     for sk in obs_states
-        y = Float64.(prob.data_values[:, obs_of_state[sk][1]])
-        σ², ℓ, σn² = optimize_gp_hyperparams(times, y .- mean(y), alg.kernel;
+        # Hyperparameters, center and initialization from the USABLE rows
+        # only — `mean`/`optimize_gp_hyperparams` return NaN otherwise, and
+        # the NaN then reaches every state matrix and the initial trajectory.
+        jc1 = obs_of_state[sk][1]
+        keep_sk = usable_rows(prob, jc1)
+        isempty(keep_sk) && error("AdaptiveGradientMatching: observation " *
+            "column $jc1 is entirely masked; state $sk has no usable data.")
+        y = Float64.(prob.data_values[keep_sk, jc1])
+        σ², ℓ, σn² = optimize_gp_hyperparams(times[keep_sk], y .- mean(y), alg.kernel;
                                              verbose=verbose)
         gp_hyperparams[sk] = (σ², ℓ, σn²)
         sigma_n2[sk] = σn²
         m_center[sk] = mean(y)
         P[sk], Lp[sk], D[sk], A_vals[sk], A_vecs[sk] = mcmc_state_matrices(σ², ℓ)
-        # Initialise at the GP posterior mean
+        # Initialise at the GP posterior mean, conditioned on the usable rows
+        # and evaluated on the full grid via the cross-covariance K(t, t_keep).
         K, _, _ = alg.kernel == :matern32 ?
             matern32_kernel_with_derivs(times, σ², ℓ) :
             rbf_kernel_with_derivs(times, σ², ℓ)
-        x_init[:, sk] = m_center[sk] .+
-                        K * (cholesky(Symmetric(K + σn² * I)) \ (y .- m_center[sk]))
+        if length(keep_sk) == length(times)
+            x_init[:, sk] = m_center[sk] .+
+                            K * (cholesky(Symmetric(K + σn² * I)) \ (y .- m_center[sk]))
+        else
+            x_init[:, sk] = m_center[sk] .+
+                K[:, keep_sk] * (cholesky(Symmetric(K[keep_sk, keep_sk] + σn² * I)) \
+                                 (y .- m_center[sk]))
+        end
     end
     ℓ_bar = mean(gp_hyperparams[sk][2] for sk in obs_states)
     σ²_bar = mean(gp_hyperparams[sk][1] for sk in obs_states)
@@ -432,10 +468,15 @@ function _agm_population_mcmc(prob::PSMProblem, alg::AdaptiveGradientMatching)
         isfinite(ll) ? ll : -Inf
     end
 
+    agm_keep = Dict{Int,Vector{Int}}(j => usable_rows(prob, j)
+                                     for j in 1:size(prob.data_values, 2))
+
     # Data + GP prior + γ prior (in log space, incl. Jacobian) + β smoothing.
     # Conventions (shared with the MAP path): with several data columns per
     # state, hyperparameters/σn²/init come from the first column while all
-    # columns enter the data term; prob.data_weights are not applied here.
+    # columns enter the data term; per-cell data_weights MAGNITUDES are not
+    # applied here (AGM weights by state through sigma_n2), but the
+    # zero-weight / NaN mask IS honored — see `agm_keep`.
     function base_logp(X, beta, lg)
         lp = 0.0
         for k in 1:K_states
@@ -443,8 +484,21 @@ function _agm_population_mcmc(prob::PSMProblem, alg::AdaptiveGradientMatching)
             lp -= 0.5 * dot(xc, P[k] * xc)
             if haskey(obs_of_state, k)
                 for j in obs_of_state[k]
-                    lp -= 0.5 / sigma_n2[k] *
-                          sum(abs2, prob.data_values[:, j] .- X[:, k])
+                    # Usable cells only. One NaN makes `lp` NaN, every MH
+                    # test then fails, and the finiteness guard downstream
+                    # aborts with a misleading "the dynamics return
+                    # non-finite values" message.
+                    rows = agm_keep[j]
+                    if length(rows) == size(prob.data_values, 1)
+                        lp -= 0.5 / sigma_n2[k] *
+                              sum(abs2, prob.data_values[:, j] .- X[:, k])
+                    else
+                        acc = 0.0
+                        for i in rows
+                            acc += (prob.data_values[i, j] - X[i, k])^2
+                        end
+                        lp -= 0.5 / sigma_n2[k] * acc
+                    end
                 end
             end
             # Gamma(2, scale) prior on γ, sampled as lg = log γ:
@@ -575,11 +629,7 @@ function _agm_population_mcmc(prob::PSMProblem, alg::AdaptiveGradientMatching)
     for j in 1:n_obs
         pred[:, j] .= X_mean[:, prob.obs_to_state[j]]
     end
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:T_pts
-        data_loss += prob.data_weights[i, j] *
-                     (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     uf_evals = Dict{Symbol, Any}()
     offset = 0
@@ -688,12 +738,27 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
         # smoothed values as "gradient targets" (i.e., match f(x[t]) to x[t+1])
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
-            y = Float64.(prob.data_values[:, j])
+            # Fit the GP on the USABLE rows only (see `_usable`): `mean`,
+            # `optimize_gp_hyperparams` and `gp_gradient_inference` are all
+            # NaN-poisoned by a single masked cell, and the results are then
+            # NaN for every time point. `keep_j` is every row for complete
+            # data, so this path is unchanged there.
+            keep_j = usable_rows(prob, j)
+            isempty(keep_j) && error("AdaptiveGradientMatching: observation " *
+                "column $j is entirely masked; there is nothing to smooth.")
+            y = Float64.(prob.data_values[keep_j, j])
+            times_j = times[keep_j]
 
-            σ², ℓ, σn² = optimize_gp_hyperparams(times, y, alg.kernel; verbose=verbose)
+            # Center the data before GP fitting (zero-mean GP prior); add the
+            # mean back to the smoothed states. Without centering, data with
+            # large mean levels get shrunk toward 0 (cf. the MCMC path).
+            ȳ = mean(y)
+            σ², ℓ, σn² = optimize_gp_hyperparams(times_j, y .- ȳ, alg.kernel; verbose=verbose)
             gp_hyperparams[sk] = (σ², ℓ, σn²)
 
-            xs, _, gc = gp_gradient_inference(times, y, σ², ℓ, σn², alg.kernel)
+            xs, _, gc = gp_gradient_inference(times, y .- ȳ, σ², ℓ, σn²,
+                                              alg.kernel; keep=keep_j)
+            xs = xs .+ ȳ
             x_smooth[:, sk] .= xs
 
             # For discrete: "gradient_mean" = next state value (forward shift)
@@ -709,13 +774,28 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     else
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
-            y = Float64.(prob.data_values[:, j])
+            # Fit the GP on the USABLE rows only (see `_usable`): `mean`,
+            # `optimize_gp_hyperparams` and `gp_gradient_inference` are all
+            # NaN-poisoned by a single masked cell, and the results are then
+            # NaN for every time point. `keep_j` is every row for complete
+            # data, so this path is unchanged there.
+            keep_j = usable_rows(prob, j)
+            isempty(keep_j) && error("AdaptiveGradientMatching: observation " *
+                "column $j is entirely masked; there is nothing to smooth.")
+            y = Float64.(prob.data_values[keep_j, j])
+            times_j = times[keep_j]
 
-            σ², ℓ, σn² = optimize_gp_hyperparams(times, y, alg.kernel; verbose=verbose)
+            # Center the data before GP fitting (zero-mean GP prior); add the
+            # mean back to the smoothed states. Derivative estimates need no
+            # offset (d/dt of a constant is zero). Cf. the MCMC path, which
+            # centers via m_center[sk].
+            ȳ = mean(y)
+            σ², ℓ, σn² = optimize_gp_hyperparams(times_j, y .- ȳ, alg.kernel; verbose=verbose)
             gp_hyperparams[sk] = (σ², ℓ, σn²)
 
-            xs, gm, gc = gp_gradient_inference(times, y, σ², ℓ, σn², alg.kernel)
-            x_smooth[:, sk] .= xs
+            xs, gm, gc = gp_gradient_inference(times, y .- ȳ, σ², ℓ, σn²,
+                                               alg.kernel; keep=keep_j)
+            x_smooth[:, sk] .= xs .+ ȳ
             grad_means[:, sk] .= gm
             grad_covs[sk] = gc
         end
@@ -833,10 +913,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
         pred[:, j] .= x_smooth[:, sk]
     end
 
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:T_pts
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Derivative matching loss
     p_opt = build_param_struct(prob, beta_opt)
@@ -860,23 +937,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            _, st = Lux.setup(rng, approx.model)
-            rng2 = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            ps_ca = Float64.(ComponentArray(Lux.initialparameters(rng2, approx.model)))
-            ps_final = similar(ps_ca)
-            ps_final .= params_k
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            uf_evals[approx.name] = x -> begin
-                xn = if lo !== nothing && span !== nothing && span > 0
-                    (Float64(x isa AbstractArray ? x[1] : x) - lo) / span
-                else
-                    Float64(x isa AbstractArray ? x[1] : x)
-                end
-                out, _ = Lux.apply(approx.model, Float32.(reshape([xn], :, 1)), ps_final, st)
-                length(out) == 1 ? Float64(out[1]) : Float64.(out)
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator

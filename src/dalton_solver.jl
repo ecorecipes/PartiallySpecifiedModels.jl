@@ -31,9 +31,18 @@
 
 """
     _dalton_reference(ode_fun!, p, u0, tspan, n_steps, q, sigma; interrogate)
+        -> (logZ, ssq, calib_acc)
 
-ODE-only joint Kalman filter: the marginal ODE log-evidence `logp(Z)`,
-linearized about its own (data-free) predicted means.
+ODE-only joint Kalman filter: the marginal ODE log-evidence `logp(Z)` at the
+supplied diffusion scale `sigma`, linearized about its own (data-free)
+predicted means.
+
+Also returns the quasi-maximum-likelihood global diffusion estimate
+`ssq = (1/(N·n_vars)) Σ_n νᵀS⁻¹ν` accumulated from the ODE innovations, and
+the raw statistic `calib_acc = Σ_n νᵀS⁻¹ν`.  These are what
+[`_dalton_loglik`](@ref) uses to put both DALTON passes on a single
+calibrated diffusion, matching the calibration `probsolve_filter` already
+applies for Fenrir.
 """
 function _dalton_reference(ode_fun!, p, u0::AbstractVector,
                            tspan::Tuple{Float64,Float64},
@@ -48,6 +57,7 @@ function _dalton_reference(ode_fun!, p, u0::AbstractVector,
     μf = _joint_init(ode_fun!, Float64.(u0), t_min, p, q)
     Σf = zeros(D, D)
     logZ = 0.0
+    calib_acc = 0.0
     ztarget = zeros(n_vars)
 
     for n in 1:n_steps
@@ -59,10 +69,13 @@ function _dalton_reference(ode_fun!, p, u0::AbstractVector,
         S = H * Σp * H' + V; S = 0.5 * (S + S')
         logZ += logpdf_mvn(ztarget, zmean, S)
         Sf = cholesky(Symmetric(S), check=false)
-        K = (Σp * H') * (issuccess(Sf) ? inv(Sf) : pinv(S))
+        Sinv = issuccess(Sf) ? inv(Sf) : pinv(S)
+        calib_acc += dot(zmean, Sinv * zmean)   # ν = −zmean, so νᵀS⁻¹ν = zmeanᵀS⁻¹zmean
+        K = (Σp * H') * Sinv
         μf = μp - K * zmean; Σf = Σp - K * H * Σp; Σf = 0.5 * (Σf + Σf')
     end
-    logZ
+    ssq = max(calib_acc / max(n_steps * n_vars, 1), 1e-12)
+    logZ, ssq, calib_acc
 end
 
 """
@@ -139,6 +152,27 @@ end
 DALTON data-conditional log-likelihood `logp(Y|Z) ≈ logp(Y,Z) − logp(Z)`
 (Wu & Lysy 2024), with each pass linearized about its own predicted means:
 data-informed for the joint pass, ODE-only for the marginal (see note above).
+
+# Diffusion calibration
+
+Both passes are evaluated at a SINGLE quasi-maximum-likelihood diffusion
+`σ̂² = (1/(N·n_vars)) Σ_n νᵀS⁻¹ν`, estimated from the ODE-only pass's
+innovations (Bosch, Tronarp & Hennig 2021) — the same calibration
+`probsolve_filter` applies for [`fenrir_loglik`](@ref).
+
+This is not cosmetic. Uncalibrated, each ODE pseudo-observation contributes
+a QUADRATIC defect penalty `−½νᵀS⁻¹ν` measured against the fixed 1e-10
+nugget, so a parameter vector whose trajectory the fixed-`sigma` IBM prior
+cannot represent drives each pass's log-evidence to ∓1e11 or worse. The two
+passes use different linearization points by construction, so their
+difference then inherits that scale: `logp(Y,Z) − logp(Z)` becomes unbounded
+above and is dominated by defect-scale mismatch rather than by data fit,
+handing the optimizer spurious "infinite likelihood" directions. Under the
+shared calibrated diffusion each evidence grows only LOGARITHMICALLY in the
+defect magnitude (`−½·N·n_vars·log σ̂²`), and the difference stays bounded.
+
+Calibrating both passes with the same `σ̂²` keeps them on a common
+probability space, so the Bayes identity remains as valid as it was.
 """
 function _dalton_loglik(ode_fun!, p, u0::AbstractVector,
                         tspan::Tuple{Float64, Float64},
@@ -150,11 +184,32 @@ function _dalton_loglik(ode_fun!, p, u0::AbstractVector,
                         obs_var::Float64;
                         interrogate::Symbol=:kramer)
     q = n_deriv
-    logZ = _dalton_reference(ode_fun!, p, u0, tspan, n_steps, q, sigma;
-                             interrogate=interrogate)
-    logYZ = _dalton_joint_evidence(ode_fun!, p, u0, tspan, n_steps, q, sigma,
+    n_vars = length(u0)
+
+    # Pass 1 (at the nominal scale): marginal evidence + the quasi-MLE
+    # diffusion statistic.
+    logZ0, ssq, calib_acc = _dalton_reference(ode_fun!, p, u0, tspan, n_steps, q,
+                                              sigma; interrogate=interrogate)
+    isfinite(ssq) || return -Inf
+
+    # With the negligible ODE nugget the filter gains — hence the predicted
+    # means and the linearization points — are invariant to an overall
+    # rescale of the diffusion, and every covariance simply scales by σ̂²
+    # (the argument `probsolve_filter` documents).  So the marginal evidence
+    # at the calibrated scale follows in closed form, with no second pass:
+    #   logZ_c = logZ₀ − ½·N·n_vars·log σ̂² + ½·calib_acc·(1 − 1/σ̂²)
+    # and calib_acc/σ̂² = N·n_vars by construction.
+    N = n_steps
+    logZ = logZ0 - 0.5 * N * n_vars * log(ssq) + 0.5 * calib_acc - 0.5 * N * n_vars
+
+    # The joint pass mixes ODE pseudo-observations (which scale with σ̂²) and
+    # data observations (fixed `obs_var`, which do not), so it must actually
+    # be run at the calibrated scale rather than rescaled after the fact.
+    sigma_c = sigma .* sqrt(ssq)
+    logYZ = _dalton_joint_evidence(ode_fun!, p, u0, tspan, n_steps, q, sigma_c,
                                    obs_data, obs_times, obs_to_state, obs_var;
                                    interrogate=interrogate)
+
     ll = logYZ - logZ
     isfinite(ll) ? ll : -Inf
 end
@@ -175,11 +230,15 @@ marginal pass's by the ODE alone.
 # Algorithm
 1. Set up the IBM prior of order `n_deriv` for each state variable.
 2. Marginal pass: ODE-only joint filter giving `logp(Z)`, EKF-linearized
-   about its own trajectory.
-3. Joint pass: filter assimilating both the ODE pseudo-observations and
+   about its own trajectory, and the quasi-MLE global diffusion `σ̂²`.
+3. Both evidences are then taken at that single calibrated diffusion (as
+   `probsolve_filter` already does for Fenrir); without this the
+   uncalibrated quadratic ODE-defect penalty makes the difference in step 5
+   unbounded above — see [`_dalton_loglik`](@ref).
+4. Joint pass: filter assimilating both the ODE pseudo-observations and
    the data, re-interrogating the ODE at each data-informed predicted
    mean, giving `logp(Y,Z)`.
-4. `logp(Y|Z) ≈ logp(Y,Z) − logp(Z)`; optimize the parameters.
+5. `logp(Y|Z) ≈ logp(Y,Z) − logp(Z)`; optimize the parameters.
 
 # References
 - Wu, M. & Lysy, M. (2024), "Data-adaptive probabilistic likelihood
@@ -187,9 +246,27 @@ marginal pass's by the ODE alone.
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
+
+# Masked data
+
+This solver does NOT support masked observations and raises an error if
+any data cell is masked (`data_weights == 0` or a non-finite
+`data_values` entry). Its likelihood is evaluated inside a Kalman /
+particle recursion with no per-cell mask: honouring a mask means skipping
+the FILTER UPDATE, not merely the density term, for the masked cells.
+Left unguarded the masked cells corrupt the filter state while the run
+still looks like an ordinary converged fit, so it fails loudly instead.
+Drop the masked rows from `data_times`/`data_values`, or use one of the
+masking-capable solvers (`LAML`, `GCVSolver`, `CollocationLAML`,
+`GradientMatching`, `TwoStageSolver`, `BNGSolver`, `ODINSolver`,
+`RKHSSolver`, `IntegralMatchingSolver`, `AdamSolver`,
+`MultipleShootingSolver`, `DerivativeFreeSolver`, `MCMCSolver`,
+`MagiSolver`, `VariationalSolver`, `ABCSolver`,
+`ProfileLikelihoodSolver`).
 """
 function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
     _validate_problem(prob, "DaltonSolver"; require_continuous=true)
+    _reject_masked_data(prob, "DaltonSolver")
     verbose = alg.verbose
     n_vars = length(prob.u0)
     n_obs = size(prob.data_values, 2)
@@ -225,7 +302,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
         alg.sigma
     end
 
-    obs_var = alg.obs_var
+    # Observation noise variance: auto-estimate from the data scale when not
+    # provided (same estimator as RodeoSolver/PseudoMarginalSolver — a fixed
+    # default like 0.01 is scale-blind and badly misfits data of order ≫ 1).
+    obs_var = if alg.obs_var === nothing
+        total_var = 0.0
+        for j in 1:n_obs
+            total_var += var(prob.data_values[:, j])
+        end
+        max(total_var / n_obs * 0.01, 1e-4)
+    else
+        alg.obs_var
+    end
 
     if verbose
         @printf("  σ (IBM scale): %s\n", string(round.(sigma, sigdigits=3)))
@@ -459,7 +547,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
         interrogate=alg.interrogate)
 
     # Extract fitted values and data loss
-    data_loss = 0.0
     pred = zeros(n_t, n_obs)
     for i in 1:n_t
         idx = _nearest_grid_index(times, prob.data_times[i])
@@ -467,10 +554,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             pred[i, j] = μ_smooth[idx][sk][1]
-            data_loss += prob.data_weights[i, j] *
-                         (prob.data_values[i, j] - pred[i, j])^2
         end
     end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Build unknown function evaluators (same pattern as RodeoSolver)
     uf_evals = Dict{Symbol, Any}()
@@ -484,28 +570,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            rng = approx.rng_seed !== nothing ?
-                  Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            _, st = Lux.setup(rng, approx.model)
-            rng2 = approx.rng_seed !== nothing ?
-                   Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            ps_ca = Float64.(ComponentArray(
-                Lux.initialparameters(rng2, approx.model)))
-            ps_final = similar(ps_ca)
-            ps_final .= params_k
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing :
-                   (approx.domain[2] - approx.domain[1])
-            uf_evals[approx.name] = x -> begin
-                xn = if lo !== nothing && span !== nothing && span > 0
-                    (Float64(x isa AbstractArray ? x[1] : x) - lo) / span
-                else
-                    Float64(x isa AbstractArray ? x[1] : x)
-                end
-                out, _ = Lux.apply(approx.model,
-                    Float32.(reshape([xn], :, 1)), ps_final, st)
-                length(out) == 1 ? Float64(out[1]) : Float64.(out)
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator

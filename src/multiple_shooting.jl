@@ -71,13 +71,24 @@ Returns matrix (n_intervals-1) × K for interior boundary points.
 """
 function init_shooting_vars(data_times::Vector{Float64}, data_values::Matrix{Float64},
                             obs_to_state::Vector{Int}, K::Int,
-                            boundaries::Vector{Float64})
+                            boundaries::Vector{Float64};
+                            data_weights::Union{Nothing,AbstractMatrix}=nothing)
     n_interior = length(boundaries) - 2  # exclude first and last
     shooting_vars = zeros(n_interior, K)
 
     for j in 1:size(data_values, 2)
         sk = obs_to_state[j]
-        itp = CubicSpline(data_values[:, j], data_times;
+        # Interpolate through the USABLE rows only. `CubicSpline` solves a
+        # tridiagonal system for its coefficients, so one NaN in the column
+        # makes the interpolant NaN EVERYWHERE — the shooting variables would
+        # all start NaN and the optimizer would begin from a NaN point,
+        # independently of any masking in the loss. Complete data keeps every
+        # row, so the interpolant is bit-for-bit the same.
+        keep = [i for i in axes(data_values, 1)
+                if isfinite(data_values[i, j]) &&
+                   (data_weights === nothing || data_weights[i, j] > 0)]
+        length(keep) < 2 && continue   # leave this state at 0.0; too little data
+        itp = CubicSpline(data_values[keep, j], data_times[keep];
                           extrapolation=ExtrapolationType.Extension)
         for i in 1:n_interior
             shooting_vars[i, sk] = itp(boundaries[i + 1])
@@ -91,8 +102,11 @@ end
 
 """
 Compute the multiple shooting loss:
-- Data fit: SSE across all intervals
+- Data fit across all intervals: weighted SSE (`loss_sym == :mse`) or the
+  weighted Poisson negative log-likelihood kernel `−Σ w(y log μ − μ)`
+  (`loss_sym == :poisson`, matching `adam_loss_poisson`)
 - Continuity constraints: augmented Lagrangian penalty on shooting gaps
+- Optional fixed smoothing penalty `adam_penalty(prob, θ, penalty_w)`
 
 Parameters z = [θ; vec(shooting_vars)] where θ are the model parameters
 and shooting_vars are the state values at interior boundaries.
@@ -106,10 +120,11 @@ _all_finite(x::ForwardDiff.Dual) =
 
 function ms_loss(prob::PSMProblem, z, n_theta::Int, K::Int,
                  boundaries::Vector{Float64}, intervals::Vector{Vector{Int}},
-                 lagrange_mult::Matrix{Float64}, rho::Float64)
+                 lagrange_mult::Matrix{Float64}, rho::Float64,
+                 loss_sym::Symbol=:mse, penalty_w::Float64=0.0)
     try
         return _ms_loss_inner(prob, z, n_theta, K, boundaries, intervals,
-                              lagrange_mult, rho)
+                              lagrange_mult, rho, loss_sym, penalty_w)
     catch e
         # A blow-up region can throw from inside the spline evaluators
         # (NaN Dual state reaching DataInterpolations) before the
@@ -122,7 +137,8 @@ end
 
 function _ms_loss_inner(prob::PSMProblem, z, n_theta::Int, K::Int,
                  boundaries::Vector{Float64}, intervals::Vector{Vector{Int}},
-                 lagrange_mult::Matrix{Float64}, rho::Float64)
+                 lagrange_mult::Matrix{Float64}, rho::Float64,
+                 loss_sym::Symbol=:mse, penalty_w::Float64=0.0)
     n_intervals = length(intervals)
     n_interior = n_intervals - 1
     T = eltype(z)
@@ -195,10 +211,22 @@ function _ms_loss_inner(prob::PSMProblem, z, n_theta::Int, K::Int,
                           "recorded at t=$t_nearest for observation at " *
                           "t=$t_data in interval [$t_lo, $t_hi]")
                 for j in 1:size(prob.data_values, 2)
+                    # Masked cells contribute nothing. `0 * NaN = NaN`,
+                    # and the `_all_finite` sentinel would then flatten
+                    # the whole augmented Lagrangian to the constant
+                    # 1e10 — L-BFGS makes no progress, the shooting gaps
+                    # never close, and the outer loop exits at maxiters.
+                    usable_cell(prob, gi, j) || continue
                     sk = prob.obs_to_state[j]
                     pred = u_at_t[sk]
                     obs = T(prob.data_values[gi, j])
-                    data_loss += prob.data_weights[gi, j] * (pred - obs)^2
+                    if loss_sym == :poisson
+                        mu = max(pred, T(1e-10))
+                        data_loss -= prob.data_weights[gi, j] *
+                                     (obs * log(mu) - mu)
+                    else
+                        data_loss += prob.data_weights[gi, j] * (pred - obs)^2
+                    end
                 end
             end
 
@@ -229,15 +257,33 @@ function _ms_loss_inner(prob::PSMProblem, z, n_theta::Int, K::Int,
             # Data fit loss on this interval
             for (li, gi) in enumerate(idx)
                 t_data = prob.data_times[gi]
+                # As in the discrete branch: a data time with no matching
+                # saved point indicates an internal inconsistency between
+                # the interval partition and `saveat` — fail loudly rather
+                # than silently dropping observations from the objective.
                 sol_idx = findfirst(t -> abs(t - t_data) < 1e-10, sol.t)
-                if sol_idx === nothing
-                    continue
-                end
+                sol_idx === nothing &&
+                    error("MultipleShooting internal error: the ODE " *
+                          "solution on [$t_lo, $t_hi] has no saved point " *
+                          "at the observation time t=$t_data " *
+                          "(saved times: $(sol.t))")
                 for j in 1:size(prob.data_values, 2)
+                    # Masked cells contribute nothing. `0 * NaN = NaN`,
+                    # and the `_all_finite` sentinel would then flatten
+                    # the whole augmented Lagrangian to the constant
+                    # 1e10 — L-BFGS makes no progress, the shooting gaps
+                    # never close, and the outer loop exits at maxiters.
+                    usable_cell(prob, gi, j) || continue
                     sk = prob.obs_to_state[j]
                     pred = sol[sk, sol_idx]
                     obs = T(prob.data_values[gi, j])
-                    data_loss += prob.data_weights[gi, j] * (pred - obs)^2
+                    if loss_sym == :poisson
+                        mu = max(pred, T(1e-10))
+                        data_loss -= prob.data_weights[gi, j] *
+                                     (obs * log(mu) - mu)
+                    else
+                        data_loss += prob.data_weights[gi, j] * (pred - obs)^2
+                    end
                 end
             end
 
@@ -255,7 +301,8 @@ function _ms_loss_inner(prob::PSMProblem, z, n_theta::Int, K::Int,
         end
     end
 
-    total = data_loss + lagrangian_term + constraint_violation
+    total = data_loss + lagrangian_term + constraint_violation +
+            adam_penalty(prob, theta, penalty_w)
     _all_finite(total) ? total : T(1e10)
 end
 
@@ -273,8 +320,13 @@ objective penalises data misfit and continuity gaps between intervals.
    boundaries for discrete-time models).
 2. Introduce free initial conditions at each interval boundary, optimized
    jointly with the model parameters.
-3. Form the augmented Lagrangian: data-fit residuals + v'h + (ρ/2)‖h‖²
+3. Form the augmented Lagrangian: data-fit loss + v'h + (ρ/2)‖h‖²
    over the continuity gaps h, with multiplier updates v ← v + ρh.
+   The data-fit loss follows `prob.likelihood` via `loss=:auto`
+   (Gaussian → weighted SSE, Poisson → weighted negative log-likelihood
+   kernel, matching `AdamSolver`; other families error). A fixed
+   smoothing penalty `penalty_weight · Σₖ βₖ'Sₖβₖ` is added when
+   `penalty_weight > 0`.
 4. Minimise each subproblem with L-BFGS (ForwardDiff gradients through
    the ODE/map solve), escalating ρ while gaps stagnate.
 5. Return the final iterate (which best satisfies the continuity
@@ -290,6 +342,13 @@ delayed history).
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
+`objective` is the final single-shoot data-fit loss in the training metric
+(weighted SSE for `:mse`, the weighted Poisson NLL kernel for `:poisson`)
+plus the smoothing penalty when `penalty_weight > 0`; `data_loss` is
+always the descriptive weighted SSE. `sol.convergence` is a NamedTuple
+`(optimizer, method, n_intervals, converged, iterations, reason, max_gap,
+rho_final)` — see the `MultipleShootingSolver` docstring for the key
+taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
     _validate_problem(prob, "MultipleShootingSolver")
@@ -302,16 +361,44 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
     T_pts = length(prob.data_times)
     n_intervals = alg.n_intervals
 
+    # Select the data-fit loss. :auto follows prob.likelihood; an explicit
+    # choice is honored but warned about on mismatch (same policy as
+    # AdamSolver).
+    loss_sym = alg.loss
+    if loss_sym == :auto
+        loss_sym = if prob.likelihood isa Gaussian
+            :mse
+        elseif prob.likelihood isa Poisson
+            :poisson
+        else
+            error("MultipleShootingSolver has no loss for " *
+                  "$(typeof(prob.likelihood)); it supports Gaussian (:mse) " *
+                  "and Poisson (:poisson). Use LAML for other likelihood " *
+                  "families.")
+        end
+    elseif loss_sym in (:mse, :poisson)
+        expected = prob.likelihood isa Poisson ? :poisson : :mse
+        if !(prob.likelihood isa Gaussian || prob.likelihood isa Poisson)
+            @warn "MultipleShootingSolver: prob.likelihood is " *
+                  "$(typeof(prob.likelihood)), which this solver cannot " *
+                  "honor; fitting with loss=$loss_sym instead"
+        elseif loss_sym != expected
+            @warn "MultipleShootingSolver: loss=$loss_sym does not match " *
+                  "prob.likelihood=$(typeof(prob.likelihood)) (expected :$expected)"
+        end
+    else
+        error("MultipleShootingSolver: unknown loss :$loss_sym. " *
+              "Supported: :auto, :mse, :poisson.")
+    end
+    penalty_w = alg.penalty_weight
+
     # Initialize model parameters
     theta = Float64[]
-    mlp_specs = Dict{Symbol, MLPSpec}()
 
     for approx in prob.approximators
         if approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            mlp_specs[approx.name] = spec
             rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            append!(theta, init_mlp_params(spec, rng))
+            append!(theta, neural_init_params(approx, rng))
         else
             append!(theta, initial_params(approx))
         end
@@ -336,7 +423,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
     # Initialize shooting variables from data
     shooting_vars = init_shooting_vars(Float64.(prob.data_times),
                                        Float64.(prob.data_values),
-                                       prob.obs_to_state, K, boundaries)
+                                       prob.obs_to_state, K, boundaries;
+                                       data_weights=prob.data_weights)
 
     # Optimization variable: z = [theta; vec(shooting_vars)]
     z = vcat(theta, vec(shooting_vars))
@@ -353,10 +441,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
 
     prev_max_gap = Inf
 
+    # Honest convergence reporting: defaults describe outer-loop exhaustion.
+    conv_converged = false
+    conv_reason = :maxiters
+    conv_iters = 0
+    final_max_gap = NaN
+
     # Outer loop: augmented Lagrangian
     for outer in 1:alg.maxiters_outer
+        conv_iters = outer
         # Re-create loss function with current lagrange_mult and rho
-        loss_fn = z_ -> ms_loss(prob, z_, n_theta, K, boundaries, intervals, lagrange_mult, rho)
+        loss_fn = z_ -> ms_loss(prob, z_, n_theta, K, boundaries, intervals,
+                                lagrange_mult, rho, loss_sym, penalty_w)
 
         if verbose
             println("\n─── Outer iter $outer: ρ=$(round(rho, sigdigits=3)) ───")
@@ -435,15 +531,19 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
 
         if verbose
             data_only_loss = ms_loss(prob, z, n_theta, K, boundaries,
-                                     intervals, zeros(n_interior, K), 0.0)
+                                     intervals, zeros(n_interior, K), 0.0,
+                                     loss_sym, 0.0)
             println("  Max shooting gap: $(round(max_gap, sigdigits=4))")
             println("  Data-only loss: $(round(data_only_loss, sigdigits=5))")
         end
 
         # Check convergence (relative to state scale)
+        final_max_gap = max_gap
         state_scale = norm(u0_init)
         if max_gap < 1e-2 * state_scale
             if verbose; println("  Shooting gaps converged!"); end
+            conv_converged = true
+            conv_reason = :converged_tol
             break
         end
 
@@ -486,10 +586,25 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
         end
     end
 
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:T_pts
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
+    data_loss = weighted_data_loss(prob, pred)
+
+    # Objective in the TRAINING metric (matching AdamSolver's reporting):
+    # weighted SSE for :mse, the weighted Poisson negative log-likelihood
+    # kernel for :poisson, plus the fixed smoothing penalty when active.
+    # data_loss above stays the descriptive weighted SSE in both cases.
+    final_obj = if loss_sym == :poisson
+        obj = 0.0
+        for j in 1:n_obs, i in 1:T_pts
+            usable_cell(prob, i, j) || continue
+            mu = max(pred[i, j], 1e-10)
+            y = prob.data_values[i, j]
+            obj -= prob.data_weights[i, j] * (y * log(mu) - mu)
+        end
+        obj
+    else
+        data_loss
     end
+    final_obj += adam_penalty(prob, theta_final, penalty_w)
 
     # Build evaluators for unknown functions
     uf_evals = Dict{Symbol, Any}()
@@ -503,20 +618,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_specs[approx.name]
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                uf_evals[approx.name] = x -> begin
-                    xval = x isa AbstractArray ? x[1] : x
-                    xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
-                        (Float64(xval) - lo_) / span_
-                    else
-                        Float64(xval)
-                    end
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator
@@ -544,9 +646,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
         println("\nFinal (single-shoot): data_SS=$(round(data_loss, sigdigits=5))")
     end
 
-    PSMSolution(params, data_loss, data_loss, edf, Float64[],
+    PSMSolution(params, final_obj, data_loss, edf, Float64[],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
                 (optimizer=:lbfgs, method=:multiple_shooting,
-                 n_intervals=n_intervals))
+                 n_intervals=n_intervals,
+                 converged=conv_converged, iterations=conv_iters,
+                 reason=conv_reason, max_gap=final_max_gap, rho_final=rho))
 end

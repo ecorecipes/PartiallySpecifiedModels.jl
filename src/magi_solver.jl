@@ -108,7 +108,7 @@ struct MAGILogDensity{P <: PSMProblem}
     prob::P
     grid_times::Vector{Float64}
     obs_indices::Vector{Int}
-    obs_var::Float64
+    obs_var::Vector{Float64}           # per state component
     prior_scale::Float64
     n_vars::Int
     n_grid::Int
@@ -143,16 +143,7 @@ function _magi_build_uf(prob, theta)
         elseif approx isa GPApproximator
             push!(uf_entries, approx.name => build_gp_evaluator(approx, params_k))
         elseif approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = params_k, s = spec, lo_ = lo, span_ = span
-                push!(uf_entries, approx.name => (x -> begin
-                    xval = x isa AbstractArray ? x[1] : x
-                    xn = (lo_ !== nothing && span_ !== nothing && span_ > 0) ? (xval - lo_) / span_ : xval
-                    mlp_evaluate(s, pk, xn)
-                end))
-            end
+            push!(uf_entries, approx.name => build_neural_evaluator(approx, params_k))
         end
     end
     merge(NamedTuple(uf_entries), prob.known_params)
@@ -193,16 +184,18 @@ function _magi_logposterior(ld::MAGILogDensity, v::AbstractVector{T}) where T
         lp += -T(0.5) * dot(resid, ld.Kstar_inv[d] * resid)
     end
 
-    # Data likelihood
-    inv2v = T(1.0) / (2 * ld.obs_var)
+    # Data likelihood (Gaussian; per-state noise variance). Weight-zero
+    # entries encode masked points and are excluded, matching the other
+    # solvers' data_weights semantics.
     for i in 1:size(prob.data_values, 1)
         gi = ld.obs_indices[i]
         for j in 1:size(prob.data_values, 2)
             y = prob.data_values[i, j]
-            isnan(y) && continue
+            w = prob.data_weights[i, j]
+            _usable(y, w) || continue
             sk = prob.obs_to_state[j]
             r = T(y) - X[gi, sk]
-            lp += -inv2v * r^2
+            lp += -T(w) / (2 * ld.obs_var[sk]) * r^2
         end
     end
 
@@ -243,15 +236,42 @@ field through the conditional covariance `K* = ''K − 'K C⁻¹ ('K)ᵀ`, and t
 states `X(I)` are sampled jointly with the unknown-function parameters θ via
 NUTS.
 
+Gaussian likelihoods only: the manifold-constrained posterior's data term
+is a Gaussian quadratic form on the state grid, so non-Gaussian
+`prob.likelihood` errors at entry. Observation noise is per state
+component: `sigma` (explicit SDs) takes priority over `obs_var` (shared
+variance; specifying both errors), which takes priority over
+auto-estimation. `data_weights` scale each observation's contribution;
+weight-zero entries are excluded like NaN.
+
 # References
 - Yang, Wong & Kou (2021), "Inference of dynamic systems from noisy and
   sparse data via manifold-constrained Gaussian processes", PNAS 118(15).
 
 # Returns
 `PSMSolution`; `convergence.chains` holds the posterior samples of θ.
+`objective` is minus the mean log-posterior over the retained draws (the
+only scalar objective a sampler has; negated for the package-wide
+lower-is-better convention) and `data_loss` is the usual mask-aware
+`weighted_data_loss` at the posterior-mean trajectory. `convergence`
+also carries `converged`/`reason`; NUTS runs a fixed budget with no
+stopping criterion, so these are always `false`/`:maxiters` — judge the
+sampler by the R̂ and ESS of `convergence.chains`.
+
+Masked observations (`NaN` value and/or zero weight) are supported: they
+are dropped from the data term, the GP hyperparameter fit and the state
+initialization.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     _validate_problem(prob, "MagiSolver"; require_continuous=true)
+    # The manifold-constrained GP posterior assumes Gaussian observation
+    # noise (the data term is a Gaussian quadratic form on the state grid),
+    # so refuse other families rather than silently fitting Gaussian.
+    prob.likelihood isa Gaussian ||
+        error("MagiSolver supports Gaussian likelihoods only (the " *
+              "manifold-constrained GP posterior assumes Gaussian " *
+              "observation noise); got $(typeof(prob.likelihood)). " *
+              "Use MCMCSolver or LAML for other likelihood families.")
     verbose = alg.verbose
     n_vars = length(prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)
 
@@ -265,14 +285,26 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
         push!(obs_indices, idx)
     end
 
-    # ── Observation noise variance ──
-    # If unspecified, estimate per observed column with the second-difference
-    # estimator Var(Δ²y) = 6σ² (exact for locally-linear signal + iid noise)
-    # and average across columns. A fixed default is scale-blind: with data
-    # in units ≫ 0.1 it made the data term overwhelm the GP and manifold
-    # terms, silently distorting the posterior.
-    obs_var = alg.obs_var
-    if obs_var === nothing
+    # ── Observation noise variance (one per state component) ──
+    # Priority: `sigma` (explicit per-state SDs) > `obs_var` (shared
+    # variance) > auto-estimation. If unspecified, estimate per observed
+    # column with a local-linear residual estimator and average across
+    # columns. A fixed default is scale-blind: with data in units ≫ 0.1 it
+    # made the data term overwhelm the GP and manifold terms, silently
+    # distorting the posterior.
+    if alg.sigma !== nothing
+        length(alg.sigma) == n_vars ||
+            error("MagiSolver: sigma must supply one observation SD per " *
+                  "state component ($n_vars); got length $(length(alg.sigma)).")
+        all(>(0.0), alg.sigma) ||
+            error("MagiSolver: sigma entries must be positive.")
+        alg.obs_var === nothing ||
+            error("MagiSolver: specify observation noise via sigma " *
+                  "(per-state SDs) or obs_var (shared variance), not both.")
+        obs_var_vec = alg.sigma .^ 2
+    elseif alg.obs_var !== nothing
+        obs_var_vec = fill(alg.obs_var, n_vars)
+    else
         # Gasser–Sroka–Jennen local-linear residual estimator: for each
         # interior point, ε̂ᵢ = yᵢ − aᵢy₍ᵢ₋₁₎ − bᵢy₍ᵢ₊₁₎ with the linear-
         # interpolation weights, σ̂² = Σ cᵢ²ε̂ᵢ²/(n−2), cᵢ² = 1/(aᵢ²+bᵢ²+1).
@@ -282,7 +314,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
         t_all = Float64.(prob.data_times)
         for j in 1:size(prob.data_values, 2)
             y = Float64.(prob.data_values[:, j])
-            keep = .!isnan.(y)
+            # weight-0 points are masked: exclude them like NaN
+            keep = _usable.(y, prob.data_weights[:, j])
             yv = y[keep]; tv = t_all[keep]
             n = length(yv)
             n >= 4 || continue
@@ -299,6 +332,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
         end
         obs_var = isempty(ests) ? 0.01 : Statistics.mean(ests)
         verbose && println("MAGI: estimated obs_var = $(round(obs_var, sigdigits=3))")
+        obs_var_vec = fill(obs_var, n_vars)
     end
 
     # ── GP hyperparameters and precomputed matrices per component ──
@@ -315,9 +349,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
         ocol = findfirst(j -> prob.obs_to_state[j] == d, 1:size(prob.data_values, 2))
         if ocol !== nothing
             yobs = Float64.(prob.data_values[:, ocol])
-            keep = .!isnan.(yobs)
+            # weight-0 points are masked: keep them out of the GP
+            # hyperparameter fit and the state initialization too
+            keep = _usable.(yobs, prob.data_weights[:, ocol])
             td = data_times[keep]; yv = yobs[keep]
-            ℓ, σ2 = _magi_fit_hyperparams(td, yv, obs_var)
+            ℓ, σ2 = _magi_fit_hyperparams(td, yv, obs_var_vec[d])
             ybar = Statistics.mean(yv)
             for i in 1:n_grid
                 Xinit[i, d] = _magi_linear_interp(td, yv, grid_times[i])
@@ -350,7 +386,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     end
     v0 = vcat(theta0, vec(Xinit))
 
-    ld = MAGILogDensity(prob, grid_times, obs_indices, obs_var, alg.prior_scale,
+    ld = MAGILogDensity(prob, grid_times, obs_indices, obs_var_vec, alg.prior_scale,
                         n_vars, n_grid, n_params, Cinv, mmap, Kstar_inv, μ)
 
     ld_ad = LogDensityProblemsAD.ADgradient(Val(:ForwardDiff), ld)
@@ -387,10 +423,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     n_keep = alg.n_samples
     sample_matrix = zeros(n_keep, n_params)       # θ samples only
     state_mean = zeros(n_grid, n_vars)
+    # Mean log-posterior over the retained draws. This is the only scalar
+    # objective MAGI actually has: the sampler targets the joint posterior
+    # over (θ, x) and there is no penalized-likelihood value to report.
+    # Reported NEGATED below, so `sol.objective` keeps the package-wide
+    # "lower is better" convention (MCMCSolver reports −log p likewise).
+    mean_logpost = 0.0
     for i in 1:n_keep
         z = chain_raw[alg.n_warmup + i].z.θ
         sample_matrix[i, :] = z[1:n_params]
         state_mean .+= reshape(z[n_params+1:end], n_grid, n_vars) ./ n_keep
+        mean_logpost += _magi_logposterior(ld, z) / n_keep
     end
 
     param_names = String[]
@@ -422,17 +465,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                uf_evals[approx.name] = x -> begin
-                    xn = (lo_ !== nothing && span_ !== nothing && span_ > 0) ?
-                         (Float64(x isa AbstractArray ? x[1] : x) - lo_) / span_ :
-                         Float64(x isa AbstractArray ? x[1] : x)
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         end
     end
 
@@ -456,8 +489,24 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     end
 
     verbose && println("MAGI: sampling complete.")
-    PSMSolution(params, 0.0, 0.0, Float64(n_params), Float64[],
+
+    # Reported loss: the SAME weighted, mask-aware residual sum of squares
+    # every other solver reports (`weighted_data_loss`), evaluated at the
+    # posterior-mean state trajectory. A hard-coded 0.0 here claimed a
+    # perfect fit for every MAGI run, which no diagnostic could distinguish
+    # from a genuinely perfect one.
+    data_loss = weighted_data_loss(prob, pred)
+
+    # NUTS has no stopping criterion: it runs the requested budget and
+    # stops. Reporting `converged = true` would be a fabrication, so this
+    # is loop exhaustion — `:maxiters`, the same taxonomy the iterative
+    # solvers use. Assess the sampler with the R̂/ESS diagnostics of
+    # `convergence.chains`, not with this flag.
+    PSMSolution(params, -mean_logpost, data_loss, Float64(n_params), Float64[],
                 pred, Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (method=:magi, chains=chains, state_mean=state_mean))
+                (method=:magi, chains=chains, state_mean=state_mean,
+                 mean_logposterior=mean_logpost,
+                 converged=false, reason=:maxiters,
+                 iterations=n_total))
 end

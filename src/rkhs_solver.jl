@@ -113,14 +113,37 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
     # between observed and unobserved states has taken hold.
     n_ramp = max(1, alg.maxiters ÷ 5)
 
+    # Usable rows per observation column; `rkhs_all_usable` selects the
+    # original (bit-for-bit unchanged) vectorized paths below.
+    rkhs_keep = Dict{Int,Vector{Int}}(j => usable_rows(prob, j)
+                                      for j in 1:n_obs)
+    rkhs_all_usable = all(length(rkhs_keep[j]) == n_times for j in 1:n_obs)
+
     # ── Centers m_k and initial trajectory (kernel ridge on the data) ──
     m_center = zeros(n_vars)
     B = zeros(m, n_vars)                          # trajectory coefficients
     for k in 1:n_vars
         if haskey(obs_of_state, k)
-            m_center[k] = mean(prob.data_values[:, obs_of_state[k]])  # pooled over replicate columns
-            y_k = prob.data_values[:, obs_of_state[k][1]]
-            B[:, k] = Symmetric(A_data + λ * A_pen) \ (Φd' * (y_k .- m_center[k]))
+            # Pool over replicate columns, USABLE cells only: `mean` over a
+            # column holding a NaN is NaN, and that center then makes the
+            # whole trajectory-coefficient block NaN.
+            vals = Float64[prob.data_values[i, jc] for jc in obs_of_state[k]
+                           for i in axes(prob.data_values, 1)
+                           if usable_cell(prob, i, jc)]
+            isempty(vals) && error("RKHSSolver: state $k has no usable " *
+                "observations (all masked).")
+            m_center[k] = length(vals) == n_times * length(obs_of_state[k]) ?
+                          mean(prob.data_values[:, obs_of_state[k]]) : mean(vals)
+            jc1 = obs_of_state[k][1]
+            keep1 = usable_rows(prob, jc1)
+            if length(keep1) == n_times
+                y_k = prob.data_values[:, jc1]
+                B[:, k] = Symmetric(A_data + λ * A_pen) \ (Φd' * (y_k .- m_center[k]))
+            else
+                Φk = Φd[keep1, :]
+                y_k = Float64.(prob.data_values[keep1, jc1])
+                B[:, k] = Symmetric(Φk' * Φk + λ * A_pen) \ (Φk' * (y_k .- m_center[k]))
+            end
         else
             m_center[k] = u0_vec[k]               # flat at IC; ODE term moves it
         end
@@ -130,10 +153,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
     beta = Float64[]
     for approx in prob.approximators
         if approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
             rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) :
                   Random.default_rng()
-            append!(beta, init_mlp_params(spec, rng))
+            append!(beta, neural_init_params(approx, rng))
         else
             append!(beta, initial_params(approx))
         end
@@ -195,7 +217,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
             if haskey(obs_of_state, k)
                 xk = Φd * Bmat[:, k] .+ m_center[k]
                 for j in obs_of_state[k]
-                    J += sum(abs2, prob.data_values[:, j] .- xk)
+                    # Usable cells only — one NaN otherwise makes the tracked
+                    # objective NaN, so the convergence test never fires and
+                    # `sol.objective` is reported as NaN.
+                    rows = rkhs_keep[j]
+                    if length(rows) == n_times
+                        J += sum(abs2, prob.data_values[:, j] .- xk)
+                    else
+                        for i in rows
+                            J += (prob.data_values[i, j] - xk[i])^2
+                        end
+                    end
                 end
             end
             J += λ * dot(Bmat[:, k], K_cc * Bmat[:, k])
@@ -252,10 +284,26 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
         blk(j) = ((j-1)*m + 1):(j*m)
         for j in 1:n_vars
             w_j = haskey(obs_of_state, j) ? Float64(length(obs_of_state[j])) : 0.0
-            H[blk(j), blk(j)] .+= w_j .* A_data .+ λ .* A_pen
-            if w_j > 0
+            # `w_j .* A_data` is a shortcut for Σ_jc Φd'Φd that is only valid
+            # when EVERY row of every replicate column carries a usable datum.
+            # Under masking the design must lose those rows, and the rhs must
+            # not read their NaN values (`Φd' * NaN` contaminates the whole
+            # block, and the weight never multiplies it away here at all).
+            if w_j > 0 && !rkhs_all_usable
+                Hj = zeros(m, m)
                 for jc in obs_of_state[j]
-                    rhs[blk(j)] .+= Φd' * (prob.data_values[:, jc] .- m_center[j])
+                    Φk = @view Φd[rkhs_keep[jc], :]
+                    Hj .+= Φk' * Φk
+                    rhs[blk(j)] .+= Φk' *
+                        (Float64.(prob.data_values[rkhs_keep[jc], jc]) .- m_center[j])
+                end
+                H[blk(j), blk(j)] .+= Hj .+ λ .* A_pen
+            else
+                H[blk(j), blk(j)] .+= w_j .* A_data .+ λ .* A_pen
+                if w_j > 0
+                    for jc in obs_of_state[j]
+                        rhs[blk(j)] .+= Φd' * (prob.data_values[:, jc] .- m_center[j])
+                    end
                 end
             end
         end
@@ -316,7 +364,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
         sk = prob.obs_to_state[j]
         pred[:, j] = Φd * B[:, sk] .+ m_center[sk]
     end
-    data_loss = sum(abs2, prob.data_values .- pred)
+    # Weighted sum of squares over usable cells, matching the data_loss
+    # convention of the other solvers (masked / NaN cells are skipped so
+    # one missing observation does not turn the reported loss into NaN).
+    data_loss = weighted_data_loss(prob, pred)
 
     uf_evals = Dict{Symbol, Any}()
     offset = 0
@@ -329,19 +380,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                uf_evals[approx.name] = x -> begin
-                    xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
-                        (Float64(x isa AbstractArray ? x[1] : x) - lo_) / span_
-                    else
-                        Float64(x isa AbstractArray ? x[1] : x)
-                    end
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator
@@ -369,6 +408,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
     PSMSolution(params, J_final, data_loss, edf, Float64[λ, ρ],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (converged=converged, iterations=final_iter, method=:rkhs,
+                (converged=converged, iterations=final_iter,
+                 reason=(converged ? :converged_tol : :maxiters), method=:rkhs,
                  kernel=alg.kernel, lengthscale=ℓ))
 end

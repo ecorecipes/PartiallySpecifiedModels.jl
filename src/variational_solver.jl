@@ -55,6 +55,10 @@ end
     _gaussian_loglik(pred, data, weights, obs_noise_var)
 
 Gaussian log-likelihood: -0.5 Σ w_ij (pred_ij - data_ij)² / σ²_obs.
+
+Zero-weight and NaN cells are skipped rather than multiplied by their
+weight: `0 * NaN = NaN`, which would poison the whole ELBO (and with it
+every gradient) from a single masked datum.
 """
 function _gaussian_loglik(pred, data, weights, obs_noise_var)
     T = eltype(pred)
@@ -62,7 +66,37 @@ function _gaussian_loglik(pred, data, weights, obs_noise_var)
     n_t, n_obs = size(data)
     for j in 1:n_obs
         for i in 1:n_t
-            ll -= weights[i, j] * (pred[i, j] - data[i, j])^2 / (2 * obs_noise_var)
+            w = weights[i, j]
+            y = data[i, j]
+            _usable(y, w) || continue
+            ll -= w * (pred[i, j] - y)^2 / (2 * obs_noise_var)
+        end
+    end
+    ll
+end
+
+"""
+    _vi_loglik(fam, pred, data, weights, obs_noise_var)
+
+Observation log-likelihood dispatched on the likelihood family. Gaussian
+keeps the σ²-scaled quadratic form (`obs_noise_var` is the noise
+variance); every other family uses its own pointwise log-likelihood with
+`data_weights` multiplied in (`obs_noise_var` is ignored — dispersion
+parameters live in the family object).
+"""
+_vi_loglik(::Gaussian, pred, data, weights, obs_noise_var) =
+    _gaussian_loglik(pred, data, weights, obs_noise_var)
+
+function _vi_loglik(fam::AbstractLikelihood, pred, data, weights, obs_noise_var)
+    T = eltype(pred)
+    ll = zero(T)
+    n_t, n_obs = size(data)
+    for j in 1:n_obs
+        for i in 1:n_t
+            w = weights[i, j]
+            y = data[i, j]
+            _usable(y, w) || continue
+            ll += w * loglik_pointwise(fam, y, pred[i, j])
         end
     end
     ll
@@ -129,8 +163,8 @@ function _compute_elbo(prob::PSMProblem, mu, log_sigma, Λ, logdetΛ,
             continue
         end
 
-        avg_ll += _gaussian_loglik(pred, prob.data_values, prob.data_weights,
-                                   obs_noise_var)
+        avg_ll += _vi_loglik(prob.likelihood, pred, prob.data_values,
+                             prob.data_weights, obs_noise_var)
         n_valid += 1
     end
 
@@ -144,6 +178,87 @@ function _compute_elbo(prob::PSMProblem, mu, log_sigma, Λ, logdetΛ,
     avg_ll - kl
 end
 
+"""
+    _vi_edf(prob, mu_opt, Λ, obs_noise_var, n_p) → Float64
+
+Effective degrees of freedom of the Gaussian (Laplace) approximation at the
+variational posterior mean: `tr((H + Λ)⁻¹ H)` with the Gauss–Newton
+information `H = JᵀWJ`, `J = ∂μ̂/∂β` by forward finite differences, and
+`Λ` the variational prior precision.
+
+`W` is the FAMILY's Gauss–Newton weight for the identity link, matching
+`irls_weights` and the LAML/GCV curvature:
+
+- Gaussian: `W = w / σ²_obs` (`obs_noise_var`), the classical form.
+- everything else: `W = w / V(μ̂)` with `V` the family's variance function
+  (`_variance_function`), evaluated at the fitted mean.
+
+`obs_noise_var` is read for Gaussian data ONLY. Non-Gaussian families
+carry their dispersion in the family object and `obs_noise_var` is
+hard-set to 1.0 by the caller, so the old unconditional `H = JᵀWJ/σ²_obs`
+silently reported a Poisson/NB/TruncatedNormal EDF computed with unit
+observation variance — a curvature off by the factor `V(μ̂)`, which for a
+Poisson fit with counts in the hundreds is two orders of magnitude.
+
+Only usable observation cells (`usable_cell`: positive weight, finite
+value) enter `W`. Returns `NaN` when the model cannot be simulated at
+`mu_opt` or the linear system is singular — an honest missing value
+rather than a fabricated constant.
+"""
+function _vi_edf(prob::PSMProblem, mu_opt::Vector{Float64},
+                 Λ::Matrix{Float64}, obs_noise_var::Float64, n_p::Int)
+    n_t = length(prob.data_times)
+    n_obs = size(prob.data_values, 2)
+
+    keep = [(i, j) for j in 1:n_obs for i in 1:n_t
+            if usable_cell(prob, i, j)]
+    isempty(keep) && return NaN
+
+    base = try
+        Float64.(simulate(prob, mu_opt))
+    catch e
+        _is_program_error(e) && rethrow()
+        return NaN
+    end
+    all(isfinite, base) || return NaN
+
+    J = zeros(length(keep), n_p)
+    for b in 1:n_p
+        step = max(1e-6, abs(mu_opt[b]) * 1e-6)
+        bp = copy(mu_opt); bp[b] += step
+        pert = try
+            Float64.(simulate(prob, bp))
+        catch e
+            _is_program_error(e) && rethrow()
+            return NaN
+        end
+        all(isfinite, pert) || return NaN
+        for (r, (i, j)) in enumerate(keep)
+            J[r, b] = (pert[i, j] - base[i, j]) / step
+        end
+    end
+
+    fam = prob.likelihood
+    w_gn = if fam isa Gaussian
+        [Float64(prob.data_weights[i, j]) / obs_noise_var for (i, j) in keep]
+    else
+        # Same μ ≤ 0 regularization (`abs`) and variance floor as
+        # `laml.jl`'s Pearson dispersion, so the two curvatures agree.
+        [Float64(prob.data_weights[i, j]) /
+         max(_variance_function(fam, abs(base[i, j])), 1e-10)
+         for (i, j) in keep]
+    end
+    all(isfinite, w_gn) || return NaN
+    H = J' * Diagonal(w_gn) * J
+    edf = try
+        tr((H .+ Λ) \ H)
+    catch
+        return NaN
+    end
+    isfinite(edf) || return NaN
+    clamp(edf, 0.0, Float64(n_p))
+end
+
 # ─── Main variational solver ────────────────────────────────────────
 
 """
@@ -152,6 +267,13 @@ end
 Fit a partially specified model using mean-field variational inference.
 The posterior over unknown-function parameters is approximated by a
 diagonal Gaussian, optimised by maximising the evidence lower bound (ELBO).
+
+The ELBO's data term follows `prob.likelihood`: Gaussian data use the
+σ²-scaled quadratic form with `obs_noise_var` (user-supplied or
+estimated); Poisson, NegativeBinomial, TruncatedNormal, and
+CustomLikelihood use the family's pointwise log-likelihood with
+`data_weights` multiplied in and no Gaussian noise nuisance. Passing
+`obs_noise_var` with a non-Gaussian family errors.
 
 # Algorithm
 1. Initialise the variational mean μ from the model's initial parameters
@@ -173,6 +295,13 @@ and variational parameters `μ`, `σ` in `sol.extras`.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     _validate_problem(prob, "VariationalSolver")
+    gaussian_obs = prob.likelihood isa Gaussian
+    if !gaussian_obs && alg.obs_noise_var !== nothing
+        error("VariationalSolver: obs_noise_var is the Gaussian " *
+              "observation-noise variance, but prob.likelihood is " *
+              "$(typeof(prob.likelihood)), which has no σ² parameter " *
+              "(dispersion parameters are fixed in the family object).")
+    end
     verbose = alg.verbose
 
     # Initialize variational parameters
@@ -181,28 +310,39 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     mu = copy(beta0)
     log_sigma = fill(-2.0, n_p)  # σ ≈ 0.135
 
-    # Observation noise variance: user-specified or estimated from data
-    obs_noise_var = if alg.obs_noise_var !== nothing
+    # Observation noise variance (Gaussian families only): user-specified
+    # or estimated from data. Non-Gaussian families carry their own
+    # dispersion, so the value is never read (see `_vi_loglik`).
+    obs_noise_var = if !gaussian_obs
+        1.0
+    elseif alg.obs_noise_var !== nothing
         alg.obs_noise_var
     else
         # Estimate from short-range variability in data (successive differences)
         # This is more robust than the data range heuristic
         n_t = size(prob.data_values, 1)
         n_obs = size(prob.data_values, 2)
+        # Usable cells only: a masked/NaN datum must not poison σ̂².
+        usable(i, j) = usable_cell(prob, i, j)
+        total_var = 0.0
+        n_dd = 0
         if n_t >= 3
-            total_var = 0.0
-            count = 0
             for j in 1:n_obs
                 for i in 2:n_t-1
                     # Second differences estimate noise (removes trend)
+                    (usable(i-1, j) && usable(i, j) && usable(i+1, j)) || continue
                     dd = prob.data_values[i-1, j] - 2*prob.data_values[i, j] + prob.data_values[i+1, j]
                     total_var += dd^2
-                    count += 1
+                    n_dd += 1
                 end
             end
-            max(total_var / (6 * count), 1e-6)  # Var(Δ²y) = 6σ² for white noise
+        end
+        if n_dd > 0
+            max(total_var / (6 * n_dd), 1e-6)  # Var(Δ²y) = 6σ² for white noise
         else
-            data_range = maximum(prob.data_values) - minimum(prob.data_values)
+            vals = [prob.data_values[i, j] for j in 1:n_obs for i in 1:n_t
+                    if usable(i, j)]
+            data_range = isempty(vals) ? 0.0 : maximum(vals) - minimum(vals)
             max((0.05 * data_range)^2, 1e-6)
         end
     end
@@ -210,7 +350,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     if verbose
         println("VariationalSolver: $n_p params, $(alg.maxiters) max iters, " *
                 "lr=$(alg.lr), S=$(alg.n_elbo_samples)")
-        println("  prior_scale=$(alg.prior_scale), obs_noise_var=$(round(obs_noise_var, sigdigits=3))")
+        println("  prior_scale=$(alg.prior_scale)" *
+                (gaussian_obs ?
+                 ", obs_noise_var=$(round(obs_noise_var, sigdigits=3))" :
+                 ", likelihood=$(typeof(prob.likelihood))"))
     end
 
     # Prior precision Λ = roughness penalty (λS per smooth term) + broad
@@ -300,8 +443,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
                     iter, elbo_val, lr_t, grad_norm)
         end
 
-        # Convergence check: ELBO plateau over last 50 iterations
-        if iter > 100
+        # Convergence check: ELBO plateau over last 50 iterations, guarded
+        # against the cosine lr schedule manufacturing a plateau: near
+        # maxiters lr_t → 0, so the ELBO stops moving however far from the
+        # optimum φ still is. Only stop while the step is meaningful.
+        #
+        # `best_elbo > -1e9` is AdamSolver's failure-sentinel guard in ELBO
+        # (maximization) form: `_vi_elbo` returns −1e10 when the dynamics
+        # cannot be evaluated, and a run pinned at that sentinel is a stuck
+        # solver, not a converged one — it must keep iterating rather than
+        # stop early on the flat sentinel.
+        if iter > 100 && isfinite(best_elbo) && best_elbo > -1e9 &&
+           lr_t > 0.05 * lr
             window = max(1, length(elbo_history) - 49):length(elbo_history)
             recent = elbo_history[window]
             recent_range = maximum(recent) - minimum(recent)
@@ -312,6 +465,21 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
                 break
             end
         end
+    end
+
+    # A non-finite best ELBO means no iteration ever produced a usable
+    # objective, so `best_phi` is still the initialization: returning it
+    # would present the initial guess as a fit. Fail loudly instead.
+    if !isfinite(best_elbo)
+        n_nan = count(!isfinite, elbo_history)
+        error("VariationalSolver: the ELBO was non-finite at every one of " *
+              "$(length(elbo_history)) iterations ($n_nan non-finite), so " *
+              "the returned variational parameters would be the untouched " *
+              "initialization rather than a fit. Common causes: NaN or Inf " *
+              "in data_values at cells with nonzero data_weights, a " *
+              "likelihood undefined at the initial predictions, or dynamics " *
+              "that produce NaN. Mask unusable observations by setting " *
+              "their data_weights entry to 0.")
     end
 
     # Recover best variational parameters
@@ -338,15 +506,33 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     n_t = length(prob.data_times)
     n_obs = size(prob.data_values, 2)
 
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:n_t
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
-    end
+    # Masked/NaN cells are skipped (0 * NaN = NaN would make data_loss NaN).
+    data_loss = weighted_data_loss(prob, pred)
 
-    # Approximate effective degrees of freedom from posterior variance:
-    # Parameters with small posterior variance relative to prior are well-determined
-    edf = sum(1.0 .- (sigma_opt .^ 2) ./ (alg.prior_scale^2))
-    edf = clamp(edf, 1.0, Float64(n_p))
+    # Effective degrees of freedom of the Gaussian (Laplace) approximation
+    # taken at the variational posterior mean:
+    #
+    #     edf = tr((H + Λ)⁻¹ H),
+    #
+    # with H the Gauss–Newton observed information of the data term,
+    # H = JᵀWJ (W = w/σ²_obs for Gaussian data, w/V(μ̂) for every other
+    # family — see `_vi_edf`) and J = ∂μ̂/∂β by finite differences, and Λ the SAME
+    # prior precision (ridge + S/prior_scale) that defines the variational
+    # prior above. This is the standard penalized-regression EDF and, being
+    # built from the model Jacobian rather than from q's scale parameters,
+    # it responds to `prior_scale` as a dof must.
+    #
+    # It replaces Σᵢ (1 − σ_q,ᵢ² Λᵢᵢ), which is the correct per-coordinate
+    # shrinkage factor ONLY at the exact mean-field optimum, where
+    # σ_q,ᵢ² = 1/(Hᵢᵢ + Λᵢᵢ). Adam does not drive log σ that far in a
+    # finite iteration budget, so in practice σ_q,ᵢ² Λᵢᵢ > 1 for most
+    # coordinates, every term hit its clamp, and the reported EDF was the
+    # constant 1.0 for any smoothing level (measured: edf = 1.0 at
+    # prior_scale = 1e-4 AND at prior_scale = 1).
+    #
+    # If the Jacobian cannot be built (simulation failure at the posterior
+    # mean) the EDF is reported as NaN rather than fabricated.
+    edf = _vi_edf(prob, mu_opt, Λ, obs_noise_var, n_p)
 
     # Build unknown function evaluators using posterior mean
     uf_evals = Dict{Symbol, Any}()
@@ -361,20 +547,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing :
-                   (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                uf_evals[approx.name] = x -> begin
-                    xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
-                        (Float64(x isa AbstractArray ? x[1] : x) - lo_) / span_
-                    else
-                        Float64(x isa AbstractArray ? x[1] : x)
-                    end
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator
@@ -404,7 +577,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
         :final_elbo => best_elbo,
         :posterior_mean => copy(mu_opt),
         :posterior_std => copy(sigma_opt),
-        :obs_noise_var => obs_noise_var,
+        :obs_noise_var => gaussian_obs ? obs_noise_var : nothing,
         :n_iters => length(elbo_history),
     )
 

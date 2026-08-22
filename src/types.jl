@@ -12,6 +12,16 @@ Subtypes must implement:
 """
 abstract type AbstractApproximator end
 
+# Shared domain sanity check: every approximator needs an oriented,
+# non-degenerate domain. An inverted domain silently produced reversed
+# knot/mesh grids downstream; a degenerate one (lo == hi) produced NaNs
+# (e.g. COMONet divides by the domain width when normalizing inputs).
+function _validate_domain(ctor::AbstractString, domain::Tuple{Float64, Float64})
+    domain[2] > domain[1] || throw(ArgumentError(
+        "$ctor: domain must satisfy hi > lo, got ($(domain[1]), $(domain[2]))"))
+    nothing
+end
+
 """
     BSplineApproximator(name, domain, nknots; initial=nothing)
 
@@ -32,6 +42,12 @@ function BSplineApproximator(name::Union{Symbol,String},
                              initial=nothing)
     name = Symbol(name)
     d = (Float64(domain[1]), Float64(domain[2]))
+    _validate_domain("BSplineApproximator", d)
+    # CubicSpline interpolation needs at least 3 knots; fewer used to fail
+    # much later with a raw BoundsError from inside DataInterpolations.
+    nknots >= 3 || throw(ArgumentError(
+        "BSplineApproximator needs nknots ≥ 3 for cubic spline " *
+        "interpolation (got $nknots)"))
     init_func = if initial === nothing
         x -> 0.0
     elseif initial isa Function
@@ -52,6 +68,17 @@ Neural network approximator using a Lux.jl model.
 - `model`: a Lux.jl model (Chain, Dense, etc.)
 - `penalty_weight`: L2 regularization weight (>0 enables LAML smoothing)
 - `domain`: optional `(lo, hi)` for input normalization to `[0, 1]`
+
+# Evaluation and autodiff
+For a `Lux.Chain` of `Lux.Dense` layers (or a bare `Lux.Dense`), the
+network is evaluated through a hand-rolled, eltype-generic MLP path
+(`build_neural_evaluator`) that is fully compatible with
+`ForwardDiff.Dual` numbers — stiff ODE solvers with autodiff Jacobians
+(e.g. `TRBDF2()`, `Rosenbrock23()`) and gradient-based solvers work.
+Other architectures fall back to `Lux.apply` with the input and
+parameters promoted to a common element type; that fallback is only as
+Dual-safe as the Lux kernels of the layers involved, so exotic layers
+may not support ForwardDiff through the dynamics.
 """
 struct NeuralApproximator <: AbstractApproximator
     name::Symbol
@@ -66,6 +93,7 @@ function NeuralApproximator(name::Union{Symbol,String}, model;
                             domain::Union{Nothing, Tuple{<:Real, <:Real}}=nothing,
                             rng_seed::Union{Nothing, Int}=nothing)
     d = domain === nothing ? nothing : (Float64(domain[1]), Float64(domain[2]))
+    d === nothing || _validate_domain("NeuralApproximator", d)
     NeuralApproximator(Symbol(name), model, penalty_weight, d, rng_seed)
 end
 
@@ -165,6 +193,7 @@ function GPApproximator(name::Union{Symbol,String},
                         initial=nothing)
     name_s = Symbol(name)
     d = (Float64(domain[1]), Float64(domain[2]))
+    _validate_domain("GPApproximator", d)
     σ² = Float64(variance)
     ℓ = if lengthscale === nothing
         # Default lengthscale: normalize so adjacent inducing points have
@@ -286,6 +315,7 @@ function SPDEApproximator(name::Union{Symbol,String},
                           initial=nothing)
     name_s = Symbol(name)
     d = (Float64(domain[1]), Float64(domain[2]))
+    _validate_domain("SPDEApproximator", d)
     ν = Float64(nu)
     ν ∈ SPDE_SMOOTHNESS || error("nu must be one of $SPDE_SMOOTHNESS, got $ν")
     n_basis >= 3 || error("n_basis must be ≥ 3, got $n_basis")
@@ -322,7 +352,8 @@ end
 
 """
     ShapeConstrainedSPDEApproximator(name, domain, n_basis, constraint;
-                                     nu=1.5, range_param=nothing, initial=nothing)
+                                     nu=1.5, range_param=nothing, initial=nothing,
+                                     penalty=:gamma_matern)
 
 SPDE (Matérn) approximator with a shape constraint enforced via the SCOP-spline
 reparameterization of Pya & Wood (2015).
@@ -346,6 +377,12 @@ reduce overshoot.
 - `nu`: Matérn smoothness parameter (0.5, 1.5, or 2.5)
 - `range_param`: correlation length ρ (default: 1/3 of domain width)
 - `initial`: optional initial function `x -> y` or constant
+- `penalty`: `:gamma_matern` (default) applies the Matérn precision to the
+  unconstrained γ as `Σᵀ P_β Σ`; `:difference` applies the Pya & Wood (2015)
+  SCOP first-difference penalty on γ with the free level/slope in the null
+  space. See the `penalty_matrix(::ShapeConstrainedSPDEApproximator)`
+  docstring for the trade-offs — in particular, the default's λ→∞ limit is NOT a
+  maximally smooth member of the constraint family.
 
 # Example
 ```julia
@@ -365,6 +402,7 @@ struct ShapeConstrainedSPDEApproximator <: AbstractApproximator
     constraint::Symbol
     Sigma::Matrix{Float64}
     initial_func::Function
+    penalty::Symbol
 end
 
 function ShapeConstrainedSPDEApproximator(name::Union{Symbol,String},
@@ -373,14 +411,18 @@ function ShapeConstrainedSPDEApproximator(name::Union{Symbol,String},
                                           constraint::Symbol;
                                           nu::Real=1.5,
                                           range_param::Union{Nothing, Real}=nothing,
-                                          initial=nothing)
+                                          initial=nothing,
+                                          penalty::Symbol=:gamma_matern)
     name_s = Symbol(name)
     d = (Float64(domain[1]), Float64(domain[2]))
+    _validate_domain("ShapeConstrainedSPDEApproximator", d)
     ν = Float64(nu)
     ν ∈ SPDE_SMOOTHNESS || error("nu must be one of $SPDE_SMOOTHNESS, got $ν")
     n_basis >= 4 || error("n_basis must be ≥ 4 for shape-constrained SPDE, got $n_basis")
     constraint in SHAPE_CONSTRAINTS || throw(ArgumentError(
         "Unknown constraint :$constraint. Must be one of $SHAPE_CONSTRAINTS"))
+    penalty in (:gamma_matern, :difference) || throw(ArgumentError(
+        "Unknown penalty :$penalty. Must be :gamma_matern or :difference"))
 
     ρ = if range_param === nothing
         (d[2] - d[1]) / 3.0
@@ -402,7 +444,7 @@ function ShapeConstrainedSPDEApproximator(name::Union{Symbol,String},
     end
 
     ShapeConstrainedSPDEApproximator(name_s, d, n_basis, ν, κ, ρ, mesh,
-                                     constraint, Sig, init_func)
+                                     constraint, Sig, init_func, penalty)
 end
 
 function nparams(a::ShapeConstrainedSPDEApproximator)
@@ -518,6 +560,7 @@ function ShapeConstrainedBSplineApproximator(name::Union{Symbol,String},
                                              initial=nothing)
     name = Symbol(name)
     d = (Float64(domain[1]), Float64(domain[2]))
+    _validate_domain("ShapeConstrainedBSplineApproximator", d)
     constraint in SHAPE_CONSTRAINTS || throw(ArgumentError(
         "Unknown constraint :$constraint. Must be one of $SHAPE_CONSTRAINTS"))
     nknots >= 4 || throw(ArgumentError("Need nknots ≥ 4, got $nknots"))
@@ -546,8 +589,41 @@ function initial_params(a::ShapeConstrainedBSplineApproximator)
     # O(slope·spacing) error.
     xk = _scam_knot_vector(a.domain, a.nknots)
     xs = [(xk[i+1] + xk[i+2] + xk[i+3]) / 3 for i in 1:a.nknots]
-    beta_target = Float64[a.initial_func(clamp(x, a.domain[1], a.domain[2]))
-                          for x in xs]
+    # Evaluate at the UNCLAMPED Greville points: the boundary abscissae lie
+    # slightly outside the domain, and clamping them there broke the exact
+    # linear reproduction this initialization is built on (max error 0.067
+    # on 1+2x with 8 knots). Only if the user's function throws outside its
+    # domain do we fall back, per point, to the clamped value extrapolated
+    # linearly with a one-sided finite-difference slope.
+    lo, hi = a.domain
+    h = 1e-6 * (hi - lo)
+    beta_target = Vector{Float64}(undef, a.nknots)
+    for (i, x) in enumerate(xs)
+        beta_target[i] = if lo <= x <= hi
+            Float64(a.initial_func(x))
+        else
+            try
+                Float64(a.initial_func(x))
+            catch e
+                # Only an out-of-domain THROW justifies extrapolating. A
+                # MethodError/BoundsError/TypeError inside the user's
+                # function is a bug in that function; masking it as an
+                # extrapolation would silently initialize the spline from
+                # fabricated values. Rethrow those, and say out loud when
+                # the fallback does fire.
+                _is_program_error(e) && rethrow()
+                @warn("initial_func threw at the Greville abscissa " *
+                      "x=$x, just outside the domain $(a.domain); " *
+                      "falling back to a linear extrapolation from the " *
+                      "clamped point.", exception = e, maxlog = 1)
+                xc = clamp(x, lo, hi)
+                slope = x < lo ?
+                    (a.initial_func(xc + h) - a.initial_func(xc)) / h :
+                    (a.initial_func(xc) - a.initial_func(xc - h)) / h
+                Float64(a.initial_func(xc) + slope * (x - xc))
+            end
+        end
+    end
     # Solve Σ * d = β_target for the coefficient vector d.
     # For square Σ: direct solve; for rectangular (q × np): least-squares.
     d = a.Sigma \ beta_target
@@ -658,6 +734,7 @@ function COMONetApproximator(name::Union{Symbol,String},
                              rng_seed::Union{Nothing, Int}=nothing)
     name = Symbol(name)
     d = (Float64(domain[1]), Float64(domain[2]))
+    _validate_domain("COMONetApproximator", d)
     constraint in COMONET_CONSTRAINTS || throw(ArgumentError(
         "Unknown constraint :$constraint. Must be one of $COMONET_CONSTRAINTS"))
     activation in COMONET_ACTIVATIONS || throw(ArgumentError(
@@ -809,6 +886,13 @@ Uses Fellner-Schall + Newton for smoothing parameter estimation.
   the warmup phase the cap is progressively relaxed.  Set to a value reflecting
   your prior belief about observation noise variance (e.g. `sigma2_init=25.0`
   for ±5 measurement error).
+
+# Convergence info
+`sol.convergence` is a NamedTuple `(V_beta, sigma2, converged, iterations,
+reason, laml_failures)`: the posterior covariance and σ̂² used by
+[`confidence_band`](@ref), plus the standard honest-convergence keys (see
+[`PSMSolution`](@ref)) and `laml_failures::Int`, the number of iterations in
+which the LAML smoothing-parameter update failed and θ was kept.
 """
 struct LAML
     maxiters::Int
@@ -850,6 +934,19 @@ changes.  See Fasiolo, Pya & Wood (2016), Statistical Science 31(1).
 - `lambda_ode_end::Float64=1e4`: final ODE compliance penalty
 - `n_continuation::Int=8`: number of log-spaced continuation levels
 - `sigma2_init::Union{Nothing,Float64}=nothing`: σ² cap for Fellner-Schall
+
+!!! note "ODE problems only"
+    DDE problems are REJECTED with an error. The collocation objective
+    calls the dynamics through the 4-argument ODE signature and has no way
+    to supply the delayed history, so a DDE would silently be fitted as
+    though it had no delays. Use [`LAML`](@ref) for DDEs.
+
+# Convergence info
+`sol.convergence` is a NamedTuple `(ode_compliance, lambda_ode_final,
+converged, iterations, reason, iterations_total)`. `converged`/`reason`
+describe the final continuation level's inner loop, `iterations` counts its
+inner iterations, and `iterations_total` accumulates inner iterations across
+all continuation levels (see [`PSMSolution`](@ref) for the key taxonomy).
 """
 struct CollocationLAML
     maxiters::Int
@@ -890,6 +987,12 @@ Requires that all state variables are observed (no latent states).
 - `tol::Float64=1e-6`: convergence tolerance
 - `verbose::Bool=false`: print iteration details
 - `sigma2_init::Union{Nothing,Float64}=nothing`: σ² cap for Fellner-Schall
+
+!!! note "σ² for the Fellner-Schall update"
+    The residual variance driving the smoothing-parameter update is
+    `σ̂² = RSS / #{residuals with nonzero weight}`, not `RSS / #residuals`.
+    Unobserved-state rows are zero-weighted; counting them biased σ̂² low
+    and over-smoothed the unknown functions.
 """
 struct GradientMatching
     maxiters::Int
@@ -936,6 +1039,15 @@ quadratic roughness penalty `penalty_weight · Σₖ βₖ' Sₖ βₖ` to the l
 - `penalty_weight::Float64=0.0`: fixed weight of the quadratic smoothing
   penalty added to the loss (0 disables)
 - `autodiff::Bool=true`: use ForwardDiff (true) or finite differences (false)
+
+# Convergence info
+`sol.convergence` is a NamedTuple `(optimizer, method, converged, iterations,
+reason, final_grad_norm)` with the standard honest-convergence keys (see
+[`PSMSolution`](@ref)) plus `final_grad_norm::Float64`, the Euclidean norm of
+the last computed gradient. `reason == :plateau` is only reported while the
+cosine-annealed learning rate is still above 5% of the base `lr` — a plateau
+that appears merely because the schedule has driven the step size to zero is
+reported as `:maxiters`, not convergence.
 """
 struct AdamSolver
     maxiters::Int
@@ -953,7 +1065,8 @@ AdamSolver(; maxiters::Int=300, lr::Float64=0.01, verbose::Bool=false,
 
 """
     MultipleShootingSolver(; n_intervals=10, maxiters_inner=100, maxiters_outer=20,
-                             rho_init=10.0, rho_max=1e6, verbose=false)
+                             rho_init=10.0, rho_max=1e6, loss=:auto,
+                             penalty_weight=0.0, verbose=false)
 
 Multiple shooting solver for training neural differential equations, following
 Turan & Jäschke (2021). Partitions the time span into intervals with shooting
@@ -966,13 +1079,25 @@ Advantages over single shooting (AdamSolver):
 
 # Arguments
 - `n_intervals::Int=10`: number of shooting intervals
-- `maxiters_inner::Int=100`: Adam iterations per augmented Lagrangian step
+- `maxiters_inner::Int=100`: L-BFGS iterations per augmented Lagrangian step
 - `maxiters_outer::Int=20`: augmented Lagrangian outer iterations
-- `lr::Float64=0.01`: Adam learning rate
 - `rho_init::Float64=10.0`: initial penalty parameter for shooting constraints
 - `rho_max::Float64=1e6`: maximum penalty parameter
+- `loss::Symbol=:auto`: data-fit loss. `:auto` follows `prob.likelihood`
+  (Gaussian → `:mse` weighted SSE, Poisson → `:poisson` weighted negative
+  log-likelihood kernel; other families error). Explicit `:mse`/`:poisson`
+  are honored with a warning on mismatch, matching `AdamSolver`.
+- `penalty_weight::Float64=0.0`: fixed quadratic smoothing penalty
+  `penalty_weight · Σₖ βₖ'Sₖβₖ` added to the training objective (0 = no
+  penalty; there is no smoothing-parameter selection here)
 - `verbose::Bool=false`: print iteration details
-- `autodiff::Bool=true`: use ForwardDiff (true) or finite differences (false)
+
+# Convergence info
+`sol.convergence` is a NamedTuple `(optimizer, method, n_intervals, converged,
+iterations, reason, max_gap, rho_final)` with the standard honest-convergence
+keys (see [`PSMSolution`](@ref); `iterations` counts outer augmented-Lagrangian
+iterations) plus `max_gap::Float64`, the final maximum shooting-gap magnitude,
+and `rho_final::Float64`, the final penalty parameter.
 """
 struct MultipleShootingSolver
     n_intervals::Int
@@ -980,15 +1105,18 @@ struct MultipleShootingSolver
     maxiters_outer::Int
     rho_init::Float64
     rho_max::Float64
+    loss::Symbol
+    penalty_weight::Float64
     verbose::Bool
 end
 
 MultipleShootingSolver(; n_intervals::Int=10, maxiters_inner::Int=100,
                          maxiters_outer::Int=20,
                          rho_init::Float64=10.0, rho_max::Float64=1e6,
+                         loss::Symbol=:auto, penalty_weight::Float64=0.0,
                          verbose::Bool=false) =
     MultipleShootingSolver(n_intervals, maxiters_inner, maxiters_outer,
-                           rho_init, rho_max, verbose)
+                           rho_init, rho_max, loss, penalty_weight, verbose)
 
 """
     AdaptiveGradientMatching(; maxiters=200, verbose=false, gamma_init=1.0,
@@ -1037,6 +1165,14 @@ where:
 - `n_samples::Int=0`: cold-chain posterior draws; 0 = MAP mode
 - `n_chains::Int=10`: number of tempered chains (sampling mode; ≥ 2)
 - `rng_seed`: seed for the sampler (default `nothing` = non-reproducible)
+
+!!! note "GP centering"
+    Each state's GP prior is centered: observed states on their data mean,
+    unobserved states on their initial condition, and every `x` entering
+    the GP quadratic forms and the gradient mean is the CENTERED state
+    `x − m_k`. A zero-mean GP prior on uncentered data pulls the
+    trajectory toward zero, which biased the fitted unknown functions on
+    data far from the origin.
 """
 struct AdaptiveGradientMatching
     maxiters::Int
@@ -1086,13 +1222,24 @@ struct RodeoSolver
     verbose::Bool
 end
 
-RodeoSolver(; n_steps::Int=200, n_deriv::Int=3,
-              sigma::Union{Nothing, Vector{Float64}}=nothing,
-              obs_var::Union{Nothing, Float64}=nothing,
-              method::Symbol=:basic,
-              interrogate::Symbol=:kramer,
-              maxiters::Int=200, verbose::Bool=false) =
+function RodeoSolver(; n_steps::Int=200, n_deriv::Int=3,
+                       sigma::Union{Nothing, Vector{Float64}}=nothing,
+                       obs_var::Union{Nothing, Float64}=nothing,
+                       method::Symbol=:basic,
+                       interrogate::Symbol=:kramer,
+                       maxiters::Int=200, verbose::Bool=false)
+    method in (:basic, :fenrir) ||
+        throw(ArgumentError("RodeoSolver: method must be :basic or :fenrir " *
+                            "(got :$method)"))
+    interrogate in (:kramer, :schober) ||
+        throw(ArgumentError("RodeoSolver: interrogate must be :kramer or " *
+                            ":schober (got :$interrogate)"))
+    # The IBM prior needs at least value + first derivative per state;
+    # n_deriv=1 BoundsErrors inside the Kalman filter selectors.
+    n_deriv >= 2 ||
+        throw(ArgumentError("RodeoSolver: n_deriv must be ≥ 2 (got $n_deriv)"))
     RodeoSolver(n_steps, n_deriv, sigma, obs_var, method, interrogate, maxiters, verbose)
+end
 
 """
     MCMCSolver(; n_samples=1000, n_warmup=500, n_chains=1, target_accept=0.8,
@@ -1108,7 +1255,10 @@ Uses LogDensityProblems.jl + AdvancedHMC.jl.
 - `target_accept`: target acceptance rate for NUTS adaptation (0.6–0.95)
 - `prior_scale`: scale for Gaussian prior on parameters (larger = weaker prior).
   When penalty matrices exist (B-spline, GP), uses the penalty; otherwise N(0, prior_scale²).
-- `obs_sigma`: observation noise std dev. If `nothing`, estimated as a parameter.
+- `obs_sigma`: observation noise std dev (Gaussian likelihoods only; errors
+  otherwise). If `nothing`, sampled as a parameter for Gaussian data; non-
+  Gaussian families sample no σ (their dispersion is fixed in the family
+  object). The data term follows `prob.likelihood` in all cases.
 - `sample_smoothing`: if `true`, jointly sample log(λ) for each smooth term
   with a weakly informative N(log(λ_init), 2²) hyperprior. This gives wider,
   more honest credible intervals for the unknown functions. Default: `false`.
@@ -1134,13 +1284,18 @@ MCMCSolver(; n_samples::Int=1000, n_warmup::Int=500, n_chains::Int=1,
                obs_sigma, sample_smoothing, verbose)
 
 """
-    MagiSolver(; n_samples=1000, n_warmup=500, n_deriv=3, n_gridpoints=200,
+    MagiSolver(; n_samples=1000, n_warmup=500, n_gridpoints=200,
                  sigma=nothing, obs_var=nothing, target_accept=0.8,
                  prior_scale=1.0, preoptimize=true, verbose=false)
 
 Manifold-constrained Gaussian process inference (MAGI) for ODE systems.
+Gaussian likelihoods only (the manifold-constrained posterior assumes
+Gaussian observation noise); non-Gaussian `prob.likelihood` errors.
 
-MAGI places a Matérn-3/2 Gaussian-process prior on each state and constrains
+MAGI places a Matérn-3/2 Gaussian-process prior on each state (the MAGI
+paper uses a generalized Matérn kernel with ν ≈ 2.01; with ν = 3/2 the
+implied derivative process is rougher — mean-square continuous but not
+mean-square differentiable) and constrains
 the GP-implied derivative to the ODE vector field through the conditional
 derivative covariance `K* = ''K − 'K C⁻¹ ('K)ᵀ`. The state values on the
 discretization grid are sampled jointly with the unknown-function
@@ -1154,20 +1309,25 @@ Returns an `MCMCChains.Chains` object with posterior samples.
 # Fields
 - `n_samples`: number of posterior samples after warmup
 - `n_warmup`: warmup/adaptation iterations
-- `n_deriv`: retained for interface compatibility (the Matérn-3/2 GP prior
-  is once mean-square differentiable; this field is not used by the GP)
 - `n_gridpoints`: number of discretization grid points for the GP/manifold
   constraint
-- `sigma`: GP marginal-variance scale per state (auto-estimated if `nothing`)
-- `obs_var`: observation noise variance; `nothing` (default) estimates it
-  from the data via the second-difference estimator Var(Δ²y) = 6σ²
-  (a fixed scale-blind default distorted the posterior whenever the
-  data's units differed from O(0.1))
+- `sigma`: per-state observation noise standard deviations (one entry per
+  state component). When supplied, these fixed SDs are used in the data
+  term instead of auto-estimation; mutually exclusive with `obs_var`.
+- `obs_var`: observation noise variance shared across components;
+  `nothing` (default) estimates it from the data via a local-linear
+  residual estimator (a fixed scale-blind default distorted the posterior
+  whenever the data's units differed from O(0.1))
 - `target_accept`: NUTS target acceptance rate
 - `prior_scale`: scale for Gaussian prior on parameters
 - `preoptimize`: run a short MAP pre-optimization to initialize the
   sampler (default `true`)
 - `verbose`: print progress
+
+!!! note "Changed"
+    The former `n_deriv` field was removed: it was never read anywhere
+    (the Matérn-3/2 GP prior has no derivative-order setting), so keeping
+    it only suggested a control that did not exist.
 
 # References
 - Yang, Wong & Kou (2021) PNAS 118(15): "Inference of dynamic systems
@@ -1176,7 +1336,6 @@ Returns an `MCMCChains.Chains` object with posterior samples.
 struct MagiSolver
     n_samples::Int
     n_warmup::Int
-    n_deriv::Int
     n_gridpoints::Int
     sigma::Union{Nothing, Vector{Float64}}
     obs_var::Union{Nothing, Float64}
@@ -1186,13 +1345,13 @@ struct MagiSolver
     verbose::Bool
 end
 
-MagiSolver(; n_samples::Int=1000, n_warmup::Int=500, n_deriv::Int=3,
+MagiSolver(; n_samples::Int=1000, n_warmup::Int=500,
              n_gridpoints::Int=200,
              sigma::Union{Nothing, Vector{Float64}}=nothing,
              obs_var::Union{Nothing, Float64}=nothing,
              target_accept::Float64=0.8, prior_scale::Float64=1.0,
              preoptimize::Bool=true, verbose::Bool=false) =
-    MagiSolver(n_samples, n_warmup, n_deriv, n_gridpoints, sigma, obs_var,
+    MagiSolver(n_samples, n_warmup, n_gridpoints, sigma, obs_var,
                target_accept, prior_scale, preoptimize, verbose)
 
 # ─── BNG solver (Bonnaffé et al. 2023) ────────────────────────────
@@ -1227,6 +1386,15 @@ standard deviation.
 - `rng_seed`: seed for the bootstrap and restarts (default `nothing` =
   non-reproducible)
 - `verbose`: print progress
+
+# Convergence info
+`sol.convergence` carries the standard honest-convergence keys (see
+[`PSMSolution`](@ref)): `converged`/`reason` report the BEST ensemble
+member's outcome (`:plateau` when its loss stagnated, `:maxiters`
+otherwise), `iterations` is the total Adam iterations summed over all
+ensemble members, and `member_converged::Vector{Bool}` records each
+member's plateau flag (alongside the existing `n_ensemble`,
+`member_losses`, `member_weights`, `ensemble_std` keys).
 
 # References
 - Bonnaffé & Coulson (2023), "Fast fitting of neural ordinary
@@ -1266,7 +1434,12 @@ filter passes — one joint (ODE + observations) and one marginal (ODE only).
 - `n_steps`: number of discretization steps (default 200)
 - `n_deriv`: IBM prior derivative order (default 3)
 - `sigma`: IBM scale parameters (nothing = auto-estimate)
-- `obs_var`: observation noise variance (default 0.01)
+- `obs_var`: observation noise variance. `nothing` (the default)
+  auto-estimates it from the data at solve time as 1% of the mean
+  per-column data variance (the same estimator `RodeoSolver` and
+  `PseudoMarginalSolver` use). A fixed numeric value is honored exactly;
+  note a fixed value must be chosen relative to the data scale — a value
+  appropriate for data of order 1 badly misfits data of order 1000.
 - `interrogate`: interrogation method `:kramer` or `:schober` (default `:kramer`)
 - `maxiters`: optimization iterations (default 200)
 - `verbose`: print progress
@@ -1275,18 +1448,25 @@ struct DaltonSolver
     n_steps::Int
     n_deriv::Int
     sigma::Union{Nothing, Vector{Float64}}
-    obs_var::Float64
+    obs_var::Union{Nothing, Float64}
     interrogate::Symbol
     maxiters::Int
     verbose::Bool
 end
 
-DaltonSolver(; n_steps::Int=200, n_deriv::Int=3,
-               sigma::Union{Nothing, Vector{Float64}}=nothing,
-               obs_var::Float64=0.01,
-               interrogate::Symbol=:kramer,
-               maxiters::Int=200, verbose::Bool=false) =
+function DaltonSolver(; n_steps::Int=200, n_deriv::Int=3,
+                        sigma::Union{Nothing, Vector{Float64}}=nothing,
+                        obs_var::Union{Nothing, Float64}=nothing,
+                        interrogate::Symbol=:kramer,
+                        maxiters::Int=200, verbose::Bool=false)
+    interrogate in (:kramer, :schober) ||
+        throw(ArgumentError("DaltonSolver: interrogate must be :kramer or " *
+                            ":schober (got :$interrogate)"))
+    # See RodeoSolver: n_deriv=1 BoundsErrors in the Kalman selectors.
+    n_deriv >= 2 ||
+        throw(ArgumentError("DaltonSolver: n_deriv must be ≥ 2 (got $n_deriv)"))
     DaltonSolver(n_steps, n_deriv, sigma, obs_var, interrogate, maxiters, verbose)
+end
 
 # ─── Pseudo-marginal solver (Chkrebtii et al. 2016) ───────────────
 
@@ -1296,7 +1476,9 @@ DaltonSolver(; n_steps::Int=200, n_deriv::Int=3,
 Pseudo-marginal MCMC using a probabilistic ODE solver for likelihood estimation.
 
 Uses RODEO/fenrir as an inner solver to compute an unbiased estimate of the
-marginal likelihood p(Y|θ), then samples from the posterior p(θ|Y) via NUTS.
+marginal likelihood p(Y|θ), then samples from the posterior p(θ|Y) via
+adaptive random-walk Metropolis (the proposal scale is tuned toward
+`target_accept` during warmup).
 
 # Fields
 - `n_samples`: number of posterior samples (default 1000)
@@ -1304,9 +1486,14 @@ marginal likelihood p(Y|θ), then samples from the posterior p(θ|Y) via NUTS.
 - `n_steps`: discretization steps for inner probabilistic solver (default 200)
 - `n_deriv`: IBM prior derivative order (default 3)
 - `sigma`: IBM scale parameters (nothing = auto-estimate)
-- `obs_var`: observation noise variance (default 0.01)
-- `target_accept`: NUTS target acceptance rate (default 0.8)
-- `prior_scale`: prior standard deviation on parameters (default 1.0)
+- `obs_var`: observation noise variance (default `nothing` = estimate it
+  from the data alongside the other nuisance quantities)
+- `target_accept`: target acceptance rate for the adaptive random-walk
+  Metropolis proposal-scale adaptation (default 0.8)
+- `prior_scale`: prior VARIANCE on parameters (default 1.0). Used directly
+  as the variance of the Gaussian smoothing prior
+  `exp(−½ βₖ'Sₖβₖ / prior_scale)` and of the weak ridge
+  `exp(−½ ‖β‖² / (100·prior_scale))` — it is not squared.
 - `inner_method`: likelihood estimator — `:ffbs` (default; unbiased FFBS
   Monte-Carlo average, giving genuine pseudo-marginal MCMC), `:fenrir`
   (deterministic Fenrir evidence; the chain is then plain adaptive RWM on
@@ -1328,17 +1515,22 @@ struct PseudoMarginalSolver
     verbose::Bool
 end
 
-PseudoMarginalSolver(; n_samples::Int=1000, n_warmup::Int=500,
-                       n_steps::Int=200, n_deriv::Int=3,
-                       sigma::Union{Nothing, Vector{Float64}}=nothing,
-                       obs_var::Union{Nothing, Float64}=nothing,
-                       target_accept::Float64=0.8, prior_scale::Float64=1.0,
-                       inner_method::Symbol=:ffbs,
-                       initial_params::Union{Nothing, Vector{Float64}}=nothing,
-                       verbose::Bool=false) =
+function PseudoMarginalSolver(; n_samples::Int=1000, n_warmup::Int=500,
+                                n_steps::Int=200, n_deriv::Int=3,
+                                sigma::Union{Nothing, Vector{Float64}}=nothing,
+                                obs_var::Union{Nothing, Float64}=nothing,
+                                target_accept::Float64=0.8, prior_scale::Float64=1.0,
+                                inner_method::Symbol=:ffbs,
+                                initial_params::Union{Nothing, Vector{Float64}}=nothing,
+                                verbose::Bool=false)
+    # See RodeoSolver: n_deriv=1 BoundsErrors in the Kalman selectors.
+    n_deriv >= 2 ||
+        throw(ArgumentError("PseudoMarginalSolver: n_deriv must be ≥ 2 " *
+                            "(got $n_deriv)"))
     PseudoMarginalSolver(n_samples, n_warmup, n_steps, n_deriv, sigma, obs_var,
                           target_accept, prior_scale, inner_method,
                           initial_params, verbose)
+end
 
 # ─── GCV solver (Wood 2001 / ddefit504) ────────────────────────────
 
@@ -1355,8 +1547,15 @@ produces slightly less smooth estimates.
 - `n_grid`: number of grid points for initial λ search (default 50)
 - `maxiters`: maximum IRLS iterations (default 50)
 - `tol`: convergence tolerance (default 1e-6)
-- `gamma`: GCV inflation factor (default 1.4, >1 guards against under-smoothing)
+- `gamma`: GCV inflation factor (default 1.4, >1 guards against
+  under-smoothing; `gamma=1.0` reproduces the classical unmodified GCV of
+  Wood (2001) / ddefit)
 - `verbose`: print progress
+
+# Convergence info
+`sol.convergence` is a NamedTuple `(converged, iterations, reason, gcv)` with
+the standard honest-convergence keys (see [`PSMSolution`](@ref)) plus
+`gcv::Float64`, the last GCV score (NaN when no smooth terms are present).
 """
 struct GCVSolver
     n_grid::Int
@@ -1384,11 +1583,25 @@ Stage 2: Numerically differentiate smoothed curves, then match ODE RHS
 This is the original approach from Wood (2001) / deGradInfer (Macdonald & Husmeier 2015).
 
 # Fields
-- `n_basis_smooth`: spline basis functions for data smoothing (default 20)
+- `n_basis_smooth`: upper limit on the number of B-spline coefficients used
+  by the stage-1 smoother; the actual basis size is
+  `clamp(n − 2, 4, n_basis_smooth)` for `n` data points (default 15).
+
+  !!! note "Changed"
+      This field was previously dead: it was documented (default 20) but
+      never read — the smoother always capped the basis at 15. It is now
+      wired through; the default was set to 15 so default fits are
+      byte-identical to before.
 - `lambda_smooth`: smoothing penalty for initial data fit (default 1.0)
 - `maxiters`: max iterations for parameter matching (default 1000)
 - `lr`: learning rate for Adam optimization in matching step (default 0.01)
 - `verbose`: print progress
+
+# Convergence info
+`sol.convergence` is a NamedTuple `(converged, iterations, reason, method)`
+with the standard honest-convergence keys (see [`PSMSolution`](@ref));
+`converged=true` with `reason=:plateau` when the matching loss stagnated
+over a 30-iteration window, `reason=:maxiters` otherwise.
 """
 struct TwoStageSolver
     n_basis_smooth::Int
@@ -1398,9 +1611,13 @@ struct TwoStageSolver
     verbose::Bool
 end
 
-TwoStageSolver(; n_basis_smooth::Int=20, lambda_smooth::Float64=1.0,
-                 maxiters::Int=1000, lr::Float64=0.01, verbose::Bool=false) =
+function TwoStageSolver(; n_basis_smooth::Int=15, lambda_smooth::Float64=1.0,
+                          maxiters::Int=1000, lr::Float64=0.01, verbose::Bool=false)
+    n_basis_smooth >= 4 ||
+        throw(ArgumentError("TwoStageSolver: n_basis_smooth must be ≥ 4 " *
+                            "(cubic B-spline basis; got $n_basis_smooth)"))
     TwoStageSolver(n_basis_smooth, lambda_smooth, maxiters, lr, verbose)
+end
 
 # ─── Derivative-free solver (stochastic + NelderMead) ──────────────
 
@@ -1410,8 +1627,9 @@ TwoStageSolver(; n_basis_smooth::Int=20, lambda_smooth::Float64=1.0,
 Derivative-free optimization solver using NelderMead or particle swarm.
 
 The objective includes the quadratic roughness penalty
-`penalty_weight · Σₖ βₖ'Sₖβₖ` (default weight 1.0; set `penalty_weight=0`
-for an unpenalized fit — there is no smoothing-parameter selection here).
+`0.5 · penalty_weight · Σₖ βₖ'Sₖβₖ` (note the ½ factor; default
+`penalty_weight=1.0`; set `penalty_weight=0` for an unpenalized fit —
+there is no smoothing-parameter selection here).
 
 Useful as a robust fallback when gradient-based methods fail (non-smooth
 objectives, stiff dynamics, poor conditioning). Uses simulation-based
@@ -1421,7 +1639,11 @@ loss without requiring autodiff through ODE solves.
 - `method`: optimization method — `:nelder_mead` or `:particle_swarm` (default `:nelder_mead`)
 - `maxiters`: maximum function evaluations (default 10000)
 - `n_particles`: particle count for swarm methods (default 20)
-- `loss`: loss type `:mse` or `:likelihood` (default `:mse`)
+- `loss`: loss type (default `:auto`). `:auto` follows `prob.likelihood`
+  — Gaussian → `:mse` (weighted SSE), any other family → `:likelihood`
+  (the family's negative log-likelihood). Explicit `:mse` or
+  `:likelihood` is honored regardless of the likelihood family.
+- `penalty_weight`: weight of the roughness penalty above (default 1.0)
 - `verbose`: print progress
 """
 struct DerivativeFreeSolver
@@ -1434,7 +1656,7 @@ struct DerivativeFreeSolver
 end
 
 DerivativeFreeSolver(; method::Symbol=:nelder_mead, maxiters::Int=10000,
-                       n_particles::Int=20, loss::Symbol=:mse,
+                       n_particles::Int=20, loss::Symbol=:auto,
                        penalty_weight::Float64=1.0,
                        verbose::Bool=false) =
     DerivativeFreeSolver(method, maxiters, n_particles, loss, penalty_weight,
@@ -1455,8 +1677,21 @@ providing uncertainty estimates.
 - `maxiters`: max ELBO optimization iterations (default 2000)
 - `lr`: learning rate for Adam on ELBO (default 0.01)
 - `n_elbo_samples`: Monte Carlo samples for ELBO gradient (default 10)
-- `prior_scale`: prior std on parameters (default 1.0)
+- `prior_scale`: prior VARIANCE on parameters (default 1.0). Used directly
+  as the variance of the Gaussian smoothing prior — the prior precision is
+  `Λ = ridge·I + Σₖ Sₖ / prior_scale` — it is not squared.
+- `obs_noise_var`: Gaussian observation-noise variance (default `nothing`
+  = estimate from the data). Gaussian likelihoods only; errors otherwise.
+  Non-Gaussian families use their own pointwise log-likelihood in the ELBO.
 - `verbose`: print progress
+
+!!! note "Reported EDF"
+    `sol.edf` is the Laplace effective degrees of freedom at the
+    variational mean, `tr((H + Λ)⁻¹H)` with the Gauss–Newton information
+    `H = JᵀWJ/σ²_obs` — a real measure of model complexity that responds
+    to the smoothing level. It is `NaN` (honestly missing) when the model
+    cannot be simulated at the variational mean or the linear system is
+    singular; it is never a fabricated constant.
 """
 struct VariationalSolver
     maxiters::Int
@@ -1535,6 +1770,12 @@ against the cumulative trapezoidal integral of f(ŷ(s),p,s).
 - `lr`: learning rate (default 0.01)
 - `verbose`: print progress
 
+# Convergence info
+`sol.convergence` is a NamedTuple `(converged, iterations, reason, method)`
+with the standard honest-convergence keys (see [`PSMSolution`](@ref));
+`converged=true` with `reason=:plateau` when the matching loss stagnated
+over a 30-iteration window, `reason=:maxiters` otherwise.
+
 # References
 - Dattner & Klaassen (2015), EJS 9(2), 1939–1973
 - R package `simode` (Yaari & Dattner)
@@ -1574,6 +1815,11 @@ warm-started from the previous grid point. Gaussian likelihoods only.
 - `ci_level`: confidence level for LR-based CI (default 0.95)
 - `param_indices`: which parameter indices to profile (default `nothing` = all)
 - `verbose`: print progress
+- `base_alg`: the `LAML` fit the profile is taken around (default
+  `LAML(verbose=false)`). The returned solution reports THIS fit's
+  convergence keys, so a deliberately truncated base — e.g.
+  `LAML(maxiters=1)` — surfaces as `converged = false` rather than being
+  laundered into a converged profile-likelihood result.
 
 # References
 - Simpson & Maclaren (2023), PLOS Comp Biol
@@ -1583,12 +1829,15 @@ struct ProfileLikelihoodSolver
     ci_level::Float64
     param_indices::Union{Nothing, Vector{Int}}
     verbose::Bool
+    base_alg::LAML
 end
 
 ProfileLikelihoodSolver(; n_profile_points::Int=20, ci_level::Float64=0.95,
                            param_indices::Union{Nothing, Vector{Int}}=nothing,
-                           verbose::Bool=false) =
-    ProfileLikelihoodSolver(n_profile_points, ci_level, param_indices, verbose)
+                           verbose::Bool=false,
+                           base_alg::LAML=LAML(verbose=false)) =
+    ProfileLikelihoodSolver(n_profile_points, ci_level, param_indices, verbose,
+                            base_alg)
 
 # ─── Ensemble Kalman inversion solver ──────────────────────────────
 
@@ -1599,13 +1848,24 @@ Ensemble Kalman Inversion (EKI) for batch parameter estimation.
 
 Uses an ensemble of parameter particles, propagates each through the
 forward model (ODE simulation), and updates via the Kalman gain
-K = Cov(θ, G(θ)) [Cov(G(θ), G(θ)) + Γ]⁻¹.  Iterates until the
-ensemble collapses around the MAP estimate.
+K = Cov(θ, G(θ)) [Cov(G(θ), G(θ)) + Γ]⁻¹.  Iterates until the ensemble
+collapses around the MAP estimate — mean particle std below 1e-3 of its
+initial value, reported as `converged = true, reason =
+:ensemble_collapse` — or until `n_iterations` is exhausted, reported
+honestly as `converged = false, reason = :maxiters`.
+
+Discrete problems are propagated with `simulate_discrete` (unit steps
+over `tspan`, data times snapped to the nearest integer step), so EKI
+sees the same trajectory as every other solver.
 
 # Fields
 - `n_ensemble`: ensemble size (default 50)
 - `n_iterations`: EKI iterations (default 30)
-- `noise_scale`: observation noise std for regularisation (default 0.1)
+- `noise_scale`: observation noise std for regularisation (default 0.1).
+  This is a FIXED scale, not auto-estimated from the data: set it
+  relative to the magnitude of your observations (e.g. roughly the
+  expected noise std). The default suits data of order 1; for data of
+  order 1000 use a correspondingly larger value.
 - `verbose`: print progress
 
 # References
@@ -1654,6 +1914,20 @@ observed systems are supported.
 - `lr`: Adam learning rate (default 0.01)
 - `verbose`: print progress
 
+# Convergence info
+`sol.convergence` is a NamedTuple `(converged, iterations, reason, method,
+gp_hyperparams)` with the standard honest-convergence keys (see
+[`PSMSolution`](@ref)). `iterations` counts the joint Adam steps actually
+performed (the budget is `20 * maxiters` steps); `converged=true` with
+`reason=:plateau` when the risk stagnated over a 30-step window while the
+cosine-annealed learning rate was still above 5% of the base `lr`,
+`reason=:maxiters` otherwise.
+
+`sol.data_loss` is the WEIGHTED residual sum of squares over usable cells
+(`weighted_data_loss`), the same convention as every other solver — so
+masked (`data_weights == 0`) and down-weighted observations contribute to
+the reported misfit exactly in proportion to their weight.
+
 # References
 - Wenk, Abbati et al. (2020), AAAI — ODIN
 - Wenk et al. (2019), AISTATS — FGPGM
@@ -1701,6 +1975,12 @@ unknown-function parameters θ. Continuous-time problems only.
 - `maxiters`: outer alternations; 10 θ Adam steps each (default 200)
 - `lr`: θ learning rate (default 0.01)
 - `verbose`: print progress
+
+# Convergence info
+`sol.convergence` is a NamedTuple `(converged, iterations, reason, method,
+kernel, lengthscale)` with the standard honest-convergence keys (see
+[`PSMSolution`](@ref)); `reason` is `:converged_tol` when the relative
+objective change fell below tolerance, `:maxiters` otherwise.
 
 # References
 - González et al. (2014), Pattern Recognition Letters
@@ -1819,10 +2099,24 @@ function PSMProblem(dynamics!, u0, tspan,
                                 "that collides with an approximator of the " *
                                 "same name; rename one of them"))
     end
+    # Two approximators sharing a name would silently misalign: each still
+    # consumes its own β slice, but the parameter NamedTuple keeps only the
+    # LAST evaluator, so earlier ones become dead weight.
+    approx_names = Symbol[approx.name for approx in approximators]
+    if !allunique(approx_names)
+        dups = unique(n for n in approx_names if count(==(n), approx_names) > 1)
+        throw(ArgumentError("duplicate approximator name(s) $(dups); " *
+                            "each approximator needs a unique name — " *
+                            "rename the duplicates"))
+    end
 
     w = if data_weights === nothing
         ones(Float64, n_times, n_obs)
     else
+        size(data_weights) == size(data_values) ||
+            throw(ArgumentError("data_weights has size $(size(data_weights)) " *
+                                "but data_values has size $(size(data_values)); " *
+                                "they must match"))
         Float64.(data_weights)
     end
 
@@ -1930,12 +2224,30 @@ Result of fitting a PSM.
 # Fields
 - `parameters`: ComponentArray with sections for each approximator
 - `objective`: final penalized objective value
-- `data_loss`: unpenalized data loss (SS for Gaussian, deviance for others)
+- `data_loss`: unpenalized data misfit — the WEIGHTED residual sum of
+  squares `Σ wᵢⱼ (yᵢⱼ − ŷᵢⱼ)²`, computed by `weighted_data_loss` over the
+  usable cells only (positive weight and finite datum, so one masked-out
+  missing observation cannot turn it into `NaN`). This is the convention
+  for EVERY likelihood family and every solver: no solver reports a
+  deviance here, so for non-Gaussian families `data_loss` is a descriptive
+  SSE and NOT the quantity the solver optimised (that is `objective`)
 - `edf`: estimated degrees of freedom
 - `smoothing_params`: vector of estimated smoothing parameters λ
 - `fitted_values`: predicted values at data times (n_times × n_obs)
 - `unknown_functions`: Dict of name => callable evaluator
-- `convergence`: convergence information
+- `convergence`: convergence information. For the iterative optimisers
+  (LAML, GCVSolver, CollocationLAML, AdamSolver, MultipleShootingSolver,
+  TwoStageSolver, IntegralMatchingSolver, BNGSolver, ODINSolver, RKHSSolver)
+  this is a NamedTuple containing at least
+  - `converged::Bool` — `true` only when a genuine stopping criterion fired
+    (never when the loop merely exhausted its iteration budget),
+  - `iterations::Int` — iterations actually performed,
+  - `reason::Symbol` — why the loop stopped: `:converged_tol` (tolerance
+    criterion met), `:plateau` (objective stagnated over a window / no
+    improving step existed), `:maxiters` (budget exhausted without a
+    criterion firing), or `:early_break` (internal failure such as a
+    simulation error or singular linear system),
+  plus solver-specific extras documented on each solver type.
 """
 struct PSMSolution
     parameters::ComponentArray

@@ -179,7 +179,7 @@ IntegralMatchingSolver
 
 ### ProfileLikelihoodSolver
 
-nuisance coefficients are re-optimised at each grid point by a long Nelder–Mead run under the penalized objective at the fitted smoothing parameters (Gaussian likelihoods only; CI endpoints are interpolated between grid points)
+**Profile likelihood** for identifiability analysis and confidence intervals (Simpson & Maclaren 2023). Each unknown-function parameter is swept over a grid; the profile is taken through the penalized objective at the fitted smoothing parameters λ̂ — a penalized spline is not identified through its raw RSS — and the statistic ΔPenSS/σ̂² is referenced against χ²₁, with CI endpoints interpolated between grid points. Nuisance coefficients are re-optimised at each grid point by a long Nelder–Mead run. Gaussian likelihoods only.
 
 ```@docs
 ProfileLikelihoodSolver
@@ -217,10 +217,14 @@ RKHSSolver
 | Automatic smoothing comparison | [`GCVSolver`](@ref) |
 | Stiff or chaotic systems | [`CollocationLAML`](@ref) |
 | Quick baseline | [`TwoStageSolver`](@ref) |
+| Integration-free derivative matching | [`GradientMatching`](@ref) |
+| GP-based gradient matching (MAP or MCMC) | [`AdaptiveGradientMatching`](@ref) |
+| Ensemble gradient matching with uncertainty | [`BNGSolver`](@ref) |
 | Neural network approximators | [`AdamSolver`](@ref) |
 | Robust neural fitting | [`MultipleShootingSolver`](@ref) |
 | When gradients fail | [`DerivativeFreeSolver`](@ref) |
 | Uncertainty quantification | [`MCMCSolver`](@ref) or [`MagiSolver`](@ref) |
+| Exact posterior accounting for ODE-solver error | [`PseudoMarginalSolver`](@ref) |
 | Fast approximate Bayesian | [`VariationalSolver`](@ref) |
 | Intractable likelihood | [`ABCSolver`](@ref) |
 | Probabilistic numerics | [`RodeoSolver`](@ref) or [`DaltonSolver`](@ref) |
@@ -229,3 +233,66 @@ RKHSSolver
 | Derivative-free batch estimation | [`EnsembleKalmanSolver`](@ref) |
 | GP-weighted gradient matching | [`ODINSolver`](@ref) |
 | Trajectory-in-RKHS gradient matching | [`RKHSSolver`](@ref) |
+
+## Missing and Masked Observations
+
+An observation cell is **masked** — excluded from every objective, every
+reported loss and every denominator — when either
+
+- its value is non-finite (`data_values[i, j] = NaN`), or
+- its weight is zero (`data_weights[i, j] = 0.0`).
+
+Marking a cell **both** ways is the recommended convention, and the one every
+example and test in this package follows:
+
+```julia
+data_values[3, 1]  = NaN    # the observation is missing
+data_weights[3, 1] = 0.0    # ...and carries no weight
+```
+
+A zero weight alone is *not* sufficient protection against a `NaN` value:
+IEEE arithmetic gives `0 * NaN = NaN`, so an ungated weighted sum turns the
+entire objective — and every gradient derived from it — into `NaN`. That is
+why the package gates on the cell predicate (positive weight **and** finite
+value) rather than on the weight alone.
+
+Masking is useful for ragged panels (states observed on different schedules),
+dropped or censored samples, and hold-out cells for cross-validation, without
+having to reshape `data_times`/`data_values`.
+
+### Which solvers support masking
+
+Masked data is supported by **all but four** solvers: [`LAML`](@ref),
+[`GCVSolver`](@ref), [`CollocationLAML`](@ref), [`GradientMatching`](@ref),
+[`AdaptiveGradientMatching`](@ref), [`TwoStageSolver`](@ref),
+[`BNGSolver`](@ref), [`ODINSolver`](@ref), [`RKHSSolver`](@ref),
+[`IntegralMatchingSolver`](@ref), [`AdamSolver`](@ref),
+[`MultipleShootingSolver`](@ref), [`DerivativeFreeSolver`](@ref),
+[`MCMCSolver`](@ref), [`MagiSolver`](@ref), [`VariationalSolver`](@ref),
+[`ABCSolver`](@ref) and [`ProfileLikelihoodSolver`](@ref).
+
+Four solvers **reject masked data with an error**:
+
+- [`RodeoSolver`](@ref)
+- [`DaltonSolver`](@ref)
+- [`PseudoMarginalSolver`](@ref)
+- [`EnsembleKalmanSolver`](@ref)
+
+Their data term lives inside a Kalman-filter or particle recursion that has no
+per-cell mask. Honouring a mask there means skipping the *filter update*, not
+merely the density term, for the masked cells — a structural change to those
+recursions. Left unguarded they do not merely report `NaN`: `DaltonSolver`
+flattens its objective to a constant, `PseudoMarginalSolver` rejects every
+Metropolis–Hastings proposal, and `EnsembleKalmanSolver` turns every ensemble
+member `NaN` on the first iteration — each of which returns the initialization
+while *looking* like an ordinary converged fit. Failing loudly is the point.
+
+To use one of these four with incomplete data, drop the masked rows from
+`data_times`/`data_values` before constructing the `PSMProblem`.
+
+### Diagnostics
+
+[`residual_diagnostics`](@ref) and [`appraise`](@ref) exclude masked cells
+from every statistic. Because a `PSMSolution` stores `data_values` but not
+`data_weights`, they detect masking from the stored **value** only — one more
+reason to mark a masked cell with `NaN` as well as with a zero weight.

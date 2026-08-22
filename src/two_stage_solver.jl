@@ -25,9 +25,11 @@ nonlinear least squares against those smoothed derivatives.
 # Algorithm
 1. Smooth each observed state with a penalized (GCV) smoothing spline and evaluate derivatives
    at the data time points.
-2. Interpolate unobserved states from observed ones using the model.
-3. Minimise ∑ₜ ‖x′(t) − f(x(t), uf(t; β))‖² with respect to β using
-   `Optim.NelderMead`.
+2. Hold unobserved states constant at their initial-condition values and
+   MASK them out of the matching loss (their fabricated targets carry no
+   information).
+3. Minimise ∑ₜ ‖x′(t) − f(x(t), uf(t; β))‖² plus the smoothing penalty with
+   respect to β using Adam with ForwardDiff gradients.
 4. Reconstruct the unknown functions at the fitted parameters.
 
 # References
@@ -36,6 +38,8 @@ nonlinear least squares against those smoothed derivatives.
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
+`sol.convergence` is a NamedTuple `(converged, iterations, reason, method)`
+— see the `TwoStageSolver` docstring for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
     _validate_problem(prob, "TwoStageSolver")
@@ -61,7 +65,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             push!(observed_states, sk)
-            val, _ = _smoothing_spline(times, prob.data_values[:, j])
+            val, _ = _smoothing_spline_masked(times, Float64.(prob.data_values[:, j]),
+                                              @view(prob.data_weights[:, j]);
+                                              max_basis=alg.n_basis_smooth)
             for i in 1:n_times
                 y_smooth[i, sk] = val(times[i])
             end
@@ -78,7 +84,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             push!(observed_states, sk)
-            val, der = _smoothing_spline(times, prob.data_values[:, j])
+            val, der = _smoothing_spline_masked(times, Float64.(prob.data_values[:, j]),
+                                                @view(prob.data_weights[:, j]);
+                                                max_basis=alg.n_basis_smooth)
             for i in 1:n_times
                 y_smooth[i, sk] = val(times[i])
                 dydt[i, sk] = der(times[i])
@@ -105,14 +113,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
 
     # Initialize parameters
     beta = Float64[]
-    mlp_specs = Dict{Symbol, MLPSpec}()
 
     for approx in prob.approximators
         if approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            mlp_specs[approx.name] = spec
             rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            append!(beta, init_mlp_params(spec, rng))
+            append!(beta, neural_init_params(approx, rng))
         else
             append!(beta, initial_params(approx))
         end
@@ -121,6 +126,23 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
 
     # Number of time points used for matching
     n_match = prob.discrete ? n_times - 1 : n_times
+
+    # Per-(time, state) usability. The smoother above now drops masked cells
+    # from its fit, so `y_smooth`/`dydt` at a masked time are extrapolations
+    # rather than data; matching against them would invent information. A
+    # (time, state) pair counts if ANY observation column mapping to that
+    # state is usable at that time. All-true for complete data, so the loss
+    # below is unchanged there.
+    match_usable = falses(n_times, n_vars)
+    for j in 1:n_obs
+        sk = prob.obs_to_state[j]
+        for i in 1:n_times
+            usable_cell(prob, i, j) && (match_usable[i, sk] = true)
+        end
+    end
+    any(match_usable) || error("TwoStageSolver: every observation is masked " *
+        "(all data_weights are 0 or all data_values are NaN); there is " *
+        "nothing to fit.")
 
     if verbose
         println("TwoStageSolver Stage 2: Derivative matching — $n_beta params, " *
@@ -150,6 +172,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
                 # were filled with a constant state and zero derivative,
                 # and matching those fabricated values biases the fit.
                 k in observed_states || continue
+                # …and only at times where that state actually has a usable
+                # observation (see `match_usable`).
+                match_usable[i, k] || continue
                 loss_val += (dydt[i, k] - du[k])^2
             end
         end
@@ -189,8 +214,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
     best_loss = Inf
     loss_window = fill(Inf, 30)
     final_iter = alg.maxiters
+    # Honest convergence reporting: converged only when the plateau
+    # criterion actually fires; otherwise the loop exhausted maxiters.
+    conv_converged = false
+    conv_reason = :maxiters
 
     for iter in 1:alg.maxiters
+        final_iter = iter
         # Compute gradient via ForwardDiff
         result = DiffResults.MutableDiffResult(0.0, (zeros(n_beta),))
         ForwardDiff.gradient!(result, twostage_loss, beta)
@@ -218,13 +248,22 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
                     "lr=$(round(lr_t, sigdigits=3))")
         end
 
-        # Convergence: loss plateau over window
-        if iter > 60
+        # Convergence: loss plateau over window. Guard against SPURIOUS
+        # plateaus manufactured by the cosine lr schedule: near maxiters
+        # lr_t → 0, so the loss stops moving no matter how far from an
+        # optimum we are. Only declare plateau-convergence while the step
+        # size is still meaningful (lr_t > 5% of the base lr).
+        # `best_loss < 1e9` is AdamSolver's failure-sentinel guard: the
+        # dynamics fall back to `du .= 1e6` when the RHS throws, so a run
+        # pinned at that sentinel is a stuck solver, not a converged one.
+        if iter > 60 && best_loss < 1e9 && lr_t > 0.05 * lr
             recent_min = minimum(loss_window)
             recent_max = maximum(loss_window)
             if (recent_max - recent_min) / max(abs(recent_min), 1.0) < 1e-6
                 if verbose; println("  Converged at iter $iter (loss plateau)"); end
                 final_iter = iter
+                conv_converged = true
+                conv_reason = :plateau
                 break
             end
         end
@@ -244,10 +283,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
     end
 
     # Data loss against original observations
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:n_times
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Build evaluators for each approximator
     uf_evals = Dict{Symbol, Any}()
@@ -261,19 +297,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_specs[approx.name]
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                uf_evals[approx.name] = x -> begin
-                    xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
-                        (Float64(x isa AbstractArray ? x[1] : x) - lo_) / span_
-                    else
-                        Float64(x isa AbstractArray ? x[1] : x)
-                    end
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator
@@ -306,5 +330,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
     PSMSolution(params, best_loss, data_loss, edf, Float64[lambda_smooth],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (converged=true, iterations=final_iter, method=:two_stage))
+                (converged=conv_converged, iterations=final_iter,
+                 reason=conv_reason, method=:two_stage))
 end
