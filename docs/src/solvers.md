@@ -25,6 +25,8 @@ println("Data loss: ", round(sol.data_loss, digits=4), ", EDF: ", round(sol.edf,
 
 Penalized Iteratively Reweighted Least Squares (P-IRLS) with **Laplace Approximate Marginal Likelihood** for automatic smoothing parameter selection. The default and recommended solver for B-spline approximators. For Gaussian data, LAML is equivalent to REML.
 
+For non-Gaussian likelihoods the default smoothing criterion (`criterion=:working`) is PQL-flavored: smoothing parameters are calibrated on the Gaussian working model of the IRLS loop via a Pearson-dispersion-scaled Fellner–Schall update. The opt-in `criterion=:laplace` instead maximizes the actual family's full Laplace-approximate marginal likelihood, `ℓ(β̂) − ½β̂ᵀS_λβ̂ + ½log|S_λ|₊ − ½log|JᵀW̃J + S_λ| + (Mp/2)log 2π` (Wood 2011; Wood, Pya & Säfken 2016), using the generalized Fellner–Schall update of Wood & Fasiolo (2017) plus Newton refinement. Prefer `:laplace` for count data with low means (Poisson μ ≲ 10), where the working-model approximation is most biased. It supports `Poisson`, `NegativeBinomial` (dispersion fixed at the supplied `theta`), and `TruncatedNormal` (fixed `lower`/`sigma`); `CustomLikelihood` is rejected because it declares no normalized density or dispersion. For `Gaussian` data `:laplace` reduces exactly to the profiled-REML criterion, so results are identical to the default. `sol.convergence.criterion` records which criterion ran and `sol.convergence.laml` the criterion value at the fit.
+
 ```@docs
 LAML
 ```

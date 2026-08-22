@@ -535,11 +535,27 @@ For each IRLS iteration:
 5. Re-estimate smoothing parameters via Fellner-Schall + Newton
 
 Returns a `PSMSolution`. `sol.convergence` is a NamedTuple
-`(V_beta, sigma2, converged, iterations, reason, laml_failures)` — see the
-`LAML` and `PSMSolution` docstrings for the key taxonomy.
+`(V_beta, sigma2, converged, iterations, reason, laml_failures, criterion,
+laml)` — see the `LAML` and `PSMSolution` docstrings for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     _validate_problem(prob, "LAML")
+    # The full Laplace criterion needs the actual family's NORMALIZED
+    # log-likelihood with a KNOWN, fixed dispersion (its value enters the
+    # criterion directly, and the generalized Fellner-Schall update assumes
+    # unit dispersion). A CustomLikelihood's loglik_scalar may be an
+    # arbitrary — possibly unnormalized, possibly free-dispersion — kernel,
+    # so both the criterion value and its FS calibration would be off by
+    # unknown amounts. Refuse loudly rather than fit with a silently wrong
+    # criterion.
+    if alg.criterion === :laplace && prob.likelihood isa CustomLikelihood
+        error("LAML(criterion=:laplace) does not support CustomLikelihood: " *
+              "the full Laplace criterion requires a normalized log-density " *
+              "with fixed dispersion, which a user-supplied loglik_scalar " *
+              "does not declare. Use LAML(criterion=:working) (the default) " *
+              "or a built-in likelihood (Gaussian, Poisson, " *
+              "NegativeBinomial, TruncatedNormal).")
+    end
     maxiters = alg.maxiters
     verbose = alg.verbose
 
@@ -906,6 +922,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                                          family=prob.likelihood,
                                          rho_init=rho_init,
                                          sigma2_max=s2cap,
+                                         criterion=alg.criterion,
                                          verbose=verbose)
             catch e
                 if verbose; println("LAML failed: $e, keeping theta"); end
@@ -1005,9 +1022,29 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         1.0  # non-Gaussian: V_β already on natural scale
     end
 
+    # LAML criterion value at the returned fit (a report, not an extra
+    # optimization step): the same `laml_objective` the smoothing update
+    # maximizes, evaluated at the final (β̂, μ̂, J, W̃, θ̂) — profiled REML
+    # for Gaussian, the full Laplace criterion for the other families.
+    # Reported under BOTH criteria (under :working for non-Gaussian it is a
+    # diagnostic, not the quantity the FS update was calibrated to). NaN
+    # when no penalized term exists (m == 0) or the evaluation fails.
+    laml_value = if m > 0
+        try
+            first(laml_objective(prob.likelihood, p_opt, J, W_irls, w_vec,
+                                 y_vec, f_vec, S_list, uf_offsets, uf_nk,
+                                 log.(max.(theta, 1e-300)), n_p))
+        catch
+            NaN
+        end
+    else
+        NaN
+    end
+
     convergence_info = (V_beta=V_beta, sigma2=sigma2_hat,
                         converged=conv_converged, iterations=conv_iters,
-                        reason=conv_reason, laml_failures=laml_failures)
+                        reason=conv_reason, laml_failures=laml_failures,
+                        criterion=alg.criterion, laml=laml_value)
 
     PSMSolution(params, obj_val, data_loss, edf, copy(theta),
                 Float64.(pred), Float64.(prob.data_values),
