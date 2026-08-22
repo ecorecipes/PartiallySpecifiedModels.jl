@@ -5698,4 +5698,211 @@ struct NotAnApproximator end
         @test maximum(abs(fa(x) - f_true_gp(x)) for x in grid) < 0.2
     end
 
+    @testset "LAML full Laplace criterion (construction + Gaussian reduction)" begin
+        # Construction validation: criterion is checked at construction
+        @test LAML().criterion == :working
+        @test LAML(criterion=:laplace).criterion == :laplace
+        @test_throws ArgumentError LAML(criterion=:reml)
+
+        # CustomLikelihood is rejected under :laplace with an informative
+        # error (its loglik_scalar declares neither a normalizer nor a
+        # dispersion, both of which the full criterion needs).
+        rng = Xoshiro(20260819)
+        data_times = collect(0.0:0.5:10.0)
+        data_values = reshape(exp.(0.1 .* data_times) .+
+                              0.01 .* randn(rng, length(data_times)), :, 1)
+        exp_growth!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        mk_lik(lik) = PSMProblem(exp_growth!, [1.0], (0.0, 10.0),
+            [BSplineApproximator(:r, (0.0, 5.0), 5; initial=x -> 0.05)];
+            data_times=data_times, data_values=data_values,
+            obs_to_state=[1], likelihood=lik, solver=Tsit5())
+        err = try
+            solve(mk_lik(CustomLikelihood((y, μ) -> -0.5 * (y - μ)^2)),
+                  LAML(maxiters=5, criterion=:laplace))
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("does not support CustomLikelihood", err.msg)
+
+        # Gaussian reduction: for Gaussian data the full Laplace criterion
+        # with σ² profiled out IS the profiled-REML criterion (algebra in
+        # laml_objective's Gaussian branch), and in code the two criteria
+        # take the identical path — so λ̂ trajectory, objective and fit must
+        # coincide to machine precision.
+        prob_g = mk_lik(Gaussian())
+        sol_w = solve(prob_g, LAML(maxiters=30, verbose=false))
+        sol_l = solve(prob_g, LAML(maxiters=30, verbose=false,
+                                   criterion=:laplace))
+        @test sol_l.smoothing_params ≈ sol_w.smoothing_params rtol=1e-12
+        @test sol_l.objective ≈ sol_w.objective rtol=1e-12
+        @test sol_l.fitted_values ≈ sol_w.fitted_values rtol=1e-12
+        rgrid = range(0.5, 4.0, length=20)
+        @test [sol_l.unknown_functions[:r](x) for x in rgrid] ≈
+              [sol_w.unknown_functions[:r](x) for x in rgrid] rtol=1e-12
+
+        # Criterion is recorded, existing convergence keys are all intact,
+        # and the reported criterion value (profiled REML here) is the same
+        # finite number under both settings.
+        @test sol_w.convergence.criterion == :working
+        @test sol_l.convergence.criterion == :laplace
+        for k in (:V_beta, :sigma2, :converged, :iterations, :reason,
+                  :laml_failures, :criterion, :laml)
+            @test haskey(sol_w.convergence, k)
+        end
+        @test isfinite(sol_l.convergence.laml)
+        @test sol_l.convergence.laml ≈ sol_w.convergence.laml rtol=1e-12
+    end
+
+    @testset "LAML full Laplace criterion (objective value + FS scale)" begin
+        using PartiallySpecifiedModels: laml_objective,
+                                        estimate_smoothing_params,
+                                        spline_penalty_matrix, _safe_inv
+        # Deterministic (RNG-free) Poisson working state on a linear hat
+        # design: y is a fixed rounded pattern whose Pearson dispersion
+        # against the fit is ≈ 1.10 > 1, so the two criteria measurably
+        # disagree about λ while everything stays pure linear algebra.
+        n, nk = 40, 6
+        knots = collect(0.0:1.0:5.0)
+        xs = collect(range(0.0, 5.0, length=n))
+        hat(x, k) = max(0.0, 1.0 - abs(x - k))
+        J = [hat(xs[i], knots[j]) for i in 1:n, j in 1:nk]
+        S = spline_penalty_matrix(knots)
+        w = ones(n)
+        mu0 = 2.0 .+ 1.5 .* sin.(xs)
+        y = max.(round.(mu0 .+ 2.0 .* sin.(17.3 .* xs)), 0.0)
+
+        # β̂ at FIXED small λ by penalized IRLS for the actual Poisson family
+        # (identity link on a linear design ⟹ pseudodata z = y exactly).
+        lam_fix = 0.05
+        S_lam = lam_fix .* S
+        beta = _safe_inv(J' * Diagonal(w) * J + S_lam) * (J' * (w .* y))
+        mu = J * beta
+        for _ in 1:300
+            W_it = [w[i] / max(abs(mu[i]), 1e-6) for i in 1:n]
+            beta = _safe_inv(J' * Diagonal(W_it) * J + S_lam) *
+                   (J' * (W_it .* y))
+            mu = J * beta
+        end
+        W = [w[i] / max(abs(mu[i]), 1e-6) for i in 1:n]
+        @test all(mu .> 0.5)   # fitted means healthy (observed 0.87–3.37)
+
+        # Objective correctness: the solver's criterion (laml_objective, the
+        # exact quantity reported as sol.convergence.laml) against the
+        # Wood (2011) formula computed independently here:
+        #   V = ℓ(β̂) − ½β̂'S_λβ̂ + ½log|S_λ|₊ − ½log|J'WJ + S_λ| + (Mp/2)log 2π
+        # with W the Fisher weights 1/μ̂ (expected Hessian). Observed
+        # agreement 6.5e-10 (the residual is laml_objective's 1e-10
+        # stabilizing ridge inside _log_det_pd); atol=1e-6 leaves ~1000x
+        # headroom while catching any dropped or mis-scaled term.
+        V_solver, = laml_objective(Poisson(), beta, J, W, w, y, mu,
+                                   [S], [0], [nk], [log(lam_fix)], nk)
+        logfact(k) = sum(log.(1:Int(k)); init=0.0)
+        ll = sum(w[i] * (y[i] * log(mu[i]) - mu[i] - logfact(y[i]))
+                 for i in 1:n)
+        pen = lam_fix * dot(beta, S * beta)
+        ev = eigvals(Symmetric(S))
+        tolS = 1e-10 * maximum(abs.(ev))
+        rS = count(e -> e > tolS, ev)
+        logdetSplus = rS * log(lam_fix) + sum(log(e) for e in ev if e > tolS)
+        logdetH = logdet(cholesky(Symmetric(J' * Diagonal(W) * J + S_lam)))
+        V_direct = ll - 0.5 * pen + 0.5 * logdetSplus - 0.5 * logdetH +
+                   0.5 * (nk - rS) * log(2π)
+        @test V_solver ≈ V_direct atol=1e-6
+
+        # FS-scale discriminator: from the same frozen working state,
+        # :working calibrates FS by the Pearson dispersion φ̂ ≈ 1.10 (and
+        # skips Newton) while :laplace uses unit dispersion plus Newton
+        # refinement of V. Observed λ̂: 4.247 vs 3.213 (ratio 1.32). The
+        # computation is deterministic — no RNG, no ODE solves — so a
+        # ratio floor of 1.05 is safe against BLAS/platform variation.
+        pearson = sum((y[i] - mu[i])^2 / mu[i] for i in 1:n) / (n - rS)
+        @test pearson > 1.02   # the mechanism the discrimination relies on
+        lam_w, = estimate_smoothing_params(J, W, w, y, mu, beta,
+            [S], [0], [nk], nk; family=Poisson(), rho_init=[0.0],
+            criterion=:working)
+        lam_l, = estimate_smoothing_params(J, W, w, y, mu, beta,
+            [S], [0], [nk], nk; family=Poisson(), rho_init=[0.0],
+            criterion=:laplace)
+        @test isfinite(lam_l[1]) && lam_l[1] > 0
+        @test lam_w[1] / lam_l[1] > 1.05
+    end
+
+    @testset "LAML full Laplace criterion (count-data end-to-end)" begin
+        # Logistic growth observed as low-mean counts (μ ∈ [1, 7.96]) —
+        # exactly the regime where the Gaussian working approximation is
+        # worst. The unknown per-capita rate g(u) = r₀(1 − u/K) is fitted
+        # from Poisson observations. Data are deterministic: a fixed-seed
+        # Xoshiro drives an inversion sampler, and the solver itself is
+        # RNG-free, so both fits below are reproducible.
+        r0, K = 0.6, 8.0
+        tsl = collect(0.0:0.4:12.0)
+        tsol = OrdinaryDiffEq.solve(
+            ODEProblem((du, u, p, t) -> du[1] = r0 * (1 - u[1] / K) * u[1],
+                       [1.0], (0.0, 12.0)),
+            Tsit5(); saveat=tsl, abstol=1e-10, reltol=1e-10)
+        mu_true = [tsol.u[i][1] for i in eachindex(tsl)]
+        function rpois(rng, m)
+            L = exp(-m); k = 0; p = 1.0
+            while true
+                p *= rand(rng)
+                p <= L && return k
+                k += 1
+            end
+        end
+        growth!(du, u, p, t) = (du[1] = p.g(u[1]) * u[1])
+        mk_count(y, lik) = PSMProblem(growth!, [1.0], (0.0, 12.0),
+            [BSplineApproximator(:g, (0.3, 9.0), 6; initial=x -> 0.3)];
+            data_times=tsl, data_values=reshape(y, :, 1), obs_to_state=[1],
+            likelihood=lik, solver=Tsit5())
+        gtrue(x) = r0 * (1 - x / K)
+        gx = range(1.0, 7.5, length=40)
+        errs(s) = [abs(s.unknown_functions[:g](x) - gtrue(x)) for x in gx]
+
+        # Poisson: this draw's sample Pearson dispersion against the truth
+        # is 1.41, so the :working criterion (φ̂-scaled FS) lands on a
+        # visibly larger λ̂ than the full Laplace criterion.
+        rng_p = Xoshiro(1)
+        y_p = Float64[rpois(rng_p, m) for m in mu_true]
+        sol_pw = solve(mk_count(y_p, Poisson()),
+                       LAML(maxiters=40, verbose=false))
+        sol_pl = solve(mk_count(y_p, Poisson()),
+                       LAML(maxiters=40, verbose=false, criterion=:laplace))
+        # Honest reporting: :laplace runs to convergence and records itself
+        @test sol_pl.convergence.converged
+        @test sol_pl.convergence.criterion == :laplace
+        @test sol_pw.convergence.criterion == :working
+        @test isfinite(sol_pl.convergence.laml)
+        # Recovery of the truth under :laplace (observed maxerr 0.069,
+        # meanerr 0.029 on a truth range of ≈ 0.53 over [1, 7.5])
+        @test maximum(errs(sol_pl)) < 0.15
+        @test sum(errs(sol_pl)) / length(gx) < 0.06
+        # ...and it DIFFERS measurably from :working in λ̂: observed
+        # λ̂_working = 5.86e6 vs λ̂_laplace = 2.59e6, |Δlog λ̂| = 0.816 —
+        # the fits themselves nearly coincide here (the truth is linear in
+        # u, i.e. in the penalty null space, so both smooth heavily), which
+        # is what makes the λ̂ contrast the deterministic discriminator.
+        # Floor of 0.1 leaves 8x headroom in log terms.
+        @test sol_pl.smoothing_params[1] != sol_pw.smoothing_params[1]
+        @test abs(log(sol_pl.smoothing_params[1] /
+                      sol_pw.smoothing_params[1])) > 0.1
+
+        # NegativeBinomial end-to-end with :laplace: fixed dispersion
+        # θ = 8 in the family object, correctly specified data. Observed:
+        # converged, λ̂ = 6.66e6, maxerr 0.061, meanerr 0.041, V = −71.6.
+        rng_nb = Xoshiro(1)
+        th = 8
+        y_nb = Float64[rpois(rng_nb,
+                             m * (-sum(log(rand(rng_nb)) for _ in 1:th) / th))
+                       for m in mu_true]
+        sol_nb = solve(mk_count(y_nb, NegativeBinomial(Float64(th))),
+                       LAML(maxiters=40, verbose=false, criterion=:laplace))
+        @test sol_nb.convergence.converged
+        @test sol_nb.convergence.criterion == :laplace
+        @test isfinite(sol_nb.convergence.laml)
+        @test maximum(errs(sol_nb)) < 0.15
+        @test sum(errs(sol_nb)) / length(gx) < 0.09
+    end
+
 end

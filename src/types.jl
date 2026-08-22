@@ -1104,7 +1104,7 @@ end
 
 """
     LAML(; maxiters=100, tol=1e-6, verbose=false, initial_lambda=nothing,
-           warmup=3, sigma2_init=nothing)
+           warmup=3, sigma2_init=nothing, criterion=:working)
 
 Laplace Approximate Marginal Likelihood algorithm.
 Equivalent to REML for Gaussian data.
@@ -1130,14 +1130,47 @@ Uses Fellner-Schall + Newton for smoothing parameter estimation.
   residual variance from an early poor fit from driving oversmoothing.  After
   the warmup phase the cap is progressively relaxed.  Set to a value reflecting
   your prior belief about observation noise variance (e.g. `sigma2_init=25.0`
-  for ±5 measurement error).
+  for ±5 measurement error).  With `criterion=:laplace` and a count family,
+  a cap below 1 transiently scales the warmup FS update below the unit
+  dispersion the Newton phase optimizes — leave `sigma2_init` unset (or ≥ 1)
+  there; it is a Gaussian-noise prior, not a count-model control.
+- `criterion::Symbol=:working`: smoothing-parameter selection criterion for
+  **non-Gaussian** likelihoods.
+  - `:working` (default, previous behavior): PQL-flavored selection — the
+    Fellner-Schall update is calibrated by the Pearson dispersion φ̂ of the
+    working model (floored at 1), and the Newton refinement of the marginal
+    likelihood is skipped.
+  - `:laplace`: the true Laplace-approximate marginal likelihood of the actual
+    family (Wood 2011; Wood, Pya & Säfken 2016). At the penalized MLE β̂_λ the
+    criterion is `ℓ(β̂) − ½β̂'S_λβ̂ + ½log|S_λ|₊ − ½log|H + S_λ| + (Mp/2)log 2π`
+    with `H = J'W̃J` the GLM-style **expected** (Fisher) Hessian at the fitted
+    mean, and it is optimized by the generalized Fellner-Schall update of
+    Wood & Fasiolo (2017) — i.e. FS with the family working weights and **unit
+    dispersion** — followed by Newton refinement of the same criterion.
+    Prefer `:laplace` for genuinely non-Gaussian data, especially counts with
+    low means (Poisson μ ≲ 10), where the Gaussian working approximation
+    behind `:working` is at its worst. Dispersion caveats: the criterion
+    assumes the family's dispersion is FIXED — exact for `Poisson`, and
+    conditional on the supplied `theta` for `NegativeBinomial` and on
+    (`lower`, `sigma`) for `TruncatedNormal` (these are NOT re-estimated;
+    a misspecified fixed dispersion biases λ̂). `CustomLikelihood` is
+    rejected with an error: its `loglik_scalar` may be an unnormalized
+    kernel with no declared dispersion, so the criterion value and its FS
+    calibration would be off by unknown amounts — use `:working` there.
+    For `Gaussian` likelihoods `:laplace` reduces exactly to the current
+    profiled-REML criterion (identical code path), so results are identical
+    to `:working`.
 
 # Convergence info
 `sol.convergence` is a NamedTuple `(V_beta, sigma2, converged, iterations,
-reason, laml_failures)`: the posterior covariance and σ̂² used by
-[`confidence_band`](@ref), plus the standard honest-convergence keys (see
-[`PSMSolution`](@ref)) and `laml_failures::Int`, the number of iterations in
-which the LAML smoothing-parameter update failed and θ was kept.
+reason, laml_failures, criterion, laml)`: the posterior covariance and σ̂² used
+by [`confidence_band`](@ref), plus the standard honest-convergence keys (see
+[`PSMSolution`](@ref)), `laml_failures::Int` (the number of iterations in
+which the LAML smoothing-parameter update failed and θ was kept),
+`criterion::Symbol` (which selection criterion ran), and `laml::Float64` (the
+LAML criterion value V at the returned fit — profiled REML for Gaussian, the
+full Laplace criterion above for other families; a MAXIMIZED quantity, `NaN`
+when no penalized term exists or the evaluation fails).
 """
 struct LAML
     maxiters::Int
@@ -1146,13 +1179,19 @@ struct LAML
     initial_lambda::Union{Nothing,Float64}
     warmup::Int
     sigma2_init::Union{Nothing,Float64}
+    criterion::Symbol
 end
 
-LAML(; maxiters::Int=100, tol::Float64=1e-6, verbose::Bool=false,
-       initial_lambda::Union{Nothing,Float64}=nothing,
-       warmup::Int=3,
-       sigma2_init::Union{Nothing,Float64}=nothing) =
-    LAML(maxiters, tol, verbose, initial_lambda, warmup, sigma2_init)
+function LAML(; maxiters::Int=100, tol::Float64=1e-6, verbose::Bool=false,
+                initial_lambda::Union{Nothing,Float64}=nothing,
+                warmup::Int=3,
+                sigma2_init::Union{Nothing,Float64}=nothing,
+                criterion::Symbol=:working)
+    criterion in (:working, :laplace) ||
+        throw(ArgumentError("LAML: criterion must be :working or :laplace " *
+                            "(got $(repr(criterion)))"))
+    LAML(maxiters, tol, verbose, initial_lambda, warmup, sigma2_init, criterion)
+end
 
 """
     CollocationLAML(; kwargs...)

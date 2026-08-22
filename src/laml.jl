@@ -123,11 +123,33 @@ function laml_objective(family::AbstractLikelihood,
     # Number of unpenalized parameters
     total_rank = sum(_rank_penalty(S_list[l]) for l in eachindex(S_list))
     Mp = n_p - total_rank
+    # The non-Gaussian (Mp/2)·log 2π term below uses this raw Mp, while the
+    # Gaussian branch's n_eff uses Mp_eff. They differ only when unpenalized
+    # design columns are rank-deficient (mixed spline+NN); the difference is
+    # ρ-constant, so λ̂ is unaffected — only the reported criterion VALUE
+    # carries a constant offset in that corner.
     # …and the same count with unpenalized blocks charged by design rank
     # (equals Mp whenever those columns are of full rank; see below).
     Mp_eff = _restricted_dof_Mp(J, W_irls, offsets, nknots_list, n_p, total_rank)
 
     if family isa Gaussian
+        # This branch IS the full Laplace criterion of the non-Gaussian
+        # branch, specialized to Gaussian and with σ² profiled out — which is
+        # why `LAML(criterion=:laplace)` needs no separate Gaussian path and
+        # reduces EXACTLY to the current REML criterion. Proof: for
+        # y ~ N(Jβ, φW⁻¹) with prior precision S̃ = S_λ/φ (the REML/mgcv
+        # convention that makes β̂ = argmin RSS + β'S_λβ independent of φ),
+        # the generic Laplace expression
+        #   V = ℓ(β̂) − ½β̂'S̃β̂ + ½log|S̃|₊ − ½log|J'WJ/φ + S̃| + (Mp/2)log 2π
+        # expands, using ℓ = −RSS/(2φ) − (n/2)log(2πφ), rank(S_λ) = p − Mp,
+        # log|S_λ/φ|₊ = log|S_λ|₊ − (p−Mp)log φ and
+        # log|(J'WJ+S_λ)/φ| = log|H| − p·log φ, to
+        #   V = −(RSS+pen)/(2φ) − ((n−Mp)/2)log φ + ½log|S_λ|₊ − ½log|H|
+        #       − ((n−Mp)/2)log 2π.
+        # ∂V/∂φ = 0 gives φ̂ = (RSS+pen)/(n−Mp) — exactly `sigma2` below —
+        # and substituting yields, up to ρ-independent constants,
+        #   V = −((n−Mp)/2)log σ̂² + ½log|S_λ|₊ − ½log|H|,
+        # the expression computed here (with n−Mp → n_eff as documented).
         RSS = 0.0
         for i in eachindex(y)
             _usable(y[i], w_data[i]) || continue
@@ -285,6 +307,18 @@ Estimate smoothing parameters by maximizing LAML using two phases:
 `W_irls` are the pre-computed IRLS working weights (= w_data / V(μ)).
 `w_data` are the original data weights (for log-likelihood evaluation).
 
+`criterion` selects the smoothing criterion for NON-Gaussian families
+(Gaussian always takes the profiled-REML path, identical under both):
+- `:working` (default): PQL-flavored — FS calibrated by the Pearson
+  dispersion φ̂ of the working model (floored at 1), Newton skipped.
+- `:laplace`: the full Laplace-approximate marginal likelihood of the
+  actual family. The FS update becomes the generalized Fellner-Schall of
+  Wood & Fasiolo (2017) — the SAME update with unit dispersion (φ = 1),
+  since these families have fixed dispersion — and the Newton phase runs
+  on the non-Gaussian branch of `laml_objective`/`laml_gradient` (unit
+  scale), which is exactly the criterion FS ascends, so the two phases
+  are consistent.
+
 Returns `(lambda, edf)` where lambda[k] are the smoothing parameters.
 """
 function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
@@ -298,6 +332,7 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
                                    rho_init::Union{Nothing,Vector{Float64}}=nothing,
                                    sigma2_max::Float64=Inf,
                                    maxiter::Int=50, tol::Float64=1e-6,
+                                   criterion::Symbol=:working,
                                    verbose::Bool=false)
     m = length(S_list)
     # USABLE-cell count, not `length(y)` — see the note in `laml_objective`.
@@ -371,11 +406,20 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
         # β̂ at the CURRENT λ (working model)
         beta_fs = H_inv * JWz
 
-        # Profiled scale for Gaussian; Pearson dispersion for non-Gaussian.
-        # For non-Gaussian families with identity link, IRLS weights (1/V(μ))
-        # can be very small for large counts, causing λ to collapse.  The
-        # Pearson dispersion φ̂ acts as an effective scale that keeps the
-        # Fellner-Schall update well-calibrated (Wood & Fasiolo 2017).
+        # Profiled scale for Gaussian; for non-Gaussian the scale depends on
+        # the criterion:
+        # - :working — Pearson dispersion. For non-Gaussian families with
+        #   identity link, IRLS weights (1/V(μ)) can be very small for large
+        #   counts, causing λ to collapse.  The Pearson dispersion φ̂ acts as
+        #   an effective scale that keeps the Fellner-Schall update
+        #   well-calibrated in the quasi-likelihood sense.
+        # - :laplace — unit dispersion. These families (Poisson; NegBin and
+        #   TruncatedNormal conditional on their fixed shape parameters) have
+        #   φ ≡ 1, and with φ = 1 the update below IS the generalized
+        #   Fellner-Schall update of Wood & Fasiolo (2017) for the full
+        #   Laplace criterion: λ_k ← (r_k − λ_k tr(H⁻¹S_k)) / β̂'S_kβ̂ with the
+        #   family working weights W̃ inside H. It therefore (approximately)
+        #   ascends exactly the objective the Newton phase refines.
         # When sigma2_max is finite, cap to prevent oversmoothing.
         sigma2 = if family isa Gaussian
             r_work = z_work .- J * beta_fs
@@ -389,6 +433,8 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
             # objective uses (see `laml_objective`).
             profiled = max((RSS + pen) / n_eff, 1e-30)   # REML scale
             min(profiled, sigma2_max)
+        elseif criterion === :laplace
+            min(1.0, sigma2_max)
         else
             pearson = 0.0
             for i in eachindex(y)
@@ -444,20 +490,27 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
     rho .= clamp.(log.(lambda), RHO_MIN, RHO_MAX)
 
     # ─── Phase 2: Newton refinement ─────────────────────────────
-    # Skip Newton for non-Gaussian: the Fellner-Schall update uses Pearson
-    # dispersion φ̂ as effective scale, but the LAML gradient uses unit scale.
-    # Running Newton would push λ back toward the unit-scale optimum, undoing
-    # the FS calibration.  For Gaussian, FS and Newton are consistent because
-    # both use the profiled σ².
+    # Under :working, skip Newton for non-Gaussian: the Fellner-Schall update
+    # uses Pearson dispersion φ̂ as effective scale, but the LAML gradient uses
+    # unit scale. Running Newton would push λ back toward the unit-scale
+    # optimum, undoing the FS calibration (the T11 lesson: never let the
+    # monitored/refined objective and the update disagree about ρ).
+    # For Gaussian, FS and Newton are consistent because both use the
+    # profiled σ²; under :laplace they are consistent because both use unit
+    # dispersion, so Newton runs there too.
     MAX_STEP = 5.0
     V_prev = -Inf
-    n_newton = family isa Gaussian ? max(0, maxiter - n_fs) : 0
+    n_newton = (family isa Gaussian || criterion === :laplace) ?
+               max(0, maxiter - n_fs) : 0
 
-    # The Gaussian objective's RSS must use the SAME coefficients β̂_fs as
-    # its penalty term: passing the stale outer-loop μ paired RSS(β_outer)
-    # with pen(β_fs). Shift μ to the working-model fit so that
+    # The objective must be evaluated at the SAME coefficients β̂_fs as its
+    # penalty term: passing the stale outer-loop μ paired the data term at
+    # β_outer with pen(β_fs). Shift μ to the working-model fit so that
     # y − μ_fs = z_work − J β̂_fs, exactly the FS phase's working residuals.
-    # (Only the Gaussian family reaches Newton, and it reads μ only via RSS.)
+    # For Gaussian this feeds the RSS; for non-Gaussian (:laplace) it is the
+    # linearized mean fed to ℓ(y, μ) — an approximation to the nonlinear
+    # model's mean at β̂_fs, polished by the outer IRLS re-linearization
+    # (identical in spirit to holding J and W̃ frozen within this call).
     mu_fs = mu .+ J * (beta_fs .- beta)
 
     for iter in 1:min(n_newton, 20)
