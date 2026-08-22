@@ -1,6 +1,6 @@
 # Custom approximators
 
-PartiallySpecifiedModels.jl ships with seven approximator types, but the set is open: every solver constructs and consumes unknown functions through four generic functions, so adding your own approximator requires no changes to any solver file. Define a struct, implement the four methods, and pass it to `PSMProblem` like any built-in type.
+PartiallySpecifiedModels.jl ships with eight approximator types, but the set is open: every solver constructs and consumes unknown functions through four generic functions, so adding your own approximator requires no changes to any solver file. Define a struct, implement the four methods, and pass it to `PSMProblem` like any built-in type.
 
 ## The interface
 
@@ -99,6 +99,7 @@ Returning `nothing` from `penalty_matrix` is always safe: the approximator is th
 Three caveats for custom types:
 
 - A handful of solver capabilities are gated on the built-in types (e.g. `AdaptiveGradientMatching`'s population-MCMC mode rejects `NeuralApproximator`; `optimize_spde_range` only operates on SPDE approximators). Custom types pass these gates like any non-listed type.
+- Six solvers (`TwoStageSolver`, `IntegralMatchingSolver`, `MagiSolver`, `AdaptiveGradientMatching`, `RodeoSolver`, `DaltonSolver`) assemble their smoothing penalty through an explicit whitelist of built-in types rather than the generic `penalty_matrix`. A custom type is simply **unpenalized** there (its data fit is unaffected). The penalized-likelihood, through-the-solver, and MCMC/VI/ABC families all use the generic path, so a custom `penalty_matrix` flows in automatically.
 - The adaptive GP hyperparameter refitting inside `LAML`/`GCVSolver` is specific to `GPApproximator`; custom types keep whatever structure their four methods define.
 - `confidence_band` (diagnostics) evaluates approximators through its own restricted mechanism and supports only the built-in basis-expansion types — custom types (like `NeuralApproximator`/`COMONetApproximator`) are not supported there and will error.
 

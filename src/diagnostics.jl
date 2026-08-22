@@ -402,6 +402,15 @@ function confidence_band(sol::PSMSolution, prob::PSMProblem;
 
     offset = 0
     for approx in prob.approximators
+        # The band machinery grids a SINGLE input variable and evaluates the
+        # unknown function with one argument; a bivariate tensor surface has
+        # no univariate band. Reject loudly rather than erroring obscurely
+        # on the missing `.domain` field below.
+        approx isa TensorBSplineApproximator && throw(ArgumentError(
+            "confidence_band: TensorBSplineApproximator (:$(approx.name)) " *
+            "is a bivariate surface; univariate confidence bands are not " *
+            "defined for it. Evaluate sol.unknown_functions[:" *
+            "$(approx.name)](x, y) directly for point estimates."))
         np = nparams(approx)
         idx = (offset+1):(offset+np)
         V_k = σ² .* V_beta[idx, idx]

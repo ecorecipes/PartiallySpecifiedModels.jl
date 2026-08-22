@@ -13,7 +13,9 @@
 Construct the callable evaluator for an approximator's unknown function from
 its parameter block `params_k`. Solvers call this to build the object that
 the dynamics function receives as `p.<name>`, so the returned value must be
-callable on a scalar, `f = build_evaluator(a, θ); f(x)::Number`.
+callable on a scalar, `f = build_evaluator(a, θ); f(x)::Number` (or on as
+many scalar arguments as the dynamics pass it — `TensorBSplineApproximator`
+returns a two-argument callable `f(x, y)`).
 
 This is the extension point for user-defined approximator types. To add a
 new approximator, define a struct subtyping `AbstractApproximator` (with at
@@ -33,11 +35,12 @@ vector of `ForwardDiff.Dual` numbers, so the evaluator must be eltype-generic
 (`AdamSolver`, `MultipleShootingSolver`, `TwoStageSolver`, `BNGSolver`,
 `IntegralMatchingSolver`, …).
 
-Methods are provided for the seven built-in types:
+Methods are provided for the eight built-in types:
 
 | Approximator | Evaluator |
 |:---|:---|
 | `BSplineApproximator` | `build_bspline_evaluator` on a uniform knot grid over `domain` |
+| `TensorBSplineApproximator` | `build_tensor_bspline_evaluator` (bivariate tensor product of the univariate construction; the callable takes TWO arguments, `f(x, y)`) |
 | `NeuralApproximator` | `build_neural_evaluator` (Dual-safe MLP path + Lux fallback) |
 | `GPApproximator` | `build_gp_evaluator` (kernel interpolation) |
 | `ShapeConstrainedBSplineApproximator` | `build_constrained_bspline_evaluator` (SCOP reparameterization) |
@@ -62,6 +65,11 @@ function build_evaluator(approx::BSplineApproximator, params_k)
                             length=approx.nknots))
     build_bspline_evaluator(knots_x, params_k)
 end
+
+# Two-argument callable f(x, y) — tensor product of the univariate
+# construction; Dual-safe in params and in (x, y).
+build_evaluator(approx::TensorBSplineApproximator, params_k) =
+    build_tensor_bspline_evaluator(approx, params_k)
 
 # Dual-safe, eltype-generic (see neural_evaluator.jl) — required for
 # autodiff Jacobians in stiff ODE solvers and for gradients of any

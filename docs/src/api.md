@@ -16,6 +16,7 @@ AbstractApproximator
 ```
 
 - [`BSplineApproximator`](@ref)
+- [`TensorBSplineApproximator`](@ref)
 - [`ShapeConstrainedBSplineApproximator`](@ref)
 - [`SPDEApproximator`](@ref)
 - [`ShapeConstrainedSPDEApproximator`](@ref)

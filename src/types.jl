@@ -59,6 +59,107 @@ function BSplineApproximator(name::Union{Symbol,String},
 end
 
 """
+    TensorBSplineApproximator(name, domain_x, domain_y, nknots_x, nknots_y;
+                              anisotropy=1.0, initial=nothing)
+
+Bivariate tensor-product cubic-spline approximator for an unknown function
+of TWO state variables — e.g. the predation response `g(P, N)` of Wood
+(2001), "Partially specified ecological models", whose form depends on both
+predator and prey densities. In the dynamics the fitted surface is a
+two-argument callable, `du[1] = ... p.g(u[1], u[2]) ...`.
+
+Coefficients are function values on the `nknots_x × nknots_y` grid of
+evenly spaced knots over `domain_x × domain_y`, stored column-major as
+`vec(C)` with `C[i, j] = f(x_i, y_j)` (the x index varies fastest).
+Evaluation is the tensor product of the same univariate natural-cubic
+interpolation `BSplineApproximator` uses, with linear extrapolation per
+margin outside the domain.
+
+The roughness penalty is the Kronecker sum
+`S = I_ny ⊗ S_x + anisotropy · (S_y ⊗ I_nx)` of the univariate
+`∫(f'')²` marginal penalties. The package's penalty interface carries a
+single smoothing parameter λ per approximator, so LAML/GCV scale this whole
+matrix by one λ; `anisotropy` sets the FIXED relative weight of y-roughness
+against x-roughness (Wood's independent per-margin smoothing parameters
+would require multi-λ penalty support, which is out of scope). The penalty
+null space is the bilinear family `a + b·x + c·y + d·x·y`.
+
+# Arguments
+- `name`: symbol for the unknown function (accessed as `p.name(x, y)`)
+- `domain_x`, `domain_y`: `(lo, hi)` ranges of the first and second argument
+- `nknots_x`, `nknots_y`: knots per margin (≥ 3 each; `nparams = nknots_x · nknots_y`)
+- `anisotropy`: positive relative weight of the y-roughness penalty (default 1.0)
+- `initial`: optional initial surface — a two-argument function `(x, y) -> z`
+  or a constant (default 0)
+
+# Example
+```julia
+uf = TensorBSplineApproximator(:g, (0.0, 4.0), (0.0, 6.0), 6, 6)
+predprey!(du, u, p, t) = begin
+    du[1] = p.r * u[1] - p.g(u[1], u[2])
+    du[2] = p.e * p.g(u[1], u[2]) - p.m * u[2]
+end
+```
+
+Note: `confidence_band` and the bootstrap unknown-function bands are
+univariate and do not support tensor surfaces.
+"""
+struct TensorBSplineApproximator <: AbstractApproximator
+    name::Symbol
+    domain_x::Tuple{Float64, Float64}
+    domain_y::Tuple{Float64, Float64}
+    nknots_x::Int
+    nknots_y::Int
+    anisotropy::Float64
+    initial_func::Function
+end
+
+function TensorBSplineApproximator(name::Union{Symbol,String},
+                                   domain_x::Tuple{Real,Real},
+                                   domain_y::Tuple{Real,Real},
+                                   nknots_x::Int,
+                                   nknots_y::Int;
+                                   anisotropy::Real=1.0,
+                                   initial=nothing)
+    name = Symbol(name)
+    dx = (Float64(domain_x[1]), Float64(domain_x[2]))
+    dy = (Float64(domain_y[1]), Float64(domain_y[2]))
+    _validate_domain("TensorBSplineApproximator (x margin)", dx)
+    _validate_domain("TensorBSplineApproximator (y margin)", dy)
+    # Same floor as BSplineApproximator: cubic spline interpolation along
+    # each margin needs at least 3 knots.
+    nknots_x >= 3 || throw(ArgumentError(
+        "TensorBSplineApproximator needs nknots_x ≥ 3 for cubic spline " *
+        "interpolation (got $nknots_x)"))
+    nknots_y >= 3 || throw(ArgumentError(
+        "TensorBSplineApproximator needs nknots_y ≥ 3 for cubic spline " *
+        "interpolation (got $nknots_y)"))
+    aniso = Float64(anisotropy)
+    (isfinite(aniso) && aniso > 0.0) || throw(ArgumentError(
+        "TensorBSplineApproximator: anisotropy must be positive and finite, " *
+        "got $anisotropy"))
+    init_func = if initial === nothing
+        (x, y) -> 0.0
+    elseif initial isa Function
+        initial
+    else
+        (x, y) -> Float64(initial)
+    end
+    TensorBSplineApproximator(name, dx, dy, nknots_x, nknots_y, aniso,
+                              init_func)
+end
+
+nparams(a::TensorBSplineApproximator) = a.nknots_x * a.nknots_y
+
+function initial_params(a::TensorBSplineApproximator)
+    xs = range(a.domain_x[1], a.domain_x[2], length=a.nknots_x)
+    ys = range(a.domain_y[1], a.domain_y[2], length=a.nknots_y)
+    # Column-major vec of the (nknots_x × nknots_y) value grid — x index
+    # fastest, matching build_tensor_bspline_evaluator's reshape.
+    vec(Float64[a.initial_func(x, y) for x in xs, y in ys])
+end
+
+"""
     NeuralApproximator(name, model; penalty_weight=0.0, domain=nothing)
 
 Neural network approximator using a Lux.jl model.

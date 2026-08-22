@@ -390,10 +390,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
                         for mb in member_betas]
         offset += np
         let evs = member_evals, w = w_members
+            # Varargs so multi-argument evaluators (TensorBSplineApproximator's
+            # f(x, y)) pass through; single-argument behavior is unchanged.
             uf_evals[approx.name] =
-                x -> sum(w[i] * evs[i](x) for i in eachindex(evs))
-            ensemble_std[approx.name] = x -> begin
-                vals = [ev(x) for ev in evs]
+                (x...) -> sum(w[i] * evs[i](x...) for i in eachindex(evs))
+            ensemble_std[approx.name] = (x...) -> begin
+                vals = [ev(x...) for ev in evs]
                 μ = sum(w .* vals)
                 sqrt(max(sum(w .* (vals .- μ).^2), 0.0))
             end
