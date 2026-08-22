@@ -150,7 +150,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
     n_vars = length(prob.u0)
     n_obs = size(prob.data_values, 2)
     n_t = length(prob.data_times)
-    rng = Random.default_rng()
+    # Solver-owned RNG stream (AGM/BNG convention): seeded when rng_seed is
+    # given, otherwise randomly seeded — never the global RNG.
+    rng = alg.rng_seed === nothing ? Random.Xoshiro(rand(UInt32)) :
+          Random.Xoshiro(alg.rng_seed)
 
     if alg.initial_params !== nothing
         beta0 = copy(alg.initial_params)

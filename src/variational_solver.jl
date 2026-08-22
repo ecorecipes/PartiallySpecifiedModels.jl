@@ -384,7 +384,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     best_elbo = -Inf
     elbo_history = Float64[]
 
-    rng = Random.Xoshiro(42)
+    # rng_seed defaults to 42 (historical hard-coded stream); nothing = fresh.
+    rng = alg.rng_seed === nothing ? Random.Xoshiro(rand(UInt32)) :
+          Random.Xoshiro(alg.rng_seed)
 
     for iter in 1:alg.maxiters
         # Draw shared noise samples (fixed across gradient computation)
