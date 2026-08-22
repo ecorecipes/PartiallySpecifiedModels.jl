@@ -359,27 +359,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     # Data loss against original observations
     data_loss = weighted_data_loss(prob, pred)
 
-    # Per-member evaluators for one approximator's parameter block
-    function build_eval(approx, params_k)
-        if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2],
-                                    length=approx.nknots))
-            build_bspline_evaluator(knots_x, params_k)
-        elseif approx isa NeuralApproximator
-            build_neural_evaluator(approx, params_k)
-        elseif approx isa GPApproximator
-            build_gp_evaluator(approx, params_k)
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            build_constrained_bspline_evaluator(approx, params_k)
-        elseif approx isa COMONetApproximator
-            build_comonet_evaluator(approx, params_k)
-        elseif approx isa SPDEApproximator
-            build_spde_evaluator(approx.mesh_points, params_k)
-        elseif approx isa ShapeConstrainedSPDEApproximator
-            build_constrained_spde_evaluator(approx, params_k)
-        end
-    end
-
     # Posterior weights. Losses are only comparable WITHIN an observation
     # ensemble (each bootstrap has its own data), so exp(−Δloss) weights are
     # formed over the k_proc restarts of each obs-ensemble — zeroing
@@ -407,7 +386,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     offset = 0
     for approx in prob.approximators
         np = nparams(approx)
-        member_evals = [build_eval(approx, mb[offset+1:offset+np])
+        member_evals = [build_evaluator(approx, mb[offset+1:offset+np])
                         for mb in member_betas]
         offset += np
         let evs = member_evals, w = w_members

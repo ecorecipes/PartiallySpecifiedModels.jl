@@ -48,6 +48,10 @@ include("approximators.jl")
 # must precede solver.jl, which uses build_neural_evaluator
 include("neural_evaluator.jl")
 
+# Generic evaluator construction (the approximator extension interface);
+# must precede the solver files, which all call build_evaluator
+include("approximator_interface.jl")
+
 # Likelihood families
 include("likelihoods.jl")
 
@@ -155,7 +159,7 @@ export EnsembleKalmanSolver, ODINSolver, RKHSSolver
 # Exports — functions
 export solve, simulate, predict
 export spline_penalty_matrix, penalty_matrix
-export nparams, initial_params
+export nparams, initial_params, build_evaluator
 export optimize_spde_range, with_range_param
 export residual_diagnostics, durbin_watson, residual_acf, semivariogram
 export appraise, deviance_residuals

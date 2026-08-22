@@ -80,33 +80,10 @@ function build_param_struct(prob::PSMProblem, beta::AbstractVector)
         params_k = beta[offset+1:offset+np]
         offset += np
 
-        if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2],
-                                    length=approx.nknots))
-            evaluator = build_bspline_evaluator(knots_x, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa NeuralApproximator
-            # Dual-safe, eltype-generic (see neural_evaluator.jl) — required
-            # for autodiff Jacobians in stiff ODE solvers and for gradients
-            # of any objective w.r.t. β.
-            evaluator = build_neural_evaluator(approx, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa GPApproximator
-            evaluator = build_gp_evaluator(approx, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            evaluator = build_constrained_bspline_evaluator(approx, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa COMONetApproximator
-            evaluator = build_comonet_evaluator(approx, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa SPDEApproximator
-            evaluator = build_spde_evaluator(approx.mesh_points, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa ShapeConstrainedSPDEApproximator
-            evaluator = build_constrained_spde_evaluator(approx, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        end
+        # Per-type construction lives in build_evaluator
+        # (approximator_interface.jl) — the extension point for custom
+        # approximator types.
+        push!(uf_entries, approx.name => build_evaluator(approx, params_k))
     end
 
     # Merge unknown function evaluators with known params
@@ -992,23 +969,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         np = nparams(approx)
         params_k = p_opt[offset+1:offset+np]
         offset += np
-        if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2],
-                                    length=approx.nknots))
-            uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
-        elseif approx isa NeuralApproximator
-            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
-        elseif approx isa GPApproximator
-            uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
-        elseif approx isa COMONetApproximator
-            uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
-        elseif approx isa SPDEApproximator
-            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
-        elseif approx isa ShapeConstrainedSPDEApproximator
-            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
-        end
+        uf_evals[approx.name] = build_evaluator(approx, params_k)
     end
 
     if verbose
