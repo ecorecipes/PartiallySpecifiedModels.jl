@@ -30,6 +30,18 @@ and naturally handles non-smooth or stiff forward models.
 # Returns
 `PSMSolution` with fitted parameters and `convergence` containing
 `:ensemble_spread` (final ensemble std) and `:ensemble_history`.
+
+`sol.convergence.converged` is honest: it is `true` only when the
+ensemble actually collapsed (mean particle std fell to 1e-3 of its
+initial value, `reason = :ensemble_collapse`). Exhausting
+`n_iterations` reports `converged = false, reason = :maxiters`, and a
+failed forward solve at the ensemble mean — which makes the fitted
+values `NaN` and `data_loss` `Inf` — reports
+`reason = :final_solve_failed`.
+
+Note the discrete-time convention: discrete problems are propagated with
+`simulate_discrete` (unit steps over `tspan`, data times snapped to the
+nearest integer step), the same trajectory every other solver sees.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
     _validate_problem(prob, "EnsembleKalmanSolver")
@@ -102,8 +114,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
 
     spread_history = Float64[]
 
+    # Honest convergence reporting: EKI has a real stopping test (ensemble
+    # collapse); exhausting n_iterations is NOT convergence.
+    conv_converged = false
+    conv_reason = :maxiters
+    iters_used = n_iter
+
     # ── EKI iterations ───────────────────────────────────────────
     for iter in 1:n_iter
+        iters_used = iter
         # Evaluate forward model for each particle; failures return nothing.
         # (A 1e6 sentinel column would inflate the ensemble covariances by
         # ~1e12 and drag the whole ensemble in a single update.)
@@ -157,6 +176,22 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
             println("  iter $iter: misfit=$(round(misfit, sigdigits=4)) " *
                     "spread=$(round(spread, sigdigits=4))")
         end
+
+        # Stopping test: ensemble collapse. EKI contracts the ensemble
+        # geometrically; once the mean particle std is a thousandth of its
+        # initial value the particles agree and further iterations only
+        # shrink an already degenerate ensemble. Without this test the
+        # solver had NO stopping criterion at all, yet reported
+        # converged=true unconditionally.
+        if spread <= 1e-3 * spread_history[1]
+            conv_converged = true
+            conv_reason = :ensemble_collapse
+            if verbose
+                println("  Ensemble collapsed at iter $iter " *
+                        "(spread=$(round(spread, sigdigits=3)))")
+            end
+            break
+        end
     end
 
     # ── Build solution from ensemble mean ────────────────────────
@@ -172,8 +207,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
     pred = pred_vec === nothing ? fill(NaN, n_times, n_obs) :
                                   reshape(pred_vec, n_times, n_obs)
 
-    data_loss = pred_vec === nothing ? Inf :
-                sum(abs2, prob.data_values .- pred)
+    # NaN fitted values and an infinite loss are a failed fit, not a
+    # converged one — override whatever the iteration reported.
+    if pred_vec === nothing
+        conv_converged = false
+        conv_reason = :final_solve_failed
+    end
+
+    # Weighted sum of squares over usable cells, matching the data_loss
+    # convention of the other solvers (masked / NaN cells are skipped so
+    # one missing observation does not turn the reported loss into NaN).
+    data_loss = pred_vec === nothing ? Inf : weighted_data_loss(prob, pred)
 
     # Build UF evaluators
     uf_evals = Dict{Symbol, Any}()
@@ -216,7 +260,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
     PSMSolution(params, data_loss, data_loss, edf, Float64[alg.noise_scale],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (converged=true, iterations=n_iter, method=:ensemble_kalman,
+                (converged=conv_converged, iterations=iters_used,
+                 reason=conv_reason, method=:ensemble_kalman,
                  ensemble_spread=spread_history,
                  ensemble_std=ensemble_std))
 end

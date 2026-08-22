@@ -451,10 +451,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     pred  = simulate(prob, p_opt)
 
     # Data loss (weighted SS)
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:n_times
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Final EDF via hat matrix
     k = 1

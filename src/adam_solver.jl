@@ -12,7 +12,11 @@ using ForwardDiff
 
 # The ForwardDiff-compatible MLP machinery (MLPSpec, mlp_spec_from_lux,
 # mlp_evaluate, init_mlp_params) lives in neural_evaluator.jl, shared by
-# all solvers.
+# all solvers. Solvers reach it only through the guarded entry points
+# `neural_init_params` (initialisation) and `build_neural_evaluator`
+# (evaluation): `mlp_spec_from_lux` ERRORS on architectures it cannot
+# describe, so calling it directly turns an exotic-but-valid Lux model
+# into a hard failure at solve() instead of a fallback.
 
 # ─── ForwardDiff-compatible param struct builder ─────────────────
 
@@ -318,14 +322,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
 
     # Initialize parameters
     beta = Float64[]
-    mlp_specs = Dict{Symbol, MLPSpec}()
 
     for approx in prob.approximators
         if approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            mlp_specs[approx.name] = spec
             rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            append!(beta, init_mlp_params(spec, rng))
+            append!(beta, neural_init_params(approx, rng))
         else
             append!(beta, initial_params(approx))
         end
@@ -490,10 +491,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
         end
     end
 
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:T_pts
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Build evaluators for plotting
     uf_evals = Dict{Symbol, Any}()

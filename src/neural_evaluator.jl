@@ -108,6 +108,55 @@ function init_mlp_params(spec::MLPSpec, rng::AbstractRNG)
     params
 end
 
+# ─── Architecture probe shared by every solver ───────────────────
+
+"""
+    neural_mlp_spec(approx::NeuralApproximator) -> Union{MLPSpec, Nothing}
+
+The Dual-safe `MLPSpec` for `approx.model`, or `nothing` when
+`mlp_spec_from_lux` cannot describe the architecture (anything other than
+a `Lux.Chain` of `Lux.Dense` layers — `WrappedFunction`, `Dropout`,
+`SkipConnection`, `use_bias=false`, …).
+
+`mlp_spec_from_lux` *errors* on those models by design, so every caller
+must go through this probe rather than calling it directly: an
+unguarded call turns an exotic-but-valid architecture into a hard error
+at `solve()`, when the correct behaviour is to fall back to the
+`Lux.apply` path in `build_neural_evaluator`.
+"""
+function neural_mlp_spec(approx::NeuralApproximator)
+    try
+        mlp_spec_from_lux(approx.model)
+    catch e
+        e isa InterruptException && rethrow()
+        # Not silent: without this the only symptom of a genuine bug (a
+        # typo or a Lux rename inside mlp_spec_from_lux) would be every
+        # model quietly taking the slower, less Dual-safe fallback.
+        @debug("Dual-safe MLP evaluator unavailable for approximator " *
+               ":$(approx.name); using the Lux.apply fallback.",
+               exception = e)
+        nothing
+    end
+end
+
+"""
+    neural_init_params(approx::NeuralApproximator, rng) -> Vector{Float64}
+
+Initial parameter vector for a `NeuralApproximator`, always
+`nparams(approx)` long: Glorot draws via `init_mlp_params` for a
+Dense-only chain, and Lux's own initialisation (driven by the same `rng`)
+for architectures the MLP spec cannot describe. Solvers use this instead
+of `init_mlp_params(mlp_spec_from_lux(...), rng)` so an exotic
+architecture initialises correctly and is then evaluated through the
+`build_neural_evaluator` fallback, rather than erroring out of `solve`.
+"""
+function neural_init_params(approx::NeuralApproximator, rng::AbstractRNG)
+    spec = neural_mlp_spec(approx)
+    spec === nothing || return init_mlp_params(spec, rng)
+    ps, _ = Lux.setup(rng, approx.model)
+    Float64.(collect(ComponentArray(ps)))
+end
+
 # ─── Unified NeuralApproximator evaluator ────────────────────────
 
 """
@@ -133,12 +182,8 @@ function build_neural_evaluator(approx::NeuralApproximator, params_k)
     span = approx.domain === nothing ? nothing :
            (approx.domain[2] - approx.domain[1])
 
-    spec = try
-        mlp_spec_from_lux(approx.model)
-    catch e
-        e isa InterruptException && rethrow()
-        nothing  # exotic architecture — use the Lux.apply fallback below
-    end
+    # `nothing` ⇒ exotic architecture; use the Lux.apply fallback below.
+    spec = neural_mlp_spec(approx)
 
     if spec !== nothing
         let pk = params_k, s = spec, lo_ = lo, span_ = span

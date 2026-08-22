@@ -268,9 +268,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     beta0 = Float64[]
     for approx in prob.approximators
         if approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
             rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            append!(beta0, init_mlp_params(spec, rng))
+            append!(beta0, neural_init_params(approx, rng))
         else
             append!(beta0, initial_params(approx))
         end
@@ -402,13 +401,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     end
 
     # Masked/NaN cells are skipped (0 * NaN = NaN would make data_loss NaN).
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:n_t
-        w = prob.data_weights[i, j]
-        y = prob.data_values[i, j]
-        (w > 0 && !isnan(y)) || continue
-        data_loss += w * (y - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Build evaluators from MAP params
     uf_evals = Dict{Symbol, Any}()
@@ -432,19 +425,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
         elseif approx isa ShapeConstrainedSPDEApproximator
             uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                uf_evals[approx.name] = x -> begin
-                    xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
-                        (Float64(x isa AbstractArray ? x[1] : x) - lo_) / span_
-                    else
-                        Float64(x isa AbstractArray ? x[1] : x)
-                    end
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         end
     end
 

@@ -345,7 +345,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
                                            interrogate=alg.interrogate)
 
     # Extract solution at data times and compute data loss
-    data_loss = 0.0
     pred = zeros(n_t, n_obs)
     for i in 1:n_t
         idx = _nearest_grid_index(times, prob.data_times[i])
@@ -353,9 +352,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             pred[i, j] = μ_smooth[idx][sk][1]
-            data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
         end
     end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Build evaluators
     uf_evals = Dict{Symbol, Any}()

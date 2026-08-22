@@ -758,10 +758,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     end
 
     # Compute data loss
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:T_pts
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Compute ODE compliance
     F = eval_ode_rhs(prob, times, alpha, beta)

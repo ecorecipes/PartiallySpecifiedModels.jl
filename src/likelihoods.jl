@@ -33,20 +33,29 @@ function _normcdf(x::Real)
 end
 
 """
-Standard normal log-CDF log Φ(x), stable and accurate for large negative x.
+Standard normal log-CDF log Φ(x), stable and accurate in BOTH tails.
 
 Replaces a truncated asymptotic expansion that dropped the Mills-series
 correction, causing a ~0.022 jump at the old x = −6 branch switch and
 0.3–0.7% log error across the tail (the A&S rational `_normcdf` is accurate
-ABSOLUTELY to 7.5e-8, so its log error also grows in the tail). Both
-branches below are accurate to ~1e-15, so the x = −1 seam is smooth to
-machine precision — second differences across it (e.g. finite-difference
+ABSOLUTELY to 7.5e-8, so its log error also grows in the tail). All
+branches below are accurate to ~1e-15 relative, so the seams are smooth to
+machine precision — second differences across them (e.g. finite-difference
 information checks) stay clean.
+
+The positive half is computed from the negative half by complement,
+`log Φ(x) = log1p(−Φ(−x))`: `log(0.5 + φ(x)Σ…)` loses all relative
+precision as Φ → 1 (only ~7 correct digits at x = 6, none past x ≈ 9,
+where it returns exactly 0), and a branch switch there made the function
+DECREASE by 3.5e-12 across x = 6 — the only non-monotone point of the
+whole function. Going through the (tiny, fully accurate) upper tail
+instead keeps ~1e-16 relative accuracy for every x > 0.
 """
 function _normlogcdf(x::Real)
-    if x > 6.0
-        # Φ ≈ 1: the rational approximation's log error here is ≲1e-12.
-        log(_normcdf(x))
+    if x > 0.0
+        # Φ(x) = 1 − Φ(−x) with Φ(−x) ≤ ½ computed to full relative
+        # precision by the branches below; log1p is exact for tiny inputs.
+        log1p(-exp(_normlogcdf(-x)))
     elseif x > -1.0
         # Exact small-|x| series (Abramowitz & Stegun 26.2.11):
         #   Φ(x) = ½ + φ(x) Σ_{n≥0} x^{2n+1}/(2n+1)!!

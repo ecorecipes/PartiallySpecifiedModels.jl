@@ -115,6 +115,29 @@ function build_param_struct(prob::PSMProblem, beta::AbstractVector)
 end
 
 """
+    weighted_data_loss(prob, pred) -> Float64
+
+The reported `PSMSolution.data_loss`: the weighted residual sum of
+squares `Σ wᵢⱼ (yᵢⱼ − ŷᵢⱼ)²` taken over the USABLE data cells only.
+
+A cell is usable when its weight is positive and its datum is finite.
+Skipping the rest matters twice over: an unweighted sum silently ignores
+`data_weights` (so a masked or down-weighted observation still counts),
+and `0 * NaN = NaN` would otherwise let a single masked-out missing
+observation turn the whole reported loss into `NaN`.
+"""
+function weighted_data_loss(prob::PSMProblem, pred::AbstractMatrix)
+    dl = 0.0
+    for k in eachindex(prob.data_values)
+        w = prob.data_weights[k]
+        y = prob.data_values[k]
+        (w > 0 && isfinite(y)) || continue
+        dl += w * (pred[k] - y)^2
+    end
+    dl
+end
+
+"""
     _is_program_error(e)
 
 Classify an exception caught inside a solver objective. Programming
@@ -136,7 +159,14 @@ function _is_program_error(e::InexactError)
 end
 _is_program_error(e) = e isa Union{MethodError, BoundsError, UndefVarError,
                                    TypeError, KeyError, DimensionMismatch,
-                                   UndefRefError}
+                                   UndefRefError,
+                                   # Not a "program error" as such, but it
+                                   # must escape for the same reason: a
+                                   # Ctrl-C landing inside user dynamics was
+                                   # otherwise swallowed as a numerical
+                                   # failure at ~20 rethrow sites, making
+                                   # long solves uninterruptible.
+                                   InterruptException}
 
 """
     _adapt_gp_approximators!(prob, beta) -> Bool
@@ -836,11 +866,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     # Compute data loss (masked cells — zero weight or NaN datum — are
     # skipped; `0 * NaN = NaN` would otherwise contaminate the total)
     data_loss = 0.0
+    n_used = 0          # cells that actually contributed to data_loss
     for j in 1:n_obs, i in 1:n_times
         wv = prob.data_weights[i,j]
         y = prob.data_values[i,j]
         (wv > 0 && !isnan(y)) || continue
         data_loss += wv * (y - pred[i,j])^2
+        n_used += 1
     end
 
     # EDF from hat matrix
@@ -923,7 +955,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
 
     # Estimate σ² for Gaussian (needed for CI scaling)
     sigma2_hat = if prob.likelihood isa Gaussian
-        data_loss / max(n_data - edf, 1.0)
+        # Divide the MASKED data_loss by the number of cells that actually
+        # contributed to it, not by every cell in the data matrix: using
+        # n_data biased σ̂² low (and CIs narrow) in proportion to the amount
+        # of missing/zero-weight data. Matches profile_likelihood_solver.jl.
+        data_loss / max(n_used - edf, 1.0)
     else
         1.0  # non-Gaussian: V_β already on natural scale
     end

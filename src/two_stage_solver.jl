@@ -111,14 +111,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
 
     # Initialize parameters
     beta = Float64[]
-    mlp_specs = Dict{Symbol, MLPSpec}()
 
     for approx in prob.approximators
         if approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            mlp_specs[approx.name] = spec
             rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            append!(beta, init_mlp_params(spec, rng))
+            append!(beta, neural_init_params(approx, rng))
         else
             append!(beta, initial_params(approx))
         end
@@ -229,8 +226,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
                     "lr=$(round(lr_t, sigdigits=3))")
         end
 
-        # Convergence: loss plateau over window
-        if iter > 60
+        # Convergence: loss plateau over window. Guard against SPURIOUS
+        # plateaus manufactured by the cosine lr schedule: near maxiters
+        # lr_t → 0, so the loss stops moving no matter how far from an
+        # optimum we are. Only declare plateau-convergence while the step
+        # size is still meaningful (lr_t > 5% of the base lr).
+        if iter > 60 && lr_t > 0.05 * lr
             recent_min = minimum(loss_window)
             recent_max = maximum(loss_window)
             if (recent_max - recent_min) / max(abs(recent_min), 1.0) < 1e-6
@@ -257,10 +258,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
     end
 
     # Data loss against original observations
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:n_times
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Build evaluators for each approximator
     uf_evals = Dict{Symbol, Any}()
@@ -274,19 +272,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_specs[approx.name]
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                uf_evals[approx.name] = x -> begin
-                    xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
-                        (Float64(x isa AbstractArray ? x[1] : x) - lo_) / span_
-                    else
-                        Float64(x isa AbstractArray ? x[1] : x)
-                    end
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator

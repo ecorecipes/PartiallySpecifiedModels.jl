@@ -143,16 +143,7 @@ function _magi_build_uf(prob, theta)
         elseif approx isa GPApproximator
             push!(uf_entries, approx.name => build_gp_evaluator(approx, params_k))
         elseif approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = params_k, s = spec, lo_ = lo, span_ = span
-                push!(uf_entries, approx.name => (x -> begin
-                    xval = x isa AbstractArray ? x[1] : x
-                    xn = (lo_ !== nothing && span_ !== nothing && span_ > 0) ? (xval - lo_) / span_ : xval
-                    mlp_evaluate(s, pk, xn)
-                end))
-            end
+            push!(uf_entries, approx.name => build_neural_evaluator(approx, params_k))
         end
     end
     merge(NamedTuple(uf_entries), prob.known_params)
@@ -456,17 +447,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                uf_evals[approx.name] = x -> begin
-                    xn = (lo_ !== nothing && span_ !== nothing && span_ > 0) ?
-                         (Float64(x isa AbstractArray ? x[1] : x) - lo_) / span_ :
-                         Float64(x isa AbstractArray ? x[1] : x)
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         end
     end
 

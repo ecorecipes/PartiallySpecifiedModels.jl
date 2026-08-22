@@ -4130,6 +4130,34 @@ using StableRNGs
             # jumped by ~0.022).
             @test abs(_normlogcdf(-1.0) - log(_normcdf(-1.0))) < 1e-7
             @test abs(_normlogcdf(-1.0 + 1e-10) - _normlogcdf(-1.0 - 1e-10)) < 1e-7
+
+            # RIGHT tail (RB/N5). The x > 6 branch used to be
+            # log(_normcdf(x)), which loses all relative precision as
+            # Φ → 1: it erred by 3.6e-3 at x = 6.0001, 7.1e-2 at x = 8,
+            # returned exactly 0.0 from x ≈ 9 on, and DECREASED by
+            # 3.5e-12 across x = 6 — the only non-monotone point of the
+            # function. Computing the positive half by complement,
+            # log1p(−Φ(−x)), is accurate to ~1e-15 everywhere.
+            # References: 512-bit BigFloat Simpson quadrature of φ on
+            # [x, x+60], log1p(−Q).
+            right_refs = ((6.0,  -9.865876455244298e-10),
+                          (7.0,  -1.2798125438867863e-12),
+                          (8.0,  -6.220960574272895e-16),
+                          (10.0, -7.619853024163884e-24))
+            for (x, r) in right_refs
+                @test _normlogcdf(x) ≈ r rtol=1e-11
+            end
+            # Continuity AND monotonicity across the retired x = 6 seam.
+            @test _normlogcdf(nextfloat(6.0)) >= _normlogcdf(6.0)
+            # Across ±1e-10 the only change should be the true slope
+            # φ(6)/Φ(6) ≈ 6.076e-9, i.e. ≈1.2e-18 — the old branch jumped
+            # by 3.5e-12, nine orders of magnitude more.
+            @test abs(_normlogcdf(6.0 + 1e-10) - _normlogcdf(6.0 - 1e-10)) < 1e-17
+            # Monotone over a dense sweep spanning every branch.
+            sweep = [_normlogcdf(x) for x in range(-10.0, 10.0, length=20_001)]
+            @test all(sweep[i+1] >= sweep[i] for i in 1:length(sweep)-1)
+            # log Φ(x) < 0 strictly for every finite x (never rounds to 0).
+            @test all(_normlogcdf(x) < 0 for x in (6.0, 8.0, 10.0, 15.0, 20.0))
         end
 
         @testset "Poisson: mu floor consistent between loglik and weights" begin
@@ -4248,6 +4276,160 @@ using StableRNGs
                 smooth_and_differentiate(times, data, [1, 1], 2)
             end
             @test isapprox(ys[5, 1], 2 * times[5], atol=1e-6)
+        end
+    end
+
+    # ── Remediation round RB: completeness fixes ─────────────────
+    @testset "Remediation RB — completeness" begin
+
+        @testset "exotic Lux architectures reach the fallback, not an error" begin
+            import Lux
+            using PartiallySpecifiedModels: neural_mlp_spec, neural_init_params,
+                                            mlp_spec_from_lux
+            # mlp_spec_from_lux errors by design on anything that is not a
+            # Chain of Dense layers. Every solver used to call it directly,
+            # so a perfectly valid architecture hard-errored at solve():
+            #   "The Dual-safe MLP evaluator supports Chains of Lux.Dense
+            #    layers only; the given model contains a
+            #    Lux.WrappedFunction{…} layer"
+            # thrown from AdamSolver's beta initialisation, BEFORE the
+            # solver could reach its own working Lux.apply fallback.
+            m_wf = Lux.Chain(Lux.Dense(1, 4, tanh),
+                             Lux.WrappedFunction(x -> x),
+                             Lux.Dense(4, 1))
+            m_nb = Lux.Chain(Lux.Dense(1, 4, tanh),
+                             Lux.Dense(4, 1; use_bias=false))
+            for m in (m_wf, m_nb)
+                a = NeuralApproximator(:f, m; domain=(0.0, 6.0), rng_seed=7)
+                @test_throws ErrorException mlp_spec_from_lux(a.model)
+                # The guarded probe reports "no spec" instead of throwing…
+                @test neural_mlp_spec(a) === nothing
+                # …and initialisation still yields a full-length vector
+                # (Lux's own init), so the fallback evaluator can use it.
+                p0 = neural_init_params(a, Random.Xoshiro(7))
+                @test length(p0) == nparams(a)
+                @test all(isfinite, p0)
+            end
+            # A Dense-only chain still takes the fast Dual-safe path.
+            a_ok = NeuralApproximator(:f, Lux.Chain(Lux.Dense(1, 4, tanh),
+                                                    Lux.Dense(4, 1));
+                                      domain=(0.0, 6.0), rng_seed=7)
+            @test neural_mlp_spec(a_ok) !== nothing
+
+            # End-to-end: both exotic architectures now fit.
+            decay_rb!(du, u, p, t) = (du[1] = -p.f(u[1]))
+            ts_rb = collect(0.0:0.5:10.0)
+            ys_rb = reshape(5.0 .* exp.(-0.5 .* ts_rb), :, 1)
+            for m in (m_wf, m_nb)
+                a = NeuralApproximator(:f, m; domain=(0.0, 6.0), rng_seed=7)
+                prob_rb = PSMProblem(decay_rb!, [5.0], (0.0, 10.0), [a];
+                    data_times=ts_rb, data_values=ys_rb, obs_to_state=[1],
+                    known_params=NamedTuple(), solver=Tsit5())
+                sol_rb = solve(prob_rb, AdamSolver(maxiters=30, lr=0.02,
+                                                   verbose=false))
+                @test sol_rb isa PSMSolution
+                @test isfinite(sol_rb.data_loss)
+                @test all(isfinite, sol_rb.fitted_values)
+                @test isfinite(sol_rb.unknown_functions[:f](2.0))
+            end
+        end
+
+        @testset "cosine-lr plateau guard — TwoStage / IntegralMatching" begin
+            # With maxiters = 70 every iteration past the plateau window
+            # start (iter > 60) has lr_t = lr·½(1+cos(π·iter/70)) < 0.05·lr,
+            # and lr = 1e-12 freezes beta, so the loss window is flat.
+            # Pre-fix both solvers reported converged=true, reason=:plateau
+            # at iter 61 — a plateau manufactured entirely by the schedule.
+            decay_g!(du, u, p, t) = (du[1] = -p.f(u[1]))
+            ts_g = collect(0.0:0.5:10.0)
+            ys_g = reshape(5.0 .* exp.(-0.5 .* ts_g), :, 1)
+            prob_g = PSMProblem(decay_g!, [5.0], (0.0, 10.0),
+                [BSplineApproximator(:f, (0.0, 6.0), 6)];
+                data_times=ts_g, data_values=ys_g, obs_to_state=[1],
+                known_params=NamedTuple(), solver=Tsit5())
+
+            s_ts = solve(prob_g, TwoStageSolver(maxiters=70, lr=1e-12,
+                                                verbose=false))
+            @test s_ts.convergence.converged == false
+            @test s_ts.convergence.reason == :maxiters
+            @test s_ts.convergence.iterations == 70
+
+            s_im = solve(prob_g, IntegralMatchingSolver(maxiters=70, lr=1e-12,
+                                                        verbose=false))
+            @test s_im.convergence.converged == false
+            @test s_im.convergence.reason == :maxiters
+        end
+
+        @testset "EnsembleKalmanSolver — honest convergence" begin
+            decay_ke!(du, u, p, t) = (du[1] = -p.f(u[1]))
+            ts_ke = collect(0.0:0.5:10.0)
+            ys_ke = reshape(5.0 .* exp.(-0.5 .* ts_ke), :, 1)
+            prob_ke = PSMProblem(decay_ke!, [5.0], (0.0, 10.0),
+                [BSplineApproximator(:f, (0.0, 6.0), 6)];
+                data_times=ts_ke, data_values=ys_ke, obs_to_state=[1],
+                known_params=NamedTuple(), solver=Tsit5())
+            s_ke = solve(prob_ke, EnsembleKalmanSolver(n_ensemble=30,
+                                                       n_iterations=15))
+            # Pre-fix: converged=true unconditionally, with no stopping
+            # test of any kind and no :reason key at all.
+            @test haskey(s_ke.convergence, :reason)
+            @test s_ke.convergence.converged == false
+            @test s_ke.convergence.reason == :maxiters
+            @test s_ke.convergence.iterations == 15
+            # The ensemble did not collapse to 1e-3 of its initial spread,
+            # which is exactly why :maxiters is the honest answer.
+            spread = s_ke.convergence.ensemble_spread
+            @test spread[end] > 1e-3 * spread[1]
+            # converged=true is reachable only via the collapse criterion.
+            @test !s_ke.convergence.converged ||
+                  s_ke.convergence.reason == :ensemble_collapse
+        end
+
+        @testset "ProfileLikelihoodSolver propagates base convergence" begin
+            decay_pl!(du, u, p, t) = (du[1] = -p.f(u[1]))
+            ts_pl = collect(0.0:0.5:10.0)
+            ys_pl = reshape(5.0 .* exp.(-0.5 .* ts_pl), :, 1)
+            prob_pl = PSMProblem(decay_pl!, [5.0], (0.0, 10.0),
+                [BSplineApproximator(:f, (0.0, 6.0), 6)];
+                data_times=ts_pl, data_values=ys_pl, obs_to_state=[1],
+                known_params=NamedTuple(), solver=Tsit5())
+            base = solve(prob_pl, LAML(verbose=false))
+            s_pl = solve(prob_pl, ProfileLikelihoodSolver(n_profile_points=5,
+                                                          param_indices=[1]))
+            # Pre-fix the base fit's NamedTuple was discarded and replaced
+            # by a hard-coded converged=true with no :reason/:iterations.
+            @test s_pl.convergence.converged == base.convergence.converged
+            @test s_pl.convergence.reason == base.convergence.reason
+            @test s_pl.convergence.iterations == base.convergence.iterations
+            @test s_pl.convergence.method == :profile_likelihood
+            @test haskey(s_pl.convergence, :profiles)
+        end
+
+        @testset "weighted_data_loss — weighted and NaN-safe" begin
+            using PartiallySpecifiedModels: weighted_data_loss
+            decay_w!(du, u, p, t) = (du[1] = -p.f(u[1]))
+            ts_w = collect(0.0:1.0:5.0)
+            ys_w = reshape(collect(1.0:6.0), :, 1)
+            w = ones(6, 1); w[2] = 0.0; w[4] = 0.5
+            dv = copy(ys_w); dv[2] = NaN          # masked-out missing datum
+            prob_w = PSMProblem(decay_w!, [1.0], (0.0, 5.0),
+                [BSplineApproximator(:f, (0.0, 6.0), 4)];
+                data_times=ts_w, data_values=dv, obs_to_state=[1],
+                known_params=NamedTuple(), data_weights=w, solver=Tsit5())
+            pred = fill(0.0, 6, 1)
+            # 0*NaN = NaN would poison an unmasked sum; the masked cell and
+            # the half-weighted cell must both be honoured.
+            expected = 1.0^2 + 0.5 * 4.0^2 + 3.0^2 + 5.0^2 + 6.0^2
+            @test weighted_data_loss(prob_w, pred) ≈ expected
+            @test isfinite(weighted_data_loss(prob_w, pred))
+        end
+
+        @testset "_is_program_error rethrows InterruptException" begin
+            using PartiallySpecifiedModels: _is_program_error
+            # Ctrl-C inside user dynamics was previously swallowed as a
+            # numerical failure at ~20 rethrow sites.
+            @test _is_program_error(InterruptException())
+            @test !_is_program_error(DomainError(-1.0, "sqrt"))
         end
     end
 

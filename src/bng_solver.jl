@@ -114,12 +114,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     end
 
     # ── Parameter initialisation ─────────────────────────────────
-    mlp_specs = Dict{Symbol, MLPSpec}()
-    for approx in prob.approximators
-        approx isa NeuralApproximator &&
-            (mlp_specs[approx.name] = mlp_spec_from_lux(approx.model))
-    end
-
     # kp = 1 uses the default initialisation (a seeded neural approximator
     # keeps its own seed; unseeded ones draw fresh weights); kp > 1 perturbs
     # it — fresh random weights for neural approximators, jittered
@@ -131,7 +125,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
             if approx isa NeuralApproximator
                 r = kp == 1 && approx.rng_seed !== nothing ?
                     Random.Xoshiro(approx.rng_seed) : rng
-                append!(beta, init_mlp_params(mlp_specs[approx.name], r))
+                append!(beta, neural_init_params(approx, r))
             else
                 b0 = Float64.(initial_params(approx))
                 kp > 1 && (b0 .+= 0.2 .* (abs.(b0) .+ 1.0) .* randn(rng, length(b0)))
@@ -221,7 +215,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
             m_hat = m_adam ./ (1 - β1_adam^iter)
             v_hat = v_adam ./ (1 - β2_adam^iter)
             beta .-= lr_t .* m_hat ./ (sqrt.(v_hat) .+ eps_adam)
-            if iter > 60
+            # Plateau convergence, guarded against the cosine lr schedule
+            # manufacturing a plateau as lr_t → 0 near maxiters.
+            if iter > 60 && lr_t > 0.05 * alg.lr
                 rmin, rmax = extrema(loss_window)
                 if (rmax - rmin) / max(abs(rmin), 1.0) < 1e-6
                     iters_used = iter
@@ -323,10 +319,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     end
 
     # Data loss against original observations
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:n_times
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Per-member evaluators for one approximator's parameter block
     function build_eval(approx, params_k)
@@ -335,19 +328,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
                                     length=approx.nknots))
             build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_specs[approx.name]
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                x -> begin
-                    xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
-                        (Float64(x isa AbstractArray ? x[1] : x) - lo_) / span_
-                    else
-                        Float64(x isa AbstractArray ? x[1] : x)
-                    end
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator
