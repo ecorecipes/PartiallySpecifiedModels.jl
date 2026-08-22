@@ -145,6 +145,7 @@ include("bootstrap.jl")
 export AbstractApproximator, BSplineApproximator, NeuralApproximator, GPApproximator, SPDEApproximator
 export TensorBSplineApproximator
 export ShapeConstrainedBSplineApproximator, ShapeConstrainedSPDEApproximator, SHAPE_CONSTRAINTS
+export ShapeConstrainedGPApproximator
 export COMONetApproximator, COMONET_CONSTRAINTS
 export AbstractLikelihood, Gaussian, Poisson, NegativeBinomial, TruncatedNormal,
        CustomLikelihood

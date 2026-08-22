@@ -22,6 +22,7 @@ AbstractApproximator
 - [`ShapeConstrainedSPDEApproximator`](@ref)
 - [`NeuralApproximator`](@ref)
 - [`GPApproximator`](@ref)
+- [`ShapeConstrainedGPApproximator`](@ref)
 - [`COMONetApproximator`](@ref)
 
 ### Shape-Constraint Constants

@@ -285,50 +285,40 @@ mutable struct GPApproximator <: AbstractApproximator
     const adapt::Bool
 end
 
-function GPApproximator(name::Union{Symbol,String},
-                        domain::Tuple{<:Real, <:Real},
-                        n_inducing::Int;
-                        kernel::Symbol=:sqexp,
-                        lengthscale::Union{Nothing, Real}=nothing,
-                        variance::Real=1.0,
-                        initial=nothing)
-    name_s = Symbol(name)
-    d = (Float64(domain[1]), Float64(domain[2]))
-    _validate_domain("GPApproximator", d)
-    σ² = Float64(variance)
-    ℓ = if lengthscale === nothing
-        # Default lengthscale: normalize so adjacent inducing points have
-        # similar correlation (~0.6) regardless of kernel type.
-        # SqExp at h gives exp(-0.5) ≈ 0.607; Matérn kernels need longer ℓ
-        # to achieve the same correlation due to their heavier tails.
-        h = Float64((d[2] - d[1]) / max(n_inducing - 1, 1))
-        if kernel == :matern32
-            2.0 * h     # (1+√3·h/(2h))·exp(-√3·h/(2h)) ≈ 0.60
-        elseif kernel == :matern52
-            1.9 * h     # (1+√5·h/(1.9h)+5/(3·1.9²))·exp(-√5·h/(1.9h)) ≈ 0.61
-        else
-            h           # SqExp: exp(-0.5) ≈ 0.607
-        end
+"""
+    _gp_default_lengthscale(kernel, d, n_inducing) -> Float64
+
+Default lengthscale: normalize so adjacent inducing points have similar
+correlation (~0.6) regardless of kernel type. SqExp at h gives
+exp(-0.5) ≈ 0.607; Matérn kernels need longer ℓ to achieve the same
+correlation due to their heavier tails.
+"""
+function _gp_default_lengthscale(kernel::Symbol, d::Tuple{Float64, Float64},
+                                 n_inducing::Int)
+    h = Float64((d[2] - d[1]) / max(n_inducing - 1, 1))
+    if kernel == :matern32
+        2.0 * h     # (1+√3·h/(2h))·exp(-√3·h/(2h)) ≈ 0.60
+    elseif kernel == :matern52
+        1.9 * h     # (1+√5·h/(1.9h)+5/(3·1.9²))·exp(-√5·h/(1.9h)) ≈ 0.61
     else
-        Float64(lengthscale)
+        h           # SqExp: exp(-0.5) ≈ 0.607
     end
+end
 
-    # Kernel function
+"""
+    _gp_kernel_matrices(kernel, ℓ, σ², x_ind) -> (K, K_inv)
+
+Build the inducing-point kernel matrix and its (jittered, symmetrized)
+inverse. Factor with scaled jitter: squared-exponential Gram matrices are
+notoriously ill-conditioned as n_inducing grows; a fixed 1e-8 jitter plus
+explicit inv() produced large oscillatory weights K⁻¹f between inducing
+points. Scale the jitter to the kernel magnitude and escalate until the
+Cholesky succeeds.
+"""
+function _gp_kernel_matrices(kernel::Symbol, ℓ::Float64, σ²::Float64,
+                             x_ind::Vector{Float64})
     kfunc = _kernel_func(kernel, ℓ, σ²)
-
-    # Inducing points uniformly spaced in domain
-    n_inducing >= 2 ||
-        throw(ArgumentError("GPApproximator needs n_inducing ≥ 2 (got $n_inducing)"))
-    x_ind = collect(range(d[1], d[2], length=n_inducing))
-
-    # Build kernel matrix
     K = _build_kernel_matrix(kfunc, x_ind)
-
-    # Factor with scaled jitter. Squared-exponential Gram matrices are
-    # notoriously ill-conditioned as n_inducing grows; a fixed 1e-8 jitter
-    # plus explicit inv() produced large oscillatory weights K⁻¹f between
-    # inducing points. Scale the jitter to the kernel magnitude and escalate
-    # until the Cholesky succeeds.
     scale = max(maximum(abs, K), 1.0)
     K_inv = nothing
     for jit in (1e-8, 1e-6, 1e-4)
@@ -340,6 +330,30 @@ function GPApproximator(name::Union{Symbol,String},
     end
     K_inv === nothing && (K_inv = pinv(K + 1e-4 * scale * I))
     K_inv = 0.5 * (K_inv + K_inv')  # symmetrize
+    K, K_inv
+end
+
+function GPApproximator(name::Union{Symbol,String},
+                        domain::Tuple{<:Real, <:Real},
+                        n_inducing::Int;
+                        kernel::Symbol=:sqexp,
+                        lengthscale::Union{Nothing, Real}=nothing,
+                        variance::Real=1.0,
+                        initial=nothing)
+    name_s = Symbol(name)
+    d = (Float64(domain[1]), Float64(domain[2]))
+    _validate_domain("GPApproximator", d)
+    σ² = Float64(variance)
+    ℓ = lengthscale === nothing ? _gp_default_lengthscale(kernel, d, n_inducing) :
+        Float64(lengthscale)
+
+    # Inducing points uniformly spaced in domain
+    n_inducing >= 2 ||
+        throw(ArgumentError("GPApproximator needs n_inducing ≥ 2 (got $n_inducing)"))
+    x_ind = collect(range(d[1], d[2], length=n_inducing))
+
+    # Kernel matrix and jittered inverse
+    K, K_inv = _gp_kernel_matrices(kernel, ℓ, σ², x_ind)
 
     init_func = if initial === nothing
         x -> 0.0
@@ -732,6 +746,136 @@ function initial_params(a::ShapeConstrainedBSplineApproximator)
     # Linear (free) components pass through unchanged; nonnegative components
     # get a small positive floor (a large floor turned flat initial functions
     # into visible ramps) and are inverted through softplus.
+    return [i in lin ? d[i] :
+            (v = max(d[i], 1e-4); v > 20.0 ? v : log(exp(v) - 1.0))
+            for i in eachindex(d)]
+end
+
+# ─── Shape-constrained GP approximator ────────────────────────────
+
+"""
+    ShapeConstrainedGPApproximator(name, domain, n_inducing, constraint;
+                                   kernel=:sqexp, lengthscale=nothing,
+                                   variance=1.0, initial=nothing)
+
+Kernel-interpolation (GP predictive-mean) approximator with a shape
+constraint enforced via the SCOP-spline reparameterization of Pya & Wood
+(2015) — the same construction used by `ShapeConstrainedBSplineApproximator`
+and `ShapeConstrainedSPDEApproximator`.
+
+Parameters are stored in unconstrained space (γ). During evaluation the
+inducing-point values are computed as `β = Σ * d(γ)` (free level/slope
+components pass through linearly; the rest are softplus'd), then
+interpolated with the GP predictive-mean formula `k(x,X)K⁻¹β` exactly as
+`GPApproximator` does. Because the constraint holds by construction in γ,
+every solver fits this approximator through the ordinary `build_evaluator`
+protocol with no constraint handling of its own.
+
+**Note:** shape constraints are enforced at the inducing-point values. The
+kernel interpolation between points can slightly overshoot (as the cubic
+interpolation of `ShapeConstrainedSPDEApproximator` can), so constraints
+hold approximately (not exactly) between points. Use more inducing points
+to reduce overshoot.
+
+Kernel hyperparameters follow `GPApproximator`: `lengthscale=nothing`
+(default) starts at the spacing-matched default and is re-estimated by
+empirical Bayes during LAML (post-warmup) and GCV fits — applied to the
+IMPLIED inducing values `β = Σ·d(γ)`, which a kernel change does not move —
+while an explicit `lengthscale` is fixed for the whole fit.
+
+The LAML/GCV penalty is the Pya & Wood (2015) SCOP first-difference penalty
+on γ, matching `penalty_matrix(::ShapeConstrainedBSplineApproximator)`: the
+free level (and the slope-like component for curvature constraints) lies in
+the penalty null space, so λ→∞ shrinks toward a maximally smooth member of
+the constraint family without biasing the level.
+
+# Arguments
+- `name`: symbol for the unknown function
+- `domain`: `(lo, hi)` range of the input variable
+- `n_inducing`: number of inducing points (≥ 4)
+- `constraint`: one of `SHAPE_CONSTRAINTS`
+- `kernel`: kernel type — `:sqexp` (default), `:matern32`, or `:matern52`
+- `lengthscale`: kernel lengthscale (`nothing` = adaptive, as above)
+- `variance`: signal variance σ² (default: 1.0)
+- `initial`: optional initial function `x -> y` or constant
+
+# Example
+```julia
+# Monotone increasing predation (functional) response
+approx = ShapeConstrainedGPApproximator(:g, (0.0, 5.0), 10, :increasing;
+    initial=x -> 0.1*x)
+```
+"""
+mutable struct ShapeConstrainedGPApproximator <: AbstractApproximator
+    # Mutable for the same reason as GPApproximator: the fit loop adapts
+    # (lengthscale, variance) — and the derived K/K_inv — by empirical Bayes
+    # on the implied inducing values β = Σ·d(γ) when the user did not supply
+    # a lengthscale. A kernel change moves only the between-point behavior;
+    # the interpolant still passes through β (up to the K⁻¹ jitter,
+    # ~1e-8 relative). Bootstrap replicates deepcopy
+    # the approximators to avoid races.
+    const name::Symbol
+    const domain::Tuple{Float64, Float64}
+    const n_inducing::Int
+    const inducing_points::Vector{Float64}
+    const kernel::Symbol
+    lengthscale::Float64
+    variance::Float64
+    const constraint::Symbol
+    const Sigma::Matrix{Float64}
+    const initial_func::Function
+    K::Matrix{Float64}        # kernel matrix at inducing points
+    K_inv::Matrix{Float64}    # inverse kernel matrix
+    const adapt::Bool
+end
+
+function ShapeConstrainedGPApproximator(name::Union{Symbol,String},
+                                        domain::Tuple{<:Real, <:Real},
+                                        n_inducing::Int,
+                                        constraint::Symbol;
+                                        kernel::Symbol=:sqexp,
+                                        lengthscale::Union{Nothing, Real}=nothing,
+                                        variance::Real=1.0,
+                                        initial=nothing)
+    name_s = Symbol(name)
+    d = (Float64(domain[1]), Float64(domain[2]))
+    _validate_domain("ShapeConstrainedGPApproximator", d)
+    constraint in SHAPE_CONSTRAINTS || throw(ArgumentError(
+        "Unknown constraint :$constraint. Must be one of $SHAPE_CONSTRAINTS"))
+    n_inducing >= 4 || throw(ArgumentError(
+        "ShapeConstrainedGPApproximator needs n_inducing ≥ 4 (got $n_inducing)"))
+    σ² = Float64(variance)
+    ℓ = lengthscale === nothing ? _gp_default_lengthscale(kernel, d, n_inducing) :
+        Float64(lengthscale)
+
+    x_ind = collect(range(d[1], d[2], length=n_inducing))
+    K, K_inv = _gp_kernel_matrices(kernel, ℓ, σ², x_ind)
+    Sig = _build_sigma_matrix(constraint, n_inducing)
+
+    init_func = if initial === nothing
+        x -> 0.0
+    elseif initial isa Function
+        initial
+    else
+        x -> Float64(initial)
+    end
+
+    ShapeConstrainedGPApproximator(name_s, d, n_inducing, x_ind, kernel, ℓ, σ²,
+                                   constraint, Sig, init_func, K, K_inv,
+                                   lengthscale === nothing)
+end
+
+function nparams(a::ShapeConstrainedGPApproximator)
+    a.constraint in _ZERO_ENDPOINT_CONSTRAINTS ? a.n_inducing - 1 : a.n_inducing
+end
+
+function initial_params(a::ShapeConstrainedGPApproximator)
+    beta_target = Float64[a.initial_func(x) for x in a.inducing_points]
+    d = a.Sigma \ beta_target
+    lin = _linear_param_indices(a.constraint)
+    # Free (linear) components pass through; nonnegative ones get a small
+    # positive floor (large floors visibly distorted flat initial functions
+    # into ramps) and are inverted through softplus.
     return [i in lin ? d[i] :
             (v = max(d[i], 1e-4); v > 20.0 ? v : log(exp(v) - 1.0))
             for i in eachindex(d)]

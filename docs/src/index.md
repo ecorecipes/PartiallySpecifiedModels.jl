@@ -115,6 +115,7 @@ end
 | [`ShapeConstrainedSPDEApproximator`](@ref) | SPDE + shape constraints | Constrained mesh values |
 | [`NeuralApproximator`](@ref) | Lux.jl neural network | Network weights |
 | [`GPApproximator`](@ref) | Gaussian process | GP hyperparameters |
+| [`ShapeConstrainedGPApproximator`](@ref) | GP + shape constraints | Constrained inducing values |
 | [`COMONetApproximator`](@ref) | Constrained monotone network | exp(W) weights |
 
 ### Likelihoods

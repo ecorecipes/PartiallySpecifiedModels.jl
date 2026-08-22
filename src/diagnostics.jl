@@ -467,6 +467,10 @@ function _eval_approx_at(approx::GPApproximator, p::Vector{Float64}, x::Real)
     build_gp_evaluator(approx, p)(x)
 end
 
+function _eval_approx_at(approx::ShapeConstrainedGPApproximator, p::Vector{Float64}, x::Real)
+    build_constrained_gp_evaluator(approx, p)(x)
+end
+
 function _eval_approx_at(approx, p::Vector{Float64}, x::Real)
     error("confidence_band: unsupported approximator type $(typeof(approx))")
 end

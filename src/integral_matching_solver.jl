@@ -203,6 +203,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
 
             if approx isa BSplineApproximator || approx isa GPApproximator ||
                approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator ||
+               approx isa ShapeConstrainedGPApproximator ||
                approx isa TensorBSplineApproximator
                 S = penalty_matrix(approx)
                 if S !== nothing

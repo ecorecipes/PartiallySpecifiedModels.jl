@@ -348,6 +348,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
                 push!(smooth_mats, S)
                 push!(smooth_offsets, offset_acc)
             end
+        elseif approx isa ShapeConstrainedGPApproximator
+            S = penalty_matrix(approx)
+            if S !== nothing
+                push!(smooth_mats, S)
+                push!(smooth_offsets, offset_acc)
+            end
         end
         offset_acc += np
     end
