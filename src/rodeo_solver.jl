@@ -129,6 +129,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
             S = spline_penalty_matrix(knots_x)
             push!(smooth_mats, S)
             push!(smooth_offsets, offset_acc)
+        elseif approx isa TensorBSplineApproximator
+            push!(smooth_mats, penalty_matrix(approx))
+            push!(smooth_offsets, offset_acc)
         elseif approx isa SPDEApproximator
             S = penalty_matrix(approx)
             if S !== nothing

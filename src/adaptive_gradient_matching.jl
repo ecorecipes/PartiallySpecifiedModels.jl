@@ -293,6 +293,9 @@ function agm_loss(prob::PSMProblem, beta::AbstractVector,
                                         length=approx.nknots))
                 S = spline_penalty_matrix(knots_x)
                 total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
+            elseif approx isa TensorBSplineApproximator
+                S = penalty_matrix(approx)
+                total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
             elseif approx isa ShapeConstrainedBSplineApproximator
                 S = penalty_matrix(approx)
                 total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)

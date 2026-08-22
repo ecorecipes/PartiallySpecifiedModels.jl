@@ -186,7 +186,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
             params_k = β_eval[offset+1:offset+np]
             offset += np
 
-            if approx isa BSplineApproximator || approx isa GPApproximator || approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator
+            if approx isa BSplineApproximator || approx isa GPApproximator || approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator || approx isa TensorBSplineApproximator
                 S = penalty_matrix(approx)
                 if S !== nothing
                     loss_val += lambda_smooth * dot(params_k, S * params_k)

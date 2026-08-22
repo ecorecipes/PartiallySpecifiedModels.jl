@@ -5252,4 +5252,279 @@ struct NotAnApproximator end
         @test abs(f_df(0.5) - 0.35) < 0.1
     end
 
+    # ─── TensorBSplineApproximator (bivariate tensor-product spline) ──
+
+    @testset "TensorBSplineApproximator — construction and validation" begin
+        # inverted / degenerate domains, per margin
+        @test_throws ArgumentError TensorBSplineApproximator(
+            :g, (1.0, 0.0), (0.0, 1.0), 5, 5)
+        @test_throws ArgumentError TensorBSplineApproximator(
+            :g, (0.0, 1.0), (2.0, 2.0), 5, 5)
+        # nknots < 3 per margin (cubic interpolation floor, as univariate)
+        @test_throws ArgumentError TensorBSplineApproximator(
+            :g, (0.0, 1.0), (0.0, 1.0), 2, 5)
+        @test_throws ArgumentError TensorBSplineApproximator(
+            :g, (0.0, 1.0), (0.0, 1.0), 5, 2)
+        # anisotropy must be positive and finite
+        @test_throws ArgumentError TensorBSplineApproximator(
+            :g, (0.0, 1.0), (0.0, 1.0), 5, 5; anisotropy=0.0)
+        @test_throws ArgumentError TensorBSplineApproximator(
+            :g, (0.0, 1.0), (0.0, 1.0), 5, 5; anisotropy=-1.0)
+        @test_throws ArgumentError TensorBSplineApproximator(
+            :g, (0.0, 1.0), (0.0, 1.0), 5, 5; anisotropy=Inf)
+
+        a = TensorBSplineApproximator(:g, (0.0, 2.0), (1.0, 3.0), 5, 4)
+        @test nparams(a) == 20
+        @test initial_params(a) == zeros(20)
+
+        # initial surface sampled on the knot grid, column-major (x fastest)
+        a2 = TensorBSplineApproximator(:g, (0.0, 2.0), (1.0, 3.0), 5, 4;
+                                       initial=(x, y) -> x + 10y)
+        th = initial_params(a2)
+        xs = range(0.0, 2.0, length=5)
+        ys = range(1.0, 3.0, length=4)
+        @test th[2] ≈ xs[2] + 10ys[1]      # grid index (2, 1)
+        @test th[6] ≈ xs[1] + 10ys[2]      # grid index (1, 2): x fastest
+        a3 = TensorBSplineApproximator(:g, (0.0, 1.0), (0.0, 1.0), 3, 3;
+                                       initial=2.5)
+        @test all(initial_params(a3) .== 2.5)
+        # string names accepted, matching the univariate constructors
+        @test TensorBSplineApproximator("g", (0.0, 1.0), (0.0, 1.0), 3, 3).name == :g
+    end
+
+    @testset "TensorBSplineApproximator — evaluator matches univariate machinery" begin
+        using ForwardDiff
+        nx, ny = 6, 5
+        a = TensorBSplineApproximator(:g, (0.0, 3.0), (-1.0, 2.0), nx, ny)
+        C = randn(StableRNG(1), nx, ny)
+        f = build_evaluator(a, vec(C))
+        kx = collect(range(0.0, 3.0, length=nx))
+        ky = collect(range(-1.0, 2.0, length=ny))
+
+        # interpolates the coefficient grid exactly
+        @test maximum(abs(f(kx[i], ky[j]) - C[i, j])
+                      for i in 1:nx, j in 1:ny) < 1e-10
+
+        # The univariate BSpline evaluator is interpolation-THROUGH-VALUES
+        # (CubicSpline with linear extrapolation), and the tensor evaluator
+        # mirrors it per margin — so on every grid line the surface must
+        # agree exactly with a univariate evaluator built from the
+        # corresponding coefficient slice, inside AND outside the domain.
+        for j in (1, 3, ny)
+            s = PartiallySpecifiedModels.build_bspline_evaluator(kx, C[:, j])
+            for x in (-0.5, 0.2, 1.7, 3.0, 3.8)
+                @test f(x, ky[j]) ≈ s(x) atol=1e-9
+            end
+        end
+        for i in (1, 4, nx)
+            s = PartiallySpecifiedModels.build_bspline_evaluator(ky, C[i, :])
+            for y in (-1.6, -0.3, 0.9, 2.0, 2.5)
+                @test f(kx[i], y) ≈ s(y) atol=1e-9
+            end
+        end
+
+        # Dual-safe in the parameters …
+        g1 = ForwardDiff.gradient(b -> build_evaluator(a, b)(1.1, 0.4), vec(C))
+        @test all(isfinite, g1)
+        # … matching finite differences
+        h = 1e-6
+        for k in (1, 13, 30)
+            e_k = [i == k ? 1.0 : 0.0 for i in 1:(nx * ny)]
+            fd = (build_evaluator(a, vec(C) .+ h .* e_k)(1.1, 0.4) -
+                  build_evaluator(a, vec(C) .- h .* e_k)(1.1, 0.4)) / (2h)
+            @test g1[k] ≈ fd atol=1e-6
+        end
+        # Dual-safe in the states (autodiff ODE solvers evaluate at Dual u)
+        g2 = ForwardDiff.gradient(v -> f(v[1], v[2]), [1.1, 0.4])
+        @test all(isfinite, g2)
+        # nested: Dual params of a Dual-state derivative (through-the-solver
+        # training with stiff autodiff Jacobians)
+        g3 = ForwardDiff.gradient(
+            b -> ForwardDiff.derivative(x -> build_evaluator(a, b)(x, 0.4), 1.1),
+            vec(C))
+        @test all(isfinite, g3)
+    end
+
+    @testset "TensorBSplineApproximator — Kronecker-sum penalty" begin
+        nx, ny = 6, 5
+        a1 = TensorBSplineApproximator(:g, (0.0, 3.0), (-1.0, 2.0), nx, ny)
+        a100 = TensorBSplineApproximator(:g, (0.0, 3.0), (-1.0, 2.0), nx, ny;
+                                         anisotropy=100.0)
+        S1 = penalty_matrix(a1)
+        S100 = penalty_matrix(a100)
+        @test size(S1) == (nx * ny, nx * ny)
+        @test issymmetric(S1)
+        ev = eigvals(Symmetric(S1))
+        @test minimum(ev) > -1e-10           # PSD
+
+        # Null space: with 2nd-derivative marginal penalties, S annihilates
+        # exactly the surfaces whose columns are affine in x AND rows affine
+        # in y — the bilinear family a + b·x + c·y + d·x·y (on the unit
+        # square, where penalty_matrix builds its knots).
+        xs = range(0.0, 1.0, length=nx)
+        ys = range(0.0, 1.0, length=ny)
+        for (α, β, γ, δ) in ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0),
+                             (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0),
+                             (2.0, -1.0, 0.5, 3.0))
+            v = vec([α + β * x + γ * y + δ * x * y for x in xs, y in ys])
+            @test norm(S1 * v) < 1e-8
+        end
+        # … and nothing more: rank is exactly nx·ny − 4
+        @test count(x -> x > 1e-8 * maximum(ev), ev) == nx * ny - 4
+
+        # Orientation w.r.t. the column-major vec layout: a surface rough in
+        # x ONLY is penalized by the x-term only (quadratic form invariant
+        # under anisotropy), while a surface rough in y ONLY scales linearly
+        # with anisotropy.
+        vx = vec([sin(6x) for x in xs, y in ys])  # varies in x, flat in y
+        vy = vec([sin(6y) for x in xs, y in ys])  # flat in x, varies in y
+        @test dot(vx, S1 * vx) > 1.0
+        @test dot(vy, S1 * vy) > 1.0
+        @test dot(vx, S100 * vx) ≈ dot(vx, S1 * vx) rtol=1e-10
+        @test dot(vy, S100 * vy) ≈ 100.0 * dot(vy, S1 * vy) rtol=1e-10
+    end
+
+    @testset "TensorBSplineApproximator — end-to-end recovery (Wood 2001 predation surface)" begin
+        # Rosenzweig–MacArthur predator–prey with an unknown BIVARIATE
+        # interaction g(N, P) = 0.6·N·P/(1 + 0.4·N): Holling II in prey,
+        # linear in predator — genuinely non-separable. Logistic prey
+        # growth keeps the system on a bounded limit cycle (with pure
+        # exponential prey growth this model diverges), so the orbit
+        # sweeps a data-rich loop through the (N, P) plane.
+        g_true_2d(N, P) = 0.6 * N * P / (1 + 0.4 * N)
+        function pp_true!(du, u, p, t)
+            g = g_true_2d(u[1], u[2])
+            du[1] = u[1] * (1 - u[1] / 6.0) - g
+            du[2] = 0.5 * g - 0.25 * u[2]
+        end
+        sol_true2d = OrdinaryDiffEq.solve(
+            ODEProblem(pp_true!, [1.0, 1.5], (0.0, 40.0)), Tsit5(),
+            saveat=0.5, abstol=1e-10, reltol=1e-10)
+        traj2d = reduce(hcat, sol_true2d.u)'
+        ts2d = collect(sol_true2d.t)
+        data2d = traj2d .+ 0.03 .* randn(StableRNG(11), size(traj2d))
+
+        function pp2d!(du, u, p, t)
+            g = p.g(u[1], u[2])
+            du[1] = u[1] * (1 - u[1] / 6.0) - g
+            du[2] = p.e * g - p.m * u[2]
+        end
+        mk2d() = PSMProblem(pp2d!, [1.0, 1.5], (0.0, 40.0),
+            [TensorBSplineApproximator(:g, (0.0, 3.0), (0.5, 3.0), 5, 5;
+                                       initial=(N, P) -> 0.3 * N * P)];
+            data_times=ts2d, data_values=data2d, obs_to_state=[1, 2],
+            known_params=(e=0.5, m=0.25), likelihood=Gaussian(),
+            solver=Tsit5())
+        prob2d = mk2d()
+
+        # A 1-D orbit only identifies the surface near the visited region:
+        # test at actual trajectory states across the cycle's phases.
+        test_pts = [(traj2d[i, 1], traj2d[i, 2]) for i in (10, 25, 40, 55, 70)]
+
+        # Reference: data loss of the initial bilinear mass-action surface
+        beta0 = PartiallySpecifiedModels.build_initial_params(prob2d)
+        loss0 = PartiallySpecifiedModels.weighted_data_loss(
+            prob2d, PartiallySpecifiedModels.simulate(prob2d, beta0))
+
+        # (a) AdamSolver — ForwardDiff through the ODE solve (Dual params
+        # AND Dual states through the two-argument evaluator)
+        sol_adam = solve(prob2d, AdamSolver(maxiters=400, lr=0.05))
+        @test sol_adam.data_loss < 1.5           # observed ≈ 0.67
+        @test sol_adam.data_loss < loss0 / 20    # loss0 ≈ 81
+        g_adam = sol_adam.unknown_functions[:g]
+        for (N, P) in test_pts
+            # observed rel. errors 0.02–0.13
+            @test abs(g_adam(N, P) - g_true_2d(N, P)) < 0.25 * g_true_2d(N, P)
+        end
+
+        # (b) LAML — finite-difference Jacobian through the ODE solve plus
+        # the Kronecker-sum penalty with automatic λ. The default
+        # data-driven initial λ oversmooths this strongly nonlinear
+        # oscillator; starting light (initial_lambda, warmup — the LAML
+        # docstring's guidance for strongly nonlinear models) recovers the
+        # surface to ≈1% at the tested states.
+        sol_laml = solve(prob2d,
+                         LAML(maxiters=60, warmup=10, initial_lambda=0.01))
+        @test sol_laml.data_loss < 1.0           # observed ≈ 0.14
+        g_laml = sol_laml.unknown_functions[:g]
+        for (N, P) in test_pts
+            # observed rel. errors ≤ 0.01
+            @test abs(g_laml(N, P) - g_true_2d(N, P)) < 0.15 * g_true_2d(N, P)
+        end
+
+        # (c) a higher fixed penalty produces a SMOOTHER surface: β'Sβ
+        # collapses under penalty_weight (the smoothness assertion is made
+        # on the fixed-λ solver because LAML's λ automation would make a
+        # λ-vs-λ comparison brittle)
+        S2d = penalty_matrix(prob2d.approximators[1])
+        sol_pen = solve(mk2d(),
+                        AdamSolver(maxiters=300, lr=0.05, penalty_weight=50.0))
+        rough_unpen = dot(sol_adam.parameters, S2d * sol_adam.parameters)
+        rough_pen = dot(sol_pen.parameters, S2d * sol_pen.parameters)
+        @test rough_pen < 0.01 * rough_unpen     # observed 1221 → 0.011
+
+        # (d) DerivativeFreeSolver completes and recovers the surface
+        sol_dfree = solve(prob2d, DerivativeFreeSolver(maxiters=3000))
+        @test sol_dfree.data_loss < 3.0          # observed ≈ 1.1
+        g_dfree = sol_dfree.unknown_functions[:g]
+        for (N, P) in test_pts[[2, 4]]
+            # observed rel. errors ≤ 0.04
+            @test abs(g_dfree(N, P) - g_true_2d(N, P)) < 0.25 * g_true_2d(N, P)
+        end
+
+        # (e) the univariate confidence-band machinery REJECTS the tensor
+        # surface loudly instead of erroring obscurely on `.domain`
+        @test_throws ArgumentError confidence_band(sol_laml, prob2d)
+    end
+
+    @testset "TensorBSplineApproximator — GCV recovery and bootstrap-band gating" begin
+        # Milder monotone 2-state decay problem: GCV's IRLS linearization
+        # is well behaved here (on the oscillatory cycle above it needs the
+        # same care as for univariate splines).
+        g_true_dec(N, P) = 0.5 * N * P / (1 + 0.5 * N)
+        function dec_true!(du, u, p, t)
+            g = g_true_dec(u[1], u[2])
+            du[1] = -g
+            du[2] = 0.2 * g - 0.1 * u[2]
+        end
+        sol_true_d = OrdinaryDiffEq.solve(
+            ODEProblem(dec_true!, [2.5, 1.5], (0.0, 12.0)), Tsit5(),
+            saveat=0.25, abstol=1e-10, reltol=1e-10)
+        traj_d = reduce(hcat, sol_true_d.u)'
+        ts_d = collect(sol_true_d.t)
+        data_d = traj_d .+ 0.01 .* randn(StableRNG(3), size(traj_d))
+        function dec!(du, u, p, t)
+            g = p.g(u[1], u[2])
+            du[1] = -g
+            du[2] = p.e * g - p.m * u[2]
+        end
+        prob_d = PSMProblem(dec!, [2.5, 1.5], (0.0, 12.0),
+            [TensorBSplineApproximator(:g, (0.0, 3.0), (0.0, 2.0), 5, 5;
+                                       initial=(N, P) -> 0.2 * N * P)];
+            data_times=ts_d, data_values=data_d, obs_to_state=[1, 2],
+            known_params=(e=0.2, m=0.1), likelihood=Gaussian(),
+            solver=Tsit5())
+
+        sol_gcv = solve(prob_d, GCVSolver(maxiters=60))
+        @test sol_gcv.data_loss < 0.5            # observed ≈ 0.10
+        g_gcv = sol_gcv.unknown_functions[:g]
+        # early-trajectory states, where g is well identified (late in the
+        # decay g → 0 and relative error stops being meaningful)
+        for i in (5, 15)
+            N, P = traj_d[i, 1], traj_d[i, 2]
+            # observed rel. errors ≤ 0.01
+            @test abs(g_gcv(N, P) - g_true_dec(N, P)) < 0.15 * g_true_dec(N, P)
+        end
+
+        # bootstrap: parameter/trajectory intervals work, but the UNIVARIATE
+        # unknown-function band is skipped with a warning rather than
+        # silently mis-gridding the bivariate surface
+        sol_dfree = solve(prob_d, DerivativeFreeSolver(maxiters=400))
+        res = @test_logs (:warn, r"bivariate") match_mode=:any bootstrap(
+            sol_dfree, prob_d, DerivativeFreeSolver(maxiters=200);
+            nboot=3, rng=StableRNG(5))
+        @test res.n_success >= 3
+        @test !haskey(res.ci_uf, :g)
+    end
+
 end

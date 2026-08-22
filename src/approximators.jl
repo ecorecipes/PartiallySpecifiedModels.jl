@@ -88,6 +88,66 @@ function penalty_matrix(a::BSplineApproximator)
 end
 
 """
+    build_tensor_bspline_evaluator(a::TensorBSplineApproximator, params_k)
+
+Build the two-argument callable `f(x, y)` for a tensor-product spline from
+the column-major coefficient grid `params_k = vec(C)`, `C[i, j] = f(x_i, y_j)`.
+
+The construction is the tensor product of the SAME univariate machinery
+`BSplineApproximator` uses (`build_bspline_evaluator`: natural cubic
+interpolation THROUGH the values, linear extrapolation outside the knots):
+each x-column `C[:, j]` is interpolated in x once at build time; per call,
+the `nknots_y` line values `sⱼ(x)` are interpolated in y. Because both
+stages interpolate through values, the surface agrees exactly with the
+univariate evaluator on every grid line —
+`f(x, y_j) = CubicSpline(C[:, j], knots_x)(x)` and
+`f(x_i, y) = CubicSpline(C[i, :], knots_y)(y)` — and extrapolates linearly
+per margin, matching the univariate behavior. Eltype-generic in both
+`params_k` and `(x, y)`, so ForwardDiff Duals propagate through either.
+"""
+function build_tensor_bspline_evaluator(a::TensorBSplineApproximator,
+                                        params_k::AbstractVector)
+    nx, ny = a.nknots_x, a.nknots_y
+    knots_x = collect(range(a.domain_x[1], a.domain_x[2], length=nx))
+    knots_y = collect(range(a.domain_y[1], a.domain_y[2], length=ny))
+    C = reshape(params_k, nx, ny)
+    col_splines = [build_bspline_evaluator(knots_x, C[:, j]) for j in 1:ny]
+    function tensor_eval(x, y)
+        line_vals = [s(x) for s in col_splines]
+        build_bspline_evaluator(knots_y, line_vals)(y)
+    end
+    tensor_eval
+end
+
+"""
+    penalty_matrix(a::TensorBSplineApproximator)
+
+Kronecker-sum roughness penalty on the column-major coefficient grid:
+
+    S = I_ny ⊗ S_x + anisotropy · (S_y ⊗ I_nx)
+
+where `S_x`, `S_y` are the univariate natural-cubic `∫(f'')²` penalties
+(`spline_penalty_matrix`) on unit-interval knot grids, exactly as
+`penalty_matrix(::BSplineApproximator)` builds them. With `β = vec(C)` and
+the x index fastest, `β' (I_ny ⊗ S_x) β = Σⱼ C[:, j]' S_x C[:, j]`
+penalizes roughness along x only, and `β' (S_y ⊗ I_nx) β =
+Σᵢ C[i, :]' S_y C[i, :]` penalizes roughness along y only; `anisotropy` is
+their fixed relative weight under the single per-approximator λ.
+
+The null space is the intersection of "every column affine in x" with
+"every row affine in y": the bilinear surfaces
+`C[i, j] = a + b·x_i + c·y_j + d·x_i·y_j` (rank `nx·ny − 4`).
+"""
+function penalty_matrix(a::TensorBSplineApproximator)
+    nx, ny = a.nknots_x, a.nknots_y
+    Sx = spline_penalty_matrix(collect(range(0.0, 1.0, length=nx)))
+    Sy = spline_penalty_matrix(collect(range(0.0, 1.0, length=ny)))
+    S = kron(Matrix{Float64}(I, ny, ny), Sx) .+
+        a.anisotropy .* kron(Sy, Matrix{Float64}(I, nx, nx))
+    (S + S') ./ 2
+end
+
+"""
     penalty_matrix(a::NeuralApproximator)
 
 Returns scaled identity matrix for L2 regularization when `penalty_weight > 0`,

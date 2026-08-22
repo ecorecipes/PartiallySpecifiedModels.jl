@@ -155,6 +155,15 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
     # NeuralApproximator constructed without one — cannot be gridded)
     uf_grids = Dict{Symbol, Vector{Float64}}()
     for approx in prob.approximators
+        if approx isa TensorBSplineApproximator
+            # Bivariate surface: the UF band machinery grids one variable
+            # and calls the evaluator with one argument. Skip its band
+            # (parameter/trajectory bootstrap still covers it).
+            @warn "bootstrap: approximator :$(approx.name) is bivariate; " *
+                  "skipping its unknown-function confidence band " *
+                  "(only univariate functions can be gridded)"
+            continue
+        end
         if approx.domain === nothing
             @warn "bootstrap: approximator :$(approx.name) has no domain; " *
                   "skipping its unknown-function confidence band"
