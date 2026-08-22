@@ -61,7 +61,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
     for j in 1:n_obs
         sk = prob.obs_to_state[j]
         push!(observed_states, sk)
-        sval, _ = _smoothing_spline(times, Float64.(prob.data_values[:, j]))
+        # Masked rows must be dropped from the smoother's normal equations,
+        # not merely ignored afterwards: one NaN makes every spline
+        # coefficient NaN, so `y_smooth` — and hence the integral-matching
+        # residual `delta` — is NaN everywhere. There is no finiteness
+        # sentinel in `integral_loss`, so the NaN reaches the Adam moments
+        # and the solver silently returns its initial parameters.
+        sval, _ = _smoothing_spline_masked(times,
+                                           Float64.(prob.data_values[:, j]),
+                                           @view(prob.data_weights[:, j]))
         for i in 1:n_times
             y_smooth[i, sk] = sval(times[i])
         end

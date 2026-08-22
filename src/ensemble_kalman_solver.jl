@@ -45,6 +45,7 @@ nearest integer step), the same trajectory every other solver sees.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
     _validate_problem(prob, "EnsembleKalmanSolver")
+    _reject_masked_data(prob, "EnsembleKalmanSolver")
     verbose = alg.verbose
 
     J = alg.n_ensemble

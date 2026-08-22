@@ -71,13 +71,24 @@ Returns matrix (n_intervals-1) × K for interior boundary points.
 """
 function init_shooting_vars(data_times::Vector{Float64}, data_values::Matrix{Float64},
                             obs_to_state::Vector{Int}, K::Int,
-                            boundaries::Vector{Float64})
+                            boundaries::Vector{Float64};
+                            data_weights::Union{Nothing,AbstractMatrix}=nothing)
     n_interior = length(boundaries) - 2  # exclude first and last
     shooting_vars = zeros(n_interior, K)
 
     for j in 1:size(data_values, 2)
         sk = obs_to_state[j]
-        itp = CubicSpline(data_values[:, j], data_times;
+        # Interpolate through the USABLE rows only. `CubicSpline` solves a
+        # tridiagonal system for its coefficients, so one NaN in the column
+        # makes the interpolant NaN EVERYWHERE — the shooting variables would
+        # all start NaN and the optimizer would begin from a NaN point,
+        # independently of any masking in the loss. Complete data keeps every
+        # row, so the interpolant is bit-for-bit the same.
+        keep = [i for i in axes(data_values, 1)
+                if !isnan(data_values[i, j]) &&
+                   (data_weights === nothing || data_weights[i, j] > 0)]
+        length(keep) < 2 && continue   # leave this state at 0.0; too little data
+        itp = CubicSpline(data_values[keep, j], data_times[keep];
                           extrapolation=ExtrapolationType.Extension)
         for i in 1:n_interior
             shooting_vars[i, sk] = itp(boundaries[i + 1])
@@ -200,6 +211,12 @@ function _ms_loss_inner(prob::PSMProblem, z, n_theta::Int, K::Int,
                           "recorded at t=$t_nearest for observation at " *
                           "t=$t_data in interval [$t_lo, $t_hi]")
                 for j in 1:size(prob.data_values, 2)
+                    # Masked cells contribute nothing. `0 * NaN = NaN`,
+                    # and the `_all_finite` sentinel would then flatten
+                    # the whole augmented Lagrangian to the constant
+                    # 1e10 — L-BFGS makes no progress, the shooting gaps
+                    # never close, and the outer loop exits at maxiters.
+                    usable_cell(prob, gi, j) || continue
                     sk = prob.obs_to_state[j]
                     pred = u_at_t[sk]
                     obs = T(prob.data_values[gi, j])
@@ -251,6 +268,12 @@ function _ms_loss_inner(prob::PSMProblem, z, n_theta::Int, K::Int,
                           "at the observation time t=$t_data " *
                           "(saved times: $(sol.t))")
                 for j in 1:size(prob.data_values, 2)
+                    # Masked cells contribute nothing. `0 * NaN = NaN`,
+                    # and the `_all_finite` sentinel would then flatten
+                    # the whole augmented Lagrangian to the constant
+                    # 1e10 — L-BFGS makes no progress, the shooting gaps
+                    # never close, and the outer loop exits at maxiters.
+                    usable_cell(prob, gi, j) || continue
                     sk = prob.obs_to_state[j]
                     pred = sol[sk, sol_idx]
                     obs = T(prob.data_values[gi, j])
@@ -400,7 +423,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
     # Initialize shooting variables from data
     shooting_vars = init_shooting_vars(Float64.(prob.data_times),
                                        Float64.(prob.data_values),
-                                       prob.obs_to_state, K, boundaries)
+                                       prob.obs_to_state, K, boundaries;
+                                       data_weights=prob.data_weights)
 
     # Optimization variable: z = [theta; vec(shooting_vars)]
     z = vcat(theta, vec(shooting_vars))
@@ -571,6 +595,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
     final_obj = if loss_sym == :poisson
         obj = 0.0
         for j in 1:n_obs, i in 1:T_pts
+            usable_cell(prob, i, j) || continue
             mu = max(pred[i, j], 1e-10)
             y = prob.data_values[i, j]
             obj -= prob.data_weights[i, j] * (y * log(mu) - mu)

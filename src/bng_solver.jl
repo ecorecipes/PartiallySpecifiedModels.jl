@@ -71,11 +71,20 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     base_fit = zeros(n_times, n_obs)             # smoother fit per data column
     resid = zeros(n_times, n_obs)                # residuals for the bootstrap
     for j in 1:n_obs
-        val, _ = _smoothing_spline(times, Float64.(prob.data_values[:, j]))
+        val, _ = _smoothing_spline_masked(times,
+                                          Float64.(prob.data_values[:, j]),
+                                          @view(prob.data_weights[:, j]))
         for i in 1:n_times
             base_fit[i, j] = val(times[i])
         end
-        resid[:, j] = prob.data_values[:, j] .- base_fit[:, j]
+        # Residual bootstrap pool: only usable cells yield real residuals.
+        # A masked cell's "residual" is NaN (or a fabricated number at
+        # weight 0) and would be resampled into random rows of every
+        # replicate, spreading the contamination across the ensemble.
+        for i in 1:n_times
+            resid[i, j] = usable_cell(prob, i, j) ?
+                          prob.data_values[i, j] - base_fit[i, j] : 0.0
+        end
     end
 
     # Smooth a data matrix into (states, derivative targets)
@@ -84,7 +93,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
         dydt = zeros(n_times, n_vars)
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
-            val, der = _smoothing_spline(times, data_matrix[:, j])
+            # `data_matrix` is the raw data on the first pass and a
+            # bootstrap resample of base_fit + resid afterwards; the
+            # former can hold NaN, so mask by the original weights.
+            val, der = _smoothing_spline_masked(times,
+                                                Float64.(data_matrix[:, j]),
+                                                @view(prob.data_weights[:, j]))
             for i in 1:n_times
                 y_smooth[i, sk] = val(times[i])
                 if !prob.discrete
@@ -137,7 +151,24 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     n_beta = length(init_beta(1))
 
     n_match = prob.discrete ? n_times - 1 : n_times
-    n_resid = n_match * length(observed_states)
+    # Per-(time, state) usability, mirroring TwoStageSolver: a match point
+    # counts if ANY observation column mapping to that state is usable
+    # there. All-true for complete data.
+    match_usable = falses(n_times, n_vars)
+    for j in 1:n_obs
+        sk = prob.obs_to_state[j]
+        for i in 1:n_times
+            usable_cell(prob, i, j) && (match_usable[i, sk] = true)
+        end
+    end
+    # n_resid is the effective sample size in the variance-marginalized
+    # log-posterior below, `(n_resid/2)*log1p(ssr/2)`. Counting masked
+    # cells over-weights the data term against the parameter prior and
+    # breaks the self-balancing property this solver advertises. Equals
+    # n_match * |observed_states| for complete data.
+    n_resid = count(match_usable[i, k] for i in 1:n_match, k in 1:n_vars)
+    n_resid == 0 && error("BNGSolver: every observation is masked; " *
+        "there is nothing to fit.")
     lambda_smooth = alg.lambda_smooth
     prior_sd = alg.prior_sd
     K_total = alg.k_obs * alg.k_proc
@@ -166,6 +197,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
                 # Match only observed states (unobserved targets are
                 # fabricated constants — see two_stage_solver.jl).
                 k in observed_states || continue
+                # …and only where that state has a usable observation:
+                # the smoother now excludes masked rows, so the target
+                # there is an extrapolation rather than data.
+                match_usable[i, k] || continue
                 ssr += (dydt[i, k] - du[k])^2
             end
         end

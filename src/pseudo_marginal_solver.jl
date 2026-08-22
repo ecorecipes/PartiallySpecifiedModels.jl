@@ -128,6 +128,7 @@ unknown-function parameters.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
     _validate_problem(prob, "PseudoMarginalSolver"; require_continuous=true)
+    _reject_masked_data(prob, "PseudoMarginalSolver")
     verbose = alg.verbose
     n_vars = length(prob.u0)
     n_obs = size(prob.data_values, 2)

@@ -46,15 +46,34 @@ function SciMLBase.solve(prob::PSMProblem, alg::DerivativeFreeSolver)
     n_obs   = length(prob.obs_to_state)
     n_data  = n_times * n_obs
 
-    # Flatten data and weights into vectors (obs-major: obs 1 times, obs 2 times, …)
+    # Flatten data and weights into vectors (obs-major: obs 1 times, obs 2 times, …),
+    # enforcing the package masking convention: a cell is usable only if its
+    # weight is positive AND its datum is non-NaN. Masked cells get weight 0
+    # and a finite placeholder value. Masking HERE (rather than in the two
+    # loss branches below) fixes both at once: the :mse branch forms
+    # `w_vec[k] * (y_vec[k] - pred)^2` and the :likelihood branch calls
+    # `log_likelihood`, and IEEE `0 * NaN = NaN` would poison either one.
+    # A poisoned loss is not merely a NaN report here: `!isfinite(data_loss)
+    # && return 1e20` below turns it into a CONSTANT objective, so Nelder-Mead
+    # / particle swarm see a flat surface, never move, and the solver returns
+    # its initialization while reporting ordinary-looking convergence.
+    # n_usable is the sample size for any per-observation denominator.
     y_vec = zeros(n_data)
     w_vec = zeros(n_data)
     k = 1
     for oi in 1:n_obs, ti in 1:n_times
-        y_vec[k] = prob.data_values[ti, oi]
-        w_vec[k] = prob.data_weights[ti, oi]
+        y = prob.data_values[ti, oi]
+        wv = prob.data_weights[ti, oi]
+        if wv > 0 && !isnan(y)
+            y_vec[k] = y
+            w_vec[k] = wv
+        end   # else keep the 0.0 placeholder with weight 0.0
         k += 1
     end
+    n_usable_cells = count(>(0), w_vec)
+    n_usable_cells == 0 && error("DerivativeFreeSolver: every observation is " *
+        "masked (all data_weights are 0 or all data_values are NaN); there " *
+        "is nothing to fit.")
 
     # Build penalty matrices for optional regularization
     S_list   = Matrix{Float64}[]

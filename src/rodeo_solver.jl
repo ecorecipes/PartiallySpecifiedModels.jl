@@ -41,6 +41,7 @@ used to condition on both the observations and the ODE constraints.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
     _validate_problem(prob, "RodeoSolver"; require_continuous=true)
+    _reject_masked_data(prob, "RodeoSolver")
     verbose = alg.verbose
     n_vars = length(prob.u0)
     n_obs = size(prob.data_values, 2)

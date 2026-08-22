@@ -91,7 +91,13 @@ function laml_objective(family::AbstractLikelihood,
                         S_list::Vector{Matrix{Float64}},
                         offsets::Vector{Int}, nknots_list::Vector{Int},
                         rho::AbstractVector, n_p::Int)
-    n = length(y)
+    # n is the REML sample size and must count USABLE cells only (positive
+    # weight, non-NaN datum) — masked cells carry no information, so
+    # counting them inflates n_eff = n − Mp and biases σ̂² = (RSS+pen)/n_eff
+    # low, which in turn biases λ. `length(y)` counts the masked
+    # placeholders the callers leave in the flattened vectors.
+    # Identical to `length(y)` for complete data.
+    n = _n_usable(y, w_data)
 
     S_lambda = build_S_lambda(S_list, offsets, nknots_list, rho, n_p)
 
@@ -122,7 +128,11 @@ function laml_objective(family::AbstractLikelihood,
     Mp_eff = _restricted_dof_Mp(J, W_irls, offsets, nknots_list, n_p, total_rank)
 
     if family isa Gaussian
-        RSS = sum(w_data[i] * (y[i] - mu[i])^2 for i in 1:n)
+        RSS = 0.0
+        for i in eachindex(y)
+            _usable(y[i], w_data[i]) || continue
+            RSS += w_data[i] * (y[i] - mu[i])^2
+        end
         # Profiled REML scale uses the restricted dof (n − Mp), NOT n. Using
         # /n (the ML scale) leaves the analytic gradient inconsistent with V
         # by a factor (n−Mp)/n on the penalty term and biases toward
@@ -290,7 +300,11 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
                                    maxiter::Int=50, tol::Float64=1e-6,
                                    verbose::Bool=false)
     m = length(S_list)
-    n = length(y)
+    # USABLE-cell count, not `length(y)` — see the note in `laml_objective`.
+    # The two functions must agree exactly: `laml_objective` computes the
+    # Newton-phase V from n − Mp_eff and this function computes the
+    # Fellner–Schall scale from the same denominator.
+    n = _n_usable(y, w_data)
 
     # Initialize ρ.  Fellner-Schall can converge to under-smoothing local
     # minima when started from very negative ρ (tiny λ). Clamp to a floor
@@ -359,16 +373,23 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
         # When sigma2_max is finite, cap to prevent oversmoothing.
         sigma2 = if family isa Gaussian
             r_work = z_work .- J * beta_fs
-            RSS = sum(w_data[i] * r_work[i]^2 for i in 1:n)
+            RSS = 0.0
+            for i in eachindex(y)
+                _usable(y[i], w_data[i]) || continue
+                RSS += w_data[i] * r_work[i]^2
+            end
             pen = dot(beta_fs, S_lambda * beta_fs)
             # Restricted dof n − Mp_eff, the SAME constant the Newton-phase
             # objective uses (see `laml_objective`).
             profiled = max((RSS + pen) / n_eff, 1e-30)   # REML scale
             min(profiled, sigma2_max)
         else
-            pearson = sum(w_data[i] * (y[i] - mu[i])^2 /
-                          max(_variance_function(family, abs(mu[i])), 1e-10)
-                          for i in 1:n)
+            pearson = 0.0
+            for i in eachindex(y)
+                _usable(y[i], w_data[i]) || continue
+                pearson += w_data[i] * (y[i] - mu[i])^2 /
+                           max(_variance_function(family, abs(mu[i])), 1e-10)
+            end
             phi = max(pearson / max(n - sum(ranks), 1), 1.0)
             min(phi, sigma2_max)
         end
