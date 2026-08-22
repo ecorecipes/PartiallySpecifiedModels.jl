@@ -517,10 +517,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
     end
 
     # Data loss (against original data, not derivatives)
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:T_pts
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Derivative matching loss
     F_final = eval_rhs_at_smooth(prob, times, y_smooth, beta)

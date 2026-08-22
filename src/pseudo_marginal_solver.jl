@@ -140,9 +140,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
         beta0 = Float64[]
         for approx in prob.approximators
             if approx isa NeuralApproximator
-                spec = mlp_spec_from_lux(approx.model)
                 rng0 = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-                append!(beta0, init_mlp_params(spec, rng0))
+                append!(beta0, neural_init_params(approx, rng0))
             else
                 append!(beta0, initial_params(approx))
             end
@@ -275,16 +274,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
                                           prob.tspan, alg.n_steps, alg.n_deriv, sigma;
                                           interrogate=:kramer)
 
-    data_loss = 0.0
     pred = zeros(n_t, n_obs)
     for i in 1:n_t
         idx = _nearest_grid_index(times, prob.data_times[i])
         for j in 1:n_obs
             sk = prob.obs_to_state[j]
             pred[i, j] = μ_smooth[idx][sk][1]
-            data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
         end
     end
+    data_loss = weighted_data_loss(prob, pred)
 
     uf_evals = Dict{Symbol, Any}()
     offset = 0
@@ -306,17 +304,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
         elseif approx isa ShapeConstrainedSPDEApproximator
             uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                uf_evals[approx.name] = x -> begin
-                    xn = (lo_ !== nothing && span_ !== nothing && span_ > 0) ?
-                         (Float64(x isa AbstractArray ? x[1] : x) - lo_) / span_ :
-                         Float64(x isa AbstractArray ? x[1] : x)
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         end
     end
 

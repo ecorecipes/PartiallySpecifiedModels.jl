@@ -604,7 +604,18 @@ function initial_params(a::ShapeConstrainedBSplineApproximator)
         else
             try
                 Float64(a.initial_func(x))
-            catch
+            catch e
+                # Only an out-of-domain THROW justifies extrapolating. A
+                # MethodError/BoundsError/TypeError inside the user's
+                # function is a bug in that function; masking it as an
+                # extrapolation would silently initialize the spline from
+                # fabricated values. Rethrow those, and say out loud when
+                # the fallback does fire.
+                _is_program_error(e) && rethrow()
+                @warn("initial_func threw at the Greville abscissa " *
+                      "x=$x, just outside the domain $(a.domain); " *
+                      "falling back to a linear extrapolation from the " *
+                      "clamped point.", exception = e, maxlog = 1)
                 xc = clamp(x, lo, hi)
                 slope = x < lo ?
                     (a.initial_func(xc + h) - a.initial_func(xc)) / h :
@@ -924,6 +935,12 @@ changes.  See Fasiolo, Pya & Wood (2016), Statistical Science 31(1).
 - `n_continuation::Int=8`: number of log-spaced continuation levels
 - `sigma2_init::Union{Nothing,Float64}=nothing`: σ² cap for Fellner-Schall
 
+!!! note "ODE problems only"
+    DDE problems are REJECTED with an error. The collocation objective
+    calls the dynamics through the 4-argument ODE signature and has no way
+    to supply the delayed history, so a DDE would silently be fitted as
+    though it had no delays. Use [`LAML`](@ref) for DDEs.
+
 # Convergence info
 `sol.convergence` is a NamedTuple `(ode_compliance, lambda_ode_final,
 converged, iterations, reason, iterations_total)`. `converged`/`reason`
@@ -970,6 +987,12 @@ Requires that all state variables are observed (no latent states).
 - `tol::Float64=1e-6`: convergence tolerance
 - `verbose::Bool=false`: print iteration details
 - `sigma2_init::Union{Nothing,Float64}=nothing`: σ² cap for Fellner-Schall
+
+!!! note "σ² for the Fellner-Schall update"
+    The residual variance driving the smoothing-parameter update is
+    `σ̂² = RSS / #{residuals with nonzero weight}`, not `RSS / #residuals`.
+    Unobserved-state rows are zero-weighted; counting them biased σ̂² low
+    and over-smoothed the unknown functions.
 """
 struct GradientMatching
     maxiters::Int
@@ -1142,6 +1165,14 @@ where:
 - `n_samples::Int=0`: cold-chain posterior draws; 0 = MAP mode
 - `n_chains::Int=10`: number of tempered chains (sampling mode; ≥ 2)
 - `rng_seed`: seed for the sampler (default `nothing` = non-reproducible)
+
+!!! note "GP centering"
+    Each state's GP prior is centered: observed states on their data mean,
+    unobserved states on their initial condition, and every `x` entering
+    the GP quadratic forms and the gradient mean is the CENTERED state
+    `x − m_k`. A zero-mean GP prior on uncentered data pulls the
+    trajectory toward zero, which biased the fitted unknown functions on
+    data far from the origin.
 """
 struct AdaptiveGradientMatching
     maxiters::Int
@@ -1455,7 +1486,8 @@ adaptive random-walk Metropolis (the proposal scale is tuned toward
 - `n_steps`: discretization steps for inner probabilistic solver (default 200)
 - `n_deriv`: IBM prior derivative order (default 3)
 - `sigma`: IBM scale parameters (nothing = auto-estimate)
-- `obs_var`: observation noise variance (default 0.01)
+- `obs_var`: observation noise variance (default `nothing` = estimate it
+  from the data alongside the other nuisance quantities)
 - `target_accept`: target acceptance rate for the adaptive random-walk
   Metropolis proposal-scale adaptation (default 0.8)
 - `prior_scale`: prior VARIANCE on parameters (default 1.0). Used directly
@@ -1645,11 +1677,21 @@ providing uncertainty estimates.
 - `maxiters`: max ELBO optimization iterations (default 2000)
 - `lr`: learning rate for Adam on ELBO (default 0.01)
 - `n_elbo_samples`: Monte Carlo samples for ELBO gradient (default 10)
-- `prior_scale`: prior std on parameters (default 1.0)
+- `prior_scale`: prior VARIANCE on parameters (default 1.0). Used directly
+  as the variance of the Gaussian smoothing prior — the prior precision is
+  `Λ = ridge·I + Σₖ Sₖ / prior_scale` — it is not squared.
 - `obs_noise_var`: Gaussian observation-noise variance (default `nothing`
   = estimate from the data). Gaussian likelihoods only; errors otherwise.
   Non-Gaussian families use their own pointwise log-likelihood in the ELBO.
 - `verbose`: print progress
+
+!!! note "Reported EDF"
+    `sol.edf` is the Laplace effective degrees of freedom at the
+    variational mean, `tr((H + Λ)⁻¹H)` with the Gauss–Newton information
+    `H = JᵀWJ/σ²_obs` — a real measure of model complexity that responds
+    to the smoothing level. It is `NaN` (honestly missing) when the model
+    cannot be simulated at the variational mean or the linear system is
+    singular; it is never a fabricated constant.
 """
 struct VariationalSolver
     maxiters::Int
@@ -1798,8 +1840,15 @@ Ensemble Kalman Inversion (EKI) for batch parameter estimation.
 
 Uses an ensemble of parameter particles, propagates each through the
 forward model (ODE simulation), and updates via the Kalman gain
-K = Cov(θ, G(θ)) [Cov(G(θ), G(θ)) + Γ]⁻¹.  Iterates until the
-ensemble collapses around the MAP estimate.
+K = Cov(θ, G(θ)) [Cov(G(θ), G(θ)) + Γ]⁻¹.  Iterates until the ensemble
+collapses around the MAP estimate — mean particle std below 1e-3 of its
+initial value, reported as `converged = true, reason =
+:ensemble_collapse` — or until `n_iterations` is exhausted, reported
+honestly as `converged = false, reason = :maxiters`.
+
+Discrete problems are propagated with `simulate_discrete` (unit steps
+over `tspan`, data times snapped to the nearest integer step), so EKI
+sees the same trajectory as every other solver.
 
 # Fields
 - `n_ensemble`: ensemble size (default 50)
@@ -1865,6 +1914,11 @@ performed (the budget is `20 * maxiters` steps); `converged=true` with
 `reason=:plateau` when the risk stagnated over a 30-step window while the
 cosine-annealed learning rate was still above 5% of the base `lr`,
 `reason=:maxiters` otherwise.
+
+`sol.data_loss` is the WEIGHTED residual sum of squares over usable cells
+(`weighted_data_loss`), the same convention as every other solver — so
+masked (`data_weights == 0`) and down-weighted observations contribute to
+the reported misfit exactly in proportion to their weight.
 
 # References
 - Wenk, Abbati et al. (2020), AAAI — ODIN
@@ -2162,7 +2216,13 @@ Result of fitting a PSM.
 # Fields
 - `parameters`: ComponentArray with sections for each approximator
 - `objective`: final penalized objective value
-- `data_loss`: unpenalized data loss (SS for Gaussian, deviance for others)
+- `data_loss`: unpenalized data misfit — the WEIGHTED residual sum of
+  squares `Σ wᵢⱼ (yᵢⱼ − ŷᵢⱼ)²`, computed by `weighted_data_loss` over the
+  usable cells only (positive weight and finite datum, so one masked-out
+  missing observation cannot turn it into `NaN`). This is the convention
+  for EVERY likelihood family and every solver: no solver reports a
+  deviance here, so for non-Gaussian families `data_loss` is a descriptive
+  SSE and NOT the quantity the solver optimised (that is `objective`)
 - `edf`: estimated degrees of freedom
 - `smoothing_params`: vector of estimated smoothing parameters λ
 - `fitted_values`: predicted values at data times (n_times × n_obs)

@@ -419,8 +419,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
                     iter, elbo_val, lr_t, grad_norm)
         end
 
-        # Convergence check: ELBO plateau over last 50 iterations
-        if iter > 100
+        # Convergence check: ELBO plateau over last 50 iterations, guarded
+        # against the cosine lr schedule manufacturing a plateau: near
+        # maxiters lr_t → 0, so the ELBO stops moving however far from the
+        # optimum φ still is. Only stop while the step is meaningful.
+        if iter > 100 && lr_t > 0.05 * lr
             window = max(1, length(elbo_history) - 49):length(elbo_history)
             recent = elbo_history[window]
             recent_range = maximum(recent) - minimum(recent)
@@ -473,13 +476,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     n_obs = size(prob.data_values, 2)
 
     # Masked/NaN cells are skipped (0 * NaN = NaN would make data_loss NaN).
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:n_t
-        w = prob.data_weights[i, j]
-        y = prob.data_values[i, j]
-        (w > 0 && !isnan(y)) || continue
-        data_loss += w * (y - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Effective degrees of freedom of the Gaussian (Laplace) approximation
     # taken at the variational posterior mean:
@@ -518,20 +515,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing :
-                   (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                uf_evals[approx.name] = x -> begin
-                    xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
-                        (Float64(x isa AbstractArray ? x[1] : x) - lo_) / span_
-                    else
-                        Float64(x isa AbstractArray ? x[1] : x)
-                    end
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator

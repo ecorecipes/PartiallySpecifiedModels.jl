@@ -350,13 +350,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
     # Weighted sum of squares over usable cells, matching the data_loss
     # convention of the other solvers (masked / NaN cells are skipped so
     # one missing observation does not turn the reported loss into NaN)
-    data_loss = 0.0
-    for k in eachindex(prob.data_values)
-        w = prob.data_weights[k]
-        y = prob.data_values[k]
-        (w > 0 && isfinite(y)) || continue
-        data_loss += w * (pred[k] - y)^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     uf_evals = _abc_build_uf_dict(prob, mean_beta)
 

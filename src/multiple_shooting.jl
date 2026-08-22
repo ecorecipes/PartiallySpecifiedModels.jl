@@ -240,10 +240,16 @@ function _ms_loss_inner(prob::PSMProblem, z, n_theta::Int, K::Int,
             # Data fit loss on this interval
             for (li, gi) in enumerate(idx)
                 t_data = prob.data_times[gi]
+                # As in the discrete branch: a data time with no matching
+                # saved point indicates an internal inconsistency between
+                # the interval partition and `saveat` — fail loudly rather
+                # than silently dropping observations from the objective.
                 sol_idx = findfirst(t -> abs(t - t_data) < 1e-10, sol.t)
-                if sol_idx === nothing
-                    continue
-                end
+                sol_idx === nothing &&
+                    error("MultipleShooting internal error: the ODE " *
+                          "solution on [$t_lo, $t_hi] has no saved point " *
+                          "at the observation time t=$t_data " *
+                          "(saved times: $(sol.t))")
                 for j in 1:size(prob.data_values, 2)
                     sk = prob.obs_to_state[j]
                     pred = sol[sk, sol_idx]
@@ -365,14 +371,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
 
     # Initialize model parameters
     theta = Float64[]
-    mlp_specs = Dict{Symbol, MLPSpec}()
 
     for approx in prob.approximators
         if approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            mlp_specs[approx.name] = spec
             rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            append!(theta, init_mlp_params(spec, rng))
+            append!(theta, neural_init_params(approx, rng))
         else
             append!(theta, initial_params(approx))
         end
@@ -559,10 +562,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
         end
     end
 
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:T_pts
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Objective in the TRAINING metric (matching AdamSolver's reporting):
     # weighted SSE for :mse, the weighted Poisson negative log-likelihood
@@ -593,20 +593,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_specs[approx.name]
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                uf_evals[approx.name] = x -> begin
-                    xval = x isa AbstractArray ? x[1] : x
-                    xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
-                        (Float64(xval) - lo_) / span_
-                    else
-                        Float64(xval)
-                    end
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator

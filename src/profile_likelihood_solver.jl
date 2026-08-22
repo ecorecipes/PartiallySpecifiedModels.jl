@@ -323,11 +323,20 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
         end
     end
 
-    # Return solution with profiles in convergence field
+    # Return solution with profiles in convergence field. The profiles are
+    # taken at the base LAML fit, so this solution is only as converged as
+    # that fit: propagate its honest convergence keys instead of hard-coding
+    # converged=true (a non-converged base fit was previously reported as a
+    # converged profile-likelihood solution). The base NamedTuple also
+    # carries V_beta/sigma2, which downstream CI code expects.
+    base_conv = base_sol.convergence
+    base_keys = base_conv isa NamedTuple ? base_conv :
+                (converged=false, reason=:unknown_base_convergence)
     PSMSolution(base_sol.parameters, base_sol.objective, base_sol.data_loss,
                 base_sol.edf, base_sol.smoothing_params,
                 base_sol.fitted_values, base_sol.data_values,
                 base_sol.data_times, base_sol.unknown_functions,
-                (converged=true, method=:profile_likelihood,
-                 profiles=profiles, mle_objective=mle_obj))
+                merge(base_keys,
+                      (method=:profile_likelihood,
+                       profiles=profiles, mle_objective=mle_obj)))
 end

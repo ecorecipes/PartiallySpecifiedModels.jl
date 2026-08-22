@@ -575,11 +575,7 @@ function _agm_population_mcmc(prob::PSMProblem, alg::AdaptiveGradientMatching)
     for j in 1:n_obs
         pred[:, j] .= X_mean[:, prob.obs_to_state[j]]
     end
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:T_pts
-        data_loss += prob.data_weights[i, j] *
-                     (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     uf_evals = Dict{Symbol, Any}()
     offset = 0
@@ -843,10 +839,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
         pred[:, j] .= x_smooth[:, sk]
     end
 
-    data_loss = 0.0
-    for j in 1:n_obs, i in 1:T_pts
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
-    end
+    data_loss = weighted_data_loss(prob, pred)
 
     # Derivative matching loss
     p_opt = build_param_struct(prob, beta_opt)

@@ -133,14 +133,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
 
     # ── Initialise unknown-function parameters ───────────────────
     beta = Float64[]
-    mlp_specs = Dict{Symbol, MLPSpec}()
 
     for approx in prob.approximators
         if approx isa NeuralApproximator
-            spec = mlp_spec_from_lux(approx.model)
-            mlp_specs[approx.name] = spec
             rng = approx.rng_seed !== nothing ? Random.Xoshiro(approx.rng_seed) : Random.default_rng()
-            append!(beta, init_mlp_params(spec, rng))
+            append!(beta, neural_init_params(approx, rng))
         else
             append!(beta, initial_params(approx))
         end
@@ -267,19 +264,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
                                     length=approx.nknots))
             uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
         elseif approx isa NeuralApproximator
-            spec = mlp_specs[approx.name]
-            lo = approx.domain === nothing ? nothing : approx.domain[1]
-            span = approx.domain === nothing ? nothing : (approx.domain[2] - approx.domain[1])
-            let pk = copy(params_k), s = spec, lo_ = lo, span_ = span
-                uf_evals[approx.name] = x -> begin
-                    xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
-                        (Float64(x isa AbstractArray ? x[1] : x) - lo_) / span_
-                    else
-                        Float64(x isa AbstractArray ? x[1] : x)
-                    end
-                    mlp_evaluate(s, pk, xn)
-                end
-            end
+            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
         elseif approx isa GPApproximator
             uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
         elseif approx isa ShapeConstrainedBSplineApproximator
