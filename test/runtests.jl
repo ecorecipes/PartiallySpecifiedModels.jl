@@ -7,6 +7,40 @@ using Random
 using OrdinaryDiffEq
 using StableRNGs
 
+# ─── Custom approximator for the "approximator extension protocol" testset ──
+# Struct and method definitions must live at top level; the tests themselves
+# are in the testset at the bottom of the file. PolyApproximator implements
+# the full four-function extension interface (see docs/src/extending.md):
+# f(x) = Σ βⱼ x^(j-1), with a ridge penalty on the curvature coefficients.
+struct PolyApproximator <: PartiallySpecifiedModels.AbstractApproximator
+    name::Symbol
+    domain::Tuple{Float64, Float64}
+    degree::Int
+end
+PartiallySpecifiedModels.nparams(a::PolyApproximator) = a.degree + 1
+PartiallySpecifiedModels.initial_params(a::PolyApproximator) = zeros(a.degree + 1)
+function PartiallySpecifiedModels.penalty_matrix(a::PolyApproximator)
+    S = zeros(a.degree + 1, a.degree + 1)
+    for j in 3:(a.degree + 1)
+        S[j, j] = 1.0
+    end
+    S
+end
+function PartiallySpecifiedModels.build_evaluator(a::PolyApproximator, params_k)
+    coeffs = collect(params_k)   # eltype-generic: params_k may be Dual-valued
+    function poly_eval(x)
+        acc = coeffs[end]
+        for j in (length(coeffs) - 1):-1:1
+            acc = acc * x + coeffs[j]
+        end
+        acc
+    end
+    poly_eval
+end
+
+# A type implementing none of the interface, for the fallback-error test.
+struct NotAnApproximator end
+
 @testset "PartiallySpecifiedModels.jl" begin
 
     # Deterministic suite: all unseeded rand/randn sites below draw from
@@ -5140,6 +5174,82 @@ using StableRNGs
             @test isapprox(s_nm.convergence.sigma2, s_np.convergence.sigma2;
                            rtol=0.02)
         end
+    end
+
+    @testset "approximator extension protocol" begin
+        import Lux
+
+        # (d) All 7 built-in types round-trip through build_evaluator:
+        # evaluator from initial_params, called at the domain midpoint,
+        # returns a finite number.
+        builtins = PartiallySpecifiedModels.AbstractApproximator[
+            BSplineApproximator(:f, (0.0, 1.0), 6),
+            ShapeConstrainedBSplineApproximator(:f, (0.0, 1.0), 8, :increasing),
+            SPDEApproximator(:f, (0.0, 1.0), 10),
+            ShapeConstrainedSPDEApproximator(:f, (0.0, 1.0), 8, :increasing),
+            GPApproximator(:f, (0.0, 1.0), 6; kernel=:matern52),
+            COMONetApproximator(:f, (0.0, 1.0), (8, 8), :increasing),
+            NeuralApproximator(:f, Lux.Chain(Lux.Dense(1, 4, tanh), Lux.Dense(4, 1));
+                               domain=(0.0, 1.0), rng_seed=42),
+        ]
+        for a in builtins
+            p0 = initial_params(a)
+            @test length(p0) == nparams(a)
+            ev = build_evaluator(a, p0)
+            v = ev(0.5)
+            @test v isa Number && isfinite(v)
+        end
+
+        # (c) Fallback error for a type implementing nothing: names all four
+        # interface functions and points at the docs page.
+        @test_throws ErrorException build_evaluator(NotAnApproximator(), Float64[])
+        err = try
+            build_evaluator(NotAnApproximator(), Float64[])
+        catch e
+            e
+        end
+        msg = sprint(showerror, err)
+        @test occursin("NotAnApproximator", msg)
+        for fn in ("nparams", "initial_params", "penalty_matrix", "build_evaluator")
+            @test occursin(fn, msg)
+        end
+        @test occursin("Custom approximators", msg)
+
+        # Custom PolyApproximator basics: interface methods and evaluator
+        pa = PolyApproximator(:f, (0.0, 1.0), 2)
+        @test nparams(pa) == 3
+        @test initial_params(pa) == zeros(3)
+        Spa = penalty_matrix(pa)
+        @test size(Spa) == (3, 3)
+        @test Spa[3, 3] == 1.0 && Spa[1, 1] == 0.0  # constants/lines unpenalized
+        @test build_evaluator(pa, [1.0, 2.0, 3.0])(0.5) ≈ 1.0 + 2.0 * 0.5 + 3.0 * 0.25
+
+        # Decay problem du = -f(u) with true f(u) = 0.7u, noise-free data.
+        # u ranges over [exp(-2.8), 1] ⊂ (0, 1], so f is a line inside the
+        # PolyApproximator's model class and should be recovered.
+        poly_decay!(du, u, p, t) = (du[1] = -p.f(u[1]))
+        ts_poly = collect(0.0:0.25:4.0)
+        obs_poly = reshape(exp.(-0.7 .* ts_poly), :, 1)
+        mk_poly() = PSMProblem(poly_decay!, [1.0], (0.0, 4.0),
+            [PolyApproximator(:f, (0.0, 1.0), 2)];
+            data_times=ts_poly, data_values=obs_poly, obs_to_state=[1],
+            likelihood=Gaussian(), solver=Tsit5())
+
+        # (a) AdamSolver (through-the-solver autodiff: exercises the
+        # Dual-safety of the custom evaluator)
+        sol_adam = solve(mk_poly(), AdamSolver(maxiters=1000, lr=0.02, verbose=false))
+        f_adam = sol_adam.unknown_functions[:f]
+        @test isfinite(sol_adam.data_loss)
+        @test sol_adam.data_loss < 0.05
+        @test abs(f_adam(0.5) - 0.35) < 0.1
+        @test abs(f_adam(0.9) - 0.63) < 0.15
+
+        # (b) DerivativeFreeSolver
+        sol_df = solve(mk_poly(), DerivativeFreeSolver(maxiters=4000, verbose=false))
+        f_df = sol_df.unknown_functions[:f]
+        @test isfinite(sol_df.data_loss)
+        @test sol_df.data_loss < 0.05
+        @test abs(f_df(0.5) - 0.35) < 0.1
     end
 
 end

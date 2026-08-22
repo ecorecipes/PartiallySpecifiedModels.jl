@@ -32,43 +32,13 @@ function build_autodiff_param_struct(prob::PSMProblem, beta)
         params_k = beta[offset+1:offset+np]
         offset += np
 
-        if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2],
-                                    length=approx.nknots))
-            # Build B-spline evaluator that preserves Dual type in coefficients
-            evaluator = build_bspline_evaluator(knots_x, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa NeuralApproximator
-            # Shared Dual-safe evaluator (closure captures params_k, which
-            # may be Dual-valued)
-            push!(uf_entries, approx.name => build_neural_evaluator(approx, params_k))
-        elseif approx isa GPApproximator
-            evaluator = build_gp_evaluator(approx, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            # Use the SAME coefficient-basis evaluator as every other solver.
-            # (The old AD path treated β = Σ·softplus(γ) as interpolation
-            # knot VALUES and natural-cubic-splined through them — a
-            # different function from the de Boor coefficient spline the
-            # returned solution reports, it could violate the constraint
-            # between knots, and it ignored the free linear parameters.)
-            # _softplus and _bspline_basis_vector are Dual-safe.
-            evaluator = build_constrained_bspline_evaluator(approx, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa COMONetApproximator
-            evaluator = build_comonet_evaluator(approx, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa SPDEApproximator
-            evaluator = build_spde_evaluator(approx.mesh_points, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa ShapeConstrainedSPDEApproximator
-            # Route through gamma_to_mesh_values so the free linear
-            # components are NOT softplus'd — the optimized function must be
-            # the same one initial_params inverts and the solution reports.
-            mesh_values = gamma_to_mesh_values(approx, params_k)
-            evaluator = build_spde_evaluator(approx.mesh_points, mesh_values)
-            push!(uf_entries, approx.name => evaluator)
-        end
+        # The shared build_evaluator methods (approximator_interface.jl) are
+        # all Dual-safe: closures capture params_k, which may be
+        # Dual-valued, and every code path is eltype-generic. They also use
+        # the SAME coefficient-basis evaluators as every other solver — the
+        # old AD-specific paths for the shape-constrained types optimized a
+        # different function from the one the returned solution reported.
+        push!(uf_entries, approx.name => build_evaluator(approx, params_k))
     end
 
     uf_nt = NamedTuple(uf_entries)
@@ -528,23 +498,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
         np = nparams(approx)
         params_k = beta[offset+1:offset+np]
         offset += np
-        if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2],
-                                    length=approx.nknots))
-            uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
-        elseif approx isa NeuralApproximator
-            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
-        elseif approx isa GPApproximator
-            uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
-        elseif approx isa COMONetApproximator
-            uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
-        elseif approx isa SPDEApproximator
-            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
-        elseif approx isa ShapeConstrainedSPDEApproximator
-            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
-        end
+        uf_evals[approx.name] = build_evaluator(approx, params_k)
     end
 
     edf = Float64(n_beta)
