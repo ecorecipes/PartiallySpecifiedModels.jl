@@ -334,6 +334,41 @@ using StableRNGs
         sol_ok = solve(prob_ok, CollocationLAML(maxiters=10, verbose=false,
             n_continuation=2))
         @test all(t -> isfinite(t) && t > 0, sol_ok.smoothing_params)
+
+        # 5) Domain-boundary sentinel asymmetry: large residual, ZERO
+        #    Jacobian. With `sqrt(u)` dynamics and a state dipping just
+        #    below zero, the base evaluation fails (DomainError → 1e6
+        #    sentinel) while the +1e-6 perturbation succeeds. Differencing
+        #    against the sentinel gave a slope of ≈ -1e12, so J'J carried
+        #    ~1e24 entries and the Gauss–Newton solve returned garbage
+        #    without erroring. Measured max|J| pre-fix: 1.0e12; post-fix 5.6.
+        function sqrt_colloc!(du, u, p, t)
+            du[1] = p.r(u[1]) * sqrt(u[1])
+        end
+        bt = collect(range(0.0, 5.0, length=15))
+        bv = reshape(0.5 .+ 0.1 .* bt, :, 1)
+        bv[3, 1] = -1e-8   # dips just below the sqrt domain boundary
+        prob_bnd = PSMProblem(sqrt_colloc!, [0.5], (0.0, 5.0),
+            [BSplineApproximator(:r, (0.0, 5.0), 5; initial=x -> 0.2)];
+            data_times=bt, data_values=bv, obs_to_state=[1],
+            likelihood=Gaussian(), solver=Tsit5())
+        beta_bnd = Float64[]
+        for a in prob_bnd.approximators
+            append!(beta_bnd, PartiallySpecifiedModels.initial_params(a))
+        end
+        resid_bnd, J_bnd = PartiallySpecifiedModels.collocation_residual_jacobian(
+            prob_bnd, bt, copy(bv), beta_bnd,
+            PartiallySpecifiedModels.build_diff_matrix(bt), 1.0, ones(length(bt)))
+        # The residual keeps the sentinel: a failed point must be expensive.
+        @test maximum(abs, resid_bnd) >= 1e5
+        # The Jacobian must not: no fabricated 1e12 slopes.
+        @test maximum(abs, J_bnd) < 1e3
+        @test all(isfinite, J_bnd)
+        # And the end-to-end solve stays finite rather than returning garbage.
+        sol_bnd = solve(prob_bnd, CollocationLAML(maxiters=5, verbose=false,
+            n_continuation=2))
+        @test all(isfinite, sol_bnd.parameters)
+        @test isfinite(sol_bnd.objective)
     end
 
     @testset "GPApproximator" begin
@@ -880,6 +915,49 @@ using StableRNGs
         @test sol_mcmc_a.unknown_functions[:r](5.0) ==
               sol_mcmc_b.unknown_functions[:r](5.0)
         copy!(Random.default_rng(), rng_state_mcmc)
+
+        # The masked-data solves below also draw from the global stream, so
+        # save and restore it too — the rest of this suite is order-coupled.
+        rng_state_msk = copy(Random.default_rng())
+
+        # Masked observations (weight 0, value NaN). Pre-fix the initial σ
+        # was `std(prob.data_values) * 0.1` over ALL cells → NaN →
+        # log(max(NaN, 0.01)) = NaN → NaN in theta0 → the whole chain NaN,
+        # reported as objective=NaN and data_loss=NaN with no error. The
+        # reported data_loss also summed over masked cells (0 * NaN = NaN).
+        data_msk = copy(data_mcmc)
+        w_msk = ones(length(times_mcmc), 1)
+        data_msk[5, 1] = NaN;  w_msk[5, 1] = 0.0
+        data_msk[12, 1] = NaN; w_msk[12, 1] = 0.0
+        prob_msk = PSMProblem(
+            ODEProblem(exp_decay_mcmc!, [1.0], (0.0, 10.0)),
+            [BSplineApproximator(:r, (0.0, 10.0), 8; initial=0.15)];
+            data_times=times_mcmc, data_values=data_msk,
+            data_weights=w_msk, obs_to_state=[1], solver=Tsit5())
+        sol_msk = solve(prob_msk, MCMCSolver(n_samples=50, n_warmup=25,
+                                             verbose=false))
+        @test isfinite(sol_msk.objective)
+        @test isfinite(sol_msk.data_loss)
+        @test all(isfinite, Array(sol_msk.convergence))
+        @test abs(sol_msk.unknown_functions[:r](5.0) - 0.3) < 0.2
+
+        # Everything masked is not a fit — say so instead of sampling NaN.
+        prob_allmsk = PSMProblem(
+            ODEProblem(exp_decay_mcmc!, [1.0], (0.0, 10.0)),
+            [BSplineApproximator(:r, (0.0, 10.0), 8; initial=0.15)];
+            data_times=times_mcmc, data_values=data_mcmc,
+            data_weights=zeros(length(times_mcmc), 1),
+            obs_to_state=[1], solver=Tsit5())
+        err_msk = try
+            solve(prob_allmsk, MCMCSolver(n_samples=5, n_warmup=5,
+                                          verbose=false))
+            nothing
+        catch e
+            e
+        end
+        @test err_msk isa ErrorException
+        @test occursin("every observation is masked", err_msk.msg)
+        copy!(Random.default_rng(), rng_state_msk)
     end
 
     @testset "MagiSolver (B-spline)" begin
@@ -2025,15 +2103,67 @@ using StableRNGs
         @test haskey(sol_vi.unknown_functions, :r)
         @test haskey(sol_vi.convergence, :posterior_std)
         @test abs(sol_vi.unknown_functions[:r](5.0) - 0.25) < 0.2
-        # edf is the mean-field analogue of tr(I − Λ Σ_q) with per-term
-        # clamping to [0, 1]: it must be a valid dof count and, with the
-        # smoothness prior active, materially below the raw parameter
-        # count.  (Pre-fix the per-term values compared σ_q² to
-        # prior_scale², which is not the prior variance under Λ —
-        # per-term values could go negative and the sum was ≈ n_p.)
+        # edf = tr((H + Λ)⁻¹H) of the Laplace approximation at the
+        # posterior mean: a valid dof count, materially below n_p with the
+        # smoothness prior active, and — crucially — it must MOVE with the
+        # smoothing level. The previous σ_q-based form saturated every
+        # per-term clamp and returned the constant 1.0 for every
+        # prior_scale, which passed a bounds-only assertion trivially.
         n_p_vi = length(sol_vi.parameters)
         @test 0.0 <= sol_vi.edf <= n_p_vi
         @test sol_vi.edf <= n_p_vi - 1.0
+        vi_opts = (maxiters=200, n_elbo_samples=5, verbose=false)
+        edf_heavy = solve(prob_vi,
+            VariationalSolver(; prior_scale=1e-4, vi_opts...)).edf
+        edf_mid = solve(prob_vi,
+            VariationalSolver(; prior_scale=1.0, vi_opts...)).edf
+        edf_light = solve(prob_vi,
+            VariationalSolver(; prior_scale=1e4, vi_opts...)).edf
+        @test all(isfinite, (edf_heavy, edf_mid, edf_light))
+        # strictly increasing with material gaps at EVERY step — the old
+        # form returned exactly 1.0 for both 1e-4 and 1.0 (both clamped),
+        # so a gap assertion only at the extremes passed on the floor.
+        # Measured post-fix: 2.01 → 3.55 → 5.99.
+        @test edf_mid - edf_heavy > 0.5
+        @test edf_light - edf_mid > 0.5
+        # heavy smoothing must collapse toward the penalty null space,
+        # light smoothing toward the full parameter count
+        @test edf_heavy < n_p_vi - 2.0
+        @test edf_light > n_p_vi - 1.0
+
+        # Masked observations (weight 0, value NaN): the DEFAULT Gaussian
+        # path must skip them. Pre-fix `_gaussian_loglik` and `data_loss`
+        # summed over all cells, so `0 * NaN = NaN` gave objective=Inf,
+        # data_loss=NaN, elbo_history=[NaN,...] and r(5) frozen at the
+        # untouched initial coefficients — silently, with no error.
+        dv_vim = reshape(max.(data_vi, 0.01), :, 1)
+        w_vim = ones(length(t_vi), 1)
+        dv_vim[7, 1] = NaN; w_vim[7, 1] = 0.0
+        prob_vim = PSMProblem(logistic_vi!, [1.0], (0.0, 15.0),
+            [BSplineApproximator(:r, (0.0, 12.0), 6)];
+            data_times=t_vi, data_values=dv_vim, data_weights=w_vim,
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_vim = solve(prob_vim,
+            VariationalSolver(maxiters=500, n_elbo_samples=5, verbose=false))
+        @test isfinite(sol_vim.objective)
+        @test isfinite(sol_vim.data_loss)
+        @test all(isfinite, sol_vim.convergence[:elbo_history])
+        @test abs(sol_vim.unknown_functions[:r](5.0) - 0.25) < 0.2
+
+        # An ELBO that is non-finite at every iteration means the returned
+        # parameters would be the untouched initialization: error loudly
+        # instead of presenting the initial guess as a fit. (A zero
+        # observation variance makes every quadratic term -Inf.)
+        err_vi = try
+            solve(prob_vi, VariationalSolver(maxiters=20, n_elbo_samples=2,
+                                             obs_noise_var=0.0, verbose=false))
+            nothing
+        catch e
+            e
+        end
+        @test err_vi isa ErrorException
+        @test occursin("non-finite at every", err_vi.msg)
     end
 
     @testset "ABCSolver — exponential decay" begin
@@ -2709,6 +2839,68 @@ using StableRNGs
 
         @test lam_mixed[1] ≈ lam_pure[1] rtol=1e-8
         @test edf_mixed ≈ edf_pure rtol=1e-8
+    end
+
+    @testset "LAML restricted dof is a design-only rank" begin
+        using PartiallySpecifiedModels: _restricted_dof_Mp, laml_objective,
+                                        spline_penalty_matrix, _rank_penalty,
+                                        build_S_lambda, _safe_inv
+        # The Gaussian restricted dof must be a function of the DESIGN only —
+        # never of ρ. `laml_gradient` omits any −½·(dn_eff/dρ)·(log σ̂² − 1)
+        # term, so a ρ-dependent n_eff silently de-synchronizes the
+        # objective/gradient pair (the campaign already fixed one such
+        # inconsistency in this file). The earlier EDF form
+        # n − Mp_null − Σ_unpen diag(H⁻¹J'WJ) read H, hence ρ; it is also an
+        # exact algebraic no-op (build_S_lambda leaves those columns of S_λ
+        # identically zero ⟹ diag(H⁻¹J'WJ) ≡ 1 there), so every departure
+        # from n − Mp it ever produced came from the 1e-10 ridge in
+        # `_safe_inv`. It is replaced by the classical REML rank count.
+        n, nk = 40, 6
+        knots_rd = collect(0.0:1.0:5.0)
+        xs_rd = collect(range(0.0, 5.0, length=n))
+        hat_rd(x, k) = max(0.0, 1.0 - abs(x - k))
+        Jspl = [hat_rd(xs_rd[i], knots_rd[j]) for i in 1:n, j in 1:nk]
+        S_rd = spline_penalty_matrix(knots_rd)
+        rk_S = _rank_penalty(S_rd)      # 4 for a 6-knot second-difference S
+        w_rd = ones(n)
+        u_rd = cos.(1.3 .* xs_rd)
+        v_rd = sin.(2.1 .* xs_rd)
+
+        # Pure spline: identical to the raw count n_p − rank(S).
+        @test _restricted_dof_Mp(Jspl, w_rd, [0], [nk], nk, rk_S) == nk - rk_S
+        # Full-rank unpenalized block: also identical (no behaviour change).
+        Jfull = hcat(Jspl, u_rd, v_rd)
+        @test _restricted_dof_Mp(Jfull, w_rd, [0], [nk], nk + 2, rk_S) ==
+              (nk + 2) - rk_S
+        # An identically-zero column carries no information and must not be
+        # charged a degree of freedom (the raw count charges it one).
+        Jzero = hcat(Jspl, u_rd, zeros(n))
+        @test _restricted_dof_Mp(Jzero, w_rd, [0], [nk], nk + 2, rk_S) ==
+              (nk + 2) - rk_S - 1
+        # Nor must an exact duplicate.
+        Jdup = hcat(Jspl, u_rd, u_rd)
+        @test _restricted_dof_Mp(Jdup, w_rd, [0], [nk], nk + 2, rk_S) ==
+              (nk + 2) - rk_S - 1
+
+        # ρ-invariance of the implied restricted dof, read back out of
+        # `laml_objective` as (RSS + pen)/σ̂², with an unpenalized block
+        # present. Must be bit-identical across four decades of λ.
+        y_rd = sin.(xs_rd) .+ 0.3 .* cos.(2.0 .* xs_rd) .+
+               0.05 .* sin.(37.0 .* (1:n))
+        n_p_rd = nk + 2
+        implied = map(([-5.0], [0.0], [4.0], [8.0])) do rho
+            S_lam = build_S_lambda([S_rd], [0], [nk], rho, n_p_rd)
+            beta = _safe_inv(Jfull' * Diagonal(w_rd) * Jfull + S_lam) *
+                   (Jfull' * (w_rd .* y_rd))
+            mu = Jfull * beta
+            _, _, S_l, s2 = laml_objective(Gaussian(), beta, Jfull, w_rd,
+                                           w_rd, y_rd, mu, [S_rd], [0], [nk],
+                                           rho, n_p_rd)
+            RSS = sum(w_rd[i] * (y_rd[i] - mu[i])^2 for i in 1:n)
+            (RSS + dot(beta, S_l * beta)) / s2
+        end
+        @test all(≈(implied[1]; rtol=1e-12), implied)
+        @test implied[1] ≈ n - (n_p_rd - rk_S) rtol=1e-12
     end
 
     @testset "LAML mixed spline+NN — end-to-end sanity" begin

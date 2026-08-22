@@ -55,6 +55,10 @@ end
     _gaussian_loglik(pred, data, weights, obs_noise_var)
 
 Gaussian log-likelihood: -0.5 Σ w_ij (pred_ij - data_ij)² / σ²_obs.
+
+Zero-weight and NaN cells are skipped rather than multiplied by their
+weight: `0 * NaN = NaN`, which would poison the whole ELBO (and with it
+every gradient) from a single masked datum.
 """
 function _gaussian_loglik(pred, data, weights, obs_noise_var)
     T = eltype(pred)
@@ -62,7 +66,10 @@ function _gaussian_loglik(pred, data, weights, obs_noise_var)
     n_t, n_obs = size(data)
     for j in 1:n_obs
         for i in 1:n_t
-            ll -= weights[i, j] * (pred[i, j] - data[i, j])^2 / (2 * obs_noise_var)
+            w = weights[i, j]
+            y = data[i, j]
+            (w > 0 && !isnan(y)) || continue
+            ll -= w * (pred[i, j] - y)^2 / (2 * obs_noise_var)
         end
     end
     ll
@@ -171,6 +178,62 @@ function _compute_elbo(prob::PSMProblem, mu, log_sigma, Λ, logdetΛ,
     avg_ll - kl
 end
 
+"""
+    _vi_edf(prob, mu_opt, Λ, obs_noise_var, n_p) → Float64
+
+Effective degrees of freedom of the Gaussian (Laplace) approximation at the
+variational posterior mean: `tr((H + Λ)⁻¹ H)` with the Gauss–Newton
+information `H = JᵀWJ / σ²_obs`, `J = ∂μ̂/∂β` by forward finite
+differences, and `Λ` the variational prior precision.
+
+Only usable observation cells (`weight > 0`, non-NaN) enter `W`. Returns
+`NaN` when the model cannot be simulated at `mu_opt` or the linear system
+is singular — an honest missing value rather than a fabricated constant.
+"""
+function _vi_edf(prob::PSMProblem, mu_opt::Vector{Float64},
+                 Λ::Matrix{Float64}, obs_noise_var::Float64, n_p::Int)
+    n_t = length(prob.data_times)
+    n_obs = size(prob.data_values, 2)
+
+    keep = [(i, j) for j in 1:n_obs for i in 1:n_t
+            if prob.data_weights[i, j] > 0 && !isnan(prob.data_values[i, j])]
+    isempty(keep) && return NaN
+
+    base = try
+        Float64.(simulate(prob, mu_opt))
+    catch e
+        _is_program_error(e) && rethrow()
+        return NaN
+    end
+    all(isfinite, base) || return NaN
+
+    J = zeros(length(keep), n_p)
+    for b in 1:n_p
+        step = max(1e-6, abs(mu_opt[b]) * 1e-6)
+        bp = copy(mu_opt); bp[b] += step
+        pert = try
+            Float64.(simulate(prob, bp))
+        catch e
+            _is_program_error(e) && rethrow()
+            return NaN
+        end
+        all(isfinite, pert) || return NaN
+        for (r, (i, j)) in enumerate(keep)
+            J[r, b] = (pert[i, j] - base[i, j]) / step
+        end
+    end
+
+    W = Diagonal([Float64(prob.data_weights[i, j]) for (i, j) in keep])
+    H = (J' * W * J) ./ obs_noise_var
+    edf = try
+        tr((H .+ Λ) \ H)
+    catch
+        return NaN
+    end
+    isfinite(edf) || return NaN
+    clamp(edf, 0.0, Float64(n_p))
+end
+
 # ─── Main variational solver ────────────────────────────────────────
 
 """
@@ -234,20 +297,28 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
         # This is more robust than the data range heuristic
         n_t = size(prob.data_values, 1)
         n_obs = size(prob.data_values, 2)
+        # Usable cells only: a masked/NaN datum must not poison σ̂².
+        usable(i, j) = prob.data_weights[i, j] > 0 &&
+                       !isnan(prob.data_values[i, j])
+        total_var = 0.0
+        n_dd = 0
         if n_t >= 3
-            total_var = 0.0
-            count = 0
             for j in 1:n_obs
                 for i in 2:n_t-1
                     # Second differences estimate noise (removes trend)
+                    (usable(i-1, j) && usable(i, j) && usable(i+1, j)) || continue
                     dd = prob.data_values[i-1, j] - 2*prob.data_values[i, j] + prob.data_values[i+1, j]
                     total_var += dd^2
-                    count += 1
+                    n_dd += 1
                 end
             end
-            max(total_var / (6 * count), 1e-6)  # Var(Δ²y) = 6σ² for white noise
+        end
+        if n_dd > 0
+            max(total_var / (6 * n_dd), 1e-6)  # Var(Δ²y) = 6σ² for white noise
         else
-            data_range = maximum(prob.data_values) - minimum(prob.data_values)
+            vals = [prob.data_values[i, j] for j in 1:n_obs for i in 1:n_t
+                    if usable(i, j)]
+            data_range = isempty(vals) ? 0.0 : maximum(vals) - minimum(vals)
             max((0.05 * data_range)^2, 1e-6)
         end
     end
@@ -362,6 +433,21 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
         end
     end
 
+    # A non-finite best ELBO means no iteration ever produced a usable
+    # objective, so `best_phi` is still the initialization: returning it
+    # would present the initial guess as a fit. Fail loudly instead.
+    if !isfinite(best_elbo)
+        n_nan = count(!isfinite, elbo_history)
+        error("VariationalSolver: the ELBO was non-finite at every one of " *
+              "$(length(elbo_history)) iterations ($n_nan non-finite), so " *
+              "the returned variational parameters would be the untouched " *
+              "initialization rather than a fit. Common causes: NaN or Inf " *
+              "in data_values at cells with nonzero data_weights, a " *
+              "likelihood undefined at the initial predictions, or dynamics " *
+              "that produce NaN. Mask unusable observations by setting " *
+              "their data_weights entry to 0.")
+    end
+
     # Recover best variational parameters
     phi .= best_phi
     mu_opt = phi[1:n_p]
@@ -386,22 +472,38 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     n_t = length(prob.data_times)
     n_obs = size(prob.data_values, 2)
 
+    # Masked/NaN cells are skipped (0 * NaN = NaN would make data_loss NaN).
     data_loss = 0.0
     for j in 1:n_obs, i in 1:n_t
-        data_loss += prob.data_weights[i, j] * (prob.data_values[i, j] - pred[i, j])^2
+        w = prob.data_weights[i, j]
+        y = prob.data_values[i, j]
+        (w > 0 && !isnan(y)) || continue
+        data_loss += w * (y - pred[i, j])^2
     end
 
-    # Approximate effective degrees of freedom from posterior variance:
-    # the mean-field analogue of tr(I − Λ Σ_q) = Σᵢ (1 − σ_qᵢ² Λᵢᵢ),
-    # where Λ is the SAME prior precision (ridge + S/prior_scale) that
-    # defines the variational prior above.  A parameter the data pin down
-    # (σ_q² ≪ 1/Λᵢᵢ) contributes ≈1; one the prior returns to its own
-    # variance contributes ≈0.  (The old form divided σ_q² by
-    # prior_scale², which is NOT the prior variance under Λ — per-term
-    # values could go negative and the sum was dimensionally meaningless.)
-    # Each term is clamped to [0, 1], its valid range under the prior.
-    edf = sum(clamp.(1.0 .- (sigma_opt .^ 2) .* diag(Λ), 0.0, 1.0))
-    edf = clamp(edf, 1.0, Float64(n_p))
+    # Effective degrees of freedom of the Gaussian (Laplace) approximation
+    # taken at the variational posterior mean:
+    #
+    #     edf = tr((H + Λ)⁻¹ H),
+    #
+    # with H the Gauss–Newton observed information of the data term,
+    # H = JᵀWJ/σ²_obs and J = ∂μ̂/∂β by finite differences, and Λ the SAME
+    # prior precision (ridge + S/prior_scale) that defines the variational
+    # prior above. This is the standard penalized-regression EDF and, being
+    # built from the model Jacobian rather than from q's scale parameters,
+    # it responds to `prior_scale` as a dof must.
+    #
+    # It replaces Σᵢ (1 − σ_q,ᵢ² Λᵢᵢ), which is the correct per-coordinate
+    # shrinkage factor ONLY at the exact mean-field optimum, where
+    # σ_q,ᵢ² = 1/(Hᵢᵢ + Λᵢᵢ). Adam does not drive log σ that far in a
+    # finite iteration budget, so in practice σ_q,ᵢ² Λᵢᵢ > 1 for most
+    # coordinates, every term hit its clamp, and the reported EDF was the
+    # constant 1.0 for any smoothing level (measured: edf = 1.0 at
+    # prior_scale = 1e-4 AND at prior_scale = 1).
+    #
+    # If the Jacobian cannot be built (simulation failure at the posterior
+    # mean) the EDF is reported as NaN rather than fabricated.
+    edf = _vi_edf(prob, mu_opt, Λ, obs_noise_var, n_p)
 
     # Build unknown function evaluators using posterior mean
     uf_evals = Dict{Symbol, Any}()
