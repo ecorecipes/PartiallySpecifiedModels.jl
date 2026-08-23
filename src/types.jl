@@ -1294,7 +1294,7 @@ GradientMatching(; maxiters::Int=500, tol::Float64=1e-6, verbose::Bool=false,
 
 """
     AdamSolver(; maxiters=300, lr=0.01, verbose=false, loss=:auto,
-                 penalty_weight=0.0, autodiff=true)
+                 penalty_weight=0.0, autodiff=true, sensealg=nothing)
 
 Adam optimizer that trains unknown function parameters through ODE integration.
 
@@ -1322,16 +1322,33 @@ quadratic roughness penalty `penalty_weight · Σₖ βₖ' Sₖ βₖ` to the l
   warning on mismatch.
 - `penalty_weight::Float64=0.0`: fixed weight of the quadratic smoothing
   penalty added to the loss (0 disables)
-- `autodiff::Bool=true`: use ForwardDiff (true) or finite differences (false)
+- `autodiff::Bool=true`: use ForwardDiff (true) or finite differences (false);
+  ignored when `sensealg` is set
+- `sensealg=nothing`: opt-in adjoint-sensitivity gradient backend. `nothing`
+  (default) keeps the ForwardDiff path. Set to `:auto` (a robust default,
+  `InterpolatingAdjoint(autojacvec=ReverseDiffVJP(false))`) or to a concrete
+  SciMLSensitivity continuous adjoint algorithm (`InterpolatingAdjoint(...)`
+  is the validated choice; `GaussAdjoint`/`QuadratureAdjoint` were observed
+  to mis-differentiate spline-parameterized dynamics — validate against
+  ForwardDiff before trusting them) to compute gradients via adjoint
+  sensitivities instead. **Requires `using SciMLSensitivity`**
+  (the package extension implements this path; without it, `solve` throws an
+  informative error). Adjoints make the gradient cost roughly independent of
+  the parameter count, which pays off for `NeuralApproximator` models with
+  many weights; ForwardDiff is usually faster below a few dozen parameters.
+  Only continuous ODE problems are supported (no discrete maps, no DDEs);
+  the loss families are the same as the ForwardDiff path (`:mse`,
+  `:poisson`).
 
 # Convergence info
 `sol.convergence` is a NamedTuple `(optimizer, method, converged, iterations,
-reason, final_grad_norm)` with the standard honest-convergence keys (see
-[`PSMSolution`](@ref)) plus `final_grad_norm::Float64`, the Euclidean norm of
-the last computed gradient. `reason == :plateau` is only reported while the
-cosine-annealed learning rate is still above 5% of the base `lr` — a plateau
-that appears merely because the schedule has driven the step size to zero is
-reported as `:maxiters`, not convergence.
+reason, final_grad_norm, backend)` with the standard honest-convergence keys
+(see [`PSMSolution`](@ref)) plus `final_grad_norm::Float64`, the Euclidean
+norm of the last computed gradient, and `backend`, the gradient backend that
+ran (`:forwarddiff`, `:finitediff`, or `:adjoint`). `reason == :plateau` is
+only reported while the cosine-annealed learning rate is still above 5% of
+the base `lr` — a plateau that appears merely because the schedule has driven
+the step size to zero is reported as `:maxiters`, not convergence.
 """
 struct AdamSolver
     maxiters::Int
@@ -1340,12 +1357,18 @@ struct AdamSolver
     loss::Symbol
     penalty_weight::Float64
     autodiff::Bool
+    sensealg::Any
 end
 
 AdamSolver(; maxiters::Int=300, lr::Float64=0.01, verbose::Bool=false,
              loss::Symbol=:auto, penalty_weight::Float64=0.0,
-             autodiff::Bool=true) =
-    AdamSolver(maxiters, lr, verbose, loss, penalty_weight, autodiff)
+             autodiff::Bool=true, sensealg=nothing) =
+    AdamSolver(maxiters, lr, verbose, loss, penalty_weight, autodiff, sensealg)
+
+# Backward-compatible positional constructor (pre-sensealg arity).
+AdamSolver(maxiters::Int, lr::Float64, verbose::Bool, loss::Symbol,
+           penalty_weight::Float64, autodiff::Bool) =
+    AdamSolver(maxiters, lr, verbose, loss, penalty_weight, autodiff, nothing)
 
 """
     MultipleShootingSolver(; n_intervals=10, maxiters_inner=100, maxiters_outer=20,

@@ -97,6 +97,18 @@ BNGSolver
 
 Gradient-based optimization through the ODE solver using the **Adam** optimizer. This is the standard approach for Universal Differential Equations (UDEs). Works with all approximator types including neural networks.
 
+By default, gradients are computed with ForwardDiff through the ODE solve, whose cost grows with the number of parameters. For continuous ODE problems you can opt into **adjoint sensitivities** instead by loading SciMLSensitivity and setting `sensealg`:
+
+```julia
+using SciMLSensitivity   # activates the adjoint extension
+sol = solve(prob, AdamSolver(sensealg=:auto))                 # validated default
+sol = solve(prob, AdamSolver(                # compiled tape: branch-free MLP
+          sensealg=InterpolatingAdjoint(     # dynamics ONLY — silently wrong
+              autojacvec=ReverseDiffVJP(true))))   # on spline evaluators
+```
+
+`sensealg=:auto` uses `InterpolatingAdjoint(autojacvec=ReverseDiffVJP(false))`, which re-tapes the dynamics at every step and is therefore safe for spline evaluators (their knot-interval lookup branches on the state). For branch-free dynamics — pure `Lux.Dense`/`tanh` MLP approximators — the compiled tape `ReverseDiffVJP(true)` is several times faster and becomes competitive with (and beyond ~1000 parameters faster than) ForwardDiff; for small parameter counts ForwardDiff generally remains fastest. `GaussAdjoint`/`QuadratureAdjoint` were observed to mis-differentiate spline-parameterized dynamics in testing — validate gradients against ForwardDiff before trusting them, and avoid `EnzymeVJP()` here (the closure-based dynamics wrapper is not Enzyme-compatible). The adjoint backend supports continuous ODE problems only (not discrete maps or DDEs) and the same loss families as the default path; `sol.convergence.backend` records which gradient backend ran.
+
 ```@docs
 AdamSolver
 ```

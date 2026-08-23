@@ -6566,4 +6566,284 @@ struct NotAnApproximator end
         @test Array(sol_p_sq.convergence) == Array(sol_p_sq2.convergence)
     end
 
+    # ─── AdamSolver adjoint-sensitivity backend (SciMLSensitivity ext) ──
+    #
+    # The opt-in `sensealg` gradient backend: continuous adjoint
+    # sensitivities via the PartiallySpecifiedModelsSciMLSensitivityExt
+    # package extension (trigger: SciMLSensitivity only — its internal
+    # vjps use ReverseDiff, a hard dep of SciMLSensitivity, so no Zygote
+    # is involved). The parity tests are the correctness contract: the
+    # extension mirrors the ForwardDiff loss paths (masking, penalty,
+    # loss=:auto, u0-as-function, 1e10 sentinel) and must agree with them
+    # by value (rtol 1e-10) and by gradient (rtol 1e-5).
+    @testset "AdamSolver adjoint backend (sensealg)" begin
+        using SciMLSensitivity
+        using ForwardDiff
+        import Lux
+        PSM = PartiallySpecifiedModels
+
+        # Shared spline problem: exponential growth with unknown rate fn
+        growth_aj!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        t_aj = collect(range(0.0, 5.0, length=30))
+        y_aj = reshape(exp.(0.3 .* t_aj), :, 1)
+        mk_spline_prob() = PSMProblem(growth_aj!, [1.0], (0.0, 5.0),
+            [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+            data_times=t_aj, data_values=y_aj, obs_to_state=[1],
+            likelihood=Gaussian(), solver=Tsit5(), abstol=1e-8, reltol=1e-8)
+
+        # The extension must be active under the test environment
+        @test Base.get_extension(PSM,
+            :PartiallySpecifiedModelsSciMLSensitivityExt) !== nothing
+
+        @testset "gradient parity — spline (penalty and mask)" begin
+            prob = mk_spline_prob()
+            beta = PSM.initial_params(prob.approximators[1]) .+
+                   0.05 .* randn(StableRNG(11), 6)
+            f = b -> PSM.adam_loss_mse(prob, b, 0.5)
+            l_fd = f(beta)
+            g_fd = ForwardDiff.gradient(f, beta)
+            l_aj, g_aj = PSM._adam_adjoint_loss_grad(prob, beta, :mse, 0.5,
+                                                     :auto)
+            @test isapprox(l_aj, l_fd; rtol=1e-10)
+            @test isapprox(g_aj, g_fd; rtol=1e-5)
+
+            # Masked cells (NaN datum + zero weight) contribute nothing
+            y_mask = copy(y_aj); y_mask[5, 1] = NaN
+            w_mask = ones(size(y_aj)); w_mask[9, 1] = 0.0
+            prob_m = PSMProblem(growth_aj!, [1.0], (0.0, 5.0),
+                [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+                data_times=t_aj, data_values=y_mask, data_weights=w_mask,
+                obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5(),
+                abstol=1e-8, reltol=1e-8)
+            fm = b -> PSM.adam_loss_mse(prob_m, b, 0.0)
+            l_fdm = fm(beta)
+            g_fdm = ForwardDiff.gradient(fm, beta)
+            l_ajm, g_ajm = PSM._adam_adjoint_loss_grad(prob_m, beta, :mse,
+                                                       0.0, :auto)
+            @test isapprox(l_ajm, l_fdm; rtol=1e-10)
+            @test isapprox(g_ajm, g_fdm; rtol=1e-5)
+        end
+
+        @testset "gradient parity — Poisson loss" begin
+            prob_p = PSMProblem(growth_aj!, [1.0], (0.0, 5.0),
+                [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+                data_times=t_aj, data_values=round.(y_aj), obs_to_state=[1],
+                likelihood=Poisson(), solver=Tsit5(),
+                abstol=1e-8, reltol=1e-8)
+            beta = PSM.initial_params(prob_p.approximators[1]) .+
+                   0.05 .* randn(StableRNG(12), 6)
+            fp = b -> PSM.adam_loss_poisson(prob_p, b, 0.0)
+            l_fd = fp(beta)
+            g_fd = ForwardDiff.gradient(fp, beta)
+            l_aj, g_aj = PSM._adam_adjoint_loss_grad(prob_p, beta, :poisson,
+                                                     0.0, :auto)
+            @test isapprox(l_aj, l_fd; rtol=1e-10)
+            @test isapprox(g_aj, g_fd; rtol=1e-5)
+        end
+
+        @testset "gradient parity — u0 as a function of p" begin
+            prob_u = PSMProblem(growth_aj!, p -> [1.0 + 0.5 * p.r(1.0)],
+                (0.0, 5.0),
+                [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+                data_times=t_aj, data_values=y_aj, obs_to_state=[1],
+                likelihood=Gaussian(), solver=Tsit5(),
+                abstol=1e-8, reltol=1e-8)
+            beta = PSM.initial_params(prob_u.approximators[1]) .+
+                   0.05 .* randn(StableRNG(13), 6)
+            fu = b -> PSM.adam_loss_mse(prob_u, b, 0.0)
+            l_fd = fu(beta)
+            g_fd = ForwardDiff.gradient(fu, beta)
+            l_aj, g_aj = PSM._adam_adjoint_loss_grad(prob_u, beta, :mse,
+                                                     0.0, :auto)
+            @test isapprox(l_aj, l_fd; rtol=1e-10)
+            @test isapprox(g_aj, g_fd; rtol=1e-5)
+        end
+
+        # Neural parity + timing on a 321-parameter MLP UDE
+        @testset "gradient parity and timing — neural (321 params)" begin
+            decay_aj!(du, u, p, t) = (du[1] = -p.f(u[1]) * u[1])
+            sol_true = OrdinaryDiffEq.solve(
+                ODEProblem((du, u, p, t) -> (du[1] = -0.5 * u[1] * u[1]),
+                           [5.0], (0.0, 10.0)), Tsit5(); saveat=0.5)
+            rng_aj = StableRNG(7)
+            y_nn = reshape([u[1] + 0.1 * randn(rng_aj) for u in sol_true.u],
+                           :, 1)
+            model = Lux.Chain(Lux.Dense(1, 16, tanh),
+                              Lux.Dense(16, 16, tanh), Lux.Dense(16, 1))
+            uf = NeuralApproximator(:f, model; domain=(0.0, 5.0),
+                                    rng_seed=42)
+            prob_nn = PSMProblem(decay_aj!, [5.0], (0.0, 10.0), [uf];
+                data_times=collect(sol_true.t), data_values=y_nn,
+                obs_to_state=[1], solver=Tsit5())
+            beta = PSM.neural_init_params(uf, Random.Xoshiro(42))
+            @test length(beta) == 321
+
+            fn = b -> PSM.adam_loss_mse(prob_nn, b, 0.0)
+            l_fd = fn(beta)
+            g_fd = ForwardDiff.gradient(fn, beta)
+            # Compiled tape: valid here (tanh MLP dynamics are branch-free)
+            salg = InterpolatingAdjoint(autojacvec=ReverseDiffVJP(true))
+            l_aj, g_aj = PSM._adam_adjoint_loss_grad(prob_nn, beta, :mse,
+                                                     0.0, salg)
+            @test isapprox(l_aj, l_fd; rtol=1e-10)
+            @test isapprox(g_aj, g_fd; rtol=1e-5)
+
+            # Timing sanity (not a benchmark). Representative measurements
+            # (M-series laptop, n=321): compiled-tape adjoint ~0.018 s/grad
+            # vs ForwardDiff 0.0065-0.073 s/grad (ForwardDiff timing varies
+            # with chunking/GC state); at n=1153 adjoint 0.058 vs
+            # ForwardDiff 0.072 s/grad; the non-compiled tape (:auto) is
+            # ~4x slower than the compiled one. Assert loosely to stay
+            # robust on loaded CI machines.
+            t_adj = minimum(@elapsed PSM._adam_adjoint_loss_grad(
+                                prob_nn, beta, :mse, 0.0, salg)
+                            for _ in 1:3)
+            t_fwd = minimum(@elapsed ForwardDiff.gradient(fn, beta)
+                            for _ in 1:3)
+            @info "AdamSolver adjoint timing (n=321)" t_adj t_fwd ratio =
+                t_adj / t_fwd
+            # Loose bound only: ForwardDiff per-gradient time varies ~10×
+            # with chunking/GC on shared hardware, and a timing flake fails
+            # the whole suite. The real numbers are in the @info line.
+            @test t_adj < 10 * t_fwd
+        end
+
+        # End-to-end neural UDE fit through solve() with the adjoint
+        # backend (smaller sibling of "AdamSolver with NeuralApproximator")
+        @testset "end-to-end neural fit with sensealg" begin
+            decay_e2e!(du, u, p, t) = (du[1] = -p.f(u[1]) * u[1])
+            sol_true = OrdinaryDiffEq.solve(
+                ODEProblem((du, u, p, t) -> (du[1] = -0.5 * u[1] * u[1]),
+                           [5.0], (0.0, 10.0)), Tsit5(); saveat=0.5)
+            rng_e2e = StableRNG(21)
+            y_e2e = reshape([u[1] + 0.1 * randn(rng_e2e)
+                             for u in sol_true.u], :, 1)
+            model = Lux.Chain(Lux.Dense(1, 8, tanh), Lux.Dense(8, 1))
+            uf = NeuralApproximator(:f, model; domain=(0.0, 5.0),
+                                    rng_seed=42)
+            prob_e2e = PSMProblem(decay_e2e!, [5.0], (0.0, 10.0), [uf];
+                data_times=collect(sol_true.t), data_values=y_e2e,
+                obs_to_state=[1], solver=Tsit5())
+            sol = solve(prob_e2e, AdamSolver(lr=0.02, maxiters=400,
+                sensealg=InterpolatingAdjoint(
+                    autojacvec=ReverseDiffVJP(true))))
+            @test sol.convergence.backend == :adjoint
+            # Recovery comparable to the ForwardDiff-path testset (which
+            # runs 1000 iters and asserts < 0.15/0.25); at 400 iters the
+            # fit is slightly looser, so use its outer band throughout.
+            @test sol.data_loss < 1.0
+            fhat = sol.unknown_functions[:f]
+            for x in (0.5, 1.0, 2.0)
+                @test abs(fhat(x) - 0.5 * x) < 0.25
+            end
+        end
+
+        @testset "default path untouched and rejections" begin
+            prob = mk_spline_prob()
+            sol_fd = solve(prob, AdamSolver(maxiters=5, lr=0.01))
+            @test sol_fd.convergence.backend == :forwarddiff
+            sol_fdiff = solve(prob, AdamSolver(maxiters=3, lr=0.01,
+                                               autodiff=false))
+            @test sol_fdiff.convergence.backend == :finitediff
+            sol_aj = solve(prob, AdamSolver(maxiters=5, lr=0.01,
+                                            sensealg=:auto))
+            @test sol_aj.convergence.backend == :adjoint
+
+            # Discrete maps have no ODE solve to adjoint
+            prob_disc = PSMProblem(growth_aj!, [1.0], (0.0, 5.0),
+                [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+                data_times=collect(0.0:1.0:5.0),
+                data_values=reshape(exp.(0.1 .* collect(0.0:1.0:5.0)), :, 1),
+                obs_to_state=[1], discrete=true)
+            err = try
+                solve(prob_disc, AdamSolver(maxiters=2, sensealg=:auto))
+                nothing
+            catch e; e; end
+            @test err isa ErrorException
+            @test occursin("discrete-time", err.msg)
+
+            # DDE problems go through adam_solve_dde, not the adjoint path
+            prob_dde = PSMProblem(growth_aj!, [1.0], (0.0, 5.0),
+                [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+                data_times=t_aj, data_values=y_aj, obs_to_state=[1],
+                delays=[1.0], history=(p, t) -> [1.0])
+            err = try
+                solve(prob_dde, AdamSolver(maxiters=2, sensealg=:auto))
+                nothing
+            catch e; e; end
+            @test err isa ErrorException
+            @test occursin("delays", err.msg)
+
+            # Forward sensitivity algorithms are rejected (adjoint-only)
+            err = try
+                solve(prob, AdamSolver(maxiters=2,
+                                       sensealg=ForwardDiffSensitivity()))
+                nothing
+            catch e; e; end
+            @test err isa ErrorException
+            @test occursin("not an adjoint", err.msg)
+
+            # Unknown sensealg symbol
+            err = try
+                solve(prob, AdamSolver(maxiters=2, sensealg=:bogus))
+                nothing
+            catch e; e; end
+            @test err isa ErrorException
+            @test occursin("unknown sensealg symbol", err.msg)
+
+            # Junk sensealg values fall through the extension to the stub
+            err = try
+                solve(prob, AdamSolver(maxiters=2, sensealg="junk"))
+                nothing
+            catch e; e; end
+            @test err isa ErrorException
+            @test occursin("not a valid adjoint specification", err.msg)
+
+            # Unsupported likelihood family: same rejection as the
+            # ForwardDiff path (AdamSolver supports Gaussian/Poisson only)
+            prob_nb = PSMProblem(growth_aj!, [1.0], (0.0, 5.0),
+                [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+                data_times=t_aj, data_values=y_aj, obs_to_state=[1],
+                likelihood=NegativeBinomial(10.0))
+            err = try
+                solve(prob_nb, AdamSolver(maxiters=2, sensealg=:auto))
+                nothing
+            catch e; e; end
+            @test err isa ErrorException
+            @test occursin("no loss for", err.msg)
+        end
+
+        # The stub must fire when the extension is NOT loaded: spawn julia
+        # on the package environment and assert the informative error. This
+        # works because extension activation requires the trigger package to
+        # be LOADED, not merely installed somewhere on the LOAD_PATH stack —
+        # the subprocess never runs `using SciMLSensitivity`, so a global-env
+        # install cannot activate the extension. (The subprocess does need
+        # the package-dir Manifest to exist, which dev checkouts and CI
+        # buildpkg both guarantee.)
+        @testset "stub error without the extension (subprocess)" begin
+            pkgdir_psm = dirname(dirname(pathof(PartiallySpecifiedModels)))
+            code = """
+            using PartiallySpecifiedModels
+            growth!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+            prob = PSMProblem(growth!, [1.0], (0.0, 1.0),
+                [BSplineApproximator(:r, (0.5, 2.0), 4)];
+                data_times=[0.0, 0.5, 1.0],
+                data_values=reshape([1.0, 1.1, 1.2], :, 1),
+                obs_to_state=[1])
+            try
+                solve(prob, AdamSolver(maxiters=2, sensealg=:auto))
+                print("NO_ERROR")
+            catch e
+                msg = sprint(showerror, e)
+                print(occursin("SciMLSensitivity", msg) &&
+                      occursin("not loaded", msg) ? "STUB_OK" : "WRONG_ERROR")
+            end
+            """
+            out = read(`$(Base.julia_cmd()) --project=$(pkgdir_psm)
+                        --startup-file=no -e $code`, String)
+            @test endswith(out, "STUB_OK")
+        end
+    end
+
 end
