@@ -1832,11 +1832,19 @@ end
 """
     GCVSolver
 
-Generalized Cross-Validation solver for smoothing parameter selection.
+Cross-validation solver for smoothing parameter selection.
 
 Uses GCV score minimization (via golden-section search on log(λ)) as an
 alternative to LAML/REML. Simpler and faster than LAML, but typically
-produces slightly less smooth estimates.
+produces slightly less smooth estimates. With `criterion=:ncv` the GCV
+score is replaced by neighbourhood cross-validation (NCV; Wood 2024,
+arXiv:2404.16490): each point is predicted from a penalized fit that
+omits a temporal *neighbourhood* around it, not just the point itself.
+Because dynamical-systems residuals are typically short-range
+autocorrelated, ordinary GCV/LOOCV sees the correlated neighbours make
+the left-out point look predictable and undersmooths badly; NCV removes
+exactly those neighbours and is the recommended criterion whenever
+residual autocorrelation is suspected (check `residual_diagnostics`).
 
 # Fields
 - `n_grid`: number of grid points for initial λ search (default 50)
@@ -1844,25 +1852,52 @@ produces slightly less smooth estimates.
 - `tol`: convergence tolerance (default 1e-6)
 - `gamma`: GCV inflation factor (default 1.4, >1 guards against
   under-smoothing; `gamma=1.0` reproduces the classical unmodified GCV of
-  Wood (2001) / ddefit)
+  Wood (2001) / ddefit). **Ignored when `criterion=:ncv`**: NCV needs no
+  inflation factor — leaving out the neighbourhood is itself the guard
+  against the undersmoothing that `gamma` patches over (Wood 2024 uses
+  γ has no role in the base NCV criterion as implemented here).
+- `criterion`: `:gcv` (default, classical GCV) or `:ncv`
+  (neighbourhood cross-validation)
+- `ncv_width`: half-width of the NCV deletion neighbourhood, in
+  time-index steps (default 2). For observation i of a component, the
+  neighbourhood δ(i) is every usable observation of the SAME component
+  whose time index is within `ncv_width` of i's (i itself included).
+  Must be ≥ 0; `ncv_width=0` gives exact leave-one-out CV. Choose it
+  to cover the residual correlation length (e.g. the lag at which the
+  residual ACF dies off). Ignored when `criterion=:gcv`.
 - `verbose`: print progress
 
 # Convergence info
-`sol.convergence` is a NamedTuple `(converged, iterations, reason, gcv)` with
-the standard honest-convergence keys (see [`PSMSolution`](@ref)) plus
-`gcv::Float64`, the last GCV score (NaN when no smooth terms are present).
+`sol.convergence` is a NamedTuple
+`(converged, iterations, reason, criterion, gcv, ncv)` with the standard
+honest-convergence keys (see [`PSMSolution`](@ref)) plus:
+- `criterion::Symbol`: which selection criterion ran (`:gcv` or `:ncv`)
+- `gcv::Float64`: the final GCV score when `criterion=:gcv`; `NaN`
+  otherwise (also NaN when no smooth terms are present)
+- `ncv::Float64`: the final NCV score when `criterion=:ncv`; `NaN`
+  otherwise
 """
 struct GCVSolver
     n_grid::Int
     maxiters::Int
     tol::Float64
     gamma::Float64
+    criterion::Symbol
+    ncv_width::Int
     verbose::Bool
 end
 
-GCVSolver(; n_grid::Int=50, maxiters::Int=50, tol::Float64=1e-6,
-            gamma::Float64=1.4, verbose::Bool=false) =
-    GCVSolver(n_grid, maxiters, tol, gamma, verbose)
+function GCVSolver(; n_grid::Int=50, maxiters::Int=50, tol::Float64=1e-6,
+                     gamma::Float64=1.4, criterion::Symbol=:gcv,
+                     ncv_width::Int=2, verbose::Bool=false)
+    criterion in (:gcv, :ncv) ||
+        throw(ArgumentError("GCVSolver: criterion must be :gcv or :ncv " *
+                            "(got $(repr(criterion)))"))
+    ncv_width >= 0 ||
+        throw(ArgumentError("GCVSolver: ncv_width must be ≥ 0 " *
+                            "(got $ncv_width; 0 = leave-one-out CV)"))
+    GCVSolver(n_grid, maxiters, tol, gamma, criterion, ncv_width, verbose)
+end
 
 # ─── Two-stage solver (Wood 2001 / deGradInfer) ───────────────────
 
