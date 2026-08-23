@@ -6846,4 +6846,201 @@ struct NotAnApproximator end
         end
     end
 
+    # ─── W10: GCVSolver search=:reuse (ddefit EScv one-decomposition trick) ──
+
+    @testset "GCVSolver search=:reuse — one-decomposition fast GCV" begin
+        PSM = PartiallySpecifiedModels
+
+        # ── Construction validation ──
+        @test_throws ArgumentError GCVSolver(search=:fast)
+        @test_throws ArgumentError GCVSolver(search=:eigen)
+        # :reuse is a pure-GCV trick: NCV's neighbourhood downdates need
+        # A(λ)⁻¹ per λ, incompatible with one decomposition — rejected.
+        @test_throws ArgumentError GCVSolver(search=:reuse, criterion=:ncv)
+        @test GCVSolver().search == :direct                    # default unchanged
+        @test GCVSolver(search=:reuse).search == :reuse
+        @test GCVSolver(search=:direct, criterion=:ncv) isa GCVSolver
+
+        # ── SCORE EQUIVALENCE: reuse family vs direct _gcv_score on fixed
+        # working models. The reuse scorer replicates the direct scorer's
+        # λ-dependent stability ridge exactly (per-argmax-segment pencil),
+        # so agreement is limited only by the factorization roundoff:
+        #  · full-rank S: ~1e-15 relative at ALL λ across the RHO bounds;
+        #  · rank-deficient S: the penalty null-space eigenvalues of the
+        #    whitened pencil are O(1e-12) (the replicated ridge) and carry
+        #    the absolute O(eps·‖K‖) error of any double-precision
+        #    eigendecomposition, so agreement degrades as λ·eps once
+        #    λ ≳ 1e15 — measured (Xoshiro(7) fixtures of this shape):
+        #    ≤9e-11 for ρ ≤ 15, ~1e-8 at ρ = 20, ~3e-4 over the full
+        #    range to ρ = 40 (λ = 2.4e17, essentially-infinite smoothing
+        #    where the direct path's trA/β are themselves conditioning-
+        #    limited — the direct SCORE proper stays more stable there,
+        #    so the loose full-range pin reflects reuse-side eps·λ
+        #    growth in a region no search ever selects).
+        #    Pinned below with ≥10× margins: 1e-10 for ρ ∈ [RHO_MIN, 13],
+        #    1e-6 to ρ = 20, 5e-3 full range.
+        rng_w10 = StableRNG(7)
+        n_w10, p_w10 = 60, 12
+        J_w10 = randn(rng_w10, n_w10, p_w10)
+        z_w10 = randn(rng_w10, n_w10)
+        ones_w10 = ones(n_w10)
+        Z0_w10 = zeros(p_w10, p_w10)
+        # B-spline-style second-difference penalty: 2-dim null space
+        D_w10 = zeros(p_w10 - 2, p_w10)
+        for i in 1:p_w10-2
+            D_w10[i, i] = 1.0; D_w10[i, i+1] = -2.0; D_w10[i, i+2] = 1.0
+        end
+        S_rd_w10 = D_w10' * D_w10
+        @test rank(S_rd_w10) == p_w10 - 2
+        S_fr_w10 = Matrix(1.0I, p_w10, p_w10) .+
+                   0.1 .* (x -> x' * x)(randn(rng_w10, p_w10, p_w10) ./ sqrt(p_w10))
+        wv_w10 = rand(rng_w10, n_w10) .+ 0.3
+        wm_w10 = copy(wv_w10)
+        wm_w10[3] = 0.0; wm_w10[17] = 0.0; wm_w10[44] = 0.0   # masked rows
+        nm_w10 = count(>(0), wm_w10)
+
+        # worst relative disagreement (score AND tr(A) AND β̂) over 20 λ
+        function reuse_worst_w10(w, n, S_base, S_pen; rho_hi=PSM.RHO_MAX)
+            fam = PSM._gcv_reuse_family(J_w10, w, z_w10, S_base, S_pen,
+                                        n, 1.4)
+            fam === nothing && return Inf
+            worst = 0.0
+            for lam in exp.(range(PSM.RHO_MIN, rho_hi, length=20))
+                gf, bf, _, tf = fam(lam)
+                gd, bd, _, td = PSM._gcv_score(J_w10, w, z_w10,
+                                               S_base .+ lam .* S_pen, n, 1.4)
+                worst = max(worst,
+                            abs(gf - gd) / max(abs(gd), 1e-300),
+                            abs(tf - td) / max(td, 1e-300),
+                            norm(bf - bd) / max(norm(bd), 1e-300))
+            end
+            worst
+        end
+
+        # well-conditioned (full-rank S): full RHO span at 1e-10
+        @test reuse_worst_w10(ones_w10, n_w10, Z0_w10, S_fr_w10) < 1e-10
+        # rank-deficient / weighted / masked / nonzero fixed penalty
+        # (coordinate-descent shape): graded pins per the conditioning
+        # analysis above
+        for (w, n) in ((ones_w10, n_w10), (wv_w10, n_w10), (wm_w10, nm_w10))
+            @test reuse_worst_w10(w, n, Z0_w10, S_rd_w10; rho_hi=13.0) < 1e-10
+            @test reuse_worst_w10(w, n, Z0_w10, S_rd_w10; rho_hi=20.0) < 1e-6
+            @test reuse_worst_w10(w, n, Z0_w10, S_rd_w10) < 5e-3
+        end
+        S_baseK_w10 = 3.7 .* Matrix(1.0I, p_w10, p_w10)
+        @test reuse_worst_w10(wv_w10, n_w10, S_baseK_w10, S_rd_w10;
+                              rho_hi=13.0) < 1e-10
+        @test reuse_worst_w10(wv_w10, n_w10, S_baseK_w10, S_rd_w10) < 5e-3
+
+        # ── Rank-deficient penalty null space: EDF contribution is 1 per
+        # null direction (dᵢ ≈ 0 ⟹ 1/(1+λdᵢ) ≈ 1), verified against the
+        # direct score at large-but-moderate λ where the fit is otherwise
+        # fully smoothed: tr(A) ↓ but stays ≥ null-space dim = 2.
+        fam_rd_w10 = PSM._gcv_reuse_family(J_w10, ones_w10, z_w10,
+                                           Z0_w10, S_rd_w10, n_w10, 1.4)
+        _, _, _, trA_f_w10 = fam_rd_w10(1e6)
+        _, _, _, trA_d_w10 = PSM._gcv_score(J_w10, ones_w10, z_w10,
+                                            1e6 .* S_rd_w10, n_w10, 1.4)
+        @test abs(trA_f_w10 - trA_d_w10) < 1e-8
+        @test 2.0 < trA_f_w10 < 2.1
+
+        # ── Degraded case, unit level: near-singular A ⟹ family refuses
+        # (returns nothing) instead of whitening garbage ──
+        J_sing_w10 = randn(rng_w10, 8, p_w10)       # n = 8 < p = 12
+        @test PSM._gcv_reuse_family(J_sing_w10, ones(8), randn(rng_w10, 8),
+                                    Z0_w10, S_rd_w10, 8, 1.4) === nothing
+
+        # ── End-to-end equivalence, single λ: logistic growth ──
+        r_true_w10(N) = 0.5 * (1.0 - N / 10.0)
+        logi_w10!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        st_w10 = OrdinaryDiffEq.solve(
+            ODEProblem(logi_w10!, [1.0], (0.0, 15.0), (; r=r_true_w10)),
+            Tsit5(); saveat=0.2, abstol=1e-10, reltol=1e-10)
+        t_w10 = collect(st_w10.t)
+        truth_w10 = [u[1] for u in st_w10.u]
+        data_w10 = max.(truth_w10 .+
+                        0.05 .* randn(StableRNG(11), length(t_w10)), 0.01)
+        mk_w10(res, times, vals) = PSMProblem(logi_w10!, [1.0], (0.0, 15.0),
+            [BSplineApproximator(:r, (0.0, 12.0), res)];
+            data_times=times, data_values=reshape(vals, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PSM.Gaussian())
+        prob_e2e_w10 = mk_w10(8, t_w10, data_w10)
+        sol_d_w10 = solve(prob_e2e_w10, GCVSolver(maxiters=25))
+        sol_r_w10 = solve(prob_e2e_w10, GCVSolver(maxiters=25, search=:reuse))
+        # λ̂ agreement within the golden-section search tolerance: the two
+        # paths see bit-different scores (~1e-13 relative in the benign
+        # region), so iterates can part ways only below the search tol.
+        # Measured: |Δ log λ̂| = 8e-7, objective/GCV relΔ ≈ 6e-9, fitted
+        # values within 5e-9. Pinned with ~100× margin.
+        @test abs(log(sol_d_w10.smoothing_params[1]) -
+                  log(sol_r_w10.smoothing_params[1])) < 1e-4
+        @test abs(sol_d_w10.objective - sol_r_w10.objective) <
+              1e-6 * max(abs(sol_d_w10.objective), 1.0)
+        @test maximum(abs.(sol_d_w10.fitted_values .-
+                           sol_r_w10.fitted_values)) < 1e-6
+        @test abs(sol_d_w10.convergence.gcv - sol_r_w10.convergence.gcv) <
+              1e-6 * abs(sol_d_w10.convergence.gcv)
+        # identical convergence-info structure
+        @test keys(sol_d_w10.convergence) == keys(sol_r_w10.convergence)
+        @test sol_d_w10.convergence.criterion == :gcv
+        @test sol_r_w10.convergence.criterion == :gcv
+
+        # ── End-to-end, multi-λ (two approximators ⟹ coordinate descent
+        # with one decomposition per coordinate per sweep) ──
+        two_uf_w10!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1] - p.g(u[1]))
+        pt_w10 = ODEProblem((du, u, p, t) -> (du[1] = 0.4u[1] - 0.05u[1]),
+                            [1.0], (0.0, 5.0))
+        st2_w10 = OrdinaryDiffEq.solve(pt_w10, Tsit5(); saveat=0.25)
+        tt2_w10 = collect(st2_w10.t)
+        dv2_w10 = reshape([st2_w10(t)[1] for t in tt2_w10] .+
+                          0.02 .* randn(StableRNG(7), length(tt2_w10)), :, 1)
+        prob2_w10 = PSMProblem(two_uf_w10!, [1.0], (0.0, 5.0),
+            [BSplineApproximator(:r, (0.5, 6.0), 5; initial=x -> 0.3),
+             BSplineApproximator(:g, (0.5, 6.0), 5; initial=x -> 0.03x)];
+            data_times=tt2_w10, data_values=dv2_w10, obs_to_state=[1],
+            known_params=NamedTuple(), likelihood=PSM.Gaussian(),
+            solver=Tsit5())
+        sol2_d_w10 = solve(prob2_w10, GCVSolver(maxiters=15))
+        sol2_r_w10 = solve(prob2_w10, GCVSolver(maxiters=15, search=:reuse))
+        @test length(sol2_r_w10.smoothing_params) == 2
+        @test all(abs.(log.(sol2_d_w10.smoothing_params) .-
+                       log.(sol2_r_w10.smoothing_params)) .< 1e-4)
+        @test abs(sol2_d_w10.objective - sol2_r_w10.objective) <
+              1e-6 * max(abs(sol2_d_w10.objective), 1.0)
+        @test maximum(abs.(sol2_d_w10.fitted_values .-
+                           sol2_r_w10.fitted_values)) < 1e-6
+
+        # ── Degraded case, end-to-end: 8 data points, 20-knot basis ⟹
+        # J'WJ rank ≤ 8 < p ⟹ the reuse guard trips every IRLS iteration
+        # and the search runs the byte-identical direct scorer, so the two
+        # fits must be EXACTLY equal (and finite) ──
+        tt_s_w10 = collect(range(0.0, 15.0, length=8))
+        st_s_w10 = OrdinaryDiffEq.solve(
+            ODEProblem(logi_w10!, [1.0], (0.0, 15.0), (; r=r_true_w10)),
+            Tsit5(); saveat=tt_s_w10, abstol=1e-10, reltol=1e-10)
+        d_s_w10 = max.([u[1] for u in st_s_w10.u] .+
+                       0.05 .* randn(StableRNG(3), 8), 0.01)
+        prob_s_w10 = mk_w10(20, tt_s_w10, d_s_w10)
+        sol_sd_w10 = solve(prob_s_w10, GCVSolver(maxiters=8))
+        sol_sr_w10 = solve(prob_s_w10, GCVSolver(maxiters=8, search=:reuse))
+        @test sol_sr_w10.smoothing_params == sol_sd_w10.smoothing_params
+        @test sol_sr_w10.objective == sol_sd_w10.objective
+        @test isfinite(sol_sr_w10.objective)
+        @test all(isfinite, sol_sr_w10.fitted_values)
+
+        # ── Timing (comment-only, per the W9 flake-review guidance):
+        # search-only microbenchmark (grid 50 + golden section, minimum of
+        # 7 runs, warmed, second-difference penalty, this machine):
+        #   p=20 n=100: direct 2.1ms, reuse 1.0ms (2.0×)
+        #   p=30 n=150: direct 4.8ms, reuse 1.5ms (3.3×)
+        #   p=40 n=200: direct 8.7ms, reuse 2.5ms (3.5×)
+        #   p=60 n=300: direct 20.0ms, reuse 5.4ms (3.7×)
+        # Full multi-λ solve (prob2 above, m=2): 1.02s → 0.15s (~7×; the
+        # coordinate sweep multiplies the per-λ solve count, so reuse
+        # helps most there). At package-typical p ≈ 8–15 the win per IRLS
+        # iteration is real but modest (~2×); the feature matters for
+        # large bases and multi-approximator coordinate descent.
+    end
+
 end

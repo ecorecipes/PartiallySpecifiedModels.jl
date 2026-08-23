@@ -102,6 +102,166 @@ function _gcv_score(J::AbstractMatrix, W_irls::AbstractVector,
     (gcv, beta_hat, rss_w, trA)
 end
 
+# ─── One-decomposition ("reuse") fast GCV scorer ──────────────────
+#
+# The historical ddefit speed trick (code/ddefit504-cli/gcv.c,
+# `EasySmooth`/`EScv`): pay one expensive decomposition per working
+# model, then evaluate the WHOLE λ-search (grid of 50 + golden section,
+# ~80 score evaluations) from cheap arithmetic. gcv.c organizes it as
+# QR(W^½JZ) → invert R (L = R⁻¹) → T = L'Z'SZL → tridiagonalize
+# (UTU'), and each `EScv` call adds ρ to the tridiagonal's diagonal and
+# runs an O(p) tridiagonal Cholesky (`tricholeski`) for the RSS, the
+# influence trace, and the score. Here we go one step further, to the
+# full Demmler–Reinsch form: Cholesky-whiten A = J'WJ (+ any fixed
+# penalty), symmetric-eigendecompose the whitened penalty (K = R⁻ᵀS₁R⁻¹
+# = QDQ'), after which each λ needs only the 1/(1+λdᵢ) shrinkage (O(p))
+# plus one precomputed n×p projection for the fitted values (O(np)).
+#
+# EXACT equivalence with `_gcv_score`, ridge included: the direct scorer
+# regularizes H = J'WJ + S_λ with δ(λ)·I where
+# δ(λ) = 1e-12·maxᵢ diag(H)ᵢ + 1e-15. diag(H)ᵢ = bᵢ + λsᵢ is affine in
+# λ, so on every λ-segment where the argmax index i★ is constant,
+#
+#   H_reg = [A_base + (1e-12·b_{i★} + 1e-15)·I] + λ·[S_pen + 1e-12·s_{i★}·I]
+#
+# is a pencil of two FIXED matrices — one whitening+eigendecomposition
+# per segment (the upper envelope of p affine functions; 1–2 segments in
+# practice, cached lazily) reproduces the direct score to floating-point
+# accuracy at every λ, including the rank-deficient-S extreme-λ regime
+# where the ridge is material. A penalty null-space direction has
+# dᵢ = 1e-12·s_{i★}·(whitened) ≈ 0, so its EDF contribution
+# 1/(1+λdᵢ) ≈ 1 at all practically selected λ — the Demmler–Reinsch
+# handling of rank-deficient penalties — while still degrading at
+# extreme λ exactly as the direct scorer's ridge does.
+
+"""
+    _gcv_reuse_family(J, W_irls, z, S_base, S_pen, n, gamma)
+
+Build a one-decomposition GCV scorer for the penalty family
+`S_λ = S_base + λ·S_pen` on a fixed working model `(J, W_irls, z)`.
+
+Returns `eval_lam(lam) -> (gcv, beta, rss_w, trA)` agreeing with
+`_gcv_score(J, W_irls, z, S_base .+ lam .* S_pen, n, gamma)` to
+floating-point accuracy (same score, same β̂, same tr(A); the direct
+scorer's λ-dependent stability ridge is replicated exactly — see the
+segment construction above). Each evaluation costs O(np) after the
+per-segment O(p³) setup.
+
+Returns `nothing` when `A_base = J'WJ + S_base` is unusable for
+whitening — not positive definite, or condition number above 1e10 —
+in which case the caller must fall back to the direct scorer for this
+working model (logged at debug level). This mirrors the degraded cases
+the direct path survives via its truncated-SVD/backslash guards.
+"""
+function _gcv_reuse_family(J::AbstractMatrix, W_irls::AbstractVector,
+                           z::AbstractVector, S_base::AbstractMatrix,
+                           S_pen::AbstractMatrix, n::Int, gamma::Float64)
+    JWJ = J' * Diagonal(W_irls) * J
+    A_base = JWJ + S_base
+    n_p = size(A_base, 1)
+
+    # Whitening needs A_base itself (not A_base + λS_pen, which the direct
+    # path gets to factorize) to be safely invertible. Guard and let the
+    # caller fall back loudly when it is not — near-singular A is exactly
+    # the regime the direct scorer's own guards exist for.
+    ev = eigvals(Symmetric(A_base))
+    ev_min, ev_max = first(ev), last(ev)
+    if !(ev_min > 0.0) || ev_max > 1e10 * ev_min
+        @debug "GCVSolver search=:reuse — A = J'WJ (+ fixed penalty) is " *
+               "near-singular; falling back to the direct GCV scorer for " *
+               "this working model" ev_min ev_max
+        return nothing
+    end
+
+    b = diag(A_base)               # ≥ 0 (both terms PSD)
+    s = diag(S_pen)                # ≥ 0
+    Jwz = J' * (W_irls .* z)
+
+    # One decomposition per ridge-argmax segment, cached lazily.
+    # Fields: d (whitened-penalty eigenvalues ≥ 0), P = R⁻¹Q (β-space
+    # back-transform), G = J·P (n×p fitted-value projection), c = P'J'Wz,
+    # mdiag with tr(A)(λ) = Σᵢ mdiagᵢ/(1+λdᵢ).
+    segments = Dict{Int, Any}()
+
+    function build_segment(i_star::Int)
+        delta0 = 1e-12 * b[i_star] + 1e-15
+        A0 = Matrix{Float64}(A_base)
+        for i in 1:n_p
+            A0[i, i] += delta0
+        end
+        F = cholesky(Symmetric(A0); check=false)
+        issuccess(F) || return nothing   # unreachable in practice post-guard
+        R = F.U
+        S1 = Matrix{Float64}(S_pen)
+        ridge_s = 1e-12 * s[i_star]
+        for i in 1:n_p
+            S1[i, i] += ridge_s
+        end
+        K = (R' \ S1) / R                    # R⁻ᵀ S₁ R⁻¹
+        E = eigen(Symmetric((K + K') ./ 2))  # symmetrize roundoff
+        d = max.(E.values, 0.0)   # S₁ is PSD but roundoff gives raw
+                                  # eigenvalues down to −O(eps·‖K‖);
+                                  # clamping is safe (within the error
+                                  # budget at extreme λ, exact elsewhere)
+        P = R \ E.vectors
+        G = J * P
+        c = P' * Jwz
+        # tr(H⁻¹J'WJ) = Σᵢ mᵢ/(1+λdᵢ) with mᵢ = (P'J'WJP)ᵢᵢ = Σᵣ wᵣG[r,i]²
+        mdiag = zeros(n_p)
+        @inbounds for i in 1:n_p
+            acc = 0.0
+            for r in axes(G, 1)
+                acc += W_irls[r] * G[r, i]^2
+            end
+            mdiag[i] = acc
+        end
+        (d=d, P=P, G=G, c=c, mdiag=mdiag)
+    end
+
+    function eval_lam(lam::Float64)
+        # Ridge argmax i★: direct's maxd = maxᵢ(bᵢ + λsᵢ) = b_{i★} + λs_{i★}.
+        # The direct scorer wraps diag(H) in abs(); dropping it here is
+        # exact ONLY because every irls_weights method clamps weights ≥ 0
+        # and penalties are PSD, so bᵢ, sᵢ ≥ 0. A future likelihood with
+        # unclamped (possibly negative) working weights would break this
+        # equivalence — re-add abs handling if that ever changes.
+        i_star = 1
+        best = b[1] + lam * s[1]
+        @inbounds for i in 2:n_p
+            v = b[i] + lam * s[i]
+            if v > best
+                best = v
+                i_star = i
+            end
+        end
+        seg = get(segments, i_star, nothing)
+        if seg === nothing
+            seg = build_segment(i_star)
+            if seg === nothing
+                # Belt-and-braces: score this single λ via the direct path.
+                return _gcv_score(J, W_irls, z, S_base .+ lam .* S_pen,
+                                  n, gamma)
+            end
+            segments[i_star] = seg
+        end
+        shrink = 1.0 ./ (1.0 .+ lam .* seg.d)
+        sc = shrink .* seg.c
+        beta_hat = seg.P * sc                # = H_reg⁻¹ J'Wz
+        fitted = seg.G * sc                  # = J β̂
+        rss_w = 0.0
+        @inbounds for i in eachindex(z)
+            W_irls[i] > 0 || continue
+            rss_w += W_irls[i] * (z[i] - fitted[i])^2
+        end
+        trA = dot(seg.mdiag, shrink)
+        denom = n - gamma * trA
+        denom <= 0.0 && return (Inf, beta_hat, rss_w, trA)
+        (n * rss_w / denom^2, beta_hat, rss_w, trA)
+    end
+
+    eval_lam
+end
+
 # ─── NCV score computation (Wood 2024) ───────────────────────────
 
 """
@@ -252,16 +412,22 @@ Minimize a CV score over a shared log(λ) using golden-section search.
 `_gcv_score` or `_ncv_score` partially applied to the current working
 model. All approximator penalties are scaled by the same λ = exp(rho).
 Returns `(best_rho, best_beta, best_score, best_trA)`.
+
+With `family !== nothing` (a `_gcv_reuse_family` evaluator for the
+shared-λ pencil `λ·ΣₗSₗ`), each evaluation calls `family(exp(rho))`
+instead of assembling `S_λ` and running the O(p³) direct scorer —
+same scores to floating-point accuracy, O(np) per λ.
 """
 function _golden_section_gcv(scorer,
                              S_list::Vector{Matrix{Float64}},
                              offsets::Vector{Int}, nknots_list::Vector{Int},
                              n_p::Int,
                              lo::Float64, hi::Float64, tol::Float64;
-                             maxiter::Int=100)
+                             maxiter::Int=100, family=nothing)
     gr = (sqrt(5.0) + 1.0) / 2.0  # golden ratio
 
     function eval_gcv(rho)
+        family === nothing || return family(exp(rho))
         rho_vec = fill(rho, length(S_list))
         S_lam = build_S_lambda(S_list, offsets, nknots_list, rho_vec, n_p)
         gcv, beta, rss, trA = scorer(S_lam)
@@ -312,7 +478,8 @@ end
 
 Initial coarse grid search over log(λ) ∈ [RHO_MIN, RHO_MAX], then
 golden-section refinement around the best grid point. `scorer` as in
-`_golden_section_gcv`.
+`_golden_section_gcv`; `family` as in `_golden_section_gcv` (the
+one-decomposition fast evaluator, or `nothing` for the direct path).
 
 Returns `(best_rho, best_beta, best_score, best_trA)`.
 """
@@ -320,7 +487,7 @@ function _grid_then_refine_gcv(scorer,
                                S_list::Vector{Matrix{Float64}},
                                offsets::Vector{Int}, nknots_list::Vector{Int},
                                n_p::Int,
-                               n_grid::Int, tol::Float64)
+                               n_grid::Int, tol::Float64; family=nothing)
     rho_grid = range(RHO_MIN, RHO_MAX, length=n_grid)
     best_gcv = Inf
     best_idx = 1
@@ -328,9 +495,13 @@ function _grid_then_refine_gcv(scorer,
     best_trA = 0.0
 
     for (idx, rho) in enumerate(rho_grid)
-        rho_vec = fill(rho, length(S_list))
-        S_lam = build_S_lambda(S_list, offsets, nknots_list, rho_vec, n_p)
-        gcv, beta, _, trA = scorer(S_lam)
+        if family === nothing
+            rho_vec = fill(rho, length(S_list))
+            S_lam = build_S_lambda(S_list, offsets, nknots_list, rho_vec, n_p)
+            gcv, beta, _, trA = scorer(S_lam)
+        else
+            gcv, beta, _, trA = family(exp(rho))
+        end
         if gcv < best_gcv
             best_gcv = gcv
             best_idx = idx
@@ -345,7 +516,8 @@ function _grid_then_refine_gcv(scorer,
     hi = min(RHO_MAX, rho_grid[best_idx] + step)
 
     rho_opt, beta_opt, gcv_opt, trA_opt = _golden_section_gcv(
-        scorer, S_list, offsets, nknots_list, n_p, lo, hi, tol)
+        scorer, S_list, offsets, nknots_list, n_p, lo, hi, tol;
+        family=family)
 
     # Keep the better of grid and refinement
     if gcv_opt < best_gcv
@@ -366,13 +538,20 @@ treats λ as a VECTOR with one smoothing parameter per unknown function
 functions differ in scale or wiggliness. Started from the shared-λ optimum,
 2–3 sweeps typically converge. `scorer` as in `_golden_section_gcv`
 (either GCV or NCV — the multi-λ path is criterion-agnostic).
+
+With `family_factory !== nothing` (`(rho, k) -> _gcv_reuse_family(...)`
+for coordinate k with the other λⱼ held at `rho`), each coordinate's
+golden section runs from ONE decomposition per coordinate per sweep —
+A_eff = J'WJ + Σⱼ≠ₖ λⱼSⱼ is fixed within the sweep, so the same
+whitening trick applies. A factory returning `nothing` (near-singular
+A_eff) drops that coordinate back to the direct per-λ scorer.
 """
 function _coordinate_gcv(scorer,
                          S_list::Vector{Matrix{Float64}},
                          offsets::Vector{Int}, nknots_list::Vector{Int},
                          n_p::Int,
                          rho0::Vector{Float64}, tol::Float64;
-                         sweeps::Int=3)
+                         sweeps::Int=3, family_factory=nothing)
     m = length(S_list)
     rho = copy(rho0)
     gr = (sqrt(5.0) + 1.0) / 2.0
@@ -386,32 +565,38 @@ function _coordinate_gcv(scorer,
     for _ in 1:sweeps
         improved = false
         for k in 1:m
+            # One decomposition per coordinate per sweep on the fast path;
+            # `nothing` (no factory, or a near-singular A_eff) keeps the
+            # byte-identical direct per-λ evaluation.
+            fam_k = family_factory === nothing ? nothing :
+                    family_factory(rho, k)
+            eval_k = fam_k === nothing ?
+                (x -> begin
+                     rv = copy(rho); rv[k] = x
+                     eval_vec(rv)
+                 end) :
+                (x -> fam_k(exp(x)))
             a, b = RHO_MIN, RHO_MAX
             c = b - (b - a) / gr
             d = a + (b - a) / gr
-            rc = copy(rho); rc[k] = c
-            rd = copy(rho); rd[k] = d
-            gc_, _, _, _ = eval_vec(rc)
-            gd_, _, _, _ = eval_vec(rd)
+            gc_, _, _, _ = eval_k(c)
+            gd_, _, _, _ = eval_k(d)
             for _ in 1:60
                 abs(b - a) < tol && break
                 if gc_ < gd_
                     b, d, gd_ = d, c, gc_
                     c = b - (b - a) / gr
-                    rc[k] = c
-                    gc_, _, _, _ = eval_vec(rc)
+                    gc_, _, _, _ = eval_k(c)
                 else
                     a, c, gc_ = c, d, gd_
                     d = a + (b - a) / gr
-                    rd[k] = d
-                    gd_, _, _, _ = eval_vec(rd)
+                    gd_, _, _, _ = eval_k(d)
                 end
             end
             rho_k_new = (a + b) / 2
-            rtrial = copy(rho); rtrial[k] = rho_k_new
-            g_new, beta_new, _, trA_new = eval_vec(rtrial)
+            g_new, beta_new, _, trA_new = eval_k(rho_k_new)
             if g_new < best_gcv - 1e-12
-                rho = rtrial
+                rho = copy(rho); rho[k] = rho_k_new
                 best_gcv, best_beta, best_trA = g_new, beta_new, trA_new
                 improved = true
             end
@@ -438,7 +623,12 @@ For each IRLS iteration:
    when `alg.criterion == :ncv` — via grid search + golden-section
    refinement (and per-approximator coordinate descent when there are
    multiple smooth terms; both criteria drive the identical search
-   machinery)
+   machinery). With `alg.search == :reuse` the λ-search evaluates every
+   candidate from one whitening + eigendecomposition per IRLS iteration
+   (`_gcv_reuse_family`; ddefit's `EasySmooth`/`EScv` trick) instead of
+   one O(p³) solve per λ — same scores to floating-point accuracy, with
+   automatic fallback to the direct scorer when A = J'WJ is
+   near-singular
 5. Solve penalized LS at optimal λ
 6. Step contraction (backtracking)
 7. Repeat until convergence
@@ -456,6 +646,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     tol      = alg.tol
     criterion = alg.criterion
     ncv_width = alg.ncv_width
+    search   = alg.search
     crit_name = uppercase(String(criterion))
 
     n_times = length(prob.data_times)
@@ -466,6 +657,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     # Build penalty matrices per approximator
     S_list, uf_offsets, uf_nk = build_penalty_matrices(prob)
     m = length(S_list)
+
+    # search=:reuse fixtures (iteration-independent): the shared-λ search
+    # scores the pencil λ·ΣₗSₗ, so its base penalty is zero and its unit
+    # penalty is ΣₗSₗ embedded (build_S_lambda at ρ = 0).
+    S_base_zero = search === :reuse && m > 0 ? zeros(n_p, n_p) : nothing
+    S_pen_all = search === :reuse && m > 0 ?
+        build_S_lambda(S_list, uf_offsets, uf_nk, zeros(m), n_p) : nothing
 
     # Initialize λ (moderate default)
     theta = ones(m)
@@ -598,9 +796,40 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
                 (S_lam -> _gcv_score(J, w_irls, z_pseudo, S_lam,
                                      n_gcv, gamma))
 
+            # search=:reuse — one-decomposition fast path (ddefit's
+            # EasySmooth/EScv trick; construction rejects :reuse + :ncv,
+            # so this only ever wraps the GCV scorer). Rebuilt each IRLS
+            # iteration (J, W, z change); `nothing` means A is
+            # near-singular and the search falls back to the direct
+            # scorer for this iteration.
+            reuse_shared = nothing
+            reuse_factory = nothing
+            if search === :reuse
+                reuse_shared = _gcv_reuse_family(
+                    J, w_irls, z_pseudo, S_base_zero, S_pen_all,
+                    n_gcv, gamma)
+                if verbose && reuse_shared === nothing
+                    println("  Iter $iter: reuse path unavailable " *
+                            "(A near-singular); direct GCV scorer")
+                end
+                if m > 1
+                    reuse_factory = function (rho_vec_cur, k)
+                        idx = [j for j in 1:m if j != k]
+                        S_base_k = build_S_lambda(
+                            S_list[idx], uf_offsets[idx], uf_nk[idx],
+                            rho_vec_cur[idx], n_p)
+                        S_pen_k = build_S_lambda(
+                            S_list[k:k], uf_offsets[k:k], uf_nk[k:k],
+                            [0.0], n_p)
+                        _gcv_reuse_family(J, w_irls, z_pseudo,
+                                          S_base_k, S_pen_k, n_gcv, gamma)
+                    end
+                end
+            end
+
             best_rho, beta_gcv, gcv_val, trA = _grid_then_refine_gcv(
                 scorer, S_list, uf_offsets, uf_nk,
-                n_p, n_grid, tol)
+                n_p, n_grid, tol; family=reuse_shared)
 
             if m == 1
                 theta .= exp(best_rho)
@@ -610,7 +839,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
                 # shared-λ optimum.
                 rho_vec, beta_gcv, gcv_val, trA = _coordinate_gcv(
                     scorer, S_list, uf_offsets, uf_nk,
-                    n_p, fill(best_rho, m), tol)
+                    n_p, fill(best_rho, m), tol;
+                    family_factory=reuse_factory)
                 theta .= exp.(rho_vec)
             end
 
