@@ -2304,6 +2304,126 @@ ODINSolver(; maxiters::Int=50,
                gp_variance === nothing ? nothing : Float64(gp_variance),
                ode_weight, lr, verbose)
 
+# ─── FGPGM solver ──────────────────────────────────────────────────
+
+"""
+    FGPGMSolver(; n_samples=1000, n_warmup=500, gamma=0.1,
+                  gp_lengthscale=nothing, gp_variance=nothing,
+                  obs_sigma=nothing, prior_scale=1.0, target_accept=0.234,
+                  rng_seed=nothing, verbose=false)
+
+Fast Gaussian process based gradient matching (FGPGM; Wenk, Gotovos,
+Bauer, Gorbach, Krause & Buhmann, AISTATS 2019). The latent states `X`
+(at the observation times, as in the paper) and the unknown-function
+parameters `θ` are sampled JOINTLY from one product-of-experts density
+
+    p(X, θ | y) ∝ Π_k [ N(y_k | x_k, σ_{n,k}² I) · N(x_k | m_k, C_k)
+                        · N(f_k(X, θ) | D_k x̃_k, A_k + γI) ] · p(θ)
+
+with `D_k = 'C_k C_k⁻¹` and `A_k = ''C_k − 'C_k C_k⁻¹ 'C_kᵀ` (the GP
+conditional derivative map and covariance), by single-chain adaptive
+Metropolis-within-Gibbs. GP hyperparameters are fixed beforehand by
+per-state marginal likelihood — the paper's key simplification.
+
+**When to prefer FGPGM**: over [`AdaptiveGradientMatching`](@ref)'s
+population MCMC when you want genuine posterior samples without the
+temperature ladder and γ sampling (one chain, fixed hyperparameters —
+cheaper and better-behaved); over [`ODINSolver`](@ref) (the same
+authors' later pure-optimisation formulation) when you need posterior
+uncertainty rather than a point estimate; over [`MagiSolver`](@ref)
+when the observation times are dense enough to carry the latent states
+(MAGI discretizes on a finer grid and uses NUTS — heavier per sweep).
+Gaussian likelihoods only; continuous-time problems only;
+`NeuralApproximator` is rejected (use [`AdamSolver`](@ref)).
+
+# Fields
+- `n_samples`: retained posterior draws after warmup (default 1000)
+- `n_warmup`: warmup sweeps; proposal-scale adaptation happens here ONLY
+  and the scales are frozen afterwards (default 500)
+- `gamma`: the paper's model-mismatch variance γ added to the ODE
+  expert's covariance `A_k + γI` (default 0.1). The effective slack also
+  includes `σ_n²/ℓ²`, the derivative-scale observation noise, as in
+  `ODINSolver`. Must be positive
+- `gp_lengthscale`, `gp_variance`: `nothing` (default) estimates the RBF
+  hyperparameters per state by GP marginal likelihood. Supplying BOTH
+  fixes them for all states (with noise assumed at `0.01 * gp_variance`);
+  supplying only one is an error (ODIN convention)
+- `obs_sigma`: observation-noise SD overriding the marginal-likelihood
+  estimate σ_n in the data expert (default `nothing` = per-state estimate)
+- `prior_scale`: scale of the θ smoothing prior (larger = weaker), as in
+  `MCMCSolver`/`MagiSolver` (default 1.0)
+- `target_accept`: per-block acceptance rate targeted by the warmup
+  adaptation (default 0.234, the classic random-walk optimum)
+- `rng_seed`: seed for the sampler's own RNG stream (default `nothing` =
+  non-reproducible). Matches the `rng_seed` convention of
+  `AdaptiveGradientMatching`/`BNGSolver`; does not touch the global RNG.
+- `verbose`: print progress
+
+# Convergence info
+`sol.convergence` carries `chains` (`MCMCChains.Chains` of the θ draws),
+`beta_samples`, `state_mean`, `gp_hyperparams`, post-warmup
+`accept_rates` per block, and the honest keys
+`converged=false`/`reason=:maxiters`/`iterations` — a fixed-budget
+sampler has no stopping criterion (MagiSolver convention), so judge the
+run by the R̂/ESS of `convergence.chains`.
+
+# References
+- Wenk, Gotovos, Bauer, Gorbach, Krause & Buhmann (2019), "Fast
+  Gaussian process based gradient matching for parameter identification
+  in systems of nonlinear ODEs", AISTATS 89:1351-1360.
+"""
+struct FGPGMSolver
+    n_samples::Int
+    n_warmup::Int
+    gamma::Float64
+    gp_lengthscale::Union{Nothing, Float64}
+    gp_variance::Union{Nothing, Float64}
+    obs_sigma::Union{Nothing, Float64}
+    prior_scale::Float64
+    target_accept::Float64
+    rng_seed::Union{Nothing, Int}
+    verbose::Bool
+end
+
+function FGPGMSolver(; n_samples::Int=1000, n_warmup::Int=500,
+                       gamma::Real=0.1,
+                       gp_lengthscale::Union{Nothing, Real}=nothing,
+                       gp_variance::Union{Nothing, Real}=nothing,
+                       obs_sigma::Union{Nothing, Real}=nothing,
+                       prior_scale::Real=1.0,
+                       target_accept::Real=0.234,
+                       rng_seed::Union{Nothing, Int}=nothing,
+                       verbose::Bool=false)
+    n_samples >= 1 ||
+        throw(ArgumentError("FGPGMSolver: n_samples must be ≥ 1 (got $n_samples)"))
+    n_warmup >= 0 ||
+        throw(ArgumentError("FGPGMSolver: n_warmup must be ≥ 0 (got $n_warmup)"))
+    gamma > 0 ||
+        throw(ArgumentError("FGPGMSolver: gamma must be positive (got $gamma) " *
+                            "— it is the variance of the ODE-mismatch slack " *
+                            "in N(f_k | D_k x̃_k, A_k + γI)"))
+    0 < target_accept < 1 ||
+        throw(ArgumentError("FGPGMSolver: target_accept must lie in (0, 1) " *
+                            "(got $target_accept)"))
+    prior_scale > 0 ||
+        throw(ArgumentError("FGPGMSolver: prior_scale must be positive " *
+                            "(got $prior_scale)"))
+    obs_sigma === nothing || obs_sigma > 0 ||
+        throw(ArgumentError("FGPGMSolver: obs_sigma must be positive " *
+                            "(got $obs_sigma)"))
+    (gp_lengthscale === nothing) == (gp_variance === nothing) ||
+        throw(ArgumentError(
+            "FGPGMSolver: supply BOTH gp_lengthscale and gp_variance to fix " *
+            "the GP hyperparameters, or neither to estimate them per state " *
+            "by marginal likelihood."))
+    FGPGMSolver(n_samples, n_warmup, Float64(gamma),
+                gp_lengthscale === nothing ? nothing : Float64(gp_lengthscale),
+                gp_variance === nothing ? nothing : Float64(gp_variance),
+                obs_sigma === nothing ? nothing : Float64(obs_sigma),
+                Float64(prior_scale), Float64(target_accept),
+                rng_seed, verbose)
+end
+
 # ─── RKHS solver ───────────────────────────────────────────────────
 
 """

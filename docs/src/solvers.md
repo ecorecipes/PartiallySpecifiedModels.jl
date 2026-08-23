@@ -1,6 +1,6 @@
 # Solvers
 
-PartiallySpecifiedModels.jl provides 22 solvers for fitting partially specified models. Solvers are passed as the second argument to `solve`:
+PartiallySpecifiedModels.jl provides 23 solvers for fitting partially specified models. Solvers are passed as the second argument to `solve`:
 
 ```@example solvers
 using PartiallySpecifiedModels # hide
@@ -73,6 +73,14 @@ GP-based gradient matching using the **product-of-experts** formulation of Donde
 
 ```@docs
 AdaptiveGradientMatching
+```
+
+### FGPGMSolver
+
+**Fast GP-based gradient matching** (Wenk et al. 2019). One product-of-experts density over the latent states AND parameters jointly — data expert, GP prior, and ODE expert `N(f_k | D_k x̃_k, A_k + γI)` — sampled by single-chain adaptive Metropolis-within-Gibbs with the GP hyperparameters fixed beforehand by per-state marginal likelihood. Sits between [`AdaptiveGradientMatching`](@ref)'s population MCMC (cheaper: no temperature ladder, no γ sampling) and [`ODINSolver`](@ref)'s pure optimisation (unlike ODIN, it returns genuine posterior samples in `convergence.chains`). Gaussian likelihoods only.
+
+```@docs
+FGPGMSolver
 ```
 
 ### BNGSolver
@@ -221,6 +229,7 @@ RKHSSolver
 | Quick baseline | [`TwoStageSolver`](@ref) |
 | Integration-free derivative matching | [`GradientMatching`](@ref) |
 | GP-based gradient matching (MAP or MCMC) | [`AdaptiveGradientMatching`](@ref) |
+| GP gradient matching with posterior samples, one chain | [`FGPGMSolver`](@ref) |
 | Ensemble gradient matching with uncertainty | [`BNGSolver`](@ref) |
 | Neural network approximators | [`AdamSolver`](@ref) |
 | Robust neural fitting | [`MultipleShootingSolver`](@ref) |
@@ -266,7 +275,8 @@ having to reshape `data_times`/`data_values`.
 
 Masked data is supported by **all but four** solvers: [`LAML`](@ref),
 [`GCVSolver`](@ref), [`CollocationLAML`](@ref), [`GradientMatching`](@ref),
-[`AdaptiveGradientMatching`](@ref), [`TwoStageSolver`](@ref),
+[`AdaptiveGradientMatching`](@ref), [`FGPGMSolver`](@ref),
+[`TwoStageSolver`](@ref),
 [`BNGSolver`](@ref), [`ODINSolver`](@ref), [`RKHSSolver`](@ref),
 [`IntegralMatchingSolver`](@ref), [`AdamSolver`](@ref),
 [`MultipleShootingSolver`](@ref), [`DerivativeFreeSolver`](@ref),

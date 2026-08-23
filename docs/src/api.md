@@ -45,6 +45,7 @@ Detailed documentation for each solver is on the [Solvers](solvers.md) page.
 - [`TwoStageSolver`](@ref)
 - [`BNGSolver`](@ref)
 - [`AdaptiveGradientMatching`](@ref)
+- [`FGPGMSolver`](@ref)
 - [`AdamSolver`](@ref)
 - [`MultipleShootingSolver`](@ref)
 - [`DerivativeFreeSolver`](@ref)

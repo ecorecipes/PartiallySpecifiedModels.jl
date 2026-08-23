@@ -1,6 +1,6 @@
 # Custom approximators
 
-PartiallySpecifiedModels.jl ships with eight approximator types, but the set is open: every solver constructs and consumes unknown functions through four generic functions, so adding your own approximator requires no changes to any solver file. Define a struct, implement the four methods, and pass it to `PSMProblem` like any built-in type.
+PartiallySpecifiedModels.jl ships with nine approximator types, but the set is open: every solver constructs and consumes unknown functions through four generic functions, so adding your own approximator requires no changes to any solver file. Define a struct, implement the four methods, and pass it to `PSMProblem` like any built-in type.
 
 ## The interface
 
@@ -84,7 +84,7 @@ fhat = sol.unknown_functions[:f]   # callable fitted polynomial
 
 ## Which solvers consume which functions
 
-All 22 solvers use `nparams` (parameter layout), `initial_params` (starting values), and `build_evaluator` (turning coefficient blocks into the callables the dynamics receive and into `unknown_functions`). `penalty_matrix` is consumed by the solver families that apply explicit smoothing:
+All 23 solvers use `nparams` (parameter layout), `initial_params` (starting values), and `build_evaluator` (turning coefficient blocks into the callables the dynamics receive and into `unknown_functions`). `penalty_matrix` is consumed by the solver families that apply explicit smoothing:
 
 | Solver family | `penalty_matrix` used for |
 |:---|:---|

@@ -17,7 +17,7 @@ PartiallySpecifiedModels.jl provides a unified interface for specifying and fitt
 - **Basis function approximators** (B-splines, shape-constrained splines, Gaussian processes): fewer parameters, automatic smoothing via LAML/GCV, interpretable, and easy to constrain (monotonicity, convexity, positivity).
 - **Neural network approximators** (Lux.jl networks, COMONet): more flexible for high-dimensional or complex functional forms, compatible with gradient-based UDE-style training.
 
-The package builds on the [SciML ecosystem](https://sciml.ai/) and supports 22 fitting algorithms, 7 approximator types, 5 likelihood families, and 14 shape constraint types.
+The package builds on the [SciML ecosystem](https://sciml.ai/) and supports 23 fitting algorithms, 7 approximator types, 5 likelihood families, and 14 shape constraint types.
 
 ## Installation
 
@@ -82,7 +82,7 @@ r_estimated = [r_fitted(N) for N in range(0.1, 11.0, length=100)]
 
 ## Solvers
 
-PartiallySpecifiedModels.jl provides 22 solvers spanning penalized likelihood, gradient matching, probabilistic numerics, and Bayesian inference:
+PartiallySpecifiedModels.jl provides 23 solvers spanning penalized likelihood, gradient matching, probabilistic numerics, and Bayesian inference:
 
 | Solver | Method | ODE-free? | Bayesian? | Reference |
 |--------|--------|:---------:|:---------:|-----------|
@@ -93,6 +93,7 @@ PartiallySpecifiedModels.jl provides 22 solvers spanning penalized likelihood, g
 | `TwoStageSolver` | Smooth then match (simple) | Yes | No | Varah (1982) |
 | `BNGSolver` | Ensemble Bayesian gradient matching | Yes | Yes | Bonnaffé & Coulson (2023) |
 | `AdaptiveGradientMatching` | GP product-of-experts | Yes | No | Macdonald & Husmeier (2015) |
+| `FGPGMSolver` | GP product-of-experts MCMC over states + parameters | Yes | Yes | Wenk et al. (2019) |
 | `AdamSolver` | Adam through ODE (UDE-style) | No | No | Rackauckas et al. (2020) |
 | `MultipleShootingSolver` | Multiple shooting + Adam | No | No | Turan & Jäschke (2021) |
 | `DerivativeFreeSolver` | NelderMead / Particle Swarm | No | No | — |

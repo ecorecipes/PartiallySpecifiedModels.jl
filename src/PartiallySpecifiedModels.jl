@@ -5,10 +5,11 @@ A Julia package for fitting partially specified models (PSMs) — dynamical
 systems where some functional responses are modelled nonparametrically using
 penalized B-splines, Gaussian processes, or neural networks.
 
-Provides 22 solvers (LAML, collocation, gradient matching, Adam, multiple
+Provides 23 solvers (LAML, collocation, gradient matching, Adam, multiple
 shooting, adaptive gradient matching, rodeo, MCMC/HMC, MAGI, BNG, DALTON,
 pseudo-marginal, GCV, two-stage, derivative-free, variational, ABC-SMC,
-integral matching, profile likelihood, ensemble Kalman, ODIN, and RKHS)
+integral matching, profile likelihood, ensemble Kalman, ODIN, FGPGM, and
+RKHS)
 and 7 approximator types (B-spline, shape-constrained B-spline, SPDE,
 shape-constrained SPDE, neural network, Gaussian process, and COMONet).
 
@@ -129,6 +130,9 @@ include("ensemble_kalman_solver.jl")
 # ODIN solver (ODE-Informed regression, Wenk & Abbati 2020)
 include("odin_solver.jl")
 
+# FGPGM solver (fast GP-based gradient matching MCMC, Wenk et al. 2019)
+include("fgpgm_solver.jl")
+
 # RKHS solver (trajectory-in-RKHS gradient matching)
 include("rkhs_solver.jl")
 
@@ -157,6 +161,7 @@ export GCVSolver, TwoStageSolver, DerivativeFreeSolver
 export VariationalSolver, ABCSolver
 export IntegralMatchingSolver, ProfileLikelihoodSolver
 export EnsembleKalmanSolver, ODINSolver, RKHSSolver
+export FGPGMSolver
 
 # Exports — functions
 export solve, simulate, predict
