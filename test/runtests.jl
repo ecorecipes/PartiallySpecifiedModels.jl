@@ -5252,6 +5252,41 @@ struct NotAnApproximator end
         @test abs(f_df(0.5) - 0.35) < 0.1
     end
 
+    @testset "custom-type penalties in whitelist solvers (W12)" begin
+        # The six per-type penalty sites (TwoStage, IntegralMatching, MAGI,
+        # AGM, Rodeo, Dalton) fall back to generic penalty_matrix(approx)
+        # for non-built-in types. Discriminator: pre-change, a custom
+        # type's penalty was silently ignored there, so lambda_smooth had
+        # NO effect on the fit — these assertions fail on pre-change code.
+        # TwoStage and IntegralMatching are tested end-to-end (cheap);
+        # MAGI/AGM/Rodeo/Dalton share the identical fallback pattern.
+        decay_w12!(du, u, p, t) = (du[1] = -p.f(u[1]))
+        t_w12 = collect(0.0:0.4:4.0)
+        d_w12 = reshape(2.0 .* exp.(-0.5 .* t_w12), :, 1)
+        mk12 = () -> PSMProblem(decay_w12!, [2.0], (0.0, 4.0),
+            [PolyApproximator(:f, (0.0, 2.0), 2)];
+            data_times=t_w12, data_values=d_w12, obs_to_state=[1],
+            known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+
+        # PolyApproximator's penalty is a ridge on the curvature (x^2)
+        # coefficient, so a huge lambda_smooth must crush |beta_3| in the
+        # penalized fit relative to the unpenalized one.
+        sol_ts0 = solve(mk12(), TwoStageSolver(lambda_smooth=0.0,
+            maxiters=800, verbose=false))
+        sol_tsP = solve(mk12(), TwoStageSolver(lambda_smooth=1e4,
+            maxiters=800, verbose=false))
+        @test sol_ts0.parameters != sol_tsP.parameters
+        @test abs(sol_tsP.parameters[3]) < abs(sol_ts0.parameters[3])
+
+        sol_im0 = solve(mk12(), IntegralMatchingSolver(lambda_smooth=0.0,
+            maxiters=800, verbose=false))
+        sol_imP = solve(mk12(), IntegralMatchingSolver(lambda_smooth=1e4,
+            maxiters=800, verbose=false))
+        @test sol_im0.parameters != sol_imP.parameters
+        @test abs(sol_imP.parameters[3]) < abs(sol_im0.parameters[3])
+    end
+
     # ─── TensorBSplineApproximator (bivariate tensor-product spline) ──
 
     @testset "TensorBSplineApproximator — construction and validation" begin

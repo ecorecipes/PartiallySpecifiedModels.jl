@@ -150,6 +150,14 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
                 push!(smooth_mats, S)
                 push!(smooth_offsets, offset_acc)
             end
+        elseif !(approx isa _BUILTIN_APPROX_TYPES)
+            # Custom protocol types: generic penalty (built-in treatment
+            # above unchanged; see _BUILTIN_APPROX_TYPES).
+            S = penalty_matrix(approx)
+            if S !== nothing
+                push!(smooth_mats, S)
+                push!(smooth_offsets, offset_acc)
+            end
         end
         offset_acc += np
     end

@@ -186,7 +186,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
             params_k = β_eval[offset+1:offset+np]
             offset += np
 
-            if approx isa BSplineApproximator || approx isa GPApproximator || approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator || approx isa ShapeConstrainedGPApproximator || approx isa TensorBSplineApproximator
+            # Non-built-in (custom protocol) types take the generic branch
+            # too; built-in treatment is unchanged (see _BUILTIN_APPROX_TYPES).
+            if approx isa BSplineApproximator || approx isa GPApproximator || approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator || approx isa ShapeConstrainedGPApproximator || approx isa TensorBSplineApproximator || !(approx isa _BUILTIN_APPROX_TYPES)
                 S = penalty_matrix(approx)
                 if S !== nothing
                     loss_val += lambda_smooth * dot(params_k, S * params_k)
