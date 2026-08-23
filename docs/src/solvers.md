@@ -33,7 +33,7 @@ LAML
 
 ### GCVSolver
 
-Penalized IRLS with **Generalized Cross-Validation** for smoothing parameter selection. An alternative to LAML that minimizes leave-one-out prediction error.
+Penalized IRLS with **Generalized Cross-Validation** for smoothing parameter selection. An alternative to LAML that minimizes leave-one-out prediction error. With `criterion=:ncv` it instead minimizes **neighbourhood cross-validation** (NCV; Wood 2024), which leaves out a temporal neighbourhood of `ncv_width` time steps around each point — the recommended criterion when residuals are short-range autocorrelated, where ordinary GCV undersmooths.
 
 ```@docs
 GCVSolver

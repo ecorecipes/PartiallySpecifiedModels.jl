@@ -12,6 +12,28 @@
 # The algorithm uses the same IRLS outer loop as the LAML solver but
 # replaces the Fellner-Schall/Newton inner loop with golden-section search
 # on log(λ) to minimize GCV.
+#
+# With `criterion=:ncv` the GCV score is replaced by neighbourhood
+# cross-validation (NCV; Wood 2024, arXiv:2404.16490, eq. 2 with m=n,
+# δ(k)={k}, α(k)=nei(k)): each usable observation i is predicted from the
+# penalized working-model fit computed WITHOUT the rows in a temporal
+# neighbourhood δ(i) around i (same observed component, time index within
+# `ncv_width` of i's, i itself included):
+#
+#   NCV(λ) = (1/n_usable) Σ_i w_i (z_i − ẑ_i^{−δ(i)})²
+#
+# For the quadratic working model the omitted-neighbourhood coefficients
+# are available exactly by a rank-|δ| Woodbury downdate of
+# A = J'WJ + S^λ (the one-Newton-step update of Wood 2024 eq. 3-4, which
+# is exact for a quadratic loss):
+#
+#   β^{−δ} = β̂ + A⁻¹ J_δ' (W_δ⁻¹ − J_δ A⁻¹ J_δ')⁻¹ (J_δ β̂ − z_δ)
+#
+# so ẑ_i^{−δ(i)} = J_i β^{−δ(i)} costs O(p·|δ|) triangular-solve work
+# per point (two solves per column of J_δ'), reusing the Cholesky
+# factor of A. NCV uses no γ inflation
+# (`gamma` is ignored): leaving out the correlated neighbours is itself
+# the guard against undersmoothing that γ patches over.
 
 using LinearAlgebra: Diagonal, dot, tr, Symmetric, eigvals, cholesky, norm, eigen
 
@@ -80,22 +102,161 @@ function _gcv_score(J::AbstractMatrix, W_irls::AbstractVector,
     (gcv, beta_hat, rss_w, trA)
 end
 
+# ─── NCV score computation (Wood 2024) ───────────────────────────
+
+"""
+    _ncv_neighbourhood(i, n_times, W_irls, width) -> Vector{Int}
+
+Flattened indices of the NCV deletion neighbourhood δ(i).
+
+The data vectors are flattened obs-major (component-major): index
+`k = (oi−1)·n_times + ti` holds time `ti` of observed component `oi`, so
+each component's time series occupies one contiguous block and
+index distance within the block IS time-index distance. δ(i) is every
+cell of the SAME component whose time index is within `width` steps of
+i's, restricted to usable rows (working weight > 0; masked cells never
+enter a neighbourhood). The point i itself is a member whenever it is
+usable — which is the only case in which callers ask for δ(i).
+"""
+function _ncv_neighbourhood(i::Int, n_times::Int,
+                            W_irls::AbstractVector, width::Int)
+    ti = mod1(i, n_times)         # time index within the component block
+    base = i - ti                 # block offset of i's component
+    delta = Int[]
+    for t in max(1, ti - width):min(n_times, ti + width)
+        k = base + t
+        W_irls[k] > 0 && push!(delta, k)
+    end
+    delta
+end
+
+"""
+    _ncv_loo_predictions(J, W_irls, z, A_chol, beta_hat, n_times, width)
+
+Exact leave-neighbourhood-out predictions `ẑ_i^{−δ(i)}` for every usable
+row i, via the rank-|δ| Woodbury downdate of `A = J'WJ + S^λ` (whose
+Cholesky factorization is `A_chol`):
+
+    β^{−δ} = β̂ + A⁻¹ J_δ' (W_δ⁻¹ − J_δ A⁻¹ J_δ')⁻¹ (J_δ β̂ − z_δ)
+    ẑ_i^{−δ(i)} = J_i β^{−δ(i)}
+
+This equals brute-force drop-the-rows refitting exactly (the one-step
+Newton update of Wood 2024 eq. 3 is exact for the quadratic working
+model). Returns a vector with `NaN` at masked rows, or `nothing` when a
+downdated system is singular/indefinite (model saturated at this λ —
+the caller scores that λ as `Inf`, mirroring `_gcv_score`'s denominator
+guard).
+"""
+function _ncv_loo_predictions(J::AbstractMatrix, W_irls::AbstractVector,
+                              z::AbstractVector, A_chol,
+                              beta_hat::AbstractVector,
+                              n_times::Int, width::Int)
+    fitted = J * beta_hat
+    zhat = fill(NaN, length(z))
+    for i in eachindex(z)
+        W_irls[i] > 0 || continue
+        delta = _ncv_neighbourhood(i, n_times, W_irls, width)
+        Jd = J[delta, :]                       # |δ| × p
+        Q = A_chol \ Matrix(Jd')               # p × |δ| = A⁻¹ J_δ'
+        P = Jd * Q                             # |δ| × |δ| = J_δ A⁻¹ J_δ'
+        M = Diagonal(1.0 ./ W_irls[delta]) - P # W_δ⁻¹ − J_δ A⁻¹ J_δ'
+        rhs = fitted[delta] .- z[delta]        # J_δ β̂ − z_δ
+        s = try
+            M \ rhs
+        catch
+            return nothing
+        end
+        pos = findfirst(==(i), delta)
+        # J_i β^{−δ} = ẑ_i + (J_i A⁻¹ J_δ') s, and J_i A⁻¹ J_δ' is row
+        # `pos` of P.
+        v = fitted[i] + dot(view(P, pos, :), s)
+        isfinite(v) || return nothing
+        zhat[i] = v
+    end
+    zhat
+end
+
+"""
+    _ncv_score(J, W_irls, z, S_lambda, n_times, width)
+
+Compute the NCV score for a given total penalty matrix `S_lambda`:
+
+    NCV(λ) = (1/n_usable) Σ_i w_i (z_i − ẑ_i^{−δ(i)})²
+
+summed over usable rows only (working weight > 0); see
+`_ncv_loo_predictions` for the exact Woodbury computation of
+`ẑ_i^{−δ(i)}`. Returns `(ncv, beta_hat, rss_w, trA)` — the same shape as
+`_gcv_score`, so the golden-section/grid/coordinate search machinery
+drives either criterion unchanged.
+"""
+function _ncv_score(J::AbstractMatrix, W_irls::AbstractVector,
+                    z::AbstractVector, S_lambda::AbstractMatrix,
+                    n_times::Int, width::Int)
+    JWJ = J' * Diagonal(W_irls) * J
+    H = JWJ + S_lambda
+
+    # Same numerical-stability ridge as _gcv_score
+    maxd = maximum(abs.(diag(H)))
+    H_reg = copy(H)
+    n_p = size(H, 1)
+    for i in 1:n_p
+        H_reg[i, i] += 1e-12 * maxd + 1e-15
+    end
+
+    A_chol = try
+        cholesky(Symmetric(H_reg))
+    catch
+        nothing
+    end
+    if A_chol === nothing
+        # Not PD even after the ridge: saturated/degenerate at this λ.
+        beta_hat = H_reg \ (J' * (W_irls .* z))
+        return (Inf, beta_hat, NaN, NaN)
+    end
+    beta_hat = A_chol \ (J' * (W_irls .* z))
+
+    # Weighted RSS and tr(A) kept for the uniform return shape (verbose
+    # reporting); masked-row skipping as in _gcv_score.
+    r = z .- J * beta_hat
+    rss_w = 0.0
+    for i in eachindex(r)
+        W_irls[i] > 0 || continue
+        rss_w += W_irls[i] * r[i]^2
+    end
+    trA = tr(A_chol \ JWJ)
+
+    zhat = _ncv_loo_predictions(J, W_irls, z, A_chol, beta_hat,
+                                n_times, width)
+    zhat === nothing && return (Inf, beta_hat, rss_w, trA)
+
+    V = 0.0
+    cnt = 0
+    for i in eachindex(z)
+        W_irls[i] > 0 || continue
+        V += W_irls[i] * (z[i] - zhat[i])^2
+        cnt += 1
+    end
+    cnt == 0 && return (Inf, beta_hat, rss_w, trA)
+    (V / cnt, beta_hat, rss_w, trA)
+end
+
 # ─── Golden-section search on log(λ) ─────────────────────────────
 
 """
-    _golden_section_gcv(J, W_irls, z, S_list, offsets, nknots_list, n_p, n,
-                        gamma, lo, hi, tol; maxiter)
+    _golden_section_gcv(scorer, S_list, offsets, nknots_list, n_p,
+                        lo, hi, tol; maxiter)
 
-Minimize GCV over a shared log(λ) using golden-section search.
+Minimize a CV score over a shared log(λ) using golden-section search.
 
-All approximator penalties are scaled by the same λ = exp(rho).
-Returns `(best_rho, best_beta, best_gcv, best_trA)`.
+`scorer(S_lambda)` must return `(score, beta, rss, trA)` — either
+`_gcv_score` or `_ncv_score` partially applied to the current working
+model. All approximator penalties are scaled by the same λ = exp(rho).
+Returns `(best_rho, best_beta, best_score, best_trA)`.
 """
-function _golden_section_gcv(J::AbstractMatrix, W_irls::AbstractVector,
-                             z::AbstractVector,
+function _golden_section_gcv(scorer,
                              S_list::Vector{Matrix{Float64}},
                              offsets::Vector{Int}, nknots_list::Vector{Int},
-                             n_p::Int, n::Int, gamma::Float64,
+                             n_p::Int,
                              lo::Float64, hi::Float64, tol::Float64;
                              maxiter::Int=100)
     gr = (sqrt(5.0) + 1.0) / 2.0  # golden ratio
@@ -103,7 +264,7 @@ function _golden_section_gcv(J::AbstractMatrix, W_irls::AbstractVector,
     function eval_gcv(rho)
         rho_vec = fill(rho, length(S_list))
         S_lam = build_S_lambda(S_list, offsets, nknots_list, rho_vec, n_p)
-        gcv, beta, rss, trA = _gcv_score(J, W_irls, z, S_lam, n, gamma)
+        gcv, beta, rss, trA = scorer(S_lam)
         (gcv, beta, rss, trA)
     end
 
@@ -146,19 +307,19 @@ function _golden_section_gcv(J::AbstractMatrix, W_irls::AbstractVector,
 end
 
 """
-    _grid_then_refine_gcv(J, W_irls, z, S_list, offsets, nknots_list,
-                          n_p, n, gamma, n_grid, tol)
+    _grid_then_refine_gcv(scorer, S_list, offsets, nknots_list,
+                          n_p, n_grid, tol)
 
 Initial coarse grid search over log(λ) ∈ [RHO_MIN, RHO_MAX], then
-golden-section refinement around the best grid point.
+golden-section refinement around the best grid point. `scorer` as in
+`_golden_section_gcv`.
 
-Returns `(best_rho, best_beta, best_gcv, best_trA)`.
+Returns `(best_rho, best_beta, best_score, best_trA)`.
 """
-function _grid_then_refine_gcv(J::AbstractMatrix, W_irls::AbstractVector,
-                               z::AbstractVector,
+function _grid_then_refine_gcv(scorer,
                                S_list::Vector{Matrix{Float64}},
                                offsets::Vector{Int}, nknots_list::Vector{Int},
-                               n_p::Int, n::Int, gamma::Float64,
+                               n_p::Int,
                                n_grid::Int, tol::Float64)
     rho_grid = range(RHO_MIN, RHO_MAX, length=n_grid)
     best_gcv = Inf
@@ -169,7 +330,7 @@ function _grid_then_refine_gcv(J::AbstractMatrix, W_irls::AbstractVector,
     for (idx, rho) in enumerate(rho_grid)
         rho_vec = fill(rho, length(S_list))
         S_lam = build_S_lambda(S_list, offsets, nknots_list, rho_vec, n_p)
-        gcv, beta, _, trA = _gcv_score(J, W_irls, z, S_lam, n, gamma)
+        gcv, beta, _, trA = scorer(S_lam)
         if gcv < best_gcv
             best_gcv = gcv
             best_idx = idx
@@ -184,8 +345,7 @@ function _grid_then_refine_gcv(J::AbstractMatrix, W_irls::AbstractVector,
     hi = min(RHO_MAX, rho_grid[best_idx] + step)
 
     rho_opt, beta_opt, gcv_opt, trA_opt = _golden_section_gcv(
-        J, W_irls, z, S_list, offsets, nknots_list,
-        n_p, n, gamma, lo, hi, tol)
+        scorer, S_list, offsets, nknots_list, n_p, lo, hi, tol)
 
     # Keep the better of grid and refinement
     if gcv_opt < best_gcv
@@ -196,21 +356,21 @@ function _grid_then_refine_gcv(J::AbstractMatrix, W_irls::AbstractVector,
 end
 
 """
-    _coordinate_gcv(J, W_irls, z, S_list, offsets, nknots_list, n_p, n,
-                    gamma, rho0, tol; sweeps=3)
+    _coordinate_gcv(scorer, S_list, offsets, nknots_list, n_p,
+                    rho0, tol; sweeps=3)
 
-Per-approximator GCV: coordinate descent over the vector ρ, minimizing each
-component by golden section while the others are held fixed. Wood (2001)
+Per-approximator CV score: coordinate descent over the vector ρ, minimizing
+each component by golden section while the others are held fixed. Wood (2001)
 treats λ as a VECTOR with one smoothing parameter per unknown function
 (as does ddefit's gcv.c); a single shared λ mis-smooths whenever the
 functions differ in scale or wiggliness. Started from the shared-λ optimum,
-2–3 sweeps typically converge.
+2–3 sweeps typically converge. `scorer` as in `_golden_section_gcv`
+(either GCV or NCV — the multi-λ path is criterion-agnostic).
 """
-function _coordinate_gcv(J::AbstractMatrix, W_irls::AbstractVector,
-                         z::AbstractVector,
+function _coordinate_gcv(scorer,
                          S_list::Vector{Matrix{Float64}},
                          offsets::Vector{Int}, nknots_list::Vector{Int},
-                         n_p::Int, n::Int, gamma::Float64,
+                         n_p::Int,
                          rho0::Vector{Float64}, tol::Float64;
                          sweeps::Int=3)
     m = length(S_list)
@@ -219,7 +379,7 @@ function _coordinate_gcv(J::AbstractMatrix, W_irls::AbstractVector,
 
     eval_vec = function (rv)
         S_lam = build_S_lambda(S_list, offsets, nknots_list, rv, n_p)
-        _gcv_score(J, W_irls, z, S_lam, n, gamma)
+        scorer(S_lam)
     end
 
     best_gcv, best_beta, _, best_trA = eval_vec(rho)
@@ -274,14 +434,18 @@ For each IRLS iteration:
 1. Evaluate model and compute finite-difference Jacobian
 2. Form pseudodata z = y − f + J·β
 3. Compute IRLS weights from current predictions
-4. Select λ by minimizing GCV(λ) via grid search + golden-section refinement
+4. Select λ by minimizing the CV criterion — GCV(λ) by default, NCV(λ)
+   when `alg.criterion == :ncv` — via grid search + golden-section
+   refinement (and per-approximator coordinate descent when there are
+   multiple smooth terms; both criteria drive the identical search
+   machinery)
 5. Solve penalized LS at optimal λ
 6. Step contraction (backtracking)
 7. Repeat until convergence
 
 Returns a `PSMSolution`. `sol.convergence` is a NamedTuple
-`(converged, iterations, reason, gcv)` — see the `GCVSolver` and
-`PSMSolution` docstrings for the key taxonomy.
+`(converged, iterations, reason, criterion, gcv, ncv)` — see the
+`GCVSolver` and `PSMSolution` docstrings for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     _validate_problem(prob, "GCVSolver")
@@ -290,6 +454,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     gamma    = alg.gamma
     n_grid   = alg.n_grid
     tol      = alg.tol
+    criterion = alg.criterion
+    ncv_width = alg.ncv_width
+    crit_name = uppercase(String(criterion))
 
     n_times = length(prob.data_times)
     n_obs   = length(prob.obs_to_state)
@@ -384,7 +551,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     dam   = fill(1e-8, n_p)
 
     if verbose
-        println("GCV solver: $n_p params, $n_data data, $m smooth terms, γ=$gamma")
+        extra = criterion === :ncv ? "width=$ncv_width (γ ignored)" : "γ=$gamma"
+        println("$crit_name solver: $n_p params, $n_data data, " *
+                "$m smooth terms, $extra")
     end
 
     f_vec, _ = eval_model(beta)
@@ -417,13 +586,21 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
         # Form pseudodata z = y − f + J·β
         z_pseudo = y_vec .- f_vec .+ J * beta
 
-        # ── GCV smoothing parameter selection ──
+        # ── GCV/NCV smoothing parameter selection ──
         if m > 0
+            # Partially apply the criterion to the current working model:
+            # both scores are pure functions of S_lambda given (J, W, z),
+            # so the same grid/golden-section/coordinate machinery drives
+            # either. NCV ignores `gamma` (see GCVSolver docstring).
+            scorer = criterion === :ncv ?
+                (S_lam -> _ncv_score(J, w_irls, z_pseudo, S_lam,
+                                     n_times, ncv_width)) :
+                (S_lam -> _gcv_score(J, w_irls, z_pseudo, S_lam,
+                                     n_gcv, gamma))
+
             best_rho, beta_gcv, gcv_val, trA = _grid_then_refine_gcv(
-                J, w_irls, z_pseudo,
-                S_list, uf_offsets, uf_nk,
-                n_p, n_gcv, gamma,
-                n_grid, tol)
+                scorer, S_list, uf_offsets, uf_nk,
+                n_p, n_grid, tol)
 
             if m == 1
                 theta .= exp(best_rho)
@@ -432,16 +609,14 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
                 # refine each component by coordinate descent from the
                 # shared-λ optimum.
                 rho_vec, beta_gcv, gcv_val, trA = _coordinate_gcv(
-                    J, w_irls, z_pseudo,
-                    S_list, uf_offsets, uf_nk,
-                    n_p, n_gcv, gamma,
-                    fill(best_rho, m), tol)
+                    scorer, S_list, uf_offsets, uf_nk,
+                    n_p, fill(best_rho, m), tol)
                 theta .= exp.(rho_vec)
             end
 
             if verbose && (iter <= 4 || iter % 10 == 0)
-                println("  GCV iter $iter: λ=$(round.(theta, sigdigits=4)), " *
-                        "GCV=$(round(gcv_val, sigdigits=6)), " *
+                println("  $crit_name iter $iter: λ=$(round.(theta, sigdigits=4)), " *
+                        "$crit_name=$(round(gcv_val, sigdigits=6)), " *
                         "tr(A)=$(round(trA, digits=2))")
             end
         end
@@ -530,7 +705,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
                 "EDF=$(round(edf, digits=2))")
         println("Final θ: ", [round(t, sigdigits=4) for t in theta])
         if isfinite(gcv_val)
-            println("Final GCV: $(round(gcv_val, sigdigits=6))")
+            println("Final $crit_name: $(round(gcv_val, sigdigits=6))")
         end
     end
 
@@ -538,5 +713,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
                 (converged=conv_converged, iterations=conv_iters,
-                 reason=conv_reason, gcv=gcv_val))
+                 reason=conv_reason, criterion=criterion,
+                 gcv=(criterion === :gcv ? gcv_val : NaN),
+                 ncv=(criterion === :ncv ? gcv_val : NaN)))
 end

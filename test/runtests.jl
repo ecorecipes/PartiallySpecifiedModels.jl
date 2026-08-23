@@ -5905,4 +5905,171 @@ struct NotAnApproximator end
         @test sum(errs(sol_nb)) / length(gx) < 0.09
     end
 
+    @testset "GCVSolver criterion=:ncv (neighbourhood CV, Wood 2024)" begin
+        PSM = PartiallySpecifiedModels
+
+        # ── Construction validation ──
+        @test_throws ArgumentError GCVSolver(criterion=:foo)
+        @test_throws ArgumentError GCVSolver(criterion=:loocv)
+        @test_throws ArgumentError GCVSolver(ncv_width=-1)
+        @test_throws ArgumentError GCVSolver(criterion=:ncv, ncv_width=-3)
+        @test GCVSolver().criterion == :gcv                  # default unchanged
+        @test GCVSolver(criterion=:ncv).ncv_width == 2
+        @test GCVSolver(criterion=:ncv, ncv_width=0) isa GCVSolver  # 0 = LOOCV
+
+        # ── Neighbourhood construction (obs-major flattening: index
+        # k = (oi−1)·n_times + ti; δ never crosses component blocks and
+        # never contains masked rows) ──
+        nt_w6 = 12
+        w_w6 = fill(1.0, 2 * nt_w6)
+        w_w6[5] = 0.0                       # masked cell, component 1, t=5
+        @test PSM._ncv_neighbourhood(1, nt_w6, w_w6, 2) == [1, 2, 3]
+        @test PSM._ncv_neighbourhood(12, nt_w6, w_w6, 2) == [10, 11, 12]
+        @test PSM._ncv_neighbourhood(6, nt_w6, w_w6, 2) == [4, 6, 7, 8]
+        @test PSM._ncv_neighbourhood(13, nt_w6, w_w6, 2) == [13, 14, 15]
+        @test PSM._ncv_neighbourhood(24, nt_w6, w_w6, 2) == [22, 23, 24]
+        @test PSM._ncv_neighbourhood(8, nt_w6, w_w6, 0) == [8]
+
+        # ── EXACTNESS: Woodbury downdate == brute-force drop-refit-predict
+        # on a fixed working model (StableRNG), interior + edge points +
+        # a masked cell inside a neighbourhood ──
+        rng_w6 = StableRNG(42)
+        n_w6 = 2 * nt_w6
+        p_w6 = 5
+        J_w6 = randn(rng_w6, n_w6, p_w6)
+        z_w6 = randn(rng_w6, n_w6)
+        wv_w6 = rand(rng_w6, n_w6) .+ 0.5
+        wv_w6[5] = 0.0
+        S_w6 = Matrix(0.7I, p_w6, p_w6)
+        A_w6 = J_w6' * Diagonal(wv_w6) * J_w6 + S_w6
+        chol_w6 = cholesky(Symmetric(A_w6))
+        beta_w6 = chol_w6 \ (J_w6' * (wv_w6 .* z_w6))
+        zhat_w6 = PSM._ncv_loo_predictions(J_w6, wv_w6, z_w6, chol_w6,
+                                           beta_w6, nt_w6, 2)
+        # Brute force: drop δ(i)'s rows, re-solve the penalized LS, predict
+        function brute_w6(i, width)
+            delta = PSM._ncv_neighbourhood(i, nt_w6, wv_w6, width)
+            keep = setdiff(1:n_w6, delta)
+            Jk = J_w6[keep, :]; wk = wv_w6[keep]; zk = z_w6[keep]
+            bk = (Jk' * Diagonal(wk) * Jk + S_w6) \ (Jk' * (wk .* zk))
+            dot(J_w6[i, :], bk)
+        end
+        @test abs(zhat_w6[1] - brute_w6(1, 2)) < 1e-8    # left edge, truncated δ
+        @test abs(zhat_w6[12] - brute_w6(12, 2)) < 1e-8  # right edge of block 1
+        @test abs(zhat_w6[7] - brute_w6(7, 2)) < 1e-8    # interior
+        @test abs(zhat_w6[6] - brute_w6(6, 2)) < 1e-8    # δ contains masked cell 5
+        @test abs(zhat_w6[13] - brute_w6(13, 2)) < 1e-8  # block-2 edge (no bleed)
+        @test isnan(zhat_w6[5])                          # masked row: no score
+        @test maximum(abs(zhat_w6[i] - brute_w6(i, 2))
+                      for i in 1:n_w6 if wv_w6[i] > 0) < 1e-8
+
+        # ── ncv_width=0 equals exact leave-one-out CV (classic shortcut
+        # ẑ_i^{−i} = z_i − (z_i − ẑ_i)/(1 − h_ii), h_ii = w_i J_i A⁻¹ J_i') ──
+        zh0_w6 = PSM._ncv_loo_predictions(J_w6, wv_w6, z_w6, chol_w6,
+                                          beta_w6, nt_w6, 0)
+        fitted_w6 = J_w6 * beta_w6
+        @test maximum(begin
+                          h = wv_w6[i] * dot(J_w6[i, :], chol_w6 \ J_w6[i, :])
+                          loo = z_w6[i] - (z_w6[i] - fitted_w6[i]) / (1 - h)
+                          abs(loo - zh0_w6[i])
+                      end for i in 1:n_w6 if wv_w6[i] > 0) < 1e-8
+
+        # ── _ncv_score equals the manually assembled weighted mean ──
+        V_w6, beta_sc_w6, _, _ = PSM._ncv_score(J_w6, wv_w6, z_w6, S_w6,
+                                                nt_w6, 2)
+        Vb_w6 = sum(wv_w6[i] * (z_w6[i] - zhat_w6[i])^2
+                    for i in 1:n_w6 if wv_w6[i] > 0) /
+                count(>(0), wv_w6)
+        @test abs(V_w6 - Vb_w6) < 1e-8
+        @test norm(beta_sc_w6 - beta_w6) < 1e-6   # same fit (modulo tiny ridge)
+
+        # ── End-to-end setup shared by the remaining blocks ──
+        r_true_w6(N) = 0.5 * (1.0 - N / 10.0)
+        function logistic_w6!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+        end
+        sol_true_w6 = OrdinaryDiffEq.solve(
+            ODEProblem(logistic_w6!, [1.0], (0.0, 15.0), (; r=r_true_w6)),
+            Tsit5(); saveat=0.2, abstol=1e-10, reltol=1e-10)
+        t_w6 = collect(sol_true_w6.t)
+        truth_w6 = [u[1] for u in sol_true_w6.u]
+        nN_w6 = length(t_w6)                     # 76 points
+
+        # AR(1) observation noise: e_t = 0.7 e_{t−1} + ε_t, ε ~ N(0, 0.08²),
+        # stationary start. Short-range positive autocorrelation is exactly
+        # the regime where ordinary GCV/LOOCV undersmooths (Wood 2024 §5).
+        rho_ar_w6 = 0.7
+        sige_w6 = 0.08
+        rng_ar_w6 = StableRNG(1)
+        e_w6 = zeros(nN_w6)
+        e_w6[1] = sige_w6 / sqrt(1 - rho_ar_w6^2) * randn(rng_ar_w6)
+        for i in 2:nN_w6
+            e_w6[i] = rho_ar_w6 * e_w6[i-1] + sige_w6 * randn(rng_ar_w6)
+        end
+        data_w6 = truth_w6 .+ e_w6
+        mk_prob_w6(vals) = PSMProblem(logistic_w6!, [1.0], (0.0, 15.0),
+            [BSplineApproximator(:r, (0.0, 12.0), 8)];
+            data_times=t_w6, data_values=reshape(vals, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PSM.Gaussian())
+        prob_ar_w6 = mk_prob_w6(max.(data_w6, 0.01))
+
+        # ── Default equivalence: GCVSolver() ≡ GCVSolver(criterion=:gcv)
+        # (the :gcv path is byte-identical pre/post refactor; the existing
+        # GCVSolver testsets pin the pre-change behavior itself) ──
+        sol_gdef_w6 = solve(prob_ar_w6, GCVSolver(maxiters=30))
+        sol_gexp_w6 = solve(prob_ar_w6, GCVSolver(maxiters=30, criterion=:gcv))
+        @test sol_gdef_w6.smoothing_params == sol_gexp_w6.smoothing_params
+        @test sol_gdef_w6.objective == sol_gexp_w6.objective
+        @test sol_gdef_w6.convergence.gcv == sol_gexp_w6.convergence.gcv
+        @test sol_gdef_w6.convergence.criterion == :gcv
+        @test isfinite(sol_gdef_w6.convergence.gcv)
+        @test isnan(sol_gdef_w6.convergence.ncv)
+
+        # ── THE DISCRIMINATOR: under AR(1) residuals :gcv undersmooths,
+        # :ncv (width 3 ≳ correlation length) does not. Observed (StableRNG
+        # seed 1, this exact config): λ̂_gcv = 6.57e-4, λ̂_ncv = 2.61e4
+        # (ratio 4.0e7), trajectory MSE vs noise-free truth 1.84e-3 (gcv)
+        # vs 8.95e-4 (ncv), r-function MSE 2.85e-4 vs 1.42e-6. The 2×
+        # λ-margin below has ~7 orders of magnitude of headroom; every
+        # step of the pipeline (StableRNG data, FD Jacobians, grid +
+        # golden-section, Cholesky) is deterministic, and seeds 2 and 3
+        # gave ratios 472 and 5.1e4 with the same error ordering. The
+        # effect SIZE is seed-dependent (some seeds give ratios near 1),
+        # so the 2× margin is protected by the pinned seed, not
+        # universal; the MSE ordering held on every seed tried. ──
+        sol_ncv_w6 = solve(prob_ar_w6,
+                           GCVSolver(maxiters=30, criterion=:ncv, ncv_width=3))
+        lam_g_w6 = sol_gdef_w6.smoothing_params[1]
+        lam_n_w6 = sol_ncv_w6.smoothing_params[1]
+        @test lam_n_w6 > 2 * lam_g_w6
+        trajmse_w6(s) = sum(abs2, s.fitted_values[:, 1] .- truth_w6) / nN_w6
+        @test trajmse_w6(sol_ncv_w6) < trajmse_w6(sol_gdef_w6)
+        rgrid_w6 = 0.5:0.25:9.5
+        rmse_w6(s) = sum(abs2, s.unknown_functions[:r](x) - r_true_w6(x)
+                         for x in rgrid_w6) / length(rgrid_w6)
+        @test rmse_w6(sol_ncv_w6) < rmse_w6(sol_gdef_w6)
+        @test sol_ncv_w6.convergence.criterion == :ncv
+        @test isfinite(sol_ncv_w6.convergence.ncv)
+        @test isnan(sol_ncv_w6.convergence.gcv)
+        # Determinism: an identical re-run reproduces λ̂ exactly
+        sol_ncv2_w6 = solve(prob_ar_w6,
+                            GCVSolver(maxiters=30, criterion=:ncv, ncv_width=3))
+        @test sol_ncv2_w6.smoothing_params == sol_ncv_w6.smoothing_params
+        @test sol_ncv2_w6.convergence.ncv == sol_ncv_w6.convergence.ncv
+
+        # ── Masked data: NCV run completes and honors masking (NaN cells
+        # are excluded from the score sum and from every neighbourhood) ──
+        data_mask_w6 = copy(max.(data_w6, 0.01))
+        data_mask_w6[10] = NaN
+        data_mask_w6[30] = NaN
+        data_mask_w6[31] = NaN
+        sol_mask_w6 = solve(mk_prob_w6(data_mask_w6),
+                            GCVSolver(maxiters=15, criterion=:ncv, ncv_width=3))
+        @test sol_mask_w6 isa PSMSolution
+        @test isfinite(sol_mask_w6.data_loss)
+        @test isfinite(sol_mask_w6.convergence.ncv)
+        @test all(isfinite, sol_mask_w6.fitted_values)
+    end
+
 end
