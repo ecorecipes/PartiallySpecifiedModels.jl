@@ -84,6 +84,7 @@ include("adaptive_gradient_matching.jl")
 include("ibm_prior.jl")
 include("kalman.jl")
 include("probsolve.jl")
+include("sqrt_kalman.jl")
 include("rodeo_solver.jl")
 
 # MCMC/HMC solver (Bayesian inference)

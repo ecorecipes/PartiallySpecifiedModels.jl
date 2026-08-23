@@ -6263,4 +6263,307 @@ struct NotAnApproximator end
         @test isfinite(sol_ofg1.data_loss)
     end
 
+    # ─── W8: square-root (QR-based) Kalman filtering ──────────────────
+    #
+    # Opt-in `sqrt_filter=true` on RodeoSolver / DaltonSolver /
+    # PseudoMarginalSolver runs the probabilistic-ODE Kalman recursions on
+    # right Cholesky/QR factors (P = RᵀR) instead of covariances
+    # (src/sqrt_kalman.jl; Krämer & Hennig JMLR 2024 / Kailath et al. array
+    # algorithms). Default `false` leaves the standard code paths untouched.
+
+    @testset "Square-root Kalman — construction and default equivalence" begin
+        PSM = PartiallySpecifiedModels
+
+        # Validated opt-in kwarg, default false on all three consumers.
+        @test RodeoSolver().sqrt_filter == false
+        @test DaltonSolver().sqrt_filter == false
+        @test PseudoMarginalSolver().sqrt_filter == false
+        @test RodeoSolver(sqrt_filter=true).sqrt_filter == true
+        @test DaltonSolver(sqrt_filter=true).sqrt_filter == true
+        @test PseudoMarginalSolver(sqrt_filter=true, inner_method=:ffbs).sqrt_filter == true
+        # Typed kwarg: non-Bool values are rejected at construction.
+        @test_throws TypeError RodeoSolver(sqrt_filter=:yes)
+        @test_throws TypeError DaltonSolver(sqrt_filter=1.0)
+        @test_throws TypeError PseudoMarginalSolver(sqrt_filter=:yes)
+
+        # `sqrt_filter=false` takes the standard code path exactly (the
+        # delegation branch is never entered): identical output to a call
+        # that does not pass the keyword at all, and no factor keys.
+        logis_sq!(du, u, p, t) = (du[1] = 0.5 * u[1] * (1 - u[1] / 10.0))
+        f_def = PSM.probsolve_filter(logis_sq!, nothing, [0.1], (0.0, 10.0),
+                                     50, 3, [1.0])
+        f_off = PSM.probsolve_filter(logis_sq!, nothing, [0.1], (0.0, 10.0),
+                                     50, 3, [1.0]; sqrt_filter=false)
+        @test f_def["μ_filt"] == f_off["μ_filt"]
+        @test f_def["Σ_filt"] == f_off["Σ_filt"]
+        @test f_def["ssq"] == f_off["ssq"]
+        @test !haskey(f_def, "R_filt")
+
+        # sqrt output carries the factors, and they reconstruct the stored
+        # covariances exactly (Σ = RᵀR by definition of the representation).
+        f_sq = PSM.probsolve_filter(logis_sq!, nothing, [0.1], (0.0, 10.0),
+                                    50, 3, [1.0]; sqrt_filter=true)
+        @test haskey(f_sq, "R_filt") && haskey(f_sq, "R_pred") && haskey(f_sq, "R_Q")
+        @test all(f_sq["Σ_filt"][n] == f_sq["R_filt"][n]' * f_sq["R_filt"][n]
+                  for n in 1:51)
+    end
+
+    @testset "Square-root Kalman — parity with the standard filter" begin
+        PSM = PartiallySpecifiedModels
+        logis_par!(du, u, p, t) = (du[1] = 0.5 * u[1] * (1 - u[1] / 10.0))
+        lv_par!(du, u, p, t) = (du[1] = 1.5*u[1] - u[1]*u[2];
+                                du[2] = -3.0*u[2] + u[1]*u[2])
+
+        # Filter parity, q=3 moderate steps: means to 1e-10, covariances to
+        # 1e-8 relative, calibrated diffusion to 1e-10 relative.
+        # (Measured: 1.9e-14 / 4.0e-12 / 2e-19.)
+        fs = PSM.probsolve_filter(logis_par!, nothing, [0.1], (0.0, 10.0),
+                                  100, 3, [1.0])
+        fq = PSM.probsolve_filter(logis_par!, nothing, [0.1], (0.0, 10.0),
+                                  100, 3, [1.0]; sqrt_filter=true)
+        @test maximum(maximum(abs.(fs["μ_filt"][n] .- fq["μ_filt"][n]))
+                      for n in 1:101) < 1e-10
+        @test maximum(maximum(abs.(fs["Σ_filt"][n] .- fq["Σ_filt"][n])) /
+                      max(maximum(abs.(fs["Σ_filt"][n])), 1e-30)
+                      for n in 2:101) < 1e-8
+        @test abs(fs["ssq"] - fq["ssq"]) / fs["ssq"] < 1e-10
+
+        # Smoother parity at q=2 (measured 1.5e-10 / 1.9e-8). At higher q /
+        # finer steps the comparison is limited by the STANDARD smoother's
+        # own `+1e-12·I` jitter on Σ_pred, which the square-root gain (pure
+        # triangular solves) does not need — the paths then differ by the
+        # jitter's perturbation of G, not by an error in the sqrt pass.
+        fs2 = PSM.probsolve_filter(logis_par!, nothing, [0.1], (0.0, 10.0),
+                                   50, 2, [1.0])
+        fq2 = PSM.probsolve_filter(logis_par!, nothing, [0.1], (0.0, 10.0),
+                                   50, 2, [1.0]; sqrt_filter=true)
+        ms2, Ss2 = PSM.probsolve_smooth(fs2, 1)
+        mq2, Sq2 = PSM.probsolve_smooth(fq2, 1)
+        @test maximum(maximum(abs.(ms2[n][1] .- mq2[n][1])) for n in 1:51) < 1e-7
+        @test maximum(maximum(abs.(Ss2[n][1] .- Sq2[n][1])) /
+                      max(maximum(abs.(Ss2[n][1])), 1e-30) for n in 2:51) < 1e-6
+
+        # Log-evidence parity (log-evidence read off the triangular factor,
+        # 2·Σ log|diag S_R|, must equal the standard Cholesky value).
+        # Measured: fenrir 2.0e-8, basic 1.1e-7, dalton 1.4e-9,
+        # ssq/calib_acc 8.9e-12 relative.
+        sol_lv = OrdinaryDiffEq.solve(
+            ODEProblem(lv_par!, [1.0, 1.0], (0.0, 10.0)), Tsit5(),
+            saveat=collect(0.5:0.5:9.5))
+        tobs_lv = collect(sol_lv.t)
+        data_lv = Matrix(hcat([sol_lv[k, :] for k in 1:2]...))
+        args_lv = (lv_par!, nothing, [1.0, 1.0], (0.0, 10.0), 100, 3,
+                   [1.0, 1.0], data_lv, tobs_lv, [1, 2], 0.05)
+        @test isapprox(PSM.fenrir_loglik(args_lv...),
+                       PSM.fenrir_loglik(args_lv...; sqrt_filter=true);
+                       atol=1e-6, rtol=1e-7)
+        @test isapprox(PSM.basic_loglik(args_lv...),
+                       PSM.basic_loglik(args_lv...; sqrt_filter=true);
+                       atol=1e-5, rtol=1e-7)
+        @test isapprox(PSM._dalton_loglik(args_lv...),
+                       PSM._dalton_loglik(args_lv...; sqrt_filter=true);
+                       atol=1e-6, rtol=1e-7)
+
+        # DALTON's calibration triple (logZ, σ̂², calib_acc) — the inputs to
+        # its closed-form quasi-MLE rescale — must match across paths.
+        ref_s = PSM._dalton_reference(lv_par!, nothing, [1.0, 1.0],
+                                      (0.0, 10.0), 100, 3, [1.0, 1.0])
+        ref_q = PSM._dalton_reference(lv_par!, nothing, [1.0, 1.0],
+                                      (0.0, 10.0), 100, 3, [1.0, 1.0];
+                                      sqrt_filter=true)
+        @test isapprox(ref_s[1], ref_q[1]; atol=1e-5, rtol=1e-8)   # logZ
+        @test abs(ref_s[2] - ref_q[2]) / ref_s[2] < 1e-9           # ssq
+        @test abs(ref_s[3] - ref_q[3]) / ref_s[3] < 1e-9           # calib_acc
+    end
+
+    @testset "Square-root Kalman — stress at high IBM order" begin
+        PSM = PartiallySpecifiedModels
+        lv_st!(du, u, p, t) = (du[1] = 1.5*u[1] - u[1]*u[2];
+                               du[2] = -3.0*u[2] + u[1]*u[2])
+
+        # STANDARD-path degradation (the discriminator): at n_deriv=7 with
+        # small steps the standard recursion Σ⁺ = Σ − KHΣ demonstrably
+        # loses positive-semidefiniteness — strictly negative eigenvalues
+        # appear in the filtered covariances (the COUNT is BLAS/machine-
+        # specific — 25 on the machine that wrote this, 8 on the reviewer's;
+        # worst eigenvalue −3.4e-10 on both — so only n_indef > 0 is
+        # asserted). Honest caveat, stated plainly: no in-package
+        # configuration was found where this degradation is CATASTROPHIC
+        # (NaN / hard cholesky failure) — the violations stay at rounding
+        # level relative to ‖Σ‖ (~1e-16·‖Σ‖) and the existing band-aids
+        # (0.5(Σ+Σ') symmetrization, the adaptive jitter in logpdf_mvn, the
+        # jitter escalation in _pm_mvn_sample, and the cholesky→pinv
+        # fallbacks) absorb them.
+        f_std7 = PSM.probsolve_filter(lv_st!, nothing, [1.0, 1.0],
+                                      (0.0, 10.0), 2000, 7, [1.0, 1.0])
+        n_indef = count(minimum(eigvals(Symmetric(f_std7["Σ_filt"][n]))) < -1e-12
+                        for n in 2:2001)
+        @test n_indef > 0
+
+        # sqrt path at the same configuration: finite everywhere and the
+        # means track the standard filter's (measured 7e-5 at q=7).
+        f_sq7 = PSM.probsolve_filter(lv_st!, nothing, [1.0, 1.0],
+                                     (0.0, 10.0), 2000, 7, [1.0, 1.0];
+                                     sqrt_filter=true)
+        @test all(all(isfinite, m) for m in f_sq7["μ_filt"])
+        @test all(all(isfinite, R) for R in f_sq7["R_filt"])
+        @test maximum(maximum(abs.(f_std7["μ_filt"][n] .- f_sq7["μ_filt"][n]))
+                      for n in 1:2001) < 1e-2
+
+        # PSD-by-construction at n_deriv=5: every reconstructed filter and
+        # predict covariance is a Gram matrix RᵀR, so its eigenvalues are
+        # nonnegative up to the rounding of forming/eigensolving the
+        # product (measured: ≥ −3.6e-21 relative; bound 1e-12 relative).
+        f_sq5 = PSM.probsolve_filter(lv_st!, nothing, [1.0, 1.0],
+                                     (0.0, 10.0), 500, 5, [1.0, 1.0];
+                                     sqrt_filter=true)
+        psd_ok(Σ) = (ev = eigvals(Symmetric(Σ));
+                     minimum(ev) >= -1e-12 * max(maximum(abs, ev), 1.0))
+        @test all(psd_ok(f_sq5["Σ_filt"][n]) for n in 2:501)
+        @test all(psd_ok(f_sq5["Σ_pred"][n]) for n in 2:501)
+
+        # The square-root smoother stays finite and PSD there too.
+        _, Ssm5 = PSM.probsolve_smooth(f_sq5, 2)
+        @test all(psd_ok(Ssm5[n][k]) for n in 1:501, k in 1:2)
+    end
+
+    @testset "Square-root Kalman — FFBS sampling under sqrt" begin
+        PSM = PartiallySpecifiedModels
+        logis_ff!(du, u, p, t) = (du[1] = 0.5 * u[1] * (1 - u[1] / 10.0))
+
+        # Factor-based FFBS is supported: backward draws use the
+        # PSD-by-construction covariance factors (no jitter escalation).
+        # Distributional check: empirical mean/variance of the sampled value
+        # coordinate match the smoothing posterior.
+        filt_ff = PSM.probsolve_filter(logis_ff!, nothing, [0.5], (0.0, 10.0),
+                                       50, 3, [1.0]; sqrt_filter=true)
+        mu_ff, S_ff = PSM.probsolve_smooth(filt_ff, 1)
+        rng_ff = Random.Xoshiro(1)
+        n_draw = 1500
+        vals_ff = zeros(n_draw, 51)
+        for s in 1:n_draw
+            X = PSM._pm_sample_traj(filt_ff, rng_ff)
+            @assert length(X) == 51
+            for n in 1:51
+                vals_ff[s, n] = X[n][1]
+            end
+        end
+        @test all(isfinite, vals_ff)
+        worst_m_ff = 0.0
+        worst_v_ff = 0.0
+        for n in 2:51
+            m_emp = mean(vals_ff[:, n])
+            v_emp = sum(abs2, vals_ff[:, n] .- m_emp) / (n_draw - 1)
+            m_th = mu_ff[n][1][1]
+            v_th = S_ff[n][1][1, 1]
+            sd_th = sqrt(max(v_th, 1e-30))
+            worst_m_ff = max(worst_m_ff, abs(m_emp - m_th) / max(sd_th, 1e-12))
+            worst_v_ff = max(worst_v_ff, abs(v_emp - v_th) / max(v_th, 1e-12))
+        end
+        @test worst_m_ff < 0.15   # measured ≈ 0.02 (in posterior-sd units)
+        @test worst_v_ff < 0.25   # measured ≈ 0.05 (relative)
+
+        # And the two samplers estimate the same marginal likelihood
+        # (unbiasedness preserved): compare _pm_loglik_hat across seeds.
+        data_ff = reshape([0.6, 1.2, 2.5, 4.5, 6.8, 8.5], :, 1)
+        t_ff = collect(1.0:1.5:9.0)
+        ll_s = mean(PSM._pm_loglik_hat(logis_ff!, [0.5], (0.0, 10.0), 50, 3,
+                                       [1.0], data_ff, t_ff, [1], 0.05, 64,
+                                       Random.Xoshiro(s)) for s in 1:10)
+        ll_q = mean(PSM._pm_loglik_hat(logis_ff!, [0.5], (0.0, 10.0), 50, 3,
+                                       [1.0], data_ff, t_ff, [1], 0.05, 64,
+                                       Random.Xoshiro(s); sqrt_filter=true)
+                    for s in 1:10)
+        @test abs(ll_s - ll_q) < 0.05   # measured ≈ 5e-5, MC sd ≈ 1e-3
+    end
+
+    @testset "Square-root Kalman — end-to-end solver fits" begin
+        PSM = PartiallySpecifiedModels
+
+        # DaltonSolver: same problem as the "DaltonSolver — exponential
+        # decay" testset. The two likelihoods agree to ~1e-9, but the
+        # NelderMead → L-BFGS(FD-gradient) optimizer amplifies sub-1e-8
+        # objective differences into slightly different (equally good)
+        # optima, so the recovered functions agree to ~4e-3 rather than
+        # 1e-6 (measured max |Δf| = 3.7e-3, Δobjective = 3.3e-5). Both fits
+        # must recover the truth to the original testset's tolerance.
+        decay_sq!(du, u, p, t) = (du[1] = -p.f(u[1]))
+        rng_dsq = Random.Xoshiro(42)
+        sol_true_dsq = OrdinaryDiffEq.solve(
+            ODEProblem(decay_sq!, [5.0], (0.0, 10.0), (; f=x -> 0.5*x)),
+            Tsit5(); saveat=0.5)
+        t_dsq = collect(sol_true_dsq.t)
+        data_dsq = [sol_true_dsq.u[i][1] + 0.05*randn(rng_dsq)
+                    for i in 1:length(t_dsq)]
+        uf_dsq = BSplineApproximator(:f, (0.0, 6.0), 8)
+        prob_dsq = PSMProblem(decay_sq!, [5.0], (0.0, 10.0), [uf_dsq];
+            data_times=t_dsq, data_values=reshape(max.(data_dsq, 0.01), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_d_std = solve(prob_dsq, DaltonSolver(n_steps=100, maxiters=50,
+                                                 verbose=false))
+        sol_d_sq = solve(prob_dsq, DaltonSolver(n_steps=100, maxiters=50,
+                                                verbose=false, sqrt_filter=true))
+        @test sol_d_sq isa PSMSolution
+        @test isfinite(sol_d_sq.objective)
+        @test abs(sol_d_sq.unknown_functions[:f](3.0) - 1.5) < 0.35
+        @test maximum(abs(sol_d_std.unknown_functions[:f](x) -
+                          sol_d_sq.unknown_functions[:f](x))
+                      for x in 0.5:0.5:5.5) < 0.05
+        @test abs(sol_d_std.objective - sol_d_sq.objective) < 1e-2
+
+        # RodeoSolver: same problem as the "Rodeo solver (B-spline)"
+        # testset (with a pinned rng). Measured max |Δr| = 1.7e-5.
+        growth_sq!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        rng_rsq = Random.Xoshiro(7)
+        t_rsq = collect(0.0:0.25:5.0)
+        data_rsq = reshape(2.0 .* exp.(0.3 .* t_rsq) .+
+                           0.05 .* randn(rng_rsq, length(t_rsq)), :, 1)
+        uf_rsq = BSplineApproximator(:r, (1.5, 10.0), 6; initial=0.5)
+        prob_rsq = PSMProblem(growth_sq!, [2.0], (0.0, 5.0), [uf_rsq];
+            data_times=t_rsq, data_values=data_rsq,
+            obs_to_state=[1], solver=Tsit5())
+        sol_r_std = solve(prob_rsq, RodeoSolver(n_steps=100, n_deriv=3,
+                                                maxiters=100, obs_var=0.01,
+                                                verbose=false))
+        sol_r_sq = solve(prob_rsq, RodeoSolver(n_steps=100, n_deriv=3,
+                                               maxiters=100, obs_var=0.01,
+                                               verbose=false, sqrt_filter=true))
+        @test sol_r_sq isa PSMSolution
+        @test abs(sol_r_sq.unknown_functions[:r](3.0) - 0.3) < 0.15
+        @test maximum(abs(sol_r_std.unknown_functions[:r](x) -
+                          sol_r_sq.unknown_functions[:r](x))
+                      for x in 2.0:0.5:8.0) < 0.01
+        @test abs(sol_r_std.objective - sol_r_sq.objective) < 1e-2
+
+        # PseudoMarginalSolver under sqrt (:ffbs inner method is supported
+        # via factor-based backward sampling): runs, finite, valid chain,
+        # and reproducible under the solver-owned rng_seed.
+        r_true_psq(N) = 0.5 * (1.0 - N / 10.0)
+        logis_psq!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        rng_psq = Random.Xoshiro(42)
+        sol_true_psq = OrdinaryDiffEq.solve(
+            ODEProblem(logis_psq!, [1.0], (0.0, 15.0), (; r=r_true_psq)),
+            Tsit5(); saveat=1.0)
+        t_psq = collect(sol_true_psq.t)
+        data_psq = [sol_true_psq.u[i][1] + 0.1*randn(rng_psq)
+                    for i in 1:length(t_psq)]
+        uf_psq = BSplineApproximator(:r, (0.0, 12.0), 6)
+        prob_psq = PSMProblem(logis_psq!, [1.0], (0.0, 15.0), [uf_psq];
+            data_times=t_psq, data_values=reshape(max.(data_psq, 0.01), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_p_sq = solve(prob_psq, PseudoMarginalSolver(
+            n_samples=50, n_warmup=25, n_steps=50, rng_seed=31415,
+            verbose=false, sqrt_filter=true))
+        @test sol_p_sq isa PSMSolution
+        @test sol_p_sq.convergence isa MCMCChains.Chains
+        @test size(sol_p_sq.convergence, 1) == 50
+        @test all(isfinite, Array(sol_p_sq.convergence))
+        sol_p_sq2 = solve(prob_psq, PseudoMarginalSolver(
+            n_samples=50, n_warmup=25, n_steps=50, rng_seed=31415,
+            verbose=false, sqrt_filter=true))
+        @test Array(sol_p_sq.convergence) == Array(sol_p_sq2.convergence)
+    end
+
 end

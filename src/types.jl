@@ -1492,6 +1492,11 @@ approximate the ODE solution and compute an approximate marginal likelihood.
 - `obs_var`: observation noise variance (or nothing for auto)
 - `method`: likelihood approximation (`:basic` or `:fenrir`)
 - `interrogate`: interrogation method (`:kramer` or `:schober`)
+- `sqrt_filter`: run the Kalman recursions in square-root (Cholesky/QR)
+  form (default: false). Numerically stabler at high `n_deriv` and small
+  steps, where the standard covariance recursion can lose
+  positive-semidefiniteness; with `false` the standard covariance
+  recursion is used unchanged.
 - `maxiters`: max L-BFGS iterations (default: 200)
 - `verbose`: print progress (default: false)
 """
@@ -1504,6 +1509,7 @@ struct RodeoSolver
     interrogate::Symbol
     maxiters::Int
     verbose::Bool
+    sqrt_filter::Bool
 end
 
 function RodeoSolver(; n_steps::Int=200, n_deriv::Int=3,
@@ -1511,7 +1517,8 @@ function RodeoSolver(; n_steps::Int=200, n_deriv::Int=3,
                        obs_var::Union{Nothing, Float64}=nothing,
                        method::Symbol=:basic,
                        interrogate::Symbol=:kramer,
-                       maxiters::Int=200, verbose::Bool=false)
+                       maxiters::Int=200, verbose::Bool=false,
+                       sqrt_filter::Bool=false)
     method in (:basic, :fenrir) ||
         throw(ArgumentError("RodeoSolver: method must be :basic or :fenrir " *
                             "(got :$method)"))
@@ -1522,7 +1529,8 @@ function RodeoSolver(; n_steps::Int=200, n_deriv::Int=3,
     # n_deriv=1 BoundsErrors inside the Kalman filter selectors.
     n_deriv >= 2 ||
         throw(ArgumentError("RodeoSolver: n_deriv must be ≥ 2 (got $n_deriv)"))
-    RodeoSolver(n_steps, n_deriv, sigma, obs_var, method, interrogate, maxiters, verbose)
+    RodeoSolver(n_steps, n_deriv, sigma, obs_var, method, interrogate, maxiters,
+                verbose, sqrt_filter)
 end
 
 """
@@ -1731,6 +1739,11 @@ filter passes — one joint (ODE + observations) and one marginal (ODE only).
   note a fixed value must be chosen relative to the data scale — a value
   appropriate for data of order 1 badly misfits data of order 1000.
 - `interrogate`: interrogation method `:kramer` or `:schober` (default `:kramer`)
+- `sqrt_filter`: run both DALTON Kalman passes in square-root
+  (Cholesky/QR) form (default: false). Numerically stabler at high
+  `n_deriv` and small steps; the quasi-MLE diffusion calibration is
+  computed from mathematically equivalent quantities. With `false` the
+  standard covariance recursion is used unchanged.
 - `maxiters`: optimization iterations (default 200)
 - `verbose`: print progress
 """
@@ -1742,20 +1755,23 @@ struct DaltonSolver
     interrogate::Symbol
     maxiters::Int
     verbose::Bool
+    sqrt_filter::Bool
 end
 
 function DaltonSolver(; n_steps::Int=200, n_deriv::Int=3,
                         sigma::Union{Nothing, Vector{Float64}}=nothing,
                         obs_var::Union{Nothing, Float64}=nothing,
                         interrogate::Symbol=:kramer,
-                        maxiters::Int=200, verbose::Bool=false)
+                        maxiters::Int=200, verbose::Bool=false,
+                        sqrt_filter::Bool=false)
     interrogate in (:kramer, :schober) ||
         throw(ArgumentError("DaltonSolver: interrogate must be :kramer or " *
                             ":schober (got :$interrogate)"))
     # See RodeoSolver: n_deriv=1 BoundsErrors in the Kalman selectors.
     n_deriv >= 2 ||
         throw(ArgumentError("DaltonSolver: n_deriv must be ≥ 2 (got $n_deriv)"))
-    DaltonSolver(n_steps, n_deriv, sigma, obs_var, interrogate, maxiters, verbose)
+    DaltonSolver(n_steps, n_deriv, sigma, obs_var, interrogate, maxiters,
+                 verbose, sqrt_filter)
 end
 
 # ─── Pseudo-marginal solver (Chkrebtii et al. 2016) ───────────────
@@ -1792,6 +1808,13 @@ adaptive random-walk Metropolis (the proposal scale is tuned toward
 - `rng_seed`: seed for the chain's own RNG stream (default `nothing` =
   non-reproducible). Matches the `rng_seed` convention of
   `AdaptiveGradientMatching`/`BNGSolver`; does not touch the global RNG.
+- `sqrt_filter`: run the inner probabilistic-ODE Kalman recursions in
+  square-root (Cholesky/QR) form (default: false). Numerically stabler
+  at high `n_deriv` and small steps. Supported by all three
+  `inner_method`s — under `:ffbs` the backward draws use the
+  PSD-by-construction covariance factors, so the jitter escalation of
+  the standard sampler is never needed. With `false` the standard
+  covariance recursion is used unchanged.
 - `verbose`: print progress
 """
 struct PseudoMarginalSolver
@@ -1807,6 +1830,7 @@ struct PseudoMarginalSolver
     initial_params::Union{Nothing, Vector{Float64}}
     rng_seed::Union{Nothing, Int}
     verbose::Bool
+    sqrt_filter::Bool
 end
 
 function PseudoMarginalSolver(; n_samples::Int=1000, n_warmup::Int=500,
@@ -1817,14 +1841,15 @@ function PseudoMarginalSolver(; n_samples::Int=1000, n_warmup::Int=500,
                                 inner_method::Symbol=:ffbs,
                                 initial_params::Union{Nothing, Vector{Float64}}=nothing,
                                 rng_seed::Union{Nothing, Int}=nothing,
-                                verbose::Bool=false)
+                                verbose::Bool=false,
+                                sqrt_filter::Bool=false)
     # See RodeoSolver: n_deriv=1 BoundsErrors in the Kalman selectors.
     n_deriv >= 2 ||
         throw(ArgumentError("PseudoMarginalSolver: n_deriv must be ≥ 2 " *
                             "(got $n_deriv)"))
     PseudoMarginalSolver(n_samples, n_warmup, n_steps, n_deriv, sigma, obs_var,
                           target_accept, prior_scale, inner_method,
-                          initial_params, rng_seed, verbose)
+                          initial_params, rng_seed, verbose, sqrt_filter)
 end
 
 # ─── GCV solver (Wood 2001 / ddefit504) ────────────────────────────
