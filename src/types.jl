@@ -1104,7 +1104,7 @@ end
 
 """
     LAML(; maxiters=100, tol=1e-6, verbose=false, initial_lambda=nothing,
-           warmup=3, sigma2_init=nothing, criterion=:working)
+           warmup=3, sigma2_init=nothing, criterion=:working, jac=:fd)
 
 Laplace Approximate Marginal Likelihood algorithm.
 Equivalent to REML for Gaussian data.
@@ -1160,6 +1160,22 @@ Uses Fellner-Schall + Newton for smoothing parameter estimation.
     For `Gaussian` likelihoods `:laplace` reduces exactly to the current
     profiled-REML criterion (identical code path), so results are identical
     to `:working`.
+- `jac::Symbol=:fd`: backend for the working-model Jacobian of the
+  predictions w.r.t. the coefficients (`compute_jacobian!`).
+  - `:fd` (default, historical behavior, byte-identical): adaptive central
+    finite differences — 2·n_p full model solves per IRLS iteration, with
+    truncation + integration-noise error in each column.
+  - `:forwarddiff`: forward-mode AD (`ForwardDiff.jacobian`) straight
+    through the ODE/map/DDE solve — exact to solver precision and cheaper
+    (n_p/chunk Dual solves instead of 2·n_p). The chunked configuration is
+    built once per solve. If the Dual-valued solve fails numerically or
+    returns non-finite entries, that iteration falls back to the `:fd`
+    path (with a `@debug` note) rather than erroring — mirroring the FD
+    path's own per-column degradation. Works for continuous ODEs (in-place
+    and out-of-place dynamics), discrete maps, `u0`-as-function problems,
+    and DDEs (`MethodOfSteps` is Dual-safe; a failure there also lands on
+    the per-iteration FD fallback). Requires the dynamics and any custom
+    evaluators to be eltype-generic (all built-in approximators are).
 
 # Convergence info
 `sol.convergence` is a NamedTuple `(V_beta, sigma2, converged, iterations,
@@ -1180,18 +1196,31 @@ struct LAML
     warmup::Int
     sigma2_init::Union{Nothing,Float64}
     criterion::Symbol
+    jac::Symbol
 end
 
 function LAML(; maxiters::Int=100, tol::Float64=1e-6, verbose::Bool=false,
                 initial_lambda::Union{Nothing,Float64}=nothing,
                 warmup::Int=3,
                 sigma2_init::Union{Nothing,Float64}=nothing,
-                criterion::Symbol=:working)
+                criterion::Symbol=:working,
+                jac::Symbol=:fd)
     criterion in (:working, :laplace) ||
         throw(ArgumentError("LAML: criterion must be :working or :laplace " *
                             "(got $(repr(criterion)))"))
-    LAML(maxiters, tol, verbose, initial_lambda, warmup, sigma2_init, criterion)
+    jac in (:fd, :forwarddiff) ||
+        throw(ArgumentError("LAML: jac must be :fd or :forwarddiff " *
+                            "(got $(repr(jac)))"))
+    LAML(maxiters, tol, verbose, initial_lambda, warmup, sigma2_init,
+         criterion, jac)
 end
+
+# Backward-compatible positional constructor (pre-jac arity).
+LAML(maxiters::Int, tol::Float64, verbose::Bool,
+     initial_lambda::Union{Nothing,Float64}, warmup::Int,
+     sigma2_init::Union{Nothing,Float64}, criterion::Symbol) =
+    LAML(maxiters, tol, verbose, initial_lambda, warmup, sigma2_init,
+         criterion, :fd)
 
 """
     CollocationLAML(; kwargs...)
@@ -1218,6 +1247,26 @@ changes.  See Fasiolo, Pya & Wood (2016), Statistical Science 31(1).
 - `lambda_ode_end::Float64=1e4`: final ODE compliance penalty
 - `n_continuation::Int=8`: number of log-spaced continuation levels
 - `sigma2_init::Union{Nothing,Float64}=nothing`: σ² cap for Fellner-Schall
+- `jac::Symbol=:fd`: backend for the differentiated parts of the
+  collocation Jacobian — the pointwise state Jacobian ∂F/∂x, the
+  coefficient block ∂F/∂β, and the Fellner–Schall EDF Jacobian of the
+  simulated predictions.
+  - `:fd` (default, historical behavior, byte-identical): finite
+    differences.
+  - `:forwarddiff`: forward-mode AD. The failure-sentinel convention is
+    preserved EXACTLY (see the comment block in `collocation_solver.jl`):
+    the residual at a failed collocation point still holds the large
+    `_COLLOC_FAIL_SENTINEL`, the sentinel value itself is NEVER part of
+    the differentiated computation (failed points are skipped inside the
+    Dual sweep), and the Jacobian rows/columns at failed points are forced
+    to zero exactly as the FD path forces them — large residual, zero
+    Jacobian. If a Dual-valued sweep fails outright it falls back to the
+    FD path for that evaluation (`@debug` note). One behavioral nuance,
+    strictly an improvement: at a point whose BASE evaluation succeeds,
+    forward mode returns the exact derivative and never perturbs the
+    state, so FD's defensive zero column for "perturbation crossed a
+    domain boundary" cannot arise (that zero existed only to protect FD
+    from its own perturbation).
 
 !!! note "ODE problems only"
     DDE problems are REJECTED with an error. The collocation objective
@@ -1240,14 +1289,30 @@ struct CollocationLAML
     lambda_ode_end::Float64
     n_continuation::Int
     sigma2_init::Union{Nothing,Float64}
+    jac::Symbol
 end
 
-CollocationLAML(; maxiters::Int=50, tol::Float64=1e-6, verbose::Bool=false,
-                  lambda_ode_start::Float64=0.01, lambda_ode_end::Float64=1e4,
-                  n_continuation::Int=8,
-                  sigma2_init::Union{Nothing,Float64}=nothing) =
+function CollocationLAML(; maxiters::Int=50, tol::Float64=1e-6,
+                           verbose::Bool=false,
+                           lambda_ode_start::Float64=0.01,
+                           lambda_ode_end::Float64=1e4,
+                           n_continuation::Int=8,
+                           sigma2_init::Union{Nothing,Float64}=nothing,
+                           jac::Symbol=:fd)
+    jac in (:fd, :forwarddiff) ||
+        throw(ArgumentError("CollocationLAML: jac must be :fd or " *
+                            ":forwarddiff (got $(repr(jac)))"))
     CollocationLAML(maxiters, tol, verbose, lambda_ode_start, lambda_ode_end,
-                    n_continuation, sigma2_init)
+                    n_continuation, sigma2_init, jac)
+end
+
+# Backward-compatible positional constructor (pre-jac arity).
+CollocationLAML(maxiters::Int, tol::Float64, verbose::Bool,
+                lambda_ode_start::Float64, lambda_ode_end::Float64,
+                n_continuation::Int,
+                sigma2_init::Union{Nothing,Float64}) =
+    CollocationLAML(maxiters, tol, verbose, lambda_ode_start, lambda_ode_end,
+                    n_continuation, sigma2_init, :fd)
 
 """
     GradientMatching(; maxiters=500, tol=1e-6, verbose=false, sigma2_init=nothing)
@@ -1935,6 +2000,15 @@ residual autocorrelation is suspected (check `residual_diagnostics`).
   supported: the NCV neighbourhood downdates need `A(λ)⁻¹` at every λ,
   which is genuinely incompatible with the one-decomposition trick, so
   `search=:reuse` with `criterion=:ncv` is rejected at construction.
+- `jac`: backend for the working-model Jacobian of predictions w.r.t. the
+  coefficients — `:fd` (default; adaptive central finite differences,
+  historical behavior, byte-identical) or `:forwarddiff` (forward-mode AD
+  through the ODE/map/DDE solve; exact to solver precision, one chunked
+  Dual sweep instead of 2·n_p perturbed solves, config built once per
+  solve; falls back to `:fd` for an iteration — `@debug` note — whenever
+  the Dual-valued solve fails or returns non-finite entries). See the
+  `LAML` docstring for the full description; the two solvers share
+  `compute_jacobian!`.
 - `verbose`: print progress
 
 # Convergence info
@@ -1956,12 +2030,13 @@ struct GCVSolver
     ncv_width::Int
     search::Symbol
     verbose::Bool
+    jac::Symbol
 end
 
 function GCVSolver(; n_grid::Int=50, maxiters::Int=50, tol::Float64=1e-6,
                      gamma::Float64=1.4, criterion::Symbol=:gcv,
                      ncv_width::Int=2, search::Symbol=:direct,
-                     verbose::Bool=false)
+                     verbose::Bool=false, jac::Symbol=:fd)
     criterion in (:gcv, :ncv) ||
         throw(ArgumentError("GCVSolver: criterion must be :gcv or :ncv " *
                             "(got $(repr(criterion)))"))
@@ -1977,9 +2052,19 @@ function GCVSolver(; n_grid::Int=50, maxiters::Int=50, tol::Float64=1e-6,
                             "need A(λ)⁻¹ at every λ, which is incompatible " *
                             "with the one-decomposition reuse trick; use " *
                             "search=:direct with criterion=:ncv"))
+    jac in (:fd, :forwarddiff) ||
+        throw(ArgumentError("GCVSolver: jac must be :fd or :forwarddiff " *
+                            "(got $(repr(jac)))"))
     GCVSolver(n_grid, maxiters, tol, gamma, criterion, ncv_width, search,
-              verbose)
+              verbose, jac)
 end
+
+# Backward-compatible positional constructor (pre-jac arity).
+GCVSolver(n_grid::Int, maxiters::Int, tol::Float64, gamma::Float64,
+          criterion::Symbol, ncv_width::Int, search::Symbol,
+          verbose::Bool) =
+    GCVSolver(n_grid, maxiters, tol, gamma, criterion, ncv_width, search,
+              verbose, :fd)
 
 # ─── Two-stage solver (Wood 2001 / deGradInfer) ───────────────────
 

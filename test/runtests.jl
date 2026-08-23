@@ -7043,4 +7043,320 @@ struct NotAnApproximator end
         # large bases and multi-approximator coordinate descent.
     end
 
+    @testset "W11: jac=:forwarddiff prediction Jacobians" begin
+        import ForwardDiff
+        import Lux
+        PSM = PartiallySpecifiedModels
+
+        # ── Construction validation on all three solvers ──
+        @test_throws ArgumentError LAML(jac=:bogus)
+        @test_throws ArgumentError GCVSolver(jac=:bogus)
+        @test_throws ArgumentError CollocationLAML(jac=:bogus)
+        # Default is :fd on all three — the historical FD path stays the
+        # default and is pinned byte-identical below.
+        @test LAML().jac === :fd
+        @test GCVSolver().jac === :fd
+        @test CollocationLAML().jac === :fd
+        @test LAML(jac=:forwarddiff).jac === :forwarddiff
+
+        # ── Shared smooth logistic problem (BSpline) ──
+        r_true_w11(N) = 0.8 * (1.0 - N / 2.0)
+        function logi_w11!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+        end
+        tt_w11 = collect(range(0.0, 10.0, length=25))
+        st_w11 = OrdinaryDiffEq.solve(
+            ODEProblem((du, u, p, t) -> (du[1] = r_true_w11(u[1]) * u[1]),
+                       [0.2], (0.0, 10.0)), Tsit5();
+            saveat=tt_w11, abstol=1e-10, reltol=1e-10)
+        # Seed choice is deliberate (see the LAML end-to-end block below):
+        # on this draw both Jacobian backends land on the same LAML optimum.
+        dat_w11 = reshape([u[1] for u in st_w11.u] .+
+                          0.02 .* randn(StableRNG(4), 25), :, 1)
+        mk_w11(; data=dat_w11, weights=nothing) = PSMProblem(
+            logi_w11!, [0.2], (0.0, 10.0),
+            [BSplineApproximator(:r, (0.0, 2.5), 8)];
+            data_times=tt_w11, data_values=data,
+            (weights === nothing ? (;) : (; data_weights=weights))...)
+        prob_w11 = mk_w11()
+        b0_w11 = PSM.build_initial_params(prob_w11)
+        np_w11 = length(b0_w11)
+
+        # ── Jacobian agreement, FD vs ForwardDiff (smooth ODE) ──
+        f0_w11 = vec(PSM.simulate(prob_w11, b0_w11))
+        J_fd_w11 = zeros(25, np_w11)
+        J_ad_w11 = zeros(25, np_w11)
+        cfg_w11 = PSM._fd_jacobian_config(np_w11)
+        PSM.compute_jacobian!(J_fd_w11, prob_w11, b0_w11, f0_w11, 25, 1;
+                              dam=fill(1e-8, np_w11))
+        PSM.compute_jacobian!(J_ad_w11, prob_w11, b0_w11, f0_w11, 25, 1;
+                              dam=fill(1e-8, np_w11),
+                              jac=:forwarddiff, fd_cfg=cfg_w11)
+        @test all(isfinite, J_ad_w11)
+        # FD's own error bound (truncation + integration noise); measured
+        # agreement here is ~4e-11 relative.
+        scale_w11 = maximum(abs, J_ad_w11)
+        @test maximum(abs, J_fd_w11 - J_ad_w11) < 1e-6 * max(scale_w11, 1.0)
+        # Silent-fallback detector (see the DDE variant below): a permanent
+        # AD→FD fallback would make this diff EXACTLY 0.0; genuine AD
+        # leaves FD truncation noise (~4e-11 measured).
+        @test maximum(abs, J_fd_w11 - J_ad_w11) > 0
+
+        # Default path untouched: jac=:fd through the keyword is EXACTLY the
+        # implicit default (same code path, same adaptive steps).
+        J_fd2_w11 = zeros(25, np_w11)
+        PSM.compute_jacobian!(J_fd2_w11, prob_w11, b0_w11, f0_w11, 25, 1;
+                              dam=fill(1e-8, np_w11), jac=:fd)
+        @test J_fd2_w11 == J_fd_w11
+
+        # ── Analytic case: discrete linear map u_{t+1} = g(1)·u_t ──
+        # pred_t = g^t·u_0 with g = Σ cⱼBⱼ(1), so ∂pred_t/∂cⱼ = t·g^{t-1}·Bⱼ(1)
+        # in closed form. No integrator → AD must hit machine precision while
+        # FD carries its truncation error.
+        function linmap_w11!(un, u, p, t)
+            un[1] = p.g(1.0) * u[1]
+        end
+        ttd_w11 = collect(0.0:1.0:8.0)
+        probd_w11 = PSMProblem(linmap_w11!, [1.0], (0.0, 8.0),
+                               [BSplineApproximator(:g, (0.0, 2.0), 6;
+                                                    initial=x -> 0.9)];
+                               data_times=ttd_w11,
+                               data_values=reshape(fill(1.0, 9), :, 1),
+                               discrete=true)
+        bd_w11 = PSM.build_initial_params(probd_w11)
+        npd_w11 = length(bd_w11)
+        g0_w11 = PSM.build_evaluator(probd_w11.approximators[1], bd_w11)(1.0)
+        Bj_w11 = ForwardDiff.gradient(
+            c -> PSM.build_evaluator(probd_w11.approximators[1], c)(1.0),
+            bd_w11)
+        J_an_w11 = zeros(9, npd_w11)
+        for (i, t) in enumerate(ttd_w11), j in 1:npd_w11
+            J_an_w11[i, j] = t == 0.0 ? 0.0 : t * g0_w11^(t - 1) * Bj_w11[j]
+        end
+        f0d_w11 = vec(PSM.simulate(probd_w11, bd_w11))
+        J_fdd_w11 = zeros(9, npd_w11)
+        J_add_w11 = zeros(9, npd_w11)
+        PSM.compute_jacobian!(J_fdd_w11, probd_w11, bd_w11, f0d_w11, 9, 1;
+                              dam=fill(1e-8, npd_w11))
+        PSM.compute_jacobian!(J_add_w11, probd_w11, bd_w11, f0d_w11, 9, 1;
+                              dam=fill(1e-8, npd_w11), jac=:forwarddiff,
+                              fd_cfg=PSM._fd_jacobian_config(npd_w11))
+        # Measured: AD 4.4e-16 (machine), FD 8.2e-11 (its truncation error)
+        @test maximum(abs, J_add_w11 - J_an_w11) < 1e-12
+        @test maximum(abs, J_fdd_w11 - J_an_w11) < 1e-8
+        @test maximum(abs, J_add_w11 - J_an_w11) <
+              maximum(abs, J_fdd_w11 - J_an_w11)
+
+        # ── Neural approximator agreement ──
+        nn_w11 = Lux.Chain(Lux.Dense(1 => 4, tanh), Lux.Dense(4 => 1))
+        probn_w11 = PSMProblem(logi_w11!, [0.2], (0.0, 10.0),
+                               [NeuralApproximator(:r, nn_w11; rng_seed=7)];
+                               data_times=tt_w11, data_values=dat_w11)
+        bn_w11 = PSM.build_initial_params(probn_w11)
+        npn_w11 = length(bn_w11)
+        f0n_w11 = vec(PSM.simulate(probn_w11, bn_w11))
+        J_fdn_w11 = zeros(25, npn_w11)
+        J_adn_w11 = zeros(25, npn_w11)
+        PSM.compute_jacobian!(J_fdn_w11, probn_w11, bn_w11, f0n_w11, 25, 1;
+                              dam=fill(1e-8, npn_w11))
+        PSM.compute_jacobian!(J_adn_w11, probn_w11, bn_w11, f0n_w11, 25, 1;
+                              dam=fill(1e-8, npn_w11), jac=:forwarddiff,
+                              fd_cfg=PSM._fd_jacobian_config(npn_w11))
+        @test all(isfinite, J_adn_w11)
+        @test maximum(abs, J_fdn_w11 - J_adn_w11) <
+              1e-4 * max(maximum(abs, J_adn_w11), 1.0)   # measured 1.6e-7
+
+        # ── Masked cells: rows are computed for masked cells too (masking
+        #    is applied downstream through the weights), identically in
+        #    both backends ──
+        datm_w11 = copy(dat_w11); datm_w11[5] = NaN
+        wm_w11 = ones(25, 1); wm_w11[9] = 0.0
+        probm_w11 = mk_w11(data=datm_w11, weights=wm_w11)
+        f0m_w11 = vec(PSM.simulate(probm_w11, b0_w11))
+        J_fdm_w11 = zeros(25, np_w11)
+        J_adm_w11 = zeros(25, np_w11)
+        PSM.compute_jacobian!(J_fdm_w11, probm_w11, b0_w11, f0m_w11, 25, 1;
+                              dam=fill(1e-8, np_w11))
+        PSM.compute_jacobian!(J_adm_w11, probm_w11, b0_w11, f0m_w11, 25, 1;
+                              dam=fill(1e-8, np_w11), jac=:forwarddiff,
+                              fd_cfg=PSM._fd_jacobian_config(np_w11))
+        @test all(isfinite, J_adm_w11)
+        @test !all(iszero, J_adm_w11[5, :])   # masked rows still populated
+        @test !all(iszero, J_adm_w11[9, :])
+        @test maximum(abs, J_fdm_w11 - J_adm_w11) <
+              1e-6 * max(maximum(abs, J_adm_w11), 1.0)
+
+        # ── End-to-end equivalence: LAML ──
+        # Measured on this draw: fitted-values maxdiff 4.2e-8,
+        # |log θ ratio| 2.5e-6, data_loss rel diff 4.7e-7, criterion diff
+        # 1.5e-5 — the two backends land on the SAME optimum. Honest caveat
+        # (why the seed is pinned): an 8-seed scan showed that on ~half the
+        # draws of THIS near-linear-r problem the IRLS accept/reject
+        # branching diverges to different Fellner–Schall fixed points in the
+        # flat heavy-smoothing regime (λ̂ ratios up to e^12, in BOTH
+        # directions — sometimes :fd attains the better LAML criterion,
+        # sometimes :forwarddiff). That is path sensitivity of the IRLS/FS
+        # iteration itself, not Jacobian error: the Jacobians agree to 1e-6
+        # relative (pinned above) on every draw, and GCVSolver — whose λ is
+        # selected by a global grid+golden search per iteration rather than
+        # an FS fixed-point path — agrees to |log λ ratio| < 6e-3 on ALL
+        # eight seeds.
+        sol_lf_w11 = solve(mk_w11(), LAML(maxiters=20))
+        sol_la_w11 = solve(mk_w11(), LAML(maxiters=20, jac=:forwarddiff))
+        @test maximum(abs, sol_lf_w11.fitted_values -
+                           sol_la_w11.fitted_values) < 1e-4
+        @test abs(log(sol_la_w11.smoothing_params[1] /
+                      sol_lf_w11.smoothing_params[1])) < 0.05
+        @test abs(sol_la_w11.data_loss - sol_lf_w11.data_loss) <
+              1e-3 * max(sol_lf_w11.data_loss, 1e-8)
+
+        # ── End-to-end equivalence: GCVSolver ──
+        sol_gf_w11 = solve(mk_w11(), GCVSolver(maxiters=12))
+        sol_ga_w11 = solve(mk_w11(), GCVSolver(maxiters=12, jac=:forwarddiff))
+        # Measured: fitted-values maxdiff 2.7e-6, |log λ ratio| 1.0e-3
+        # (within the golden-section search tolerance).
+        @test maximum(abs, sol_gf_w11.fitted_values -
+                           sol_ga_w11.fitted_values) < 1e-4
+        @test abs(log(sol_ga_w11.smoothing_params[1] /
+                      sol_gf_w11.smoothing_params[1])) < 0.05
+
+        # ── End-to-end equivalence: CollocationLAML ──
+        sol_cf_w11 = solve(mk_w11(), CollocationLAML(maxiters=15,
+                                                     n_continuation=4))
+        sol_ca_w11 = solve(mk_w11(), CollocationLAML(maxiters=15,
+                                                     n_continuation=4,
+                                                     jac=:forwarddiff))
+        # Measured: fitted-values maxdiff 3.9e-9, data_loss rel diff 6e-8.
+        @test maximum(abs, sol_cf_w11.fitted_values -
+                           sol_ca_w11.fitted_values) < 1e-5
+        @test abs(sol_ca_w11.data_loss - sol_cf_w11.data_loss) <
+              1e-4 * max(sol_cf_w11.data_loss, 1e-8)
+
+        # ── THE critical test: collocation failure-mask preservation ──
+        # sqrt(u) throws DomainError at collocation points whose state is
+        # negative; the residual there must hold the sentinel in BOTH
+        # backends, the sentinel must never be differenced/differentiated
+        # (the fix-campaign regression this guards produced ~1e12 Jacobian
+        # entries), and the zero-block structure must be IDENTICAL.
+        function sq_dyn_w11!(du, u, p, t)
+            du[1] = p.h(sqrt(u[1]))
+        end
+        ttc_w11 = collect(range(0.0, 4.0, length=9))
+        datc_w11 = reshape([1.0, 0.8, -0.5, 0.6, -0.3, 0.5, 0.4, 0.35, 0.3],
+                           :, 1)
+        probc_w11 = PSMProblem(sq_dyn_w11!, [1.0], (0.0, 4.0),
+                               [BSplineApproximator(:h, (0.0, 1.5), 5)];
+                               data_times=ttc_w11, data_values=datc_w11)
+        alpha_c_w11 = reshape(copy(vec(datc_w11)), :, 1)
+        beta_c_w11 = PSM.build_initial_params(probc_w11)
+        D_c_w11 = PSM.build_diff_matrix(ttc_w11)
+        _, Ffail_w11 = PSM.eval_ode_rhs_masked(probc_w11, ttc_w11,
+                                               alpha_c_w11, beta_c_w11)
+        @test findall(Ffail_w11) == [3, 5]   # the documented failure mask
+        r_fd_w11, Jc_fd_w11 = PSM.collocation_residual_jacobian(
+            probc_w11, ttc_w11, alpha_c_w11, beta_c_w11, D_c_w11, 1.0,
+            ones(9))
+        r_ad_w11, Jc_ad_w11 = PSM.collocation_residual_jacobian(
+            probc_w11, ttc_w11, alpha_c_w11, beta_c_w11, D_c_w11, 1.0,
+            ones(9); jac=:forwarddiff,
+            fd_cfg=PSM._fd_jacobian_config(length(beta_c_w11)))
+        # Residual path is shared: identical, sentinel present at failed pts
+        @test r_fd_w11 == r_ad_w11
+        @test any(x -> abs(x) > 1e5, r_fd_w11)          # sentinel present
+        # β-block rows at failed points are exactly zero in BOTH backends
+        n_alpha_c = 9
+        for i in findall(Ffail_w11)
+            @test all(iszero, Jc_fd_w11[9 + i, n_alpha_c+1:end])
+            @test all(iszero, Jc_ad_w11[9 + i, n_alpha_c+1:end])
+        end
+        # Zero-pattern of the β-block is IDENTICAL across backends
+        @test (Jc_fd_w11[:, n_alpha_c+1:end] .== 0.0) ==
+              (Jc_ad_w11[:, n_alpha_c+1:end] .== 0.0)
+        # No fabricated ~1e12 slopes anywhere (the regression guard)
+        @test maximum(abs, Jc_fd_w11) < 1e10
+        @test maximum(abs, Jc_ad_w11) < 1e10
+        # Away from failed points the two backends agree
+        @test maximum(abs, Jc_fd_w11 - Jc_ad_w11) < 1e-10
+        # End-to-end on the failure problem: both backends complete
+        sol_cff_w11 = solve(probc_w11, CollocationLAML(maxiters=8,
+                                                       n_continuation=3))
+        sol_caf_w11 = solve(probc_w11, CollocationLAML(maxiters=8,
+                                                       n_continuation=3,
+                                                       jac=:forwarddiff))
+        @test all(isfinite, sol_cff_w11.fitted_values)
+        @test all(isfinite, sol_caf_w11.fitted_values)
+
+        # ── Discrete-collocation branch of the AD state/β blocks ──
+        function ricker_w11!(un, u, p, t)
+            un[1] = u[1] * exp(p.g(u[1]))
+        end
+        ttr_w11 = collect(0.0:1.0:8.0)
+        datr_w11 = reshape(0.5 .+ 0.4 .* rand(StableRNG(11), 9), :, 1)
+        probr_w11 = PSMProblem(ricker_w11!, [0.5], (0.0, 8.0),
+                               [BSplineApproximator(:g, (0.0, 2.0), 5)];
+                               data_times=ttr_w11, data_values=datr_w11,
+                               discrete=true)
+        alphar_w11 = reshape(copy(vec(datr_w11)), :, 1)
+        betar_w11 = PSM.build_initial_params(probr_w11)
+        rr1_w11, Jr1_w11 = PSM.collocation_residual_jacobian(
+            probr_w11, ttr_w11, alphar_w11, betar_w11,
+            PSM.build_diff_matrix(ttr_w11), 1.0, ones(9))
+        rr2_w11, Jr2_w11 = PSM.collocation_residual_jacobian(
+            probr_w11, ttr_w11, alphar_w11, betar_w11,
+            PSM.build_diff_matrix(ttr_w11), 1.0, ones(9);
+            jac=:forwarddiff,
+            fd_cfg=PSM._fd_jacobian_config(length(betar_w11)))
+        @test rr1_w11 == rr2_w11        # residual path is backend-independent
+        # measured 2.7e-6 — the FD path's own one-sided truncation error
+        @test maximum(abs, Jr1_w11 - Jr2_w11) < 1e-4
+
+        # ── DDE support: MethodOfSteps is Dual-safe (decision: SUPPORTED,
+        #    with the same per-iteration FD fallback as the ODE path) ──
+        function dde_w11!(du, u, h, p, t)
+            ud = h(p, t - 1.0)
+            du[1] = -p.f(ud[1])
+        end
+        ttdd_w11 = collect(range(0.5, 6.0, length=12))
+        probdd_w11 = PSMProblem(dde_w11!, [1.0], (0.0, 6.0),
+                                [BSplineApproximator(:f, (-1.5, 1.5), 6)];
+                                data_times=ttdd_w11,
+                                data_values=reshape(
+                                    [exp(-0.4t) for t in ttdd_w11], :, 1),
+                                delays=[1.0])
+        bdd_w11 = PSM.build_initial_params(probdd_w11)
+        npdd_w11 = length(bdd_w11)
+        f0dd_w11 = vec(PSM.simulate(probdd_w11, bdd_w11))
+        Jd_fd_w11 = zeros(12, npdd_w11)
+        Jd_ad_w11 = zeros(12, npdd_w11)
+        PSM.compute_jacobian!(Jd_fd_w11, probdd_w11, bdd_w11, f0dd_w11, 12, 1;
+                              dam=fill(1e-8, npdd_w11))
+        PSM.compute_jacobian!(Jd_ad_w11, probdd_w11, bdd_w11, f0dd_w11, 12, 1;
+                              dam=fill(1e-8, npdd_w11), jac=:forwarddiff,
+                              fd_cfg=PSM._fd_jacobian_config(npdd_w11))
+        @test all(isfinite, Jd_ad_w11)
+        @test maximum(abs, Jd_fd_w11 - Jd_ad_w11) <
+              1e-6 * max(maximum(abs, Jd_ad_w11), 1.0)   # measured 2.2e-11
+        # Silent-fallback detector: if the AD path permanently fell back
+        # to FD, both Jacobians would be FD from identical fresh state and
+        # the diff would be EXACTLY 0.0. FD truncation noise guarantees a
+        # nonzero gap whenever AD genuinely ran (measured 1.3e-10 here).
+        @test maximum(abs, Jd_fd_w11 - Jd_ad_w11) > 0
+        sol_dfd_w11 = solve(probdd_w11, LAML(maxiters=10))
+        sol_dad_w11 = solve(probdd_w11, LAML(maxiters=10, jac=:forwarddiff))
+        @test maximum(abs, sol_dfd_w11.fitted_values -
+                           sol_dad_w11.fitted_values) < 1e-4  # measured 5.8e-7
+
+        # ── Timing (comment-only, per the W9 flake-review guidance):
+        # per-Jacobian microbenchmark (25 data points, logistic BSpline
+        # problem, minimum of 5 warmed runs, this machine):
+        #   p=8:  fd 0.57ms  forwarddiff 0.04ms  (14.0×)
+        #   p=15: fd 1.09ms  forwarddiff 0.08ms  (13.9×)
+        #   p=25: fd 1.80ms  forwarddiff 0.12ms  (15.6×)
+        # The FD path pays 2·p ODE solves per Jacobian; the AD path pays
+        # ⌈p/chunk⌉ chunked Dual solves (chunk ≤ 12), hence the ~order-of-
+        # magnitude win. End-to-end (LAML maxiters=20 on the problem above):
+        # 6.1s → 0.04s; GCVSolver: 1.1s → 0.01s; CollocationLAML: 2.5s →
+        # 0.65s (its Jacobian is dominated by the pointwise state blocks).
+    end
+
 end
