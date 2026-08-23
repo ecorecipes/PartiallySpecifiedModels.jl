@@ -654,6 +654,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     n_data  = n_times * n_obs
     n_p     = n_total_params(prob)
 
+    # jac=:forwarddiff — one JacobianConfig per solve (chunking depends only
+    # on n_p), reused by every compute_jacobian! call below.
+    fd_cfg = alg.jac === :forwarddiff ? _fd_jacobian_config(n_p) : nothing
+
     # Build penalty matrices per approximator
     S_list, uf_offsets, uf_nk = build_penalty_matrices(prob)
     m = length(S_list)
@@ -755,7 +759,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     end
 
     f_vec, _ = eval_model(beta)
-    compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+    compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                      jac=alg.jac, fd_cfg=fd_cfg)
 
     prev_obj = Inf
     gcv_val  = NaN
@@ -776,7 +781,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
             break
         end
         f_vec .= f_vec_new
-        compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+        compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                          jac=alg.jac, fd_cfg=fd_cfg)
 
         # Compute IRLS weights from current predictions
         w_irls = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
@@ -889,7 +895,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
         f_vec[k] = pred[ti, oi]
         k += 1
     end
-    compute_jacobian!(J, prob, p_opt, f_vec, n_times, n_obs; dam=dam)
+    compute_jacobian!(J, prob, p_opt, f_vec, n_times, n_obs; dam=dam,
+                      jac=alg.jac, fd_cfg=fd_cfg)
 
     B_final  = build_B(theta)
     W_irls   = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)

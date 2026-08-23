@@ -9,6 +9,7 @@
 # 6. Repeat until convergence
 
 using LinearAlgebra: Diagonal, dot, tr, Symmetric, eigvals, cholesky, norm, eigen
+using ForwardDiff   # jac=:forwarddiff prediction-Jacobian path
 
 # ─── Input validation ─────────────────────────────────────────────
 
@@ -271,6 +272,13 @@ Simulate a continuous-time (ODE) model.
 function simulate_continuous(prob::PSMProblem, beta::AbstractVector)
     p = build_param_struct(prob, beta)
     u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
+    # Promote the state eltype when β carries ForwardDiff Duals (the
+    # jac=:forwarddiff Jacobian path differentiates straight through this
+    # solve): the integrator's in-place buffers take their eltype from u0,
+    # and writing a Dual du into a Float64 buffer is a MethodError. A no-op
+    # for Float64 β (Tel === Float64 keeps the original array).
+    Tel = promote_type(eltype(beta), eltype(u0))
+    u0 = Tel === eltype(u0) ? u0 : Tel.(u0)
 
     function ode_rhs!(du, u, params, t)
         prob.dynamics!(du, u, p, t)
@@ -392,21 +400,101 @@ function predict(sol::PSMSolution, prob::PSMProblem)
     sol.fitted_values
 end
 
-# ─── Finite-difference Jacobian ───────────────────────────────────
+# ─── Prediction Jacobian (finite differences / ForwardDiff) ───────
 
 """
-    compute_jacobian!(J, prob, beta, f0, n_times, n_obs; dam)
+    _fd_jacobian_config(n_p)
 
-Compute Jacobian of model predictions w.r.t. parameters using
-central finite differences with adaptive step sizes.
+`ForwardDiff.JacobianConfig` for the `jac=:forwarddiff` prediction-Jacobian
+path. Built ONCE per solve — the chunk size is a function of the parameter
+count only, so there is no reason to rebuild it every IRLS iteration.
+Tagless (`nothing` as the function) because each call wraps `simulate` in a
+fresh closure; tag checking is disabled at the call sites accordingly.
+"""
+function _fd_jacobian_config(n_p::Int)
+    x = zeros(n_p)
+    ForwardDiff.JacobianConfig(nothing, x, ForwardDiff.Chunk(x))
+end
+
+"""
+    _forwarddiff_jacobian!(J, prob, beta, n_times, n_obs, cfg) -> Bool
+
+`jac=:forwarddiff` backend for [`compute_jacobian!`](@ref): one Dual-valued
+`simulate` sweep (n_p/chunk solves) instead of the FD path's 2·n_p perturbed
+solves, and exact to solver precision instead of carrying FD truncation +
+integration-noise error.
+
+Returns `true` when `J` was filled with finite entries. Returns `false` —
+leaving the caller to fall back to the finite-difference path for this
+iteration — when the Dual-valued solve fails numerically or produces
+non-finite entries; this mirrors how the FD path itself degrades per column
+when a perturbed solve fails. Program errors are rethrown, exactly as in
+the FD path.
+
+Rows are produced for EVERY data cell, masked ones included, identical to
+the FD path — masking is applied downstream through the weights, never
+inside the Jacobian.
+"""
+function _forwarddiff_jacobian!(J::AbstractMatrix, prob::PSMProblem,
+                                beta::AbstractVector,
+                                n_times::Int, n_obs::Int, cfg)
+    n_data = n_times * n_obs
+    # Flattened prediction map in the same obs-major order the FD path uses.
+    predmap = function (b)
+        pred = simulate(prob, b)
+        f = similar(b, n_data)
+        k = 1
+        for oi in 1:n_obs, ti in 1:n_times
+            f[k] = pred[ti, oi]
+            k += 1
+        end
+        f
+    end
+    try
+        if cfg === nothing
+            ForwardDiff.jacobian!(J, predmap, beta)
+        else
+            ForwardDiff.jacobian!(J, predmap, beta, cfg, Val{false}())
+        end
+    catch e
+        _is_program_error(e) && rethrow()
+        return false
+    end
+    all(isfinite, J)
+end
+
+"""
+    compute_jacobian!(J, prob, beta, f0, n_times, n_obs; dam, jac=:fd,
+                      fd_cfg=nothing)
+
+Compute Jacobian of model predictions w.r.t. parameters.
+
+`jac=:fd` (default, historical behavior): central finite differences with
+adaptive step sizes — one full model solve per perturbed column, 2·n_p
+solves per call. `dam` contains the adaptive fractional FD intervals per
+parameter and is updated in place.
+
+`jac=:forwarddiff`: forward-mode AD through the model solve (see
+[`_forwarddiff_jacobian!`](@ref)); `fd_cfg` is the per-solve
+`ForwardDiff.JacobianConfig` from [`_fd_jacobian_config`](@ref) (or
+`nothing` for an ad-hoc config). If the Dual-valued solve fails or returns
+non-finite entries, the call falls back to the FD path for this iteration
+(with a `@debug` note); `dam` is only consulted/updated on that fallback.
 
 J is (n_data × n_params), f0 is the flattened prediction vector.
-`dam` contains adaptive fractional FD intervals per parameter.
 """
 function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
                            beta::AbstractVector, f0::AbstractVector,
                            n_times::Int, n_obs::Int;
-                           dam::Vector{Float64})
+                           dam::Vector{Float64}, jac::Symbol=:fd,
+                           fd_cfg=nothing)
+    if jac === :forwarddiff
+        _forwarddiff_jacobian!(J, prob, beta, n_times, n_obs, fd_cfg) &&
+            return
+        @debug "compute_jacobian!: ForwardDiff Jacobian failed or returned " *
+               "non-finite entries; falling back to finite differences for " *
+               "this iteration"
+    end
     n_p = length(beta)
     n_data = n_times * n_obs
     p_pert = copy(beta)
@@ -528,7 +616,8 @@ Fit a partially specified model using IRLS with LAML smoothing.
 
 # Algorithm
 For each IRLS iteration:
-1. Evaluate model and compute FD Jacobian
+1. Evaluate model and compute the prediction Jacobian (finite differences
+   by default; forward-mode AD with `LAML(jac=:forwarddiff)`)
 2. Form pseudodata z = y - f + J*β
 3. Solve penalized least squares (augmented system)
 4. Step contraction (backtracking)
@@ -563,6 +652,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     n_obs = length(prob.obs_to_state)
     n_data = n_times * n_obs
     n_p = n_total_params(prob)
+
+    # jac=:forwarddiff — one JacobianConfig per solve (chunking depends only
+    # on n_p), reused by every compute_jacobian! call below.
+    fd_cfg = alg.jac === :forwarddiff ? _fd_jacobian_config(n_p) : nothing
 
     # Build penalty matrices per approximator
     S_list, uf_offsets, uf_nk = build_penalty_matrices(prob)
@@ -680,7 +773,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     end
 
     f_vec, _ = eval_model(beta)
-    compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+    compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                      jac=alg.jac, fd_cfg=fd_cfg)
 
     # ─── Gaussian warm-start for non-Gaussian likelihoods ─────────
     # For Poisson/NegBin with identity link, the IRLS weights (1/V(μ))
@@ -695,7 +789,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         for gw_iter in 1:50
             f_vec_new, _ = try; eval_model(beta); catch; break; end
             f_vec .= f_vec_new
-            compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+            compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                              jac=alg.jac, fd_cfg=fd_cfg)
 
             w_gauss = copy(w_vec)
             z_pseudo = y_vec .- f_vec .+ J * beta
@@ -788,7 +883,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             break
         end
         f_vec .= f_vec_new
-        compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+        compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                          jac=alg.jac, fd_cfg=fd_cfg)
 
         # Compute IRLS weights from current predictions
         w_irls = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
@@ -825,14 +921,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                 f1_vec, _ = try; eval_model(a1); catch; (f_vec, nothing); end
                 beta .= a1
                 f_vec .= f1_vec
-                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                                  jac=alg.jac, fd_cfg=fd_cfg)
                 otheta .= theta
             elseif f01 < obj_prev
                 # Old theta step improved at old theta
                 f0_vec, _ = try; eval_model(a0); catch; (f_vec, nothing); end
                 beta .= a0
                 f_vec .= f0_vec
-                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                                  jac=alg.jac, fd_cfg=fd_cfg)
                 # Also accept new theta if it didn't make data loss worse
                 if dl_a1 < dl_curr
                     otheta .= theta
@@ -842,7 +940,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                 f1_vec, _ = try; eval_model(a1); catch; (f_vec, nothing); end
                 beta .= a1
                 f_vec .= f1_vec
-                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                                  jac=alg.jac, fd_cfg=fd_cfg)
                 otheta .= theta
             else
                 # No improvement from either
@@ -856,7 +955,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             f0_vec, _ = try; eval_model(a0); catch; (f_vec, nothing); end
             beta .= a0
             f_vec .= f0_vec
-            compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+            compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                              jac=alg.jac, fd_cfg=fd_cfg)
         end
 
         # Track penalized objective for convergence monitoring
@@ -955,7 +1055,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         f_vec[k] = pred[ti, oi]
         k += 1
     end
-    compute_jacobian!(J, prob, p_opt, f_vec, n_times, n_obs; dam=dam)
+    compute_jacobian!(J, prob, p_opt, f_vec, n_times, n_obs; dam=dam,
+                      jac=alg.jac, fd_cfg=fd_cfg)
 
     B_final = build_B(theta)
     W_irls = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
