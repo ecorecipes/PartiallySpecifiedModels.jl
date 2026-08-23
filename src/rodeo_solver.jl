@@ -172,7 +172,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
                            alg.n_steps, alg.n_deriv, sigma,
                            Float64.(prob.data_values), Float64.(prob.data_times),
                            prob.obs_to_state, obs_var;
-                           interrogate=alg.interrogate)
+                           interrogate=alg.interrogate,
+                           sqrt_filter=alg.sqrt_filter)
 
             # Add smoothing penalty for B-splines
             penalty = 0.0
@@ -369,7 +370,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
 
     μ_smooth, Σ_smooth, times = probsolve(ode_rhs_opt!, nothing, Float64.(prob.u0),
                                            prob.tspan, alg.n_steps, alg.n_deriv, sigma;
-                                           interrogate=alg.interrogate)
+                                           interrogate=alg.interrogate,
+                                           sqrt_filter=alg.sqrt_filter)
 
     # Extract solution at data times and compute data loss
     pred = zeros(n_t, n_obs)

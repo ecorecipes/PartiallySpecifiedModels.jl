@@ -119,6 +119,16 @@ DerivativeFreeSolver
 
 ## Probabilistic Numerics Solvers
 
+All three Kalman-filter-based solvers in this family (`RodeoSolver`,
+`DaltonSolver`, `PseudoMarginalSolver`) accept an opt-in
+`sqrt_filter=true` keyword that runs the filter/smoother recursions in
+square-root (Cholesky/QR) form — the numerically canonical formulation of
+modern probabilistic ODE solvers (Krämer & Hennig, JMLR 2024). Covariances
+are propagated as triangular factors, so they stay positive semidefinite
+by construction; prefer it at high `n_deriv` (≥ 5) or with very fine step
+grids. The default (`false`) uses the standard covariance recursion
+unchanged.
+
 ### RodeoSolver
 
 **Probabilistic ODE solver** based on Kalman filtering/smoothing (Wu & Lysy 2024; the `:fenrir` likelihood variant follows Tronarp et al. 2022). Provides uncertainty estimates from the numerical integration itself, not just from parameter uncertainty.

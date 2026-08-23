@@ -44,9 +44,12 @@ end
     _pm_sample_traj(filt_out, rng) -> Vector{Vector{Float64}}
 
 Draw one complete joint state trajectory from the probabilistic solver's
-Gauss–Markov posterior by backward sampling (FFBS).
+Gauss–Markov posterior by backward sampling (FFBS). When `filt_out`
+carries square-root factors (filter run with `sqrt_filter=true`), the
+factor-based sampler [`_sqrt_pm_sample_traj`](@ref) is used instead.
 """
 function _pm_sample_traj(filt_out::Dict, rng)
+    haskey(filt_out, "R_filt") && return _sqrt_pm_sample_traj(filt_out, rng)
     μ_filt = filt_out["μ_filt"]; Σ_filt = filt_out["Σ_filt"]
     μ_pred = filt_out["μ_pred"]; Σ_pred = filt_out["Σ_pred"]; A = filt_out["A"]
     N = length(μ_filt) - 1
@@ -66,15 +69,16 @@ end
 """
     _pm_loglik_hat(ode_rhs!, u0, tspan, n_steps, n_deriv, sigma,
                    data, dtimes, obs_to_state, obs_var, n_particles, rng;
-                   interrogate=:kramer) -> Float64
+                   interrogate=:kramer, sqrt_filter=false) -> Float64
 
 Log of an unbiased Monte-Carlo estimate of the marginal likelihood.
+`sqrt_filter=true` runs the filter and FFBS draws in square-root form.
 """
 function _pm_loglik_hat(ode_rhs!, u0, tspan, n_steps, n_deriv, sigma,
                         data, dtimes, obs_to_state, obs_var, n_particles, rng;
-                        interrogate::Symbol=:kramer)
+                        interrogate::Symbol=:kramer, sqrt_filter::Bool=false)
     filt = probsolve_filter(ode_rhs!, nothing, u0, tspan, n_steps, n_deriv, sigma;
-                            interrogate=interrogate)
+                            interrogate=interrogate, sqrt_filter=sqrt_filter)
     times = filt["times"]; q = filt["q"]
     n_obs = size(data, 2)
     obs_ind = _nearest_grid_indices(times, dtimes)
@@ -219,15 +223,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
             if alg.inner_method == :fenrir
                 fenrir_loglik(rhs!, nothing, u0, prob.tspan, alg.n_steps,
                               alg.n_deriv, sigma, data, dtimes,
-                              prob.obs_to_state, obs_var)
+                              prob.obs_to_state, obs_var;
+                              sqrt_filter=alg.sqrt_filter)
             elseif alg.inner_method == :dalton
                 _dalton_loglik(rhs!, nothing, u0, prob.tspan, alg.n_steps,
                                alg.n_deriv, sigma, data, dtimes,
-                               prob.obs_to_state, obs_var)
+                               prob.obs_to_state, obs_var;
+                               sqrt_filter=alg.sqrt_filter)
             else
                 _pm_loglik_hat(rhs!, u0, prob.tspan, alg.n_steps, alg.n_deriv,
                                sigma, data, dtimes, prob.obs_to_state,
-                               obs_var, n_particles, rng)
+                               obs_var, n_particles, rng;
+                               sqrt_filter=alg.sqrt_filter)
             end
         catch e
             _is_program_error(e) && rethrow()
@@ -293,7 +300,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
     ode_rhs_opt!(du, u, pu, t) = prob.dynamics!(du, u, p_opt, t)
     μ_smooth, Σ_smooth, times = probsolve(ode_rhs_opt!, nothing, u0,
                                           prob.tspan, alg.n_steps, alg.n_deriv, sigma;
-                                          interrogate=:kramer)
+                                          interrogate=:kramer,
+                                          sqrt_filter=alg.sqrt_filter)
 
     pred = zeros(n_t, n_obs)
     for i in 1:n_t

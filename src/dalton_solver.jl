@@ -30,7 +30,8 @@
 # the adaptivity the method is named for.
 
 """
-    _dalton_reference(ode_fun!, p, u0, tspan, n_steps, q, sigma; interrogate)
+    _dalton_reference(ode_fun!, p, u0, tspan, n_steps, q, sigma;
+                      interrogate, sqrt_filter=false)
         -> (logZ, ssq, calib_acc)
 
 ODE-only joint Kalman filter: the marginal ODE log-evidence `logp(Z)` at the
@@ -47,7 +48,11 @@ applies for Fenrir.
 function _dalton_reference(ode_fun!, p, u0::AbstractVector,
                            tspan::Tuple{Float64,Float64},
                            n_steps::Int, q::Int, sigma::Vector{Float64};
-                           interrogate::Symbol=:kramer)
+                           interrogate::Symbol=:kramer,
+                           sqrt_filter::Bool=false)
+    sqrt_filter && return _sqrt_dalton_reference(ode_fun!, p, u0, tspan,
+                                                 n_steps, q, sigma;
+                                                 interrogate=interrogate)
     t_min, t_max = tspan
     n_vars = length(u0); D = n_vars * q
     A, Qmat = _joint_ibm((t_max - t_min) / n_steps, q, sigma)
@@ -81,7 +86,7 @@ end
 """
     _dalton_joint_evidence(ode_fun!, p, u0, tspan, n_steps, q, sigma,
                            obs_data, obs_times, obs_to_state, obs_var;
-                           interrogate)
+                           interrogate, sqrt_filter=false)
 
 Joint Kalman filter assimilating both the ODE pseudo-observations and the
 data, RE-INTERROGATING the ODE at each step's data-informed predicted mean
@@ -93,7 +98,13 @@ function _dalton_joint_evidence(ode_fun!, p, u0::AbstractVector,
                                 n_steps::Int, q::Int, sigma::Vector{Float64},
                                 obs_data::Matrix{Float64}, obs_times::Vector{Float64},
                                 obs_to_state::Vector{Int}, obs_var::Float64;
-                                interrogate::Symbol=:kramer)
+                                interrogate::Symbol=:kramer,
+                                sqrt_filter::Bool=false)
+    sqrt_filter && return _sqrt_dalton_joint_evidence(ode_fun!, p, u0, tspan,
+                                                      n_steps, q, sigma,
+                                                      obs_data, obs_times,
+                                                      obs_to_state, obs_var;
+                                                      interrogate=interrogate)
     t_min, t_max = tspan
     n_vars = length(u0); D = n_vars * q
     A, Qmat = _joint_ibm((t_max - t_min) / n_steps, q, sigma)
@@ -147,11 +158,14 @@ end
 """
     _dalton_loglik(ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma,
                    obs_data, obs_times, obs_to_state, obs_var;
-                   interrogate=:kramer)
+                   interrogate=:kramer, sqrt_filter=false)
 
 DALTON data-conditional log-likelihood `logp(Y|Z) ≈ logp(Y,Z) − logp(Z)`
 (Wu & Lysy 2024), with each pass linearized about its own predicted means:
 data-informed for the joint pass, ODE-only for the marginal (see note above).
+`sqrt_filter=true` evaluates both passes in square-root (QR-based) form;
+the closed-form calibration below is unchanged since `(logZ0, ssq,
+calib_acc)` are computed from mathematically equivalent quantities.
 
 # Diffusion calibration
 
@@ -182,14 +196,16 @@ function _dalton_loglik(ode_fun!, p, u0::AbstractVector,
                         obs_times::Vector{Float64},
                         obs_to_state::Vector{Int},
                         obs_var::Float64;
-                        interrogate::Symbol=:kramer)
+                        interrogate::Symbol=:kramer,
+                        sqrt_filter::Bool=false)
     q = n_deriv
     n_vars = length(u0)
 
     # Pass 1 (at the nominal scale): marginal evidence + the quasi-MLE
     # diffusion statistic.
     logZ0, ssq, calib_acc = _dalton_reference(ode_fun!, p, u0, tspan, n_steps, q,
-                                              sigma; interrogate=interrogate)
+                                              sigma; interrogate=interrogate,
+                                              sqrt_filter=sqrt_filter)
     isfinite(ssq) || return -Inf
 
     # With the negligible ODE nugget the filter gains — hence the predicted
@@ -208,7 +224,8 @@ function _dalton_loglik(ode_fun!, p, u0::AbstractVector,
     sigma_c = sigma .* sqrt(ssq)
     logYZ = _dalton_joint_evidence(ode_fun!, p, u0, tspan, n_steps, q, sigma_c,
                                    obs_data, obs_times, obs_to_state, obs_var;
-                                   interrogate=interrogate)
+                                   interrogate=interrogate,
+                                   sqrt_filter=sqrt_filter)
 
     ll = logYZ - logZ
     isfinite(ll) ? ll : -Inf
@@ -376,7 +393,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
                                 alg.n_steps, alg.n_deriv, sigma,
                                 Float64.(prob.data_values), Float64.(prob.data_times),
                                 prob.obs_to_state, obs_var;
-                                interrogate=alg.interrogate)
+                                interrogate=alg.interrogate,
+                                sqrt_filter=alg.sqrt_filter)
 
             if !isfinite(ll)
                 return 1e10
@@ -553,7 +571,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
     μ_smooth, Σ_smooth, times = probsolve(
         ode_rhs_opt!, nothing, Float64.(prob.u0),
         prob.tspan, alg.n_steps, alg.n_deriv, sigma;
-        interrogate=alg.interrogate)
+        interrogate=alg.interrogate, sqrt_filter=alg.sqrt_filter)
 
     # Extract fitted values and data loss
     pred = zeros(n_t, n_obs)
