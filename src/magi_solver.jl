@@ -190,11 +190,14 @@ function _magi_logposterior(ld::MAGILogDensity, v::AbstractVector{T}) where T
         nk = nparams(approx)
         pk = @view theta[offset+1:offset+nk]
         offset += nk
+        # Non-built-in (custom protocol) types take the generic branch too;
+        # built-in treatment is unchanged (see _BUILTIN_APPROX_TYPES).
         if approx isa BSplineApproximator || approx isa ShapeConstrainedBSplineApproximator ||
            approx isa GPApproximator || approx isa COMONetApproximator ||
            approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator ||
            approx isa ShapeConstrainedGPApproximator ||
-           approx isa TensorBSplineApproximator
+           approx isa TensorBSplineApproximator ||
+           !(approx isa _BUILTIN_APPROX_TYPES)
             S = penalty_matrix(approx)
             if S !== nothing
                 lp += -T(0.5) / T(ld.prior_scale) * dot(pk, T.(S) * pk)

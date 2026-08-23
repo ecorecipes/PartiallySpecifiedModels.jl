@@ -311,6 +311,13 @@ function agm_loss(prob::PSMProblem, beta::AbstractVector,
             elseif approx isa ShapeConstrainedGPApproximator
                 S = penalty_matrix(approx)
                 total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
+            elseif !(approx isa _BUILTIN_APPROX_TYPES)
+                # Custom protocol types: generic penalty (built-in
+                # treatment above unchanged; see _BUILTIN_APPROX_TYPES).
+                S = penalty_matrix(approx)
+                if S !== nothing
+                    total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
+                end
             end
         end
     end

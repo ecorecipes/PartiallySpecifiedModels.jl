@@ -7,6 +7,23 @@
 # see docs/src/extending.md ("Custom approximators") for the contracts and a
 # worked example.
 
+# The nine built-in approximator types. Six solvers (TwoStage,
+# IntegralMatching, MAGI, AGM, Rodeo, Dalton) assemble their smoothing
+# penalties through per-type whitelists whose built-in treatment is
+# historical and deliberately NOT unified (the lists differ — e.g.
+# TwoStage never penalized COMONet — and AGM/Rodeo/Dalton build their
+# BSpline penalty on DOMAIN knots where `penalty_matrix` uses unit-interval
+# knots, a different scale; changing either would change existing fits).
+# Each of those sites uses this Union to give any NON-built-in type the
+# generic `penalty_matrix(approx)` treatment instead of silently leaving
+# it unpenalized.
+const _BUILTIN_APPROX_TYPES = Union{
+    BSplineApproximator, ShapeConstrainedBSplineApproximator,
+    SPDEApproximator, ShapeConstrainedSPDEApproximator,
+    GPApproximator, ShapeConstrainedGPApproximator,
+    NeuralApproximator, COMONetApproximator,
+    TensorBSplineApproximator}
+
 """
     build_evaluator(approx, params_k) -> callable
 
