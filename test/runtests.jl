@@ -6072,4 +6072,195 @@ struct NotAnApproximator end
         @test all(isfinite, sol_mask_w6.fitted_values)
     end
 
+    # ─── W7: FGPGMSolver (Wenk et al. 2019, fast GP gradient matching) ──
+
+    @testset "FGPGMSolver — construction validation" begin
+        # Mirror ODIN's validation style: ArgumentError with the reason.
+        @test_throws ArgumentError FGPGMSolver(target_accept=1.5)
+        @test_throws ArgumentError FGPGMSolver(target_accept=0.0)
+        @test_throws ArgumentError FGPGMSolver(gamma=-1.0)
+        @test_throws ArgumentError FGPGMSolver(gamma=0.0)
+        @test_throws ArgumentError FGPGMSolver(n_samples=0)
+        @test_throws ArgumentError FGPGMSolver(n_warmup=-1)
+        @test_throws ArgumentError FGPGMSolver(prior_scale=0.0)
+        @test_throws ArgumentError FGPGMSolver(obs_sigma=-0.1)
+        # one-of-two GP hyperparameters is an error (ODIN convention:
+        # both to fix them, neither to estimate per state)
+        @test_throws ArgumentError FGPGMSolver(gp_lengthscale=1.0)
+        @test_throws ArgumentError FGPGMSolver(gp_variance=1.0)
+        alg_fg = FGPGMSolver()
+        @test alg_fg.gamma == 0.1
+        @test alg_fg.target_accept == 0.234
+        @test alg_fg.rng_seed === nothing
+    end
+
+    @testset "FGPGMSolver — exponential decay recovery" begin
+        # du/dt = -f(u), f(x) = 0.5x with a B-spline stand-in.
+        decay_fg!(du, u, p, t) = (du[1] = -p.f(u[1]))
+        rng_fg = Random.Xoshiro(42)
+        sol_true_fg = OrdinaryDiffEq.solve(
+            ODEProblem(decay_fg!, [5.0], (0.0, 10.0), (; f=x -> 0.5*x)),
+            Tsit5(); saveat=0.5)
+        t_fg = collect(sol_true_fg.t)
+        data_fg = [sol_true_fg.u[i][1] + 0.05*randn(rng_fg) for i in 1:length(t_fg)]
+        uf_fg = BSplineApproximator(:f, (0.0, 6.0), 6)
+        prob_fg = PSMProblem(decay_fg!, [5.0], (0.0, 10.0), [uf_fg];
+            data_times=t_fg, data_values=reshape(max.(data_fg, 0.01), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_fg = solve(prob_fg, FGPGMSolver(n_samples=3000, n_warmup=3000,
+                                            rng_seed=7, verbose=false))
+
+        @test sol_fg isa PSMSolution
+        @test isfinite(sol_fg.objective)
+        @test isfinite(sol_fg.data_loss)
+        @test haskey(sol_fg.unknown_functions, :f)
+        # Posterior-mean recovery of f(x) = 0.5x. Observed errors at this
+        # seed: 0.005 / 0.047 / 0.13 — assert with ~2.5x headroom.
+        f_fg = sol_fg.unknown_functions[:f]
+        @test abs(f_fg(1.5) - 0.75) < 0.35
+        @test abs(f_fg(3.0) - 1.5) < 0.25
+        @test abs(f_fg(4.5) - 2.25) < 0.35
+
+        # Honest convergence keys (MagiSolver convention: a fixed-budget
+        # sampler never claims convergence) + sampler-appropriate extras.
+        c_fg = sol_fg.convergence
+        @test c_fg.method == :fgpgm
+        @test c_fg.sampler == :metropolis_within_gibbs
+        @test c_fg.converged == false
+        @test c_fg.reason == :maxiters
+        @test c_fg.iterations == 6000
+        @test c_fg.chains isa MCMCChains.Chains
+        @test size(c_fg.chains, 1) == 3000       # n_samples retained draws
+        @test size(c_fg.beta_samples) == (3000, nparams(uf_fg))
+        # GP hyperparameters were estimated per state by marginal likelihood
+        hp_fg = c_fg.gp_hyperparams[1]
+        @test hp_fg.σ² > 0 && hp_fg.ℓ > 0 && hp_fg.σn² > 0
+        @test hp_fg.observed
+        # Warmup adaptation lands post-warmup acceptance in a broad band
+        # around target_accept = 0.234 (deterministic under rng_seed=7;
+        # observed 0.20 / 0.29 at this seed).
+        @test all(a -> 0.1 < a < 0.6, c_fg.accept_rates.x)
+        @test 0.1 < c_fg.accept_rates.theta < 0.6
+
+        # Reproducibility (W1 convention): the sampler owns its stream —
+        # same rng_seed → identical run, and the global RNG is untouched.
+        probe_fg = rand(copy(Random.default_rng()), 3)
+        sol_fg_a = solve(prob_fg, FGPGMSolver(n_samples=200, n_warmup=200,
+                                              rng_seed=5))
+        sol_fg_b = solve(prob_fg, FGPGMSolver(n_samples=200, n_warmup=200,
+                                              rng_seed=5))
+        @test sol_fg_a.parameters == sol_fg_b.parameters
+        @test sol_fg_a.convergence.beta_samples ==
+              sol_fg_b.convergence.beta_samples
+        @test sol_fg_a.unknown_functions[:f](3.0) ==
+              sol_fg_b.unknown_functions[:f](3.0)
+        @test rand(copy(Random.default_rng()), 3) == probe_fg
+
+        # Fixed-hyperparameter path (both supplied, ODIN convention:
+        # σn² assumed at 0.01·gp_variance).
+        sol_fg_fix = solve(prob_fg, FGPGMSolver(n_samples=200, n_warmup=200,
+            gp_lengthscale=2.0, gp_variance=4.0, rng_seed=5))
+        @test sol_fg_fix.convergence.gp_hyperparams[1].ℓ == 2.0
+        @test sol_fg_fix.convergence.gp_hyperparams[1].σn² == 0.04
+        @test isfinite(sol_fg_fix.objective)
+
+        # Non-Gaussian likelihoods are rejected informatively (the data
+        # expert is a Gaussian quadratic form) — MagiSolver style.
+        prob_fg_pois = PSMProblem(decay_fg!, [5.0], (0.0, 10.0), [uf_fg];
+            data_times=t_fg, data_values=reshape(max.(data_fg, 0.01), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Poisson())
+        err_fg = try
+            solve(prob_fg_pois, FGPGMSolver(n_samples=5, n_warmup=5))
+            nothing
+        catch e
+            e
+        end
+        @test err_fg isa ErrorException
+        @test occursin("Gaussian likelihoods only", err_fg.msg)
+    end
+
+    @testset "FGPGMSolver — masked observations" begin
+        decay_fgm!(du, u, p, t) = (du[1] = -p.f(u[1]))
+        t_fgm = collect(0.0:0.5:10.0)
+        u_fgm = 5.0 .* exp.(-0.5 .* t_fgm) .+
+                0.05 .* randn(Random.Xoshiro(3), length(t_fgm))
+        d_fgm = reshape(max.(u_fgm, 0.01), :, 1)
+        w_fgm = ones(length(t_fgm), 1)
+        d_fgm[5, 1] = NaN;  w_fgm[5, 1] = 0.0
+        d_fgm[12, 1] = NaN; w_fgm[12, 1] = 0.0
+        uf_fgm = BSplineApproximator(:f, (0.0, 6.0), 6)
+        prob_fgm = PSMProblem(decay_fgm!, [5.0], (0.0, 10.0), [uf_fgm];
+            data_times=t_fgm, data_values=d_fgm, data_weights=w_fgm,
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_fgm = solve(prob_fgm, FGPGMSolver(n_samples=1500, n_warmup=1500,
+                                              rng_seed=13))
+        @test isfinite(sol_fgm.objective)
+        @test isfinite(sol_fgm.data_loss)
+        @test all(isfinite, sol_fgm.convergence.beta_samples)
+        @test abs(sol_fgm.unknown_functions[:f](3.0) - 1.5) < 0.4
+
+        # Everything masked is not a fit — say so (ODIN/MCMC convention).
+        prob_fgall = PSMProblem(decay_fgm!, [5.0], (0.0, 10.0), [uf_fgm];
+            data_times=t_fgm, data_values=d_fgm,
+            data_weights=zeros(length(t_fgm), 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        err_fgall = try
+            solve(prob_fgall, FGPGMSolver(n_samples=5, n_warmup=5))
+            nothing
+        catch e
+            e
+        end
+        @test err_fgall isa ErrorException
+        @test occursin("masked", err_fgall.msg)
+    end
+
+    @testset "FGPGMSolver — multi-state and unobserved state" begin
+        # x1' = x2, x2' = -k(x1) with k(x) = x (harmonic restoring force).
+        k_fg(x) = x
+        osc_fg!(du, u, p, t) = (du[1] = u[2]; du[2] = -p.k(u[1]))
+        sol_true_ofg = OrdinaryDiffEq.solve(
+            ODEProblem((du, u, p, t) -> (du[1] = u[2]; du[2] = -k_fg(u[1])),
+                       [1.5, 0.0], (0.0, 8.0)), Tsit5(); saveat=0.25)
+        t_ofg = collect(sol_true_ofg.t)
+        rng_ofg = Random.Xoshiro(7)
+        pos_ofg = [sol_true_ofg(tt)[1] for tt in t_ofg] .+
+                  0.03 .* randn(rng_ofg, length(t_ofg))
+        vel_ofg = [sol_true_ofg(tt)[2] for tt in t_ofg] .+
+                  0.03 .* randn(rng_ofg, length(t_ofg))
+        uf_ofg = BSplineApproximator(:k, (-2.0, 2.0), 7)
+
+        # Both states observed: joint sampling over two state blocks + θ.
+        prob_ofg2 = PSMProblem(osc_fg!, [1.5, 0.0], (0.0, 8.0), [uf_ofg];
+            data_times=t_ofg, data_values=hcat(pos_ofg, vel_ofg),
+            obs_to_state=[1, 2], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_ofg2 = solve(prob_ofg2, FGPGMSolver(n_samples=3000, n_warmup=3000,
+                                                rng_seed=11))
+        errs_ofg2 = [abs(sol_ofg2.unknown_functions[:k](x) - k_fg(x))
+                     for x in -1.4:0.2:1.4]
+        # Observed max error 0.033 at this seed; 6x headroom.
+        @test maximum(errs_ofg2) < 0.2
+        @test length(sol_ofg2.convergence.accept_rates.x) == 2
+        @test all(isfinite, sol_ofg2.convergence.accept_rates.x)
+
+        # Velocity unobserved: sampled block with borrowed GP prior + ODE
+        # experts, no data term (ODIN precedent).
+        prob_ofg1 = PSMProblem(osc_fg!, [1.5, 0.0], (0.0, 8.0), [uf_ofg];
+            data_times=t_ofg, data_values=reshape(pos_ofg, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_ofg1 = solve(prob_ofg1, FGPGMSolver(n_samples=3000, n_warmup=3000,
+                                                rng_seed=11))
+        errs_ofg1 = [abs(sol_ofg1.unknown_functions[:k](x) - k_fg(x))
+                     for x in -1.4:0.2:1.4]
+        # Observed max error 0.162 at this seed; ~2x headroom.
+        @test maximum(errs_ofg1) < 0.35
+        @test sol_ofg1.convergence.gp_hyperparams[2].observed == false
+        @test isfinite(sol_ofg1.data_loss)
+    end
+
 end
