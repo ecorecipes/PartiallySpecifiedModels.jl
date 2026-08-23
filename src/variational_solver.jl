@@ -384,7 +384,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     best_elbo = -Inf
     elbo_history = Float64[]
 
-    rng = Random.Xoshiro(42)
+    # rng_seed defaults to 42 (historical hard-coded stream); nothing = fresh.
+    rng = alg.rng_seed === nothing ? Random.Xoshiro(rand(UInt32)) :
+          Random.Xoshiro(alg.rng_seed)
 
     for iter in 1:alg.maxiters
         # Draw shared noise samples (fixed across gradient computation)
@@ -542,23 +544,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
         params_k = mu_opt[offset+1:offset+np]
         offset += np
 
-        if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2],
-                                    length=approx.nknots))
-            uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
-        elseif approx isa NeuralApproximator
-            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
-        elseif approx isa GPApproximator
-            uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
-        elseif approx isa COMONetApproximator
-            uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
-        elseif approx isa SPDEApproximator
-            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
-        elseif approx isa ShapeConstrainedSPDEApproximator
-            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
-        end
+        uf_evals[approx.name] = build_evaluator(approx, params_k)
     end
 
     # Build ComponentArray for parameters

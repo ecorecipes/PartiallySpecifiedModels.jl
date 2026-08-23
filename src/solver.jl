@@ -9,6 +9,7 @@
 # 6. Repeat until convergence
 
 using LinearAlgebra: Diagonal, dot, tr, Symmetric, eigvals, cholesky, norm, eigen
+using ForwardDiff   # jac=:forwarddiff prediction-Jacobian path
 
 # ─── Input validation ─────────────────────────────────────────────
 
@@ -80,33 +81,10 @@ function build_param_struct(prob::PSMProblem, beta::AbstractVector)
         params_k = beta[offset+1:offset+np]
         offset += np
 
-        if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2],
-                                    length=approx.nknots))
-            evaluator = build_bspline_evaluator(knots_x, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa NeuralApproximator
-            # Dual-safe, eltype-generic (see neural_evaluator.jl) — required
-            # for autodiff Jacobians in stiff ODE solvers and for gradients
-            # of any objective w.r.t. β.
-            evaluator = build_neural_evaluator(approx, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa GPApproximator
-            evaluator = build_gp_evaluator(approx, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            evaluator = build_constrained_bspline_evaluator(approx, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa COMONetApproximator
-            evaluator = build_comonet_evaluator(approx, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa SPDEApproximator
-            evaluator = build_spde_evaluator(approx.mesh_points, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa ShapeConstrainedSPDEApproximator
-            evaluator = build_constrained_spde_evaluator(approx, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        end
+        # Per-type construction lives in build_evaluator
+        # (approximator_interface.jl) — the extension point for custom
+        # approximator types.
+        push!(uf_entries, approx.name => build_evaluator(approx, params_k))
     end
 
     # Merge unknown function evaluators with known params
@@ -246,7 +224,10 @@ _is_program_error(e) = e isa Union{MethodError, BoundsError, UndefVarError,
     _adapt_gp_approximators!(prob, beta) -> Bool
 
 Run the empirical-Bayes hyperparameter update for every `GPApproximator`
-with `adapt=true`, using its slice of the current coefficient vector.
+and `ShapeConstrainedGPApproximator` with `adapt=true`, using its slice of
+the current coefficient vector. The constrained type stores unconstrained
+γ, so its slice is mapped to the implied inducing values β = Σ·d(γ) first —
+the marginal likelihood is over function values.
 Returns whether any kernel changed (callers should re-evaluate the model).
 """
 function _adapt_gp_approximators!(prob::PSMProblem, beta::AbstractVector)
@@ -256,6 +237,9 @@ function _adapt_gp_approximators!(prob::PSMProblem, beta::AbstractVector)
         np = nparams(a)
         if a isa GPApproximator && a.adapt
             changed |= _adapt_gp_hyperparams!(a, Float64.(beta[off+1:off+np]))
+        elseif a isa ShapeConstrainedGPApproximator && a.adapt
+            changed |= _adapt_gp_hyperparams!(
+                a, gamma_to_inducing_values(a, Float64.(beta[off+1:off+np])))
         end
         off += np
     end
@@ -288,6 +272,13 @@ Simulate a continuous-time (ODE) model.
 function simulate_continuous(prob::PSMProblem, beta::AbstractVector)
     p = build_param_struct(prob, beta)
     u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
+    # Promote the state eltype when β carries ForwardDiff Duals (the
+    # jac=:forwarddiff Jacobian path differentiates straight through this
+    # solve): the integrator's in-place buffers take their eltype from u0,
+    # and writing a Dual du into a Float64 buffer is a MethodError. A no-op
+    # for Float64 β (Tel === Float64 keeps the original array).
+    Tel = promote_type(eltype(beta), eltype(u0))
+    u0 = Tel === eltype(u0) ? u0 : Tel.(u0)
 
     function ode_rhs!(du, u, params, t)
         prob.dynamics!(du, u, p, t)
@@ -409,21 +400,101 @@ function predict(sol::PSMSolution, prob::PSMProblem)
     sol.fitted_values
 end
 
-# ─── Finite-difference Jacobian ───────────────────────────────────
+# ─── Prediction Jacobian (finite differences / ForwardDiff) ───────
 
 """
-    compute_jacobian!(J, prob, beta, f0, n_times, n_obs; dam)
+    _fd_jacobian_config(n_p)
 
-Compute Jacobian of model predictions w.r.t. parameters using
-central finite differences with adaptive step sizes.
+`ForwardDiff.JacobianConfig` for the `jac=:forwarddiff` prediction-Jacobian
+path. Built ONCE per solve — the chunk size is a function of the parameter
+count only, so there is no reason to rebuild it every IRLS iteration.
+Tagless (`nothing` as the function) because each call wraps `simulate` in a
+fresh closure; tag checking is disabled at the call sites accordingly.
+"""
+function _fd_jacobian_config(n_p::Int)
+    x = zeros(n_p)
+    ForwardDiff.JacobianConfig(nothing, x, ForwardDiff.Chunk(x))
+end
+
+"""
+    _forwarddiff_jacobian!(J, prob, beta, n_times, n_obs, cfg) -> Bool
+
+`jac=:forwarddiff` backend for [`compute_jacobian!`](@ref): one Dual-valued
+`simulate` sweep (n_p/chunk solves) instead of the FD path's 2·n_p perturbed
+solves, and exact to solver precision instead of carrying FD truncation +
+integration-noise error.
+
+Returns `true` when `J` was filled with finite entries. Returns `false` —
+leaving the caller to fall back to the finite-difference path for this
+iteration — when the Dual-valued solve fails numerically or produces
+non-finite entries; this mirrors how the FD path itself degrades per column
+when a perturbed solve fails. Program errors are rethrown, exactly as in
+the FD path.
+
+Rows are produced for EVERY data cell, masked ones included, identical to
+the FD path — masking is applied downstream through the weights, never
+inside the Jacobian.
+"""
+function _forwarddiff_jacobian!(J::AbstractMatrix, prob::PSMProblem,
+                                beta::AbstractVector,
+                                n_times::Int, n_obs::Int, cfg)
+    n_data = n_times * n_obs
+    # Flattened prediction map in the same obs-major order the FD path uses.
+    predmap = function (b)
+        pred = simulate(prob, b)
+        f = similar(b, n_data)
+        k = 1
+        for oi in 1:n_obs, ti in 1:n_times
+            f[k] = pred[ti, oi]
+            k += 1
+        end
+        f
+    end
+    try
+        if cfg === nothing
+            ForwardDiff.jacobian!(J, predmap, beta)
+        else
+            ForwardDiff.jacobian!(J, predmap, beta, cfg, Val{false}())
+        end
+    catch e
+        _is_program_error(e) && rethrow()
+        return false
+    end
+    all(isfinite, J)
+end
+
+"""
+    compute_jacobian!(J, prob, beta, f0, n_times, n_obs; dam, jac=:fd,
+                      fd_cfg=nothing)
+
+Compute Jacobian of model predictions w.r.t. parameters.
+
+`jac=:fd` (default, historical behavior): central finite differences with
+adaptive step sizes — one full model solve per perturbed column, 2·n_p
+solves per call. `dam` contains the adaptive fractional FD intervals per
+parameter and is updated in place.
+
+`jac=:forwarddiff`: forward-mode AD through the model solve (see
+[`_forwarddiff_jacobian!`](@ref)); `fd_cfg` is the per-solve
+`ForwardDiff.JacobianConfig` from [`_fd_jacobian_config`](@ref) (or
+`nothing` for an ad-hoc config). If the Dual-valued solve fails or returns
+non-finite entries, the call falls back to the FD path for this iteration
+(with a `@debug` note); `dam` is only consulted/updated on that fallback.
 
 J is (n_data × n_params), f0 is the flattened prediction vector.
-`dam` contains adaptive fractional FD intervals per parameter.
 """
 function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
                            beta::AbstractVector, f0::AbstractVector,
                            n_times::Int, n_obs::Int;
-                           dam::Vector{Float64})
+                           dam::Vector{Float64}, jac::Symbol=:fd,
+                           fd_cfg=nothing)
+    if jac === :forwarddiff
+        _forwarddiff_jacobian!(J, prob, beta, n_times, n_obs, fd_cfg) &&
+            return
+        @debug "compute_jacobian!: ForwardDiff Jacobian failed or returned " *
+               "non-finite entries; falling back to finite differences for " *
+               "this iteration"
+    end
     n_p = length(beta)
     n_data = n_times * n_obs
     p_pert = copy(beta)
@@ -545,18 +616,35 @@ Fit a partially specified model using IRLS with LAML smoothing.
 
 # Algorithm
 For each IRLS iteration:
-1. Evaluate model and compute FD Jacobian
+1. Evaluate model and compute the prediction Jacobian (finite differences
+   by default; forward-mode AD with `LAML(jac=:forwarddiff)`)
 2. Form pseudodata z = y - f + J*β
 3. Solve penalized least squares (augmented system)
 4. Step contraction (backtracking)
 5. Re-estimate smoothing parameters via Fellner-Schall + Newton
 
 Returns a `PSMSolution`. `sol.convergence` is a NamedTuple
-`(V_beta, sigma2, converged, iterations, reason, laml_failures)` — see the
-`LAML` and `PSMSolution` docstrings for the key taxonomy.
+`(V_beta, sigma2, converged, iterations, reason, laml_failures, criterion,
+laml)` — see the `LAML` and `PSMSolution` docstrings for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     _validate_problem(prob, "LAML")
+    # The full Laplace criterion needs the actual family's NORMALIZED
+    # log-likelihood with a KNOWN, fixed dispersion (its value enters the
+    # criterion directly, and the generalized Fellner-Schall update assumes
+    # unit dispersion). A CustomLikelihood's loglik_scalar may be an
+    # arbitrary — possibly unnormalized, possibly free-dispersion — kernel,
+    # so both the criterion value and its FS calibration would be off by
+    # unknown amounts. Refuse loudly rather than fit with a silently wrong
+    # criterion.
+    if alg.criterion === :laplace && prob.likelihood isa CustomLikelihood
+        error("LAML(criterion=:laplace) does not support CustomLikelihood: " *
+              "the full Laplace criterion requires a normalized log-density " *
+              "with fixed dispersion, which a user-supplied loglik_scalar " *
+              "does not declare. Use LAML(criterion=:working) (the default) " *
+              "or a built-in likelihood (Gaussian, Poisson, " *
+              "NegativeBinomial, TruncatedNormal).")
+    end
     maxiters = alg.maxiters
     verbose = alg.verbose
 
@@ -564,6 +652,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     n_obs = length(prob.obs_to_state)
     n_data = n_times * n_obs
     n_p = n_total_params(prob)
+
+    # jac=:forwarddiff — one JacobianConfig per solve (chunking depends only
+    # on n_p), reused by every compute_jacobian! call below.
+    fd_cfg = alg.jac === :forwarddiff ? _fd_jacobian_config(n_p) : nothing
 
     # Build penalty matrices per approximator
     S_list, uf_offsets, uf_nk = build_penalty_matrices(prob)
@@ -681,7 +773,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     end
 
     f_vec, _ = eval_model(beta)
-    compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+    compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                      jac=alg.jac, fd_cfg=fd_cfg)
 
     # ─── Gaussian warm-start for non-Gaussian likelihoods ─────────
     # For Poisson/NegBin with identity link, the IRLS weights (1/V(μ))
@@ -696,7 +789,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         for gw_iter in 1:50
             f_vec_new, _ = try; eval_model(beta); catch; break; end
             f_vec .= f_vec_new
-            compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+            compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                              jac=alg.jac, fd_cfg=fd_cfg)
 
             w_gauss = copy(w_vec)
             z_pseudo = y_vec .- f_vec .+ J * beta
@@ -789,7 +883,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             break
         end
         f_vec .= f_vec_new
-        compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+        compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                          jac=alg.jac, fd_cfg=fd_cfg)
 
         # Compute IRLS weights from current predictions
         w_irls = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
@@ -826,14 +921,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                 f1_vec, _ = try; eval_model(a1); catch; (f_vec, nothing); end
                 beta .= a1
                 f_vec .= f1_vec
-                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                                  jac=alg.jac, fd_cfg=fd_cfg)
                 otheta .= theta
             elseif f01 < obj_prev
                 # Old theta step improved at old theta
                 f0_vec, _ = try; eval_model(a0); catch; (f_vec, nothing); end
                 beta .= a0
                 f_vec .= f0_vec
-                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                                  jac=alg.jac, fd_cfg=fd_cfg)
                 # Also accept new theta if it didn't make data loss worse
                 if dl_a1 < dl_curr
                     otheta .= theta
@@ -843,7 +940,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                 f1_vec, _ = try; eval_model(a1); catch; (f_vec, nothing); end
                 beta .= a1
                 f_vec .= f1_vec
-                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                                  jac=alg.jac, fd_cfg=fd_cfg)
                 otheta .= theta
             else
                 # No improvement from either
@@ -857,7 +955,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             f0_vec, _ = try; eval_model(a0); catch; (f_vec, nothing); end
             beta .= a0
             f_vec .= f0_vec
-            compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam)
+            compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                              jac=alg.jac, fd_cfg=fd_cfg)
         end
 
         # Track penalized objective for convergence monitoring
@@ -923,6 +1022,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                                          family=prob.likelihood,
                                          rho_init=rho_init,
                                          sigma2_max=s2cap,
+                                         criterion=alg.criterion,
                                          verbose=verbose)
             catch e
                 if verbose; println("LAML failed: $e, keeping theta"); end
@@ -955,7 +1055,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         f_vec[k] = pred[ti, oi]
         k += 1
     end
-    compute_jacobian!(J, prob, p_opt, f_vec, n_times, n_obs; dam=dam)
+    compute_jacobian!(J, prob, p_opt, f_vec, n_times, n_obs; dam=dam,
+                      jac=alg.jac, fd_cfg=fd_cfg)
 
     B_final = build_B(theta)
     W_irls = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
@@ -992,23 +1093,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         np = nparams(approx)
         params_k = p_opt[offset+1:offset+np]
         offset += np
-        if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2],
-                                    length=approx.nknots))
-            uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
-        elseif approx isa NeuralApproximator
-            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
-        elseif approx isa GPApproximator
-            uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
-        elseif approx isa COMONetApproximator
-            uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
-        elseif approx isa SPDEApproximator
-            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
-        elseif approx isa ShapeConstrainedSPDEApproximator
-            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
-        end
+        uf_evals[approx.name] = build_evaluator(approx, params_k)
     end
 
     if verbose
@@ -1038,9 +1123,29 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         1.0  # non-Gaussian: V_β already on natural scale
     end
 
+    # LAML criterion value at the returned fit (a report, not an extra
+    # optimization step): the same `laml_objective` the smoothing update
+    # maximizes, evaluated at the final (β̂, μ̂, J, W̃, θ̂) — profiled REML
+    # for Gaussian, the full Laplace criterion for the other families.
+    # Reported under BOTH criteria (under :working for non-Gaussian it is a
+    # diagnostic, not the quantity the FS update was calibrated to). NaN
+    # when no penalized term exists (m == 0) or the evaluation fails.
+    laml_value = if m > 0
+        try
+            first(laml_objective(prob.likelihood, p_opt, J, W_irls, w_vec,
+                                 y_vec, f_vec, S_list, uf_offsets, uf_nk,
+                                 log.(max.(theta, 1e-300)), n_p))
+        catch
+            NaN
+        end
+    else
+        NaN
+    end
+
     convergence_info = (V_beta=V_beta, sigma2=sigma2_hat,
                         converged=conv_converged, iterations=conv_iters,
-                        reason=conv_reason, laml_failures=laml_failures)
+                        reason=conv_reason, laml_failures=laml_failures,
+                        criterion=alg.criterion, laml=laml_value)
 
     PSMSolution(params, obj_val, data_loss, edf, copy(theta),
                 Float64.(pred), Float64.(prob.data_values),

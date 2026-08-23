@@ -11,6 +11,7 @@
 
 using LinearAlgebra
 using Statistics
+using ForwardDiff   # jac=:forwarddiff Jacobian path
 
 # ─── Finite-difference differentiation matrix ─────────────────────
 
@@ -127,6 +128,172 @@ function eval_ode_rhs(prob::PSMProblem, times::Vector{Float64},
     first(eval_ode_rhs_masked(prob, times, alpha, beta))
 end
 
+# ─── Pointwise state Jacobian ∂F/∂x (FD / ForwardDiff) ────────────
+
+"""
+    _colloc_state_jac!(dFdx, prob, p, u, t, du0, du_p; jac=:fd)
+
+Fill `dFdx` (K × K, entry `[k_eq, k_pert] = ∂f_{k_eq}/∂x_{k_pert}`) at one
+collocation point, preserving the failure-sentinel convention above
+(large residual, ZERO Jacobian — the sentinel is never differenced or
+differentiated):
+
+- `jac=:fd` (historical behavior, byte-identical): base evaluation plus one
+  forward perturbation per state (step 1e-6). A failed base zeroes every
+  column; a failed perturbation zeroes that column.
+- `jac=:forwarddiff`: a single Dual-valued evaluation replaces the K+1
+  Float64 evaluations. The same numerical exceptions the FD path converts
+  to the sentinel zero the WHOLE block for the point (as a failed base does
+  under `:fd`), and so do non-finite Dual partials; the sentinel value is
+  never part of the differentiated computation. One deliberate nuance,
+  strictly an improvement: when the base evaluation succeeds, forward mode
+  returns the exact derivative at the point itself and never perturbs the
+  state, so the FD path's defensive zero column for "perturbation crossed a
+  domain boundary" cannot arise — that zero existed only to protect FD from
+  differencing across a branch, a failure mode forward mode does not have.
+
+`du0`/`du_p` are Float64 work buffers (used by the `:fd` path only).
+Program errors are always rethrown.
+"""
+function _colloc_state_jac!(dFdx::Matrix{Float64}, prob::PSMProblem, p,
+                            u::Vector{Float64}, t::Float64,
+                            du0::Vector{Float64}, du_p::Vector{Float64};
+                            jac::Symbol=:fd)
+    K = length(u)
+    if jac === :forwarddiff
+        fill!(dFdx, 0.0)
+        M = try
+            ForwardDiff.jacobian(
+                uu -> (duu = zero(uu);   # zero, not similar: dynamics that
+                       # skip a du entry must read 0.0, not garbage memory
+                       # (parity with _colloc_beta_jac_ad!'s fill!(dud, 0))
+                       prob.dynamics!(duu, uu, p, t);
+                       duu), u)
+        catch e
+            _is_program_error(e) && rethrow()
+            nothing   # numerical failure → zero block (sentinel convention)
+        end
+        if M !== nothing && all(isfinite, M)
+            dFdx .= M
+        end
+        return nothing
+    end
+
+    # :fd — byte-identical to the historical inline code.
+    base_failed = false
+    try
+        prob.dynamics!(du0, u, p, t)
+    catch e
+        _is_program_error(e) && rethrow()
+        du0 .= _COLLOC_FAIL_SENTINEL  # match the residual sentinel
+        base_failed = true
+    end
+
+    eps_x = 1e-6
+    for k_pert in 1:K
+        u_p = copy(u)
+        u_p[k_pert] += eps_x
+        pert_failed = false
+        try
+            prob.dynamics!(du_p, u_p, p, t)
+        catch e
+            _is_program_error(e) && rethrow()
+            du_p .= du0
+            pert_failed = true
+        end
+        # Zero Jacobian at failed points — never difference against
+        # the sentinel (see the sentinel convention above).
+        if base_failed || pert_failed
+            dFdx[:, k_pert] .= 0.0
+        else
+            dFdx[:, k_pert] .= (du_p .- du0) ./ eps_x
+        end
+    end
+    nothing
+end
+
+# ─── ∂F/∂β via ForwardDiff (jac=:forwarddiff) ────────────────────
+
+"""
+    _colloc_beta_jac_ad!(J, prob, times, alpha, beta, F_failed, sqrt_lode,
+                         n_data, n_alpha, cfg) -> Bool
+
+Fill the `∂(√λ(Dα − F))/∂β = −√λ ∂F/∂β` block of the collocation Jacobian
+by one chunked Dual sweep over β, preserving the failure-sentinel
+convention EXACTLY:
+
+- collocation points with `F_failed[i]` (their residual holds the sentinel)
+  are skipped inside the Dual-valued map — the sentinel is never part of
+  the differentiated computation — and their Jacobian rows are forced to
+  zero, matching the FD path's zeroing (granularity differs in one
+  practically-unreachable corner: FD's `Fp_failed` zeroes per
+  (point, column), the AD path zeroes the point's whole row — the two
+  coincide whenever the primal evaluation is deterministic);
+- a point whose Dual evaluation raises a numerical error is likewise
+  masked to zero (the FD path's `Fp_failed` case), and program errors are
+  rethrown.
+
+Returns `true` on success. Returns `false` — caller falls back to the FD
+loop — when the sweep itself fails or produces non-finite entries.
+"""
+function _colloc_beta_jac_ad!(J::AbstractMatrix, prob::PSMProblem,
+                              times::Vector{Float64},
+                              alpha::Matrix{Float64},
+                              beta::Vector{Float64},
+                              F_failed::Vector{Bool}, sqrt_lode::Float64,
+                              n_data::Int, n_alpha::Int, cfg)
+    T, K = size(alpha)
+    n_beta = length(beta)
+    # Per-point failure mask for the Dual sweep. ForwardDiff may call the
+    # map several times (one pass per chunk); the dynamics are
+    # deterministic, so the same points fail on every pass and |= just
+    # re-records them.
+    ad_failed = fill(false, T)
+    Fmap = function (bd)
+        pd = build_param_struct(prob, bd)
+        Fd = zeros(eltype(bd), T * K)
+        dud = zeros(eltype(bd), K)
+        for i in 1:T
+            # Sentinel points: skipped entirely — rows stay identically
+            # zero and the sentinel never touches a Dual.
+            F_failed[i] && continue
+            fill!(dud, zero(eltype(bd)))
+            try
+                prob.dynamics!(dud, alpha[i, :], pd, times[i])
+            catch e
+                _is_program_error(e) && rethrow()
+                ad_failed[i] = true
+                continue      # numerical failure → zero row (mask below)
+            end
+            for k in 1:K
+                Fd[(k - 1) * T + i] = dud[k]
+            end
+        end
+        Fd
+    end
+    JF = try
+        if cfg === nothing
+            ForwardDiff.jacobian(Fmap, beta)
+        else
+            ForwardDiff.jacobian(Fmap, beta, cfg, Val{false}())
+        end
+    catch e
+        _is_program_error(e) && rethrow()
+        return false
+    end
+    all(isfinite, JF) || return false
+    for b in 1:n_beta
+        col = n_alpha + b
+        for k in 1:K, i in 1:T
+            row_ode = n_data + (k - 1) * T + i
+            # Zero Jacobian at failed points (see sentinel convention).
+            J[row_ode, col] = (F_failed[i] || ad_failed[i]) ? 0.0 :
+                -sqrt_lode * JF[(k - 1) * T + i, b]
+        end
+    end
+    true
+end
+
 # ─── Combined residual and Jacobian ───────────────────────────────
 
 """
@@ -138,14 +305,21 @@ and the combined Jacobian ∂r/∂[alpha_flat; beta].
 
 Uses analytical derivatives where possible:
 - Data residual ∂/∂alpha: trivial (−√w δ_{ij})
-- ODE residual ∂/∂alpha: D − ∂F/∂x (D is the diff matrix, ∂F/∂x by pointwise FD)
-- ODE residual ∂/∂beta: −∂F/∂beta (by FD over beta)
+- ODE residual ∂/∂alpha: D − ∂F/∂x (D is the diff matrix, ∂F/∂x pointwise
+  via `_colloc_state_jac!` — FD by default, ForwardDiff under
+  `jac=:forwarddiff`)
+- ODE residual ∂/∂beta: −∂F/∂beta (FD over beta by default; one Dual sweep
+  via `_colloc_beta_jac_ad!` under `jac=:forwarddiff`, with FD fallback)
+
+`fd_cfg` is an optional per-solve `ForwardDiff.JacobianConfig` over β for
+the `jac=:forwarddiff` path.
 """
 function collocation_residual_jacobian(
         prob::PSMProblem, times::Vector{Float64},
         alpha::Matrix{Float64}, beta::Vector{Float64},
         D::Matrix{Float64}, lambda_ode::Float64,
-        w_vec::Vector{Float64})
+        w_vec::Vector{Float64};
+        jac::Symbol=:fd, fd_cfg=nothing)
 
     T, K = size(alpha)
     n_obs = size(prob.data_values, 2)
@@ -230,11 +404,13 @@ function collocation_residual_jacobian(
         end
     end
 
-    # 2) Compliance residual w.r.t. alpha
-    eps_x = 1e-6
+    # 2) Compliance residual w.r.t. alpha — pointwise ∂F/∂x through
+    #    _colloc_state_jac! (FD by default, ForwardDiff under
+    #    jac=:forwarddiff; failure-sentinel convention preserved there)
     p = build_param_struct(prob, beta)
     du0 = zeros(K)
     du_p = zeros(K)
+    dFdx = zeros(K, K)   # [k_eq, k_pert] = ∂f_{k_eq}/∂x_{k_pert}
 
     if prob.discrete
         # Discrete: residual_i = sqrt_lode * (alpha[i+1,k] - F[i,k])
@@ -242,38 +418,16 @@ function collocation_residual_jacobian(
         # ∂/∂alpha[i,k_pert]: -sqrt_lode * ∂F[i,k_eq]/∂x[k_pert]
         for i in 1:(T-1)
             u = alpha[i, :]
-            base_failed = false
-            try
-                prob.dynamics!(du0, u, p, times[i])
-            catch e
-                _is_program_error(e) && rethrow()
-                du0 .= _COLLOC_FAIL_SENTINEL  # match the residual sentinel
-                base_failed = true
-            end
+            _colloc_state_jac!(dFdx, prob, p, u, times[i], du0, du_p; jac=jac)
 
             for k_pert in 1:K
-                u_p = copy(u)
-                u_p[k_pert] += eps_x
-                pert_failed = false
-                try
-                    prob.dynamics!(du_p, u_p, p, times[i])
-                catch e
-                    _is_program_error(e) && rethrow()
-                    du_p .= du0
-                    pert_failed = true
-                end
-                # Zero Jacobian at failed points — never difference against
-                # the sentinel (see the sentinel convention above).
-                dF_dx = (base_failed || pert_failed) ? zeros(K) :
-                        (du_p .- du0) ./ eps_x
-
                 col_i = (k_pert - 1) * T + i  # alpha[i, k_pert]
                 col_ip1 = (k_pert - 1) * T + (i + 1)  # alpha[i+1, k_pert]
 
                 for k_eq in 1:K
                     row_ode = n_data + (k_eq - 1) * T + i
                     # ∂/∂alpha[i, k_pert]: -sqrt_lode * ∂F/∂x
-                    J[row_ode, col_i] -= sqrt_lode * dF_dx[k_eq]
+                    J[row_ode, col_i] -= sqrt_lode * dFdx[k_eq, k_pert]
                     # ∂/∂alpha[i+1, k_pert]: +sqrt_lode if k_eq == k_pert
                     if k_eq == k_pert
                         J[row_ode, col_ip1] += sqrt_lode
@@ -283,41 +437,18 @@ function collocation_residual_jacobian(
         end
     else
         # Continuous: residual_i = sqrt_lode * (D*alpha[i] - F[i])
-        # ∂F/∂x is the state Jacobian of the ODE RHS, computed by pointwise FD
         for i in 1:T
             u = alpha[i, :]
-            base_failed = false
-            try
-                prob.dynamics!(du0, u, p, times[i])
-            catch e
-                _is_program_error(e) && rethrow()
-                du0 .= _COLLOC_FAIL_SENTINEL  # match the residual sentinel
-                base_failed = true
-            end
+            _colloc_state_jac!(dFdx, prob, p, u, times[i], du0, du_p; jac=jac)
 
             for k_pert in 1:K
-                u_p = copy(u)
-                u_p[k_pert] += eps_x
-                pert_failed = false
-                try
-                    prob.dynamics!(du_p, u_p, p, times[i])
-                catch e
-                    _is_program_error(e) && rethrow()
-                    du_p .= du0
-                    pert_failed = true
-                end
-                # Zero Jacobian at failed points — never difference against
-                # the sentinel (see the sentinel convention above).
-                dF_dx = (base_failed || pert_failed) ? zeros(K) :
-                        (du_p .- du0) ./ eps_x  # ∂f/∂x_k at time i
-
                 col = (k_pert - 1) * T + i  # alpha parameter index
                 for k_eq in 1:K
                     row_ode = n_data + (k_eq - 1) * T + i
                     if k_eq == k_pert
                         J[row_ode, col] += sqrt_lode * D[i, i]
                     end
-                    J[row_ode, col] -= sqrt_lode * dF_dx[k_eq]
+                    J[row_ode, col] -= sqrt_lode * dFdx[k_eq, k_pert]
                 end
             end
 
@@ -335,21 +466,33 @@ function collocation_residual_jacobian(
     end
 
     # 3) ODE residual w.r.t. beta: ∂(√λ(Dα - F))/∂β = -√λ ∂F/∂β
-    eps_beta = 1e-5
-    for b in 1:n_beta
-        col = n_alpha + b
-        beta_p = copy(beta)
-        step = max(eps_beta, abs(beta[b]) * eps_beta)
-        beta_p[b] += step
-        F_p, Fp_failed = eval_ode_rhs_masked(prob, times, alpha, beta_p)
-        for k in 1:K
-            for i in 1:T
-                row_ode = n_data + (k - 1) * T + i
-                # Zero Jacobian at failed points (see sentinel convention):
-                # differencing a real value against the sentinel — in either
-                # direction — fabricates a ~1e12 slope.
-                J[row_ode, col] = (F_failed[i] || Fp_failed[i]) ? 0.0 :
-                    -sqrt_lode * (F_p[i, k] - F[i, k]) / step
+    beta_block_done = false
+    if jac === :forwarddiff
+        beta_block_done = _colloc_beta_jac_ad!(
+            J, prob, times, alpha, beta, F_failed, sqrt_lode,
+            n_data, n_alpha, fd_cfg)
+        beta_block_done ||
+            @debug "CollocationLAML: ForwardDiff ∂F/∂β sweep failed or " *
+                   "returned non-finite entries; falling back to finite " *
+                   "differences for this evaluation"
+    end
+    if !beta_block_done
+        eps_beta = 1e-5
+        for b in 1:n_beta
+            col = n_alpha + b
+            beta_p = copy(beta)
+            step = max(eps_beta, abs(beta[b]) * eps_beta)
+            beta_p[b] += step
+            F_p, Fp_failed = eval_ode_rhs_masked(prob, times, alpha, beta_p)
+            for k in 1:K
+                for i in 1:T
+                    row_ode = n_data + (k - 1) * T + i
+                    # Zero Jacobian at failed points (see sentinel convention):
+                    # differencing a real value against the sentinel — in either
+                    # direction — fabricates a ~1e12 slope.
+                    J[row_ode, col] = (F_failed[i] || Fp_failed[i]) ? 0.0 :
+                        -sqrt_lode * (F_p[i, k] - F[i, k]) / step
+                end
             end
         end
     end
@@ -545,6 +688,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     end
     n_beta = length(beta)
 
+    # jac=:forwarddiff — one JacobianConfig over β per solve (chunking
+    # depends only on n_beta), shared by the ∂F/∂β residual block and the
+    # Fellner–Schall EDF Jacobian below.
+    fd_cfg = alg.jac === :forwarddiff ? _fd_jacobian_config(n_beta) : nothing
+
     # Build penalty matrices for unknown functions
     S_list, uf_offsets, uf_nk = build_penalty_matrices(prob)
     m = length(S_list)
@@ -613,7 +761,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
             conv_iters_total += 1
             # Compute combined residual and Jacobian
             resid, J_full = collocation_residual_jacobian(
-                prob, times, alpha, beta, D, lambda_ode, w_vec)
+                prob, times, alpha, beta, D, lambda_ode, w_vec;
+                jac=alg.jac, fd_cfg=fd_cfg)
 
             # Build penalty for beta only (alpha is unpenalized)
             # The penalty is embedded in the full parameter space [alpha; beta]
@@ -748,16 +897,31 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                 # `n_data` for complete data.
                 n_eff_cells = count(>(0), w_vec2)
                 Jb = zeros(n_data, n_beta)
-                for b in 1:n_beta
-                    step = max(1e-6, abs(beta[b]) * 1e-6)
-                    bp = copy(beta); bp[b] += step
-                    pp = try
-                        simulate(prob, bp)
-                    catch e
-                        _is_program_error(e) && rethrow()
-                        μ_pred  # zero FD column on numerical failure
+                # jac=:forwarddiff — one Dual sweep via the shared
+                # prediction-Jacobian backend (ord() and the compute_
+                # jacobian! flattening are both obs-major, so the row
+                # order matches); FD loop below on failure.
+                jb_ad_ok = false
+                if alg.jac === :forwarddiff
+                    jb_ad_ok = _forwarddiff_jacobian!(Jb, prob, beta,
+                                                      T_pts, n_obs, fd_cfg)
+                    jb_ad_ok ||
+                        @debug "CollocationLAML: ForwardDiff Fellner–Schall " *
+                               "Jacobian failed or returned non-finite " *
+                               "entries; falling back to finite differences"
+                end
+                if !jb_ad_ok
+                    for b in 1:n_beta
+                        step = max(1e-6, abs(beta[b]) * 1e-6)
+                        bp = copy(beta); bp[b] += step
+                        pp = try
+                            simulate(prob, bp)
+                        catch e
+                            _is_program_error(e) && rethrow()
+                            μ_pred  # zero FD column on numerical failure
+                        end
+                        Jb[:, b] .= (ord(pp) .- mu_base) ./ step
                     end
-                    Jb[:, b] .= (ord(pp) .- mu_base) ./ step
                 end
                 JWJ = Jb' * Diagonal(w_vec2) * Jb
                 S_full = zeros(n_beta, n_beta)

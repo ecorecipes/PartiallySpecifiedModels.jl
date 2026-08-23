@@ -32,43 +32,13 @@ function build_autodiff_param_struct(prob::PSMProblem, beta)
         params_k = beta[offset+1:offset+np]
         offset += np
 
-        if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2],
-                                    length=approx.nknots))
-            # Build B-spline evaluator that preserves Dual type in coefficients
-            evaluator = build_bspline_evaluator(knots_x, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa NeuralApproximator
-            # Shared Dual-safe evaluator (closure captures params_k, which
-            # may be Dual-valued)
-            push!(uf_entries, approx.name => build_neural_evaluator(approx, params_k))
-        elseif approx isa GPApproximator
-            evaluator = build_gp_evaluator(approx, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            # Use the SAME coefficient-basis evaluator as every other solver.
-            # (The old AD path treated β = Σ·softplus(γ) as interpolation
-            # knot VALUES and natural-cubic-splined through them — a
-            # different function from the de Boor coefficient spline the
-            # returned solution reports, it could violate the constraint
-            # between knots, and it ignored the free linear parameters.)
-            # _softplus and _bspline_basis_vector are Dual-safe.
-            evaluator = build_constrained_bspline_evaluator(approx, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa COMONetApproximator
-            evaluator = build_comonet_evaluator(approx, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa SPDEApproximator
-            evaluator = build_spde_evaluator(approx.mesh_points, params_k)
-            push!(uf_entries, approx.name => evaluator)
-        elseif approx isa ShapeConstrainedSPDEApproximator
-            # Route through gamma_to_mesh_values so the free linear
-            # components are NOT softplus'd — the optimized function must be
-            # the same one initial_params inverts and the solution reports.
-            mesh_values = gamma_to_mesh_values(approx, params_k)
-            evaluator = build_spde_evaluator(approx.mesh_points, mesh_values)
-            push!(uf_entries, approx.name => evaluator)
-        end
+        # The shared build_evaluator methods (approximator_interface.jl) are
+        # all Dual-safe: closures capture params_k, which may be
+        # Dual-valued, and every code path is eltype-generic. They also use
+        # the SAME coefficient-basis evaluators as every other solver — the
+        # old AD-specific paths for the shape-constrained types optimized a
+        # different function from the one the returned solution reported.
+        push!(uf_entries, approx.name => build_evaluator(approx, params_k))
     end
 
     uf_nt = NamedTuple(uf_entries)
@@ -318,6 +288,65 @@ function adam_loss_poisson(prob::PSMProblem, beta, penalty_w::Float64=0.0)
     _all_finite(total) ? total : T(1e10)
 end
 
+# ─── Adjoint-sensitivity backend hook (SciMLSensitivity extension) ───
+
+"""
+    _adam_adjoint_loss_grad(prob, beta, loss_sym, penalty_w, sensealg)
+        -> (loss::Float64, grad::Vector{Float64})
+
+Loss and gradient of the AdamSolver objective at `beta`, computed with
+continuous adjoint sensitivities instead of ForwardDiff through the solve.
+Implemented by the `PartiallySpecifiedModelsSciMLSensitivityExt` package
+extension; this fallback fires when the extension is not loaded. The
+semantics (masking, penalty, failure sentinel) mirror `adam_loss_mse` /
+`adam_loss_poisson` exactly.
+"""
+function _adam_adjoint_loss_grad(prob::PSMProblem, beta, loss_sym::Symbol,
+                                 penalty_w::Float64, sensealg)
+    ext = Base.get_extension(@__MODULE__,
+                             :PartiallySpecifiedModelsSciMLSensitivityExt)
+    if ext === nothing
+        error("AdamSolver: sensealg=$(repr(sensealg)) requires the " *
+              "SciMLSensitivity extension, which is not loaded. Run " *
+              "`using SciMLSensitivity` (it provides the adjoint methods " *
+              "and the ReverseDiff vector-Jacobian products the extension " *
+              "uses) and call solve again, or use sensealg=nothing for the " *
+              "default ForwardDiff gradient path.")
+    else
+        # The extension is loaded but its method did not match, so the
+        # value is not a sensealg at all (the extension accepts :auto or a
+        # SciMLSensitivity sensitivity-algorithm object and rejects
+        # non-adjoint algorithms with a specific message).
+        error("AdamSolver: sensealg=$(repr(sensealg)) is not a valid " *
+              "adjoint specification; use sensealg=:auto, a " *
+              "SciMLSensitivity adjoint algorithm object (e.g. " *
+              "InterpolatingAdjoint(autojacvec=ReverseDiffVJP(false))), " *
+              "or sensealg=nothing for the ForwardDiff path.")
+    end
+end
+
+"""
+    _validate_adjoint_applicable(prob, sensealg)
+
+Reject problem classes the adjoint backend cannot handle, with actionable
+messages: discrete-time maps have no ODE solve to adjoint, and the DDE path
+integrates through `adam_solve_dde`, for which SciMLSensitivity's continuous
+adjoints are not wired up here.
+"""
+function _validate_adjoint_applicable(prob::PSMProblem, sensealg)
+    prob.discrete &&
+        error("AdamSolver: sensealg=$(repr(sensealg)) requests adjoint " *
+              "sensitivities, but this is a discrete-time (map) problem — " *
+              "there is no ODE solve to differentiate with a continuous " *
+              "adjoint. Use sensealg=nothing (ForwardDiff through the map).")
+    isempty(prob.delays) ||
+        error("AdamSolver: sensealg=$(repr(sensealg)) requests adjoint " *
+              "sensitivities, but this problem has delays (DDE). The " *
+              "adjoint backend supports plain ODE problems only; use " *
+              "sensealg=nothing (ForwardDiff through the DDE solve).")
+    nothing
+end
+
 # ─── Main Adam solver ────────────────────────────────────────────
 
 """
@@ -341,12 +370,20 @@ differentiation through the ODE/map solver via `ForwardDiff.jl`.
 # Returns
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
 `sol.convergence` is a NamedTuple `(optimizer, method, converged, iterations,
-reason, final_grad_norm)` — see the `AdamSolver` docstring for the key
-taxonomy and the guarded plateau criterion.
+reason, final_grad_norm, backend)` — see the `AdamSolver` docstring for the
+key taxonomy and the guarded plateau criterion. `backend` records the
+gradient backend that ran: `:forwarddiff`, `:finitediff`, or `:adjoint`
+(the opt-in `sensealg` path via the SciMLSensitivity extension).
 """
 function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
     _validate_problem(prob, "AdamSolver")
     verbose = alg.verbose
+
+    # Opt-in adjoint-sensitivity gradient backend (SciMLSensitivity
+    # extension). `nothing` keeps the ForwardDiff/finite-difference paths
+    # untouched.
+    use_adjoint = alg.sensealg !== nothing
+    use_adjoint && _validate_adjoint_applicable(prob, alg.sensealg)
 
     # Initialize parameters
     beta = Float64[]
@@ -390,9 +427,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
         β -> adam_loss_mse(prob, β, alg.penalty_weight)
     end
 
+    backend = use_adjoint ? :adjoint : (alg.autodiff ? :forwarddiff : :finitediff)
+
     if verbose
         println("AdamSolver: $(n_beta) params, $(alg.maxiters) max iters, lr=$(alg.lr)")
-        println("  Loss: $(loss_sym) (from $(alg.loss)), autodiff: $(alg.autodiff)")
+        println("  Loss: $(loss_sym) (from $(alg.loss)), gradient backend: $(backend)")
     end
 
     # Adam state
@@ -414,7 +453,14 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
         conv_iters = iter
         # Compute gradient
         local loss_val
-        if alg.autodiff
+        local grad
+        if use_adjoint
+            # Continuous adjoint sensitivities (SciMLSensitivity extension):
+            # gradient cost roughly independent of n_beta.
+            loss_val, grad = _adam_adjoint_loss_grad(prob, beta, loss_sym,
+                                                     alg.penalty_weight,
+                                                     alg.sensealg)
+        elseif alg.autodiff
             # ForwardDiff gradient
             result = DiffResults.MutableDiffResult(0.0, (zeros(n_beta),))
             ForwardDiff.gradient!(result, loss_fn, beta)
@@ -528,23 +574,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
         np = nparams(approx)
         params_k = beta[offset+1:offset+np]
         offset += np
-        if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2],
-                                    length=approx.nknots))
-            uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
-        elseif approx isa NeuralApproximator
-            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
-        elseif approx isa GPApproximator
-            uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
-        elseif approx isa COMONetApproximator
-            uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
-        elseif approx isa SPDEApproximator
-            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
-        elseif approx isa ShapeConstrainedSPDEApproximator
-            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
-        end
+        uf_evals[approx.name] = build_evaluator(approx, params_k)
     end
 
     edf = Float64(n_beta)
@@ -566,5 +596,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
                 Float64.(prob.data_times), uf_evals,
                 (optimizer=:adam, method=:adam_ode,
                  converged=conv_converged, iterations=conv_iters,
-                 reason=conv_reason, final_grad_norm=final_grad_norm))
+                 reason=conv_reason, final_grad_norm=final_grad_norm,
+                 backend=backend))
 end

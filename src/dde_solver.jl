@@ -27,6 +27,15 @@ where `h` is the DelayDiffEq history function.
 function simulate_dde(prob::PSMProblem, beta::AbstractVector)
     p = build_param_struct(prob, beta)
     u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
+    # Promote the state eltype when β carries ForwardDiff Duals (the
+    # jac=:forwarddiff Jacobian path differentiates straight through this
+    # solve) — mirrors adam_solve_dde below; a no-op for Float64 β WITH
+    # Float64 u0 (an Int or Float32 u0 now integrates in the promoted
+    # type where it previously errored / stayed narrow — no in-tree
+    # caller is affected). The constant default history inherits the
+    # promoted u0.
+    Tel = promote_type(eltype(beta), eltype(u0))
+    u0 = Tel === eltype(u0) ? u0 : Tel.(u0)
 
     # Wrap dynamics: the DDEProblem passes its own `params` positional arg,
     # but we use our built `p` NamedTuple instead.

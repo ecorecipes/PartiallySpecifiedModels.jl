@@ -140,19 +140,29 @@ end
 
 """
     probsolve_filter(ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma;
-                     interrogate=:kramer, calibrate=true)
+                     interrogate=:kramer, calibrate=true, sqrt_filter=false)
 
 Forward (filtering) pass of the joint probabilistic ODE solver with global
 diffusion calibration. Returns a `Dict` holding the joint filter/predict
 means and covariances, the transition matrix, the calibrated diffusion
 `ssq`, and the time grid.
+
+With `sqrt_filter=true` the covariance recursion is run in square-root
+(QR-based) form ([`_sqrt_probsolve_filter`](@ref)); the returned `Dict`
+additionally carries the right factors (`"R_pred"`, `"R_filt"`, `"R_Q"`)
+consumed by the square-root smoother and FFBS backward passes.
 """
 function probsolve_filter(ode_fun!, p, u0::AbstractVector,
                           tspan::Tuple{Float64, Float64},
                           n_steps::Int, n_deriv::Int,
                           sigma::Vector{Float64};
                           interrogate::Symbol=:kramer,
-                          calibrate::Bool=true)
+                          calibrate::Bool=true,
+                          sqrt_filter::Bool=false)
+    sqrt_filter && return _sqrt_probsolve_filter(ode_fun!, p, u0, tspan,
+                                                 n_steps, n_deriv, sigma;
+                                                 interrogate=interrogate,
+                                                 calibrate=calibrate)
     t_min, t_max = tspan
     dt = (t_max - t_min) / n_steps
     n_vars = length(u0)
@@ -227,8 +237,13 @@ Backward RTS smoother on the joint filter output. Returns posterior
 mean/variance in the per-variable nested format
 `(μ_smooth[n][k]::Vector, Σ_smooth[n][k]::Matrix)` expected by callers
 (the per-variable q×q diagonal block of the joint covariance).
+
+When `filt_out` carries square-root factors (produced with
+`sqrt_filter=true`), the square-root RTS smoother
+([`_sqrt_probsolve_smooth`](@ref)) is used instead.
 """
 function probsolve_smooth(filt_out::Dict, n_vars::Int)
+    haskey(filt_out, "R_filt") && return _sqrt_probsolve_smooth(filt_out, n_vars)
     μ_filt = filt_out["μ_filt"]; Σ_filt = filt_out["Σ_filt"]
     μ_pred = filt_out["μ_pred"]; Σ_pred = filt_out["Σ_pred"]
     A = filt_out["A"]; q = filt_out["q"]
@@ -262,29 +277,33 @@ end
 
 """
     probsolve(ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma;
-              interrogate=:kramer)
+              interrogate=:kramer, sqrt_filter=false)
 
 Probabilistic ODE solve. Returns `(μ_smooth, Σ_smooth, times)` in the
 per-variable nested format described in [`probsolve_smooth`](@ref).
+`sqrt_filter=true` runs both passes in square-root (QR-based) form.
 """
 function probsolve(ode_fun!, p, u0::AbstractVector,
                    tspan::Tuple{Float64, Float64},
                    n_steps::Int, n_deriv::Int,
                    sigma::Vector{Float64};
-                   interrogate::Symbol=:kramer)
+                   interrogate::Symbol=:kramer,
+                   sqrt_filter::Bool=false)
     n_vars = length(u0)
     filt_out = probsolve_filter(ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma;
-                                interrogate=interrogate)
+                                interrogate=interrogate, sqrt_filter=sqrt_filter)
     μ_smooth, Σ_smooth = probsolve_smooth(filt_out, n_vars)
     μ_smooth, Σ_smooth, filt_out["times"]
 end
 
 """
     basic_loglik(ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma,
-                 obs_data, obs_times, obs_to_state, obs_var; interrogate=:kramer)
+                 obs_data, obs_times, obs_to_state, obs_var;
+                 interrogate=:kramer, sqrt_filter=false)
 
 Plug-in data likelihood: solve the ODE probabilistically (with full EKF1
 coupling) and evaluate the Gaussian data likelihood at the posterior mean.
+`sqrt_filter=true` runs the probabilistic solve in square-root form.
 """
 function basic_loglik(ode_fun!, p, u0::AbstractVector,
                       tspan::Tuple{Float64, Float64},
@@ -294,9 +313,10 @@ function basic_loglik(ode_fun!, p, u0::AbstractVector,
                       obs_times::Vector{Float64},
                       obs_to_state::Vector{Int},
                       obs_var::Float64;
-                      interrogate::Symbol=:kramer)
+                      interrogate::Symbol=:kramer,
+                      sqrt_filter::Bool=false)
     μ_smooth, _, times = probsolve(ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma;
-                                   interrogate=interrogate)
+                                   interrogate=interrogate, sqrt_filter=sqrt_filter)
     n_obs = size(obs_data, 2); n_t = size(obs_data, 1)
     ll = 0.0
     for i in 1:n_t
@@ -312,12 +332,15 @@ end
 
 """
     fenrir_loglik(ode_fun!, p, u0, tspan, n_steps, n_deriv, sigma,
-                  obs_data, obs_times, obs_to_state, obs_var; interrogate=:kramer)
+                  obs_data, obs_times, obs_to_state, obs_var;
+                  interrogate=:kramer, sqrt_filter=false)
 
 Fenrir marginal data likelihood (Tronarp et al. 2022) on the joint state
 space: forward filter conditioned on the ODE (with EKF1 coupling and
 calibrated diffusion), then a backward Gauss–Markov pass that conditions on
 the data and accumulates the data evidence `Σ_m log N(y_m; D_m b_m, …)`.
+`sqrt_filter=true` evaluates both passes in square-root (QR-based) form
+([`_sqrt_fenrir_loglik`](@ref)).
 """
 function fenrir_loglik(ode_fun!, p, u0::AbstractVector,
                        tspan::Tuple{Float64, Float64},
@@ -327,7 +350,12 @@ function fenrir_loglik(ode_fun!, p, u0::AbstractVector,
                        obs_times::Vector{Float64},
                        obs_to_state::Vector{Int},
                        obs_var::Float64;
-                       interrogate::Symbol=:kramer)
+                       interrogate::Symbol=:kramer,
+                       sqrt_filter::Bool=false)
+    sqrt_filter && return _sqrt_fenrir_loglik(ode_fun!, p, u0, tspan, n_steps,
+                                              n_deriv, sigma, obs_data,
+                                              obs_times, obs_to_state, obs_var;
+                                              interrogate=interrogate)
     n_vars = length(u0)
     q = n_deriv
     D = n_vars * q

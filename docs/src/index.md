@@ -13,7 +13,7 @@ PartiallySpecifiedModels.jl provides a unified interface for specifying and fitt
 - **Basis function approximators** (B-splines, shape-constrained splines, Gaussian processes): fewer parameters, automatic smoothing via LAML/GCV, interpretable, and easy to constrain (monotonicity, convexity, positivity).
 - **Neural network approximators** (Lux.jl networks, COMONet): more flexible for high-dimensional or complex functional forms, compatible with gradient-based UDE-style training.
 
-The package supports 22 fitting algorithms, 7 approximator types, 5 likelihood families, and 14 shape constraint types.
+The package supports 23 fitting algorithms, 9 approximator types, 5 likelihood families, and 14 shape constraint types.
 
 ## Installation
 
@@ -115,6 +115,7 @@ end
 | [`ShapeConstrainedSPDEApproximator`](@ref) | SPDE + shape constraints | Constrained mesh values |
 | [`NeuralApproximator`](@ref) | Lux.jl neural network | Network weights |
 | [`GPApproximator`](@ref) | Gaussian process | GP hyperparameters |
+| [`ShapeConstrainedGPApproximator`](@ref) | GP + shape constraints | Constrained inducing values |
 | [`COMONetApproximator`](@ref) | Constrained monotone network | exp(W) weights |
 
 ### Likelihoods

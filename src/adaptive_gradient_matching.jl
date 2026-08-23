@@ -293,6 +293,9 @@ function agm_loss(prob::PSMProblem, beta::AbstractVector,
                                         length=approx.nknots))
                 S = spline_penalty_matrix(knots_x)
                 total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
+            elseif approx isa TensorBSplineApproximator
+                S = penalty_matrix(approx)
+                total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
             elseif approx isa ShapeConstrainedBSplineApproximator
                 S = penalty_matrix(approx)
                 total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
@@ -305,6 +308,16 @@ function agm_loss(prob::PSMProblem, beta::AbstractVector,
             elseif approx isa ShapeConstrainedSPDEApproximator
                 S = penalty_matrix(approx)
                 total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
+            elseif approx isa ShapeConstrainedGPApproximator
+                S = penalty_matrix(approx)
+                total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
+            elseif !(approx isa _BUILTIN_APPROX_TYPES)
+                # Custom protocol types: generic penalty (built-in
+                # treatment above unchanged; see _BUILTIN_APPROX_TYPES).
+                S = penalty_matrix(approx)
+                if S !== nothing
+                    total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
+                end
             end
         end
     end
@@ -637,21 +650,7 @@ function _agm_population_mcmc(prob::PSMProblem, alg::AdaptiveGradientMatching)
         np = nparams(approx)
         params_k = beta_mean[offset+1:offset+np]
         offset += np
-        if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2],
-                                    length=approx.nknots))
-            uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
-        elseif approx isa GPApproximator
-            uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
-        elseif approx isa COMONetApproximator
-            uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
-        elseif approx isa SPDEApproximator
-            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
-        elseif approx isa ShapeConstrainedSPDEApproximator
-            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
-        end
+        uf_evals[approx.name] = build_evaluator(approx, params_k)
     end
 
     ca_entries = Pair{Symbol, Any}[]
@@ -932,23 +931,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
         np = nparams(approx)
         params_k = beta_opt[offset+1:offset+np]
         offset += np
-        if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2],
-                                    length=approx.nknots))
-            uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
-        elseif approx isa NeuralApproximator
-            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
-        elseif approx isa GPApproximator
-            uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
-        elseif approx isa COMONetApproximator
-            uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
-        elseif approx isa SPDEApproximator
-            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
-        elseif approx isa ShapeConstrainedSPDEApproximator
-            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
-        end
+        uf_evals[approx.name] = build_evaluator(approx, params_k)
     end
 
     edf = Float64(n_beta)

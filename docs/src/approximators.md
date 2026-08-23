@@ -1,6 +1,6 @@
 # Approximators
 
-PartiallySpecifiedModels.jl provides seven approximator types for representing unknown functions in dynamical systems. Each approximator is a callable object that maps scalar inputs to scalar outputs and is fitted as part of the model.
+PartiallySpecifiedModels.jl provides eight approximator types for representing unknown functions in dynamical systems. Each approximator is a callable object that maps scalar inputs to scalar outputs and is fitted as part of the model (the tensor-product approximator takes two scalar inputs).
 
 ## BSplineApproximator
 
@@ -21,6 +21,42 @@ The smoothing parameter ``\lambda`` is estimated automatically by LAML or GCV.
 
 ```@docs
 BSplineApproximator
+```
+
+## TensorBSplineApproximator
+
+Bivariate tensor-product spline for unknown functions of **two** state variables — the flagship ecological case in Wood (2001), where a predation response ``g(P, N)`` depends on both predator and prey densities.
+
+```@example approx
+approx2d = TensorBSplineApproximator(:g, (0.0, 3.0), (0.5, 3.0), 5, 5;
+                                     initial = (N, P) -> 0.3 * N * P)
+```
+
+- **`(0.0, 3.0)` / `(0.5, 3.0)`**: domains of the first and second argument
+- **`5, 5`**: knots per margin (`nparams = 5 × 5 = 25` coefficients — the surface values on the knot grid)
+- **`anisotropy`** (keyword, default 1.0): fixed relative weight of y-roughness against x-roughness in the Kronecker-sum penalty; a single smoothing parameter ``\lambda`` scales the whole penalty
+
+In the dynamics the fitted surface is called with two arguments:
+
+```julia
+function predprey!(du, u, p, t)
+    g = p.g(u[1], u[2])          # bivariate unknown interaction
+    du[1] = u[1] * (1 - u[1] / p.K) - g
+    du[2] = p.e * g - p.m * u[2]
+end
+
+prob = PSMProblem(predprey!, [1.0, 1.5], (0.0, 40.0), [approx2d];
+                  data_times=ts, data_values=data, obs_to_state=[1, 2],
+                  known_params=(K=6.0, e=0.5, m=0.25),
+                  likelihood=Gaussian(), solver=Tsit5())
+sol = solve(prob, AdamSolver(maxiters=400, lr=0.05))
+sol.unknown_functions[:g](1.5, 2.0)   # fitted surface at (N, P)
+```
+
+Works with the through-the-solver and penalized-likelihood solvers (`AdamSolver`, `LAML`, `GCVSolver`, `DerivativeFreeSolver`, `MultipleShootingSolver`, …); for strongly nonlinear oscillatory systems, start `LAML` from a light penalty (e.g. `LAML(warmup=10, initial_lambda=0.01)`). A 1-D trajectory only visits a curve through the `(x, y)` plane, so the surface is identified near the visited region — evaluate it there. `confidence_band` and the bootstrap unknown-function bands are univariate and do not cover tensor surfaces.
+
+```@docs
+TensorBSplineApproximator
 ```
 
 ## ShapeConstrainedBSplineApproximator
@@ -125,6 +161,20 @@ approx_gp = GPApproximator(:f, (0.0, 10.0), 20)
 GPApproximator
 ```
 
+## ShapeConstrainedGPApproximator
+
+Combines the GP predictive-mean interpolation of [`GPApproximator`](@ref) with the SCOP-spline reparameterization to enforce shape constraints at the inducing points. Supports all 14 constraint types (same as [`ShapeConstrainedBSplineApproximator`](@ref)).
+
+```@example approx
+approx_scgp = ShapeConstrainedGPApproximator(:f, (0.0, 10.0), 10, :increasing)
+```
+
+Constraints are enforced at the inducing-point values via a cumulative-sum reparameterization through `softplus`; the kernel interpolation between points may slightly overshoot — use more inducing points to reduce this. Kernel hyperparameters adapt during LAML/GCV fits exactly as for `GPApproximator` (pass an explicit `lengthscale` to fix them).
+
+```@docs
+ShapeConstrainedGPApproximator
+```
+
 ## COMONetApproximator
 
 Constrained Monotone Network — a neural network architecture that guarantees shape constraints by construction. Each constraint uses the architecture matching its function class: monotone constraints use positive (`exp(W)`) weights with saturating tanh hidden units, curvature-only constraints use a two-branch input-convex form (twice the parameters), and `:positive` exponentiates an unconstrained MLP.
@@ -166,6 +216,7 @@ COMONetApproximator
 
 **General guidance:**
 - Start with [`BSplineApproximator`](@ref) — it works well in most cases with automatic smoothing.
+- Use [`TensorBSplineApproximator`](@ref) when the unknown function takes TWO state variables (e.g. a predation response `g(P, N)`).
 - Use [`SPDEApproximator`](@ref) for an interpretable correlation-length parameter and Matérn-based smoothing.
 - Use [`ShapeConstrainedBSplineApproximator`](@ref) or [`ShapeConstrainedSPDEApproximator`](@ref) when you have prior knowledge about monotonicity or convexity.
 - Use [`NeuralApproximator`](@ref) when the unknown function may be complex or when using UDE-style solvers.

@@ -16,6 +16,7 @@ makedocs(
         "Home" => "index.md",
         "Getting Started" => "getting_started.md",
         "Approximators" => "approximators.md",
+        "Custom Approximators" => "extending.md",
         "Solvers" => "solvers.md",
         "Vignettes" => "vignettes.md",
         "API Reference" => "api.md",

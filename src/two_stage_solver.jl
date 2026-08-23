@@ -186,7 +186,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
             params_k = β_eval[offset+1:offset+np]
             offset += np
 
-            if approx isa BSplineApproximator || approx isa GPApproximator || approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator
+            # Non-built-in (custom protocol) types take the generic branch
+            # too; built-in treatment is unchanged (see _BUILTIN_APPROX_TYPES).
+            if approx isa BSplineApproximator || approx isa GPApproximator || approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator || approx isa ShapeConstrainedGPApproximator || approx isa TensorBSplineApproximator || !(approx isa _BUILTIN_APPROX_TYPES)
                 S = penalty_matrix(approx)
                 if S !== nothing
                     loss_val += lambda_smooth * dot(params_k, S * params_k)
@@ -292,23 +294,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
         np = nparams(approx)
         params_k = beta[offset+1:offset+np]
         offset += np
-        if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2],
-                                    length=approx.nknots))
-            uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
-        elseif approx isa NeuralApproximator
-            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
-        elseif approx isa GPApproximator
-            uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
-        elseif approx isa COMONetApproximator
-            uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
-        elseif approx isa SPDEApproximator
-            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
-        elseif approx isa ShapeConstrainedSPDEApproximator
-            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
-        end
+        uf_evals[approx.name] = build_evaluator(approx, params_k)
     end
 
     # Build ComponentArray of fitted parameters

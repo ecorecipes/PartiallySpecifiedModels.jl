@@ -5,10 +5,11 @@ A Julia package for fitting partially specified models (PSMs) — dynamical
 systems where some functional responses are modelled nonparametrically using
 penalized B-splines, Gaussian processes, or neural networks.
 
-Provides 22 solvers (LAML, collocation, gradient matching, Adam, multiple
+Provides 23 solvers (LAML, collocation, gradient matching, Adam, multiple
 shooting, adaptive gradient matching, rodeo, MCMC/HMC, MAGI, BNG, DALTON,
 pseudo-marginal, GCV, two-stage, derivative-free, variational, ABC-SMC,
-integral matching, profile likelihood, ensemble Kalman, ODIN, and RKHS)
+integral matching, profile likelihood, ensemble Kalman, ODIN, FGPGM, and
+RKHS)
 and 7 approximator types (B-spline, shape-constrained B-spline, SPDE,
 shape-constrained SPDE, neural network, Gaussian process, and COMONet).
 
@@ -48,6 +49,10 @@ include("approximators.jl")
 # must precede solver.jl, which uses build_neural_evaluator
 include("neural_evaluator.jl")
 
+# Generic evaluator construction (the approximator extension interface);
+# must precede the solver files, which all call build_evaluator
+include("approximator_interface.jl")
+
 # Likelihood families
 include("likelihoods.jl")
 
@@ -79,6 +84,7 @@ include("adaptive_gradient_matching.jl")
 include("ibm_prior.jl")
 include("kalman.jl")
 include("probsolve.jl")
+include("sqrt_kalman.jl")
 include("rodeo_solver.jl")
 
 # MCMC/HMC solver (Bayesian inference)
@@ -125,6 +131,9 @@ include("ensemble_kalman_solver.jl")
 # ODIN solver (ODE-Informed regression, Wenk & Abbati 2020)
 include("odin_solver.jl")
 
+# FGPGM solver (fast GP-based gradient matching MCMC, Wenk et al. 2019)
+include("fgpgm_solver.jl")
+
 # RKHS solver (trajectory-in-RKHS gradient matching)
 include("rkhs_solver.jl")
 
@@ -139,7 +148,9 @@ include("bootstrap.jl")
 
 # Exports — types
 export AbstractApproximator, BSplineApproximator, NeuralApproximator, GPApproximator, SPDEApproximator
+export TensorBSplineApproximator
 export ShapeConstrainedBSplineApproximator, ShapeConstrainedSPDEApproximator, SHAPE_CONSTRAINTS
+export ShapeConstrainedGPApproximator
 export COMONetApproximator, COMONET_CONSTRAINTS
 export AbstractLikelihood, Gaussian, Poisson, NegativeBinomial, TruncatedNormal,
        CustomLikelihood
@@ -151,11 +162,12 @@ export GCVSolver, TwoStageSolver, DerivativeFreeSolver
 export VariationalSolver, ABCSolver
 export IntegralMatchingSolver, ProfileLikelihoodSolver
 export EnsembleKalmanSolver, ODINSolver, RKHSSolver
+export FGPGMSolver
 
 # Exports — functions
 export solve, simulate, predict
 export spline_penalty_matrix, penalty_matrix
-export nparams, initial_params
+export nparams, initial_params, build_evaluator
 export optimize_spde_range, with_range_param
 export residual_diagnostics, durbin_watson, residual_acf, semivariogram
 export appraise, deviance_residuals

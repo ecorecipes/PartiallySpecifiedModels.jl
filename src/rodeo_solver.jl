@@ -129,6 +129,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
             S = spline_penalty_matrix(knots_x)
             push!(smooth_mats, S)
             push!(smooth_offsets, offset_acc)
+        elseif approx isa TensorBSplineApproximator
+            push!(smooth_mats, penalty_matrix(approx))
+            push!(smooth_offsets, offset_acc)
         elseif approx isa SPDEApproximator
             S = penalty_matrix(approx)
             if S !== nothing
@@ -136,6 +139,20 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
                 push!(smooth_offsets, offset_acc)
             end
         elseif approx isa ShapeConstrainedSPDEApproximator
+            S = penalty_matrix(approx)
+            if S !== nothing
+                push!(smooth_mats, S)
+                push!(smooth_offsets, offset_acc)
+            end
+        elseif approx isa ShapeConstrainedGPApproximator
+            S = penalty_matrix(approx)
+            if S !== nothing
+                push!(smooth_mats, S)
+                push!(smooth_offsets, offset_acc)
+            end
+        elseif !(approx isa _BUILTIN_APPROX_TYPES)
+            # Custom protocol types: generic penalty (built-in treatment
+            # above unchanged; see _BUILTIN_APPROX_TYPES).
             S = penalty_matrix(approx)
             if S !== nothing
                 push!(smooth_mats, S)
@@ -163,7 +180,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
                            alg.n_steps, alg.n_deriv, sigma,
                            Float64.(prob.data_values), Float64.(prob.data_times),
                            prob.obs_to_state, obs_var;
-                           interrogate=alg.interrogate)
+                           interrogate=alg.interrogate,
+                           sqrt_filter=alg.sqrt_filter)
 
             # Add smoothing penalty for B-splines
             penalty = 0.0
@@ -360,7 +378,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
 
     μ_smooth, Σ_smooth, times = probsolve(ode_rhs_opt!, nothing, Float64.(prob.u0),
                                            prob.tspan, alg.n_steps, alg.n_deriv, sigma;
-                                           interrogate=alg.interrogate)
+                                           interrogate=alg.interrogate,
+                                           sqrt_filter=alg.sqrt_filter)
 
     # Extract solution at data times and compute data loss
     pred = zeros(n_t, n_obs)
@@ -381,23 +400,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
         np = nparams(approx)
         params_k = beta_opt[offset+1:offset+np]
         offset += np
-        if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2],
-                                    length=approx.nknots))
-            uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
-        elseif approx isa NeuralApproximator
-            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
-        elseif approx isa GPApproximator
-            uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
-        elseif approx isa COMONetApproximator
-            uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
-        elseif approx isa SPDEApproximator
-            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
-        elseif approx isa ShapeConstrainedSPDEApproximator
-            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
-        end
+        uf_evals[approx.name] = build_evaluator(approx, params_k)
     end
 
     # Real EDF when smoothing ran (tr(H⁻¹J'WJ) at the final λ);

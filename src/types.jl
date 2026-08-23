@@ -59,6 +59,107 @@ function BSplineApproximator(name::Union{Symbol,String},
 end
 
 """
+    TensorBSplineApproximator(name, domain_x, domain_y, nknots_x, nknots_y;
+                              anisotropy=1.0, initial=nothing)
+
+Bivariate tensor-product cubic-spline approximator for an unknown function
+of TWO state variables — e.g. the predation response `g(P, N)` of Wood
+(2001), "Partially specified ecological models", whose form depends on both
+predator and prey densities. In the dynamics the fitted surface is a
+two-argument callable, `du[1] = ... p.g(u[1], u[2]) ...`.
+
+Coefficients are function values on the `nknots_x × nknots_y` grid of
+evenly spaced knots over `domain_x × domain_y`, stored column-major as
+`vec(C)` with `C[i, j] = f(x_i, y_j)` (the x index varies fastest).
+Evaluation is the tensor product of the same univariate natural-cubic
+interpolation `BSplineApproximator` uses, with linear extrapolation per
+margin outside the domain.
+
+The roughness penalty is the Kronecker sum
+`S = I_ny ⊗ S_x + anisotropy · (S_y ⊗ I_nx)` of the univariate
+`∫(f'')²` marginal penalties. The package's penalty interface carries a
+single smoothing parameter λ per approximator, so LAML/GCV scale this whole
+matrix by one λ; `anisotropy` sets the FIXED relative weight of y-roughness
+against x-roughness (Wood's independent per-margin smoothing parameters
+would require multi-λ penalty support, which is out of scope). The penalty
+null space is the bilinear family `a + b·x + c·y + d·x·y`.
+
+# Arguments
+- `name`: symbol for the unknown function (accessed as `p.name(x, y)`)
+- `domain_x`, `domain_y`: `(lo, hi)` ranges of the first and second argument
+- `nknots_x`, `nknots_y`: knots per margin (≥ 3 each; `nparams = nknots_x · nknots_y`)
+- `anisotropy`: positive relative weight of the y-roughness penalty (default 1.0)
+- `initial`: optional initial surface — a two-argument function `(x, y) -> z`
+  or a constant (default 0)
+
+# Example
+```julia
+uf = TensorBSplineApproximator(:g, (0.0, 4.0), (0.0, 6.0), 6, 6)
+predprey!(du, u, p, t) = begin
+    du[1] = p.r * u[1] - p.g(u[1], u[2])
+    du[2] = p.e * p.g(u[1], u[2]) - p.m * u[2]
+end
+```
+
+Note: `confidence_band` and the bootstrap unknown-function bands are
+univariate and do not support tensor surfaces.
+"""
+struct TensorBSplineApproximator <: AbstractApproximator
+    name::Symbol
+    domain_x::Tuple{Float64, Float64}
+    domain_y::Tuple{Float64, Float64}
+    nknots_x::Int
+    nknots_y::Int
+    anisotropy::Float64
+    initial_func::Function
+end
+
+function TensorBSplineApproximator(name::Union{Symbol,String},
+                                   domain_x::Tuple{Real,Real},
+                                   domain_y::Tuple{Real,Real},
+                                   nknots_x::Int,
+                                   nknots_y::Int;
+                                   anisotropy::Real=1.0,
+                                   initial=nothing)
+    name = Symbol(name)
+    dx = (Float64(domain_x[1]), Float64(domain_x[2]))
+    dy = (Float64(domain_y[1]), Float64(domain_y[2]))
+    _validate_domain("TensorBSplineApproximator (x margin)", dx)
+    _validate_domain("TensorBSplineApproximator (y margin)", dy)
+    # Same floor as BSplineApproximator: cubic spline interpolation along
+    # each margin needs at least 3 knots.
+    nknots_x >= 3 || throw(ArgumentError(
+        "TensorBSplineApproximator needs nknots_x ≥ 3 for cubic spline " *
+        "interpolation (got $nknots_x)"))
+    nknots_y >= 3 || throw(ArgumentError(
+        "TensorBSplineApproximator needs nknots_y ≥ 3 for cubic spline " *
+        "interpolation (got $nknots_y)"))
+    aniso = Float64(anisotropy)
+    (isfinite(aniso) && aniso > 0.0) || throw(ArgumentError(
+        "TensorBSplineApproximator: anisotropy must be positive and finite, " *
+        "got $anisotropy"))
+    init_func = if initial === nothing
+        (x, y) -> 0.0
+    elseif initial isa Function
+        initial
+    else
+        (x, y) -> Float64(initial)
+    end
+    TensorBSplineApproximator(name, dx, dy, nknots_x, nknots_y, aniso,
+                              init_func)
+end
+
+nparams(a::TensorBSplineApproximator) = a.nknots_x * a.nknots_y
+
+function initial_params(a::TensorBSplineApproximator)
+    xs = range(a.domain_x[1], a.domain_x[2], length=a.nknots_x)
+    ys = range(a.domain_y[1], a.domain_y[2], length=a.nknots_y)
+    # Column-major vec of the (nknots_x × nknots_y) value grid — x index
+    # fastest, matching build_tensor_bspline_evaluator's reshape.
+    vec(Float64[a.initial_func(x, y) for x in xs, y in ys])
+end
+
+"""
     NeuralApproximator(name, model; penalty_weight=0.0, domain=nothing)
 
 Neural network approximator using a Lux.jl model.
@@ -184,50 +285,40 @@ mutable struct GPApproximator <: AbstractApproximator
     const adapt::Bool
 end
 
-function GPApproximator(name::Union{Symbol,String},
-                        domain::Tuple{<:Real, <:Real},
-                        n_inducing::Int;
-                        kernel::Symbol=:sqexp,
-                        lengthscale::Union{Nothing, Real}=nothing,
-                        variance::Real=1.0,
-                        initial=nothing)
-    name_s = Symbol(name)
-    d = (Float64(domain[1]), Float64(domain[2]))
-    _validate_domain("GPApproximator", d)
-    σ² = Float64(variance)
-    ℓ = if lengthscale === nothing
-        # Default lengthscale: normalize so adjacent inducing points have
-        # similar correlation (~0.6) regardless of kernel type.
-        # SqExp at h gives exp(-0.5) ≈ 0.607; Matérn kernels need longer ℓ
-        # to achieve the same correlation due to their heavier tails.
-        h = Float64((d[2] - d[1]) / max(n_inducing - 1, 1))
-        if kernel == :matern32
-            2.0 * h     # (1+√3·h/(2h))·exp(-√3·h/(2h)) ≈ 0.60
-        elseif kernel == :matern52
-            1.9 * h     # (1+√5·h/(1.9h)+5/(3·1.9²))·exp(-√5·h/(1.9h)) ≈ 0.61
-        else
-            h           # SqExp: exp(-0.5) ≈ 0.607
-        end
+"""
+    _gp_default_lengthscale(kernel, d, n_inducing) -> Float64
+
+Default lengthscale: normalize so adjacent inducing points have similar
+correlation (~0.6) regardless of kernel type. SqExp at h gives
+exp(-0.5) ≈ 0.607; Matérn kernels need longer ℓ to achieve the same
+correlation due to their heavier tails.
+"""
+function _gp_default_lengthscale(kernel::Symbol, d::Tuple{Float64, Float64},
+                                 n_inducing::Int)
+    h = Float64((d[2] - d[1]) / max(n_inducing - 1, 1))
+    if kernel == :matern32
+        2.0 * h     # (1+√3·h/(2h))·exp(-√3·h/(2h)) ≈ 0.60
+    elseif kernel == :matern52
+        1.9 * h     # (1+√5·h/(1.9h)+5/(3·1.9²))·exp(-√5·h/(1.9h)) ≈ 0.61
     else
-        Float64(lengthscale)
+        h           # SqExp: exp(-0.5) ≈ 0.607
     end
+end
 
-    # Kernel function
+"""
+    _gp_kernel_matrices(kernel, ℓ, σ², x_ind) -> (K, K_inv)
+
+Build the inducing-point kernel matrix and its (jittered, symmetrized)
+inverse. Factor with scaled jitter: squared-exponential Gram matrices are
+notoriously ill-conditioned as n_inducing grows; a fixed 1e-8 jitter plus
+explicit inv() produced large oscillatory weights K⁻¹f between inducing
+points. Scale the jitter to the kernel magnitude and escalate until the
+Cholesky succeeds.
+"""
+function _gp_kernel_matrices(kernel::Symbol, ℓ::Float64, σ²::Float64,
+                             x_ind::Vector{Float64})
     kfunc = _kernel_func(kernel, ℓ, σ²)
-
-    # Inducing points uniformly spaced in domain
-    n_inducing >= 2 ||
-        throw(ArgumentError("GPApproximator needs n_inducing ≥ 2 (got $n_inducing)"))
-    x_ind = collect(range(d[1], d[2], length=n_inducing))
-
-    # Build kernel matrix
     K = _build_kernel_matrix(kfunc, x_ind)
-
-    # Factor with scaled jitter. Squared-exponential Gram matrices are
-    # notoriously ill-conditioned as n_inducing grows; a fixed 1e-8 jitter
-    # plus explicit inv() produced large oscillatory weights K⁻¹f between
-    # inducing points. Scale the jitter to the kernel magnitude and escalate
-    # until the Cholesky succeeds.
     scale = max(maximum(abs, K), 1.0)
     K_inv = nothing
     for jit in (1e-8, 1e-6, 1e-4)
@@ -239,6 +330,30 @@ function GPApproximator(name::Union{Symbol,String},
     end
     K_inv === nothing && (K_inv = pinv(K + 1e-4 * scale * I))
     K_inv = 0.5 * (K_inv + K_inv')  # symmetrize
+    K, K_inv
+end
+
+function GPApproximator(name::Union{Symbol,String},
+                        domain::Tuple{<:Real, <:Real},
+                        n_inducing::Int;
+                        kernel::Symbol=:sqexp,
+                        lengthscale::Union{Nothing, Real}=nothing,
+                        variance::Real=1.0,
+                        initial=nothing)
+    name_s = Symbol(name)
+    d = (Float64(domain[1]), Float64(domain[2]))
+    _validate_domain("GPApproximator", d)
+    σ² = Float64(variance)
+    ℓ = lengthscale === nothing ? _gp_default_lengthscale(kernel, d, n_inducing) :
+        Float64(lengthscale)
+
+    # Inducing points uniformly spaced in domain
+    n_inducing >= 2 ||
+        throw(ArgumentError("GPApproximator needs n_inducing ≥ 2 (got $n_inducing)"))
+    x_ind = collect(range(d[1], d[2], length=n_inducing))
+
+    # Kernel matrix and jittered inverse
+    K, K_inv = _gp_kernel_matrices(kernel, ℓ, σ², x_ind)
 
     init_func = if initial === nothing
         x -> 0.0
@@ -636,6 +751,136 @@ function initial_params(a::ShapeConstrainedBSplineApproximator)
             for i in eachindex(d)]
 end
 
+# ─── Shape-constrained GP approximator ────────────────────────────
+
+"""
+    ShapeConstrainedGPApproximator(name, domain, n_inducing, constraint;
+                                   kernel=:sqexp, lengthscale=nothing,
+                                   variance=1.0, initial=nothing)
+
+Kernel-interpolation (GP predictive-mean) approximator with a shape
+constraint enforced via the SCOP-spline reparameterization of Pya & Wood
+(2015) — the same construction used by `ShapeConstrainedBSplineApproximator`
+and `ShapeConstrainedSPDEApproximator`.
+
+Parameters are stored in unconstrained space (γ). During evaluation the
+inducing-point values are computed as `β = Σ * d(γ)` (free level/slope
+components pass through linearly; the rest are softplus'd), then
+interpolated with the GP predictive-mean formula `k(x,X)K⁻¹β` exactly as
+`GPApproximator` does. Because the constraint holds by construction in γ,
+every solver fits this approximator through the ordinary `build_evaluator`
+protocol with no constraint handling of its own.
+
+**Note:** shape constraints are enforced at the inducing-point values. The
+kernel interpolation between points can slightly overshoot (as the cubic
+interpolation of `ShapeConstrainedSPDEApproximator` can), so constraints
+hold approximately (not exactly) between points. Use more inducing points
+to reduce overshoot.
+
+Kernel hyperparameters follow `GPApproximator`: `lengthscale=nothing`
+(default) starts at the spacing-matched default and is re-estimated by
+empirical Bayes during LAML (post-warmup) and GCV fits — applied to the
+IMPLIED inducing values `β = Σ·d(γ)`, which a kernel change does not move —
+while an explicit `lengthscale` is fixed for the whole fit.
+
+The LAML/GCV penalty is the Pya & Wood (2015) SCOP first-difference penalty
+on γ, matching `penalty_matrix(::ShapeConstrainedBSplineApproximator)`: the
+free level (and the slope-like component for curvature constraints) lies in
+the penalty null space, so λ→∞ shrinks toward a maximally smooth member of
+the constraint family without biasing the level.
+
+# Arguments
+- `name`: symbol for the unknown function
+- `domain`: `(lo, hi)` range of the input variable
+- `n_inducing`: number of inducing points (≥ 4)
+- `constraint`: one of `SHAPE_CONSTRAINTS`
+- `kernel`: kernel type — `:sqexp` (default), `:matern32`, or `:matern52`
+- `lengthscale`: kernel lengthscale (`nothing` = adaptive, as above)
+- `variance`: signal variance σ² (default: 1.0)
+- `initial`: optional initial function `x -> y` or constant
+
+# Example
+```julia
+# Monotone increasing predation (functional) response
+approx = ShapeConstrainedGPApproximator(:g, (0.0, 5.0), 10, :increasing;
+    initial=x -> 0.1*x)
+```
+"""
+mutable struct ShapeConstrainedGPApproximator <: AbstractApproximator
+    # Mutable for the same reason as GPApproximator: the fit loop adapts
+    # (lengthscale, variance) — and the derived K/K_inv — by empirical Bayes
+    # on the implied inducing values β = Σ·d(γ) when the user did not supply
+    # a lengthscale. A kernel change moves only the between-point behavior;
+    # the interpolant still passes through β (up to the K⁻¹ jitter,
+    # ~1e-8 relative). Bootstrap replicates deepcopy
+    # the approximators to avoid races.
+    const name::Symbol
+    const domain::Tuple{Float64, Float64}
+    const n_inducing::Int
+    const inducing_points::Vector{Float64}
+    const kernel::Symbol
+    lengthscale::Float64
+    variance::Float64
+    const constraint::Symbol
+    const Sigma::Matrix{Float64}
+    const initial_func::Function
+    K::Matrix{Float64}        # kernel matrix at inducing points
+    K_inv::Matrix{Float64}    # inverse kernel matrix
+    const adapt::Bool
+end
+
+function ShapeConstrainedGPApproximator(name::Union{Symbol,String},
+                                        domain::Tuple{<:Real, <:Real},
+                                        n_inducing::Int,
+                                        constraint::Symbol;
+                                        kernel::Symbol=:sqexp,
+                                        lengthscale::Union{Nothing, Real}=nothing,
+                                        variance::Real=1.0,
+                                        initial=nothing)
+    name_s = Symbol(name)
+    d = (Float64(domain[1]), Float64(domain[2]))
+    _validate_domain("ShapeConstrainedGPApproximator", d)
+    constraint in SHAPE_CONSTRAINTS || throw(ArgumentError(
+        "Unknown constraint :$constraint. Must be one of $SHAPE_CONSTRAINTS"))
+    n_inducing >= 4 || throw(ArgumentError(
+        "ShapeConstrainedGPApproximator needs n_inducing ≥ 4 (got $n_inducing)"))
+    σ² = Float64(variance)
+    ℓ = lengthscale === nothing ? _gp_default_lengthscale(kernel, d, n_inducing) :
+        Float64(lengthscale)
+
+    x_ind = collect(range(d[1], d[2], length=n_inducing))
+    K, K_inv = _gp_kernel_matrices(kernel, ℓ, σ², x_ind)
+    Sig = _build_sigma_matrix(constraint, n_inducing)
+
+    init_func = if initial === nothing
+        x -> 0.0
+    elseif initial isa Function
+        initial
+    else
+        x -> Float64(initial)
+    end
+
+    ShapeConstrainedGPApproximator(name_s, d, n_inducing, x_ind, kernel, ℓ, σ²,
+                                   constraint, Sig, init_func, K, K_inv,
+                                   lengthscale === nothing)
+end
+
+function nparams(a::ShapeConstrainedGPApproximator)
+    a.constraint in _ZERO_ENDPOINT_CONSTRAINTS ? a.n_inducing - 1 : a.n_inducing
+end
+
+function initial_params(a::ShapeConstrainedGPApproximator)
+    beta_target = Float64[a.initial_func(x) for x in a.inducing_points]
+    d = a.Sigma \ beta_target
+    lin = _linear_param_indices(a.constraint)
+    # Free (linear) components pass through; nonnegative ones get a small
+    # positive floor (large floors visibly distorted flat initial functions
+    # into ramps) and are inverted through softplus.
+    return [i in lin ? d[i] :
+            (v = max(d[i], 1e-4); v > 20.0 ? v : log(exp(v) - 1.0))
+            for i in eachindex(d)]
+end
+
 # ─── COMONet shape-constrained neural network approximator ────────
 
 """
@@ -859,7 +1104,7 @@ end
 
 """
     LAML(; maxiters=100, tol=1e-6, verbose=false, initial_lambda=nothing,
-           warmup=3, sigma2_init=nothing)
+           warmup=3, sigma2_init=nothing, criterion=:working, jac=:fd)
 
 Laplace Approximate Marginal Likelihood algorithm.
 Equivalent to REML for Gaussian data.
@@ -885,14 +1130,63 @@ Uses Fellner-Schall + Newton for smoothing parameter estimation.
   residual variance from an early poor fit from driving oversmoothing.  After
   the warmup phase the cap is progressively relaxed.  Set to a value reflecting
   your prior belief about observation noise variance (e.g. `sigma2_init=25.0`
-  for ±5 measurement error).
+  for ±5 measurement error).  With `criterion=:laplace` and a count family,
+  a cap below 1 transiently scales the warmup FS update below the unit
+  dispersion the Newton phase optimizes — leave `sigma2_init` unset (or ≥ 1)
+  there; it is a Gaussian-noise prior, not a count-model control.
+- `criterion::Symbol=:working`: smoothing-parameter selection criterion for
+  **non-Gaussian** likelihoods.
+  - `:working` (default, previous behavior): PQL-flavored selection — the
+    Fellner-Schall update is calibrated by the Pearson dispersion φ̂ of the
+    working model (floored at 1), and the Newton refinement of the marginal
+    likelihood is skipped.
+  - `:laplace`: the true Laplace-approximate marginal likelihood of the actual
+    family (Wood 2011; Wood, Pya & Säfken 2016). At the penalized MLE β̂_λ the
+    criterion is `ℓ(β̂) − ½β̂'S_λβ̂ + ½log|S_λ|₊ − ½log|H + S_λ| + (Mp/2)log 2π`
+    with `H = J'W̃J` the GLM-style **expected** (Fisher) Hessian at the fitted
+    mean, and it is optimized by the generalized Fellner-Schall update of
+    Wood & Fasiolo (2017) — i.e. FS with the family working weights and **unit
+    dispersion** — followed by Newton refinement of the same criterion.
+    Prefer `:laplace` for genuinely non-Gaussian data, especially counts with
+    low means (Poisson μ ≲ 10), where the Gaussian working approximation
+    behind `:working` is at its worst. Dispersion caveats: the criterion
+    assumes the family's dispersion is FIXED — exact for `Poisson`, and
+    conditional on the supplied `theta` for `NegativeBinomial` and on
+    (`lower`, `sigma`) for `TruncatedNormal` (these are NOT re-estimated;
+    a misspecified fixed dispersion biases λ̂). `CustomLikelihood` is
+    rejected with an error: its `loglik_scalar` may be an unnormalized
+    kernel with no declared dispersion, so the criterion value and its FS
+    calibration would be off by unknown amounts — use `:working` there.
+    For `Gaussian` likelihoods `:laplace` reduces exactly to the current
+    profiled-REML criterion (identical code path), so results are identical
+    to `:working`.
+- `jac::Symbol=:fd`: backend for the working-model Jacobian of the
+  predictions w.r.t. the coefficients (`compute_jacobian!`).
+  - `:fd` (default, historical behavior, byte-identical): adaptive central
+    finite differences — 2·n_p full model solves per IRLS iteration, with
+    truncation + integration-noise error in each column.
+  - `:forwarddiff`: forward-mode AD (`ForwardDiff.jacobian`) straight
+    through the ODE/map/DDE solve — exact to solver precision and cheaper
+    (n_p/chunk Dual solves instead of 2·n_p). The chunked configuration is
+    built once per solve. If the Dual-valued solve fails numerically or
+    returns non-finite entries, that iteration falls back to the `:fd`
+    path (with a `@debug` note) rather than erroring — mirroring the FD
+    path's own per-column degradation. Works for continuous ODEs (in-place
+    and out-of-place dynamics), discrete maps, `u0`-as-function problems,
+    and DDEs (`MethodOfSteps` is Dual-safe; a failure there also lands on
+    the per-iteration FD fallback). Requires the dynamics and any custom
+    evaluators to be eltype-generic (all built-in approximators are).
 
 # Convergence info
 `sol.convergence` is a NamedTuple `(V_beta, sigma2, converged, iterations,
-reason, laml_failures)`: the posterior covariance and σ̂² used by
-[`confidence_band`](@ref), plus the standard honest-convergence keys (see
-[`PSMSolution`](@ref)) and `laml_failures::Int`, the number of iterations in
-which the LAML smoothing-parameter update failed and θ was kept.
+reason, laml_failures, criterion, laml)`: the posterior covariance and σ̂² used
+by [`confidence_band`](@ref), plus the standard honest-convergence keys (see
+[`PSMSolution`](@ref)), `laml_failures::Int` (the number of iterations in
+which the LAML smoothing-parameter update failed and θ was kept),
+`criterion::Symbol` (which selection criterion ran), and `laml::Float64` (the
+LAML criterion value V at the returned fit — profiled REML for Gaussian, the
+full Laplace criterion above for other families; a MAXIMIZED quantity, `NaN`
+when no penalized term exists or the evaluation fails).
 """
 struct LAML
     maxiters::Int
@@ -901,13 +1195,32 @@ struct LAML
     initial_lambda::Union{Nothing,Float64}
     warmup::Int
     sigma2_init::Union{Nothing,Float64}
+    criterion::Symbol
+    jac::Symbol
 end
 
-LAML(; maxiters::Int=100, tol::Float64=1e-6, verbose::Bool=false,
-       initial_lambda::Union{Nothing,Float64}=nothing,
-       warmup::Int=3,
-       sigma2_init::Union{Nothing,Float64}=nothing) =
-    LAML(maxiters, tol, verbose, initial_lambda, warmup, sigma2_init)
+function LAML(; maxiters::Int=100, tol::Float64=1e-6, verbose::Bool=false,
+                initial_lambda::Union{Nothing,Float64}=nothing,
+                warmup::Int=3,
+                sigma2_init::Union{Nothing,Float64}=nothing,
+                criterion::Symbol=:working,
+                jac::Symbol=:fd)
+    criterion in (:working, :laplace) ||
+        throw(ArgumentError("LAML: criterion must be :working or :laplace " *
+                            "(got $(repr(criterion)))"))
+    jac in (:fd, :forwarddiff) ||
+        throw(ArgumentError("LAML: jac must be :fd or :forwarddiff " *
+                            "(got $(repr(jac)))"))
+    LAML(maxiters, tol, verbose, initial_lambda, warmup, sigma2_init,
+         criterion, jac)
+end
+
+# Backward-compatible positional constructor (pre-jac arity).
+LAML(maxiters::Int, tol::Float64, verbose::Bool,
+     initial_lambda::Union{Nothing,Float64}, warmup::Int,
+     sigma2_init::Union{Nothing,Float64}, criterion::Symbol) =
+    LAML(maxiters, tol, verbose, initial_lambda, warmup, sigma2_init,
+         criterion, :fd)
 
 """
     CollocationLAML(; kwargs...)
@@ -934,6 +1247,26 @@ changes.  See Fasiolo, Pya & Wood (2016), Statistical Science 31(1).
 - `lambda_ode_end::Float64=1e4`: final ODE compliance penalty
 - `n_continuation::Int=8`: number of log-spaced continuation levels
 - `sigma2_init::Union{Nothing,Float64}=nothing`: σ² cap for Fellner-Schall
+- `jac::Symbol=:fd`: backend for the differentiated parts of the
+  collocation Jacobian — the pointwise state Jacobian ∂F/∂x, the
+  coefficient block ∂F/∂β, and the Fellner–Schall EDF Jacobian of the
+  simulated predictions.
+  - `:fd` (default, historical behavior, byte-identical): finite
+    differences.
+  - `:forwarddiff`: forward-mode AD. The failure-sentinel convention is
+    preserved EXACTLY (see the comment block in `collocation_solver.jl`):
+    the residual at a failed collocation point still holds the large
+    `_COLLOC_FAIL_SENTINEL`, the sentinel value itself is NEVER part of
+    the differentiated computation (failed points are skipped inside the
+    Dual sweep), and the Jacobian rows/columns at failed points are forced
+    to zero exactly as the FD path forces them — large residual, zero
+    Jacobian. If a Dual-valued sweep fails outright it falls back to the
+    FD path for that evaluation (`@debug` note). One behavioral nuance,
+    strictly an improvement: at a point whose BASE evaluation succeeds,
+    forward mode returns the exact derivative and never perturbs the
+    state, so FD's defensive zero column for "perturbation crossed a
+    domain boundary" cannot arise (that zero existed only to protect FD
+    from its own perturbation).
 
 !!! note "ODE problems only"
     DDE problems are REJECTED with an error. The collocation objective
@@ -956,14 +1289,30 @@ struct CollocationLAML
     lambda_ode_end::Float64
     n_continuation::Int
     sigma2_init::Union{Nothing,Float64}
+    jac::Symbol
 end
 
-CollocationLAML(; maxiters::Int=50, tol::Float64=1e-6, verbose::Bool=false,
-                  lambda_ode_start::Float64=0.01, lambda_ode_end::Float64=1e4,
-                  n_continuation::Int=8,
-                  sigma2_init::Union{Nothing,Float64}=nothing) =
+function CollocationLAML(; maxiters::Int=50, tol::Float64=1e-6,
+                           verbose::Bool=false,
+                           lambda_ode_start::Float64=0.01,
+                           lambda_ode_end::Float64=1e4,
+                           n_continuation::Int=8,
+                           sigma2_init::Union{Nothing,Float64}=nothing,
+                           jac::Symbol=:fd)
+    jac in (:fd, :forwarddiff) ||
+        throw(ArgumentError("CollocationLAML: jac must be :fd or " *
+                            ":forwarddiff (got $(repr(jac)))"))
     CollocationLAML(maxiters, tol, verbose, lambda_ode_start, lambda_ode_end,
-                    n_continuation, sigma2_init)
+                    n_continuation, sigma2_init, jac)
+end
+
+# Backward-compatible positional constructor (pre-jac arity).
+CollocationLAML(maxiters::Int, tol::Float64, verbose::Bool,
+                lambda_ode_start::Float64, lambda_ode_end::Float64,
+                n_continuation::Int,
+                sigma2_init::Union{Nothing,Float64}) =
+    CollocationLAML(maxiters, tol, verbose, lambda_ode_start, lambda_ode_end,
+                    n_continuation, sigma2_init, :fd)
 
 """
     GradientMatching(; maxiters=500, tol=1e-6, verbose=false, sigma2_init=nothing)
@@ -1010,7 +1359,7 @@ GradientMatching(; maxiters::Int=500, tol::Float64=1e-6, verbose::Bool=false,
 
 """
     AdamSolver(; maxiters=300, lr=0.01, verbose=false, loss=:auto,
-                 penalty_weight=0.0, autodiff=true)
+                 penalty_weight=0.0, autodiff=true, sensealg=nothing)
 
 Adam optimizer that trains unknown function parameters through ODE integration.
 
@@ -1038,16 +1387,33 @@ quadratic roughness penalty `penalty_weight · Σₖ βₖ' Sₖ βₖ` to the l
   warning on mismatch.
 - `penalty_weight::Float64=0.0`: fixed weight of the quadratic smoothing
   penalty added to the loss (0 disables)
-- `autodiff::Bool=true`: use ForwardDiff (true) or finite differences (false)
+- `autodiff::Bool=true`: use ForwardDiff (true) or finite differences (false);
+  ignored when `sensealg` is set
+- `sensealg=nothing`: opt-in adjoint-sensitivity gradient backend. `nothing`
+  (default) keeps the ForwardDiff path. Set to `:auto` (a robust default,
+  `InterpolatingAdjoint(autojacvec=ReverseDiffVJP(false))`) or to a concrete
+  SciMLSensitivity continuous adjoint algorithm (`InterpolatingAdjoint(...)`
+  is the validated choice; `GaussAdjoint`/`QuadratureAdjoint` were observed
+  to mis-differentiate spline-parameterized dynamics — validate against
+  ForwardDiff before trusting them) to compute gradients via adjoint
+  sensitivities instead. **Requires `using SciMLSensitivity`**
+  (the package extension implements this path; without it, `solve` throws an
+  informative error). Adjoints make the gradient cost roughly independent of
+  the parameter count, which pays off for `NeuralApproximator` models with
+  many weights; ForwardDiff is usually faster below a few dozen parameters.
+  Only continuous ODE problems are supported (no discrete maps, no DDEs);
+  the loss families are the same as the ForwardDiff path (`:mse`,
+  `:poisson`).
 
 # Convergence info
 `sol.convergence` is a NamedTuple `(optimizer, method, converged, iterations,
-reason, final_grad_norm)` with the standard honest-convergence keys (see
-[`PSMSolution`](@ref)) plus `final_grad_norm::Float64`, the Euclidean norm of
-the last computed gradient. `reason == :plateau` is only reported while the
-cosine-annealed learning rate is still above 5% of the base `lr` — a plateau
-that appears merely because the schedule has driven the step size to zero is
-reported as `:maxiters`, not convergence.
+reason, final_grad_norm, backend)` with the standard honest-convergence keys
+(see [`PSMSolution`](@ref)) plus `final_grad_norm::Float64`, the Euclidean
+norm of the last computed gradient, and `backend`, the gradient backend that
+ran (`:forwarddiff`, `:finitediff`, or `:adjoint`). `reason == :plateau` is
+only reported while the cosine-annealed learning rate is still above 5% of
+the base `lr` — a plateau that appears merely because the schedule has driven
+the step size to zero is reported as `:maxiters`, not convergence.
 """
 struct AdamSolver
     maxiters::Int
@@ -1056,12 +1422,18 @@ struct AdamSolver
     loss::Symbol
     penalty_weight::Float64
     autodiff::Bool
+    sensealg::Any
 end
 
 AdamSolver(; maxiters::Int=300, lr::Float64=0.01, verbose::Bool=false,
              loss::Symbol=:auto, penalty_weight::Float64=0.0,
-             autodiff::Bool=true) =
-    AdamSolver(maxiters, lr, verbose, loss, penalty_weight, autodiff)
+             autodiff::Bool=true, sensealg=nothing) =
+    AdamSolver(maxiters, lr, verbose, loss, penalty_weight, autodiff, sensealg)
+
+# Backward-compatible positional constructor (pre-sensealg arity).
+AdamSolver(maxiters::Int, lr::Float64, verbose::Bool, loss::Symbol,
+           penalty_weight::Float64, autodiff::Bool) =
+    AdamSolver(maxiters, lr, verbose, loss, penalty_weight, autodiff, nothing)
 
 """
     MultipleShootingSolver(; n_intervals=10, maxiters_inner=100, maxiters_outer=20,
@@ -1208,6 +1580,11 @@ approximate the ODE solution and compute an approximate marginal likelihood.
 - `obs_var`: observation noise variance (or nothing for auto)
 - `method`: likelihood approximation (`:basic` or `:fenrir`)
 - `interrogate`: interrogation method (`:kramer` or `:schober`)
+- `sqrt_filter`: run the Kalman recursions in square-root (Cholesky/QR)
+  form (default: false). Numerically stabler at high `n_deriv` and small
+  steps, where the standard covariance recursion can lose
+  positive-semidefiniteness; with `false` the standard covariance
+  recursion is used unchanged.
 - `maxiters`: max L-BFGS iterations (default: 200)
 - `verbose`: print progress (default: false)
 """
@@ -1220,6 +1597,7 @@ struct RodeoSolver
     interrogate::Symbol
     maxiters::Int
     verbose::Bool
+    sqrt_filter::Bool
 end
 
 function RodeoSolver(; n_steps::Int=200, n_deriv::Int=3,
@@ -1227,7 +1605,8 @@ function RodeoSolver(; n_steps::Int=200, n_deriv::Int=3,
                        obs_var::Union{Nothing, Float64}=nothing,
                        method::Symbol=:basic,
                        interrogate::Symbol=:kramer,
-                       maxiters::Int=200, verbose::Bool=false)
+                       maxiters::Int=200, verbose::Bool=false,
+                       sqrt_filter::Bool=false)
     method in (:basic, :fenrir) ||
         throw(ArgumentError("RodeoSolver: method must be :basic or :fenrir " *
                             "(got :$method)"))
@@ -1238,12 +1617,14 @@ function RodeoSolver(; n_steps::Int=200, n_deriv::Int=3,
     # n_deriv=1 BoundsErrors inside the Kalman filter selectors.
     n_deriv >= 2 ||
         throw(ArgumentError("RodeoSolver: n_deriv must be ≥ 2 (got $n_deriv)"))
-    RodeoSolver(n_steps, n_deriv, sigma, obs_var, method, interrogate, maxiters, verbose)
+    RodeoSolver(n_steps, n_deriv, sigma, obs_var, method, interrogate, maxiters,
+                verbose, sqrt_filter)
 end
 
 """
     MCMCSolver(; n_samples=1000, n_warmup=500, n_chains=1, target_accept=0.8,
-                 prior_scale=1.0, obs_sigma=nothing, sample_smoothing=false, verbose=false)
+                 prior_scale=1.0, obs_sigma=nothing, sample_smoothing=false,
+                 rng_seed=nothing, verbose=false)
 
 Full Bayesian inference via Hamiltonian Monte Carlo (NUTS).
 Uses LogDensityProblems.jl + AdvancedHMC.jl.
@@ -1262,6 +1643,9 @@ Uses LogDensityProblems.jl + AdvancedHMC.jl.
 - `sample_smoothing`: if `true`, jointly sample log(λ) for each smooth term
   with a weakly informative N(log(λ_init), 2²) hyperprior. This gives wider,
   more honest credible intervals for the unknown functions. Default: `false`.
+- `rng_seed`: seed for the sampler's own RNG stream (default `nothing` =
+  non-reproducible). Matches the `rng_seed` convention of
+  `AdaptiveGradientMatching`/`BNGSolver`; does not touch the global RNG.
 - `verbose`: print progress
 """
 struct MCMCSolver
@@ -1272,6 +1656,7 @@ struct MCMCSolver
     prior_scale::Float64
     obs_sigma::Union{Nothing, Float64}
     sample_smoothing::Bool
+    rng_seed::Union{Nothing, Int}
     verbose::Bool
 end
 
@@ -1279,9 +1664,10 @@ MCMCSolver(; n_samples::Int=1000, n_warmup::Int=500, n_chains::Int=1,
              target_accept::Float64=0.8, prior_scale::Float64=1.0,
              obs_sigma::Union{Nothing, Float64}=nothing,
              sample_smoothing::Bool=false,
+             rng_seed::Union{Nothing, Int}=nothing,
              verbose::Bool=false) =
     MCMCSolver(n_samples, n_warmup, n_chains, target_accept, prior_scale,
-               obs_sigma, sample_smoothing, verbose)
+               obs_sigma, sample_smoothing, rng_seed, verbose)
 
 """
     MagiSolver(; n_samples=1000, n_warmup=500, n_gridpoints=200,
@@ -1441,6 +1827,11 @@ filter passes — one joint (ODE + observations) and one marginal (ODE only).
   note a fixed value must be chosen relative to the data scale — a value
   appropriate for data of order 1 badly misfits data of order 1000.
 - `interrogate`: interrogation method `:kramer` or `:schober` (default `:kramer`)
+- `sqrt_filter`: run both DALTON Kalman passes in square-root
+  (Cholesky/QR) form (default: false). Numerically stabler at high
+  `n_deriv` and small steps; the quasi-MLE diffusion calibration is
+  computed from mathematically equivalent quantities. With `false` the
+  standard covariance recursion is used unchanged.
 - `maxiters`: optimization iterations (default 200)
 - `verbose`: print progress
 """
@@ -1452,20 +1843,23 @@ struct DaltonSolver
     interrogate::Symbol
     maxiters::Int
     verbose::Bool
+    sqrt_filter::Bool
 end
 
 function DaltonSolver(; n_steps::Int=200, n_deriv::Int=3,
                         sigma::Union{Nothing, Vector{Float64}}=nothing,
                         obs_var::Union{Nothing, Float64}=nothing,
                         interrogate::Symbol=:kramer,
-                        maxiters::Int=200, verbose::Bool=false)
+                        maxiters::Int=200, verbose::Bool=false,
+                        sqrt_filter::Bool=false)
     interrogate in (:kramer, :schober) ||
         throw(ArgumentError("DaltonSolver: interrogate must be :kramer or " *
                             ":schober (got :$interrogate)"))
     # See RodeoSolver: n_deriv=1 BoundsErrors in the Kalman selectors.
     n_deriv >= 2 ||
         throw(ArgumentError("DaltonSolver: n_deriv must be ≥ 2 (got $n_deriv)"))
-    DaltonSolver(n_steps, n_deriv, sigma, obs_var, interrogate, maxiters, verbose)
+    DaltonSolver(n_steps, n_deriv, sigma, obs_var, interrogate, maxiters,
+                 verbose, sqrt_filter)
 end
 
 # ─── Pseudo-marginal solver (Chkrebtii et al. 2016) ───────────────
@@ -1499,6 +1893,16 @@ adaptive random-walk Metropolis (the proposal scale is tuned toward
   (deterministic Fenrir evidence; the chain is then plain adaptive RWM on
   an approximate likelihood), or `:dalton` (deterministic DALTON
   data-adaptive likelihood, likewise plain RWM)
+- `rng_seed`: seed for the chain's own RNG stream (default `nothing` =
+  non-reproducible). Matches the `rng_seed` convention of
+  `AdaptiveGradientMatching`/`BNGSolver`; does not touch the global RNG.
+- `sqrt_filter`: run the inner probabilistic-ODE Kalman recursions in
+  square-root (Cholesky/QR) form (default: false). Numerically stabler
+  at high `n_deriv` and small steps. Supported by all three
+  `inner_method`s — under `:ffbs` the backward draws use the
+  PSD-by-construction covariance factors, so the jitter escalation of
+  the standard sampler is never needed. With `false` the standard
+  covariance recursion is used unchanged.
 - `verbose`: print progress
 """
 struct PseudoMarginalSolver
@@ -1512,7 +1916,9 @@ struct PseudoMarginalSolver
     prior_scale::Float64
     inner_method::Symbol
     initial_params::Union{Nothing, Vector{Float64}}
+    rng_seed::Union{Nothing, Int}
     verbose::Bool
+    sqrt_filter::Bool
 end
 
 function PseudoMarginalSolver(; n_samples::Int=1000, n_warmup::Int=500,
@@ -1522,14 +1928,16 @@ function PseudoMarginalSolver(; n_samples::Int=1000, n_warmup::Int=500,
                                 target_accept::Float64=0.8, prior_scale::Float64=1.0,
                                 inner_method::Symbol=:ffbs,
                                 initial_params::Union{Nothing, Vector{Float64}}=nothing,
-                                verbose::Bool=false)
+                                rng_seed::Union{Nothing, Int}=nothing,
+                                verbose::Bool=false,
+                                sqrt_filter::Bool=false)
     # See RodeoSolver: n_deriv=1 BoundsErrors in the Kalman selectors.
     n_deriv >= 2 ||
         throw(ArgumentError("PseudoMarginalSolver: n_deriv must be ≥ 2 " *
                             "(got $n_deriv)"))
     PseudoMarginalSolver(n_samples, n_warmup, n_steps, n_deriv, sigma, obs_var,
                           target_accept, prior_scale, inner_method,
-                          initial_params, verbose)
+                          initial_params, rng_seed, verbose, sqrt_filter)
 end
 
 # ─── GCV solver (Wood 2001 / ddefit504) ────────────────────────────
@@ -1537,11 +1945,19 @@ end
 """
     GCVSolver
 
-Generalized Cross-Validation solver for smoothing parameter selection.
+Cross-validation solver for smoothing parameter selection.
 
 Uses GCV score minimization (via golden-section search on log(λ)) as an
 alternative to LAML/REML. Simpler and faster than LAML, but typically
-produces slightly less smooth estimates.
+produces slightly less smooth estimates. With `criterion=:ncv` the GCV
+score is replaced by neighbourhood cross-validation (NCV; Wood 2024,
+arXiv:2404.16490): each point is predicted from a penalized fit that
+omits a temporal *neighbourhood* around it, not just the point itself.
+Because dynamical-systems residuals are typically short-range
+autocorrelated, ordinary GCV/LOOCV sees the correlated neighbours make
+the left-out point look predictable and undersmooths badly; NCV removes
+exactly those neighbours and is the recommended criterion whenever
+residual autocorrelation is suspected (check `residual_diagnostics`).
 
 # Fields
 - `n_grid`: number of grid points for initial λ search (default 50)
@@ -1549,25 +1965,106 @@ produces slightly less smooth estimates.
 - `tol`: convergence tolerance (default 1e-6)
 - `gamma`: GCV inflation factor (default 1.4, >1 guards against
   under-smoothing; `gamma=1.0` reproduces the classical unmodified GCV of
-  Wood (2001) / ddefit)
+  Wood (2001) / ddefit). **Ignored when `criterion=:ncv`**: NCV needs no
+  inflation factor — leaving out the neighbourhood is itself the guard
+  against the undersmoothing that `gamma` patches over (Wood 2024 uses
+  γ has no role in the base NCV criterion as implemented here).
+- `criterion`: `:gcv` (default, classical GCV) or `:ncv`
+  (neighbourhood cross-validation)
+- `ncv_width`: half-width of the NCV deletion neighbourhood, in
+  time-index steps (default 2). For observation i of a component, the
+  neighbourhood δ(i) is every usable observation of the SAME component
+  whose time index is within `ncv_width` of i's (i itself included).
+  Must be ≥ 0; `ncv_width=0` gives exact leave-one-out CV. Choose it
+  to cover the residual correlation length (e.g. the lag at which the
+  residual ACF dies off). Ignored when `criterion=:gcv`.
+- `search`: `:direct` (default) evaluates every λ in the GCV search with
+  its own O(p³) penalized solve — the historical behavior, byte-identical
+  to before this option existed. `:reuse` is the classical ddefit /
+  Demmler–Reinsch speed trick (gcv.c `EasySmooth`/`EScv`): one expensive
+  whitening + eigendecomposition per IRLS iteration, after which every λ
+  in the grid + golden-section search costs only O(np) diagonal
+  arithmetic. It is a pure reformulation, not an approximation — scores
+  match `:direct` to ~1e-12 relative everywhere λ selection actually
+  happens (the stability ridge of the direct scorer is replicated
+  exactly; only at the essentially-infinite-smoothing extreme,
+  λ ≳ 1e15 with rank-deficient penalties, does agreement degrade to
+  ~1e-6, where the direct path's own trA/β are conditioning-limited
+  too), so the selected λ̂ agrees within the
+  search tolerance, and the returned fit always goes through the same
+  final PCLS solve as `:direct`. When `A = J'WJ` (plus any fixed
+  penalties) is near-singular the fast path falls back to the direct
+  scorer for that IRLS iteration (debug-level log note). With multiple
+  approximators the coordinate-descent λ search reuses one
+  decomposition per coordinate per sweep. Only `criterion=:gcv` is
+  supported: the NCV neighbourhood downdates need `A(λ)⁻¹` at every λ,
+  which is genuinely incompatible with the one-decomposition trick, so
+  `search=:reuse` with `criterion=:ncv` is rejected at construction.
+- `jac`: backend for the working-model Jacobian of predictions w.r.t. the
+  coefficients — `:fd` (default; adaptive central finite differences,
+  historical behavior, byte-identical) or `:forwarddiff` (forward-mode AD
+  through the ODE/map/DDE solve; exact to solver precision, one chunked
+  Dual sweep instead of 2·n_p perturbed solves, config built once per
+  solve; falls back to `:fd` for an iteration — `@debug` note — whenever
+  the Dual-valued solve fails or returns non-finite entries). See the
+  `LAML` docstring for the full description; the two solvers share
+  `compute_jacobian!`.
 - `verbose`: print progress
 
 # Convergence info
-`sol.convergence` is a NamedTuple `(converged, iterations, reason, gcv)` with
-the standard honest-convergence keys (see [`PSMSolution`](@ref)) plus
-`gcv::Float64`, the last GCV score (NaN when no smooth terms are present).
+`sol.convergence` is a NamedTuple
+`(converged, iterations, reason, criterion, gcv, ncv)` with the standard
+honest-convergence keys (see [`PSMSolution`](@ref)) plus:
+- `criterion::Symbol`: which selection criterion ran (`:gcv` or `:ncv`)
+- `gcv::Float64`: the final GCV score when `criterion=:gcv`; `NaN`
+  otherwise (also NaN when no smooth terms are present)
+- `ncv::Float64`: the final NCV score when `criterion=:ncv`; `NaN`
+  otherwise
 """
 struct GCVSolver
     n_grid::Int
     maxiters::Int
     tol::Float64
     gamma::Float64
+    criterion::Symbol
+    ncv_width::Int
+    search::Symbol
     verbose::Bool
+    jac::Symbol
 end
 
-GCVSolver(; n_grid::Int=50, maxiters::Int=50, tol::Float64=1e-6,
-            gamma::Float64=1.4, verbose::Bool=false) =
-    GCVSolver(n_grid, maxiters, tol, gamma, verbose)
+function GCVSolver(; n_grid::Int=50, maxiters::Int=50, tol::Float64=1e-6,
+                     gamma::Float64=1.4, criterion::Symbol=:gcv,
+                     ncv_width::Int=2, search::Symbol=:direct,
+                     verbose::Bool=false, jac::Symbol=:fd)
+    criterion in (:gcv, :ncv) ||
+        throw(ArgumentError("GCVSolver: criterion must be :gcv or :ncv " *
+                            "(got $(repr(criterion)))"))
+    ncv_width >= 0 ||
+        throw(ArgumentError("GCVSolver: ncv_width must be ≥ 0 " *
+                            "(got $ncv_width; 0 = leave-one-out CV)"))
+    search in (:direct, :reuse) ||
+        throw(ArgumentError("GCVSolver: search must be :direct or :reuse " *
+                            "(got $(repr(search)))"))
+    !(search === :reuse && criterion === :ncv) ||
+        throw(ArgumentError("GCVSolver: search=:reuse supports only " *
+                            "criterion=:gcv — the NCV neighbourhood downdates " *
+                            "need A(λ)⁻¹ at every λ, which is incompatible " *
+                            "with the one-decomposition reuse trick; use " *
+                            "search=:direct with criterion=:ncv"))
+    jac in (:fd, :forwarddiff) ||
+        throw(ArgumentError("GCVSolver: jac must be :fd or :forwarddiff " *
+                            "(got $(repr(jac)))"))
+    GCVSolver(n_grid, maxiters, tol, gamma, criterion, ncv_width, search,
+              verbose, jac)
+end
+
+# Backward-compatible positional constructor (pre-jac arity).
+GCVSolver(n_grid::Int, maxiters::Int, tol::Float64, gamma::Float64,
+          criterion::Symbol, ncv_width::Int, search::Symbol,
+          verbose::Bool) =
+    GCVSolver(n_grid, maxiters, tol, gamma, criterion, ncv_width, search,
+              verbose, :fd)
 
 # ─── Two-stage solver (Wood 2001 / deGradInfer) ───────────────────
 
@@ -1683,6 +2180,9 @@ providing uncertainty estimates.
 - `obs_noise_var`: Gaussian observation-noise variance (default `nothing`
   = estimate from the data). Gaussian likelihoods only; errors otherwise.
   Non-Gaussian families use their own pointwise log-likelihood in the ELBO.
+- `rng_seed`: seed for the ELBO Monte-Carlo draws (default `42`, which
+  reproduces the historical hard-coded behavior; `nothing` = fresh
+  non-reproducible stream). Does not touch the global RNG.
 - `verbose`: print progress
 
 !!! note "Reported EDF"
@@ -1699,14 +2199,20 @@ struct VariationalSolver
     n_elbo_samples::Int
     prior_scale::Float64
     obs_noise_var::Union{Nothing, Float64}
+    rng_seed::Union{Nothing, Int}
     verbose::Bool
 end
 
+# rng_seed defaults to 42, NOT nothing: the solver historically hard-coded
+# Xoshiro(42) for its ELBO Monte-Carlo draws, and the default must keep
+# reproducing that. `nothing` opts into a fresh non-reproducible stream.
 VariationalSolver(; maxiters::Int=2000, lr::Float64=0.01,
                     n_elbo_samples::Int=10, prior_scale::Float64=1.0,
                     obs_noise_var::Union{Nothing, Float64}=nothing,
+                    rng_seed::Union{Nothing, Int}=42,
                     verbose::Bool=false) =
-    VariationalSolver(maxiters, lr, n_elbo_samples, prior_scale, obs_noise_var, verbose)
+    VariationalSolver(maxiters, lr, n_elbo_samples, prior_scale, obs_noise_var,
+                      rng_seed, verbose)
 
 # ─── ABC solver (Approximate Bayesian Computation) ─────────────────
 
@@ -1734,6 +2240,9 @@ initialization; treat as approximate).
 - `prior`: `:smoothness` (default, GMRF) or `:box` (legacy uniform)
 - `prior_scale`: prior spread — GMRF scale, or box half-width (default 2.0)
 - `quantile_eps`: quantile for tolerance schedule (default 0.5)
+- `rng_seed`: seed for the sampler's own RNG stream (default `nothing` =
+  non-reproducible). Matches the `rng_seed` convention of
+  `AdaptiveGradientMatching`/`BNGSolver`; does not touch the global RNG.
 - `verbose`: print progress
 """
 struct ABCSolver
@@ -1743,6 +2252,7 @@ struct ABCSolver
     prior::Symbol
     prior_scale::Float64
     quantile_eps::Float64
+    rng_seed::Union{Nothing, Int}
     verbose::Bool
 end
 
@@ -1750,9 +2260,10 @@ ABCSolver(; n_particles::Int=500, n_generations::Int=10,
             summary_fn::Union{Symbol, Function}=:auto,
             prior::Symbol=:smoothness,
             prior_scale::Float64=2.0, quantile_eps::Float64=0.5,
+            rng_seed::Union{Nothing, Int}=nothing,
             verbose::Bool=false) =
     ABCSolver(n_particles, n_generations, summary_fn, prior, prior_scale,
-              quantile_eps, verbose)
+              quantile_eps, rng_seed, verbose)
 
 # ─── Integral matching solver (Dattner & Klaassen 2015) ────────────
 
@@ -1866,6 +2377,9 @@ sees the same trajectory as every other solver.
   relative to the magnitude of your observations (e.g. roughly the
   expected noise std). The default suits data of order 1; for data of
   order 1000 use a correspondingly larger value.
+- `rng_seed`: seed for the solver's own RNG stream (default `42`, which
+  reproduces the historical hard-coded behavior; `nothing` = fresh
+  non-reproducible stream). Does not touch the global RNG.
 - `verbose`: print progress
 
 # References
@@ -1876,12 +2390,18 @@ struct EnsembleKalmanSolver
     n_ensemble::Int
     n_iterations::Int
     noise_scale::Float64
+    rng_seed::Union{Nothing, Int}
     verbose::Bool
 end
 
+# rng_seed defaults to 42, NOT nothing: the solver historically hard-coded
+# Xoshiro(42) for ensemble initialization and perturbations, and the default
+# must keep reproducing that. `nothing` opts into a fresh stream.
 EnsembleKalmanSolver(; n_ensemble::Int=50, n_iterations::Int=30,
-                       noise_scale::Float64=0.1, verbose::Bool=false) =
-    EnsembleKalmanSolver(n_ensemble, n_iterations, noise_scale, verbose)
+                       noise_scale::Float64=0.1,
+                       rng_seed::Union{Nothing, Int}=42,
+                       verbose::Bool=false) =
+    EnsembleKalmanSolver(n_ensemble, n_iterations, noise_scale, rng_seed, verbose)
 
 # ─── ODIN solver (ODE-Informed regression) ─────────────────────────
 
@@ -1950,6 +2470,126 @@ ODINSolver(; maxiters::Int=50,
                gp_lengthscale === nothing ? nothing : Float64(gp_lengthscale),
                gp_variance === nothing ? nothing : Float64(gp_variance),
                ode_weight, lr, verbose)
+
+# ─── FGPGM solver ──────────────────────────────────────────────────
+
+"""
+    FGPGMSolver(; n_samples=1000, n_warmup=500, gamma=0.1,
+                  gp_lengthscale=nothing, gp_variance=nothing,
+                  obs_sigma=nothing, prior_scale=1.0, target_accept=0.234,
+                  rng_seed=nothing, verbose=false)
+
+Fast Gaussian process based gradient matching (FGPGM; Wenk, Gotovos,
+Bauer, Gorbach, Krause & Buhmann, AISTATS 2019). The latent states `X`
+(at the observation times, as in the paper) and the unknown-function
+parameters `θ` are sampled JOINTLY from one product-of-experts density
+
+    p(X, θ | y) ∝ Π_k [ N(y_k | x_k, σ_{n,k}² I) · N(x_k | m_k, C_k)
+                        · N(f_k(X, θ) | D_k x̃_k, A_k + γI) ] · p(θ)
+
+with `D_k = 'C_k C_k⁻¹` and `A_k = ''C_k − 'C_k C_k⁻¹ 'C_kᵀ` (the GP
+conditional derivative map and covariance), by single-chain adaptive
+Metropolis-within-Gibbs. GP hyperparameters are fixed beforehand by
+per-state marginal likelihood — the paper's key simplification.
+
+**When to prefer FGPGM**: over [`AdaptiveGradientMatching`](@ref)'s
+population MCMC when you want genuine posterior samples without the
+temperature ladder and γ sampling (one chain, fixed hyperparameters —
+cheaper and better-behaved); over [`ODINSolver`](@ref) (the same
+authors' later pure-optimisation formulation) when you need posterior
+uncertainty rather than a point estimate; over [`MagiSolver`](@ref)
+when the observation times are dense enough to carry the latent states
+(MAGI discretizes on a finer grid and uses NUTS — heavier per sweep).
+Gaussian likelihoods only; continuous-time problems only;
+`NeuralApproximator` is rejected (use [`AdamSolver`](@ref)).
+
+# Fields
+- `n_samples`: retained posterior draws after warmup (default 1000)
+- `n_warmup`: warmup sweeps; proposal-scale adaptation happens here ONLY
+  and the scales are frozen afterwards (default 500)
+- `gamma`: the paper's model-mismatch variance γ added to the ODE
+  expert's covariance `A_k + γI` (default 0.1). The effective slack also
+  includes `σ_n²/ℓ²`, the derivative-scale observation noise, as in
+  `ODINSolver`. Must be positive
+- `gp_lengthscale`, `gp_variance`: `nothing` (default) estimates the RBF
+  hyperparameters per state by GP marginal likelihood. Supplying BOTH
+  fixes them for all states (with noise assumed at `0.01 * gp_variance`);
+  supplying only one is an error (ODIN convention)
+- `obs_sigma`: observation-noise SD overriding the marginal-likelihood
+  estimate σ_n in the data expert (default `nothing` = per-state estimate)
+- `prior_scale`: scale of the θ smoothing prior (larger = weaker), as in
+  `MCMCSolver`/`MagiSolver` (default 1.0)
+- `target_accept`: per-block acceptance rate targeted by the warmup
+  adaptation (default 0.234, the classic random-walk optimum)
+- `rng_seed`: seed for the sampler's own RNG stream (default `nothing` =
+  non-reproducible). Matches the `rng_seed` convention of
+  `AdaptiveGradientMatching`/`BNGSolver`; does not touch the global RNG.
+- `verbose`: print progress
+
+# Convergence info
+`sol.convergence` carries `chains` (`MCMCChains.Chains` of the θ draws),
+`beta_samples`, `state_mean`, `gp_hyperparams`, post-warmup
+`accept_rates` per block, and the honest keys
+`converged=false`/`reason=:maxiters`/`iterations` — a fixed-budget
+sampler has no stopping criterion (MagiSolver convention), so judge the
+run by the R̂/ESS of `convergence.chains`.
+
+# References
+- Wenk, Gotovos, Bauer, Gorbach, Krause & Buhmann (2019), "Fast
+  Gaussian process based gradient matching for parameter identification
+  in systems of nonlinear ODEs", AISTATS 89:1351-1360.
+"""
+struct FGPGMSolver
+    n_samples::Int
+    n_warmup::Int
+    gamma::Float64
+    gp_lengthscale::Union{Nothing, Float64}
+    gp_variance::Union{Nothing, Float64}
+    obs_sigma::Union{Nothing, Float64}
+    prior_scale::Float64
+    target_accept::Float64
+    rng_seed::Union{Nothing, Int}
+    verbose::Bool
+end
+
+function FGPGMSolver(; n_samples::Int=1000, n_warmup::Int=500,
+                       gamma::Real=0.1,
+                       gp_lengthscale::Union{Nothing, Real}=nothing,
+                       gp_variance::Union{Nothing, Real}=nothing,
+                       obs_sigma::Union{Nothing, Real}=nothing,
+                       prior_scale::Real=1.0,
+                       target_accept::Real=0.234,
+                       rng_seed::Union{Nothing, Int}=nothing,
+                       verbose::Bool=false)
+    n_samples >= 1 ||
+        throw(ArgumentError("FGPGMSolver: n_samples must be ≥ 1 (got $n_samples)"))
+    n_warmup >= 0 ||
+        throw(ArgumentError("FGPGMSolver: n_warmup must be ≥ 0 (got $n_warmup)"))
+    gamma > 0 ||
+        throw(ArgumentError("FGPGMSolver: gamma must be positive (got $gamma) " *
+                            "— it is the variance of the ODE-mismatch slack " *
+                            "in N(f_k | D_k x̃_k, A_k + γI)"))
+    0 < target_accept < 1 ||
+        throw(ArgumentError("FGPGMSolver: target_accept must lie in (0, 1) " *
+                            "(got $target_accept)"))
+    prior_scale > 0 ||
+        throw(ArgumentError("FGPGMSolver: prior_scale must be positive " *
+                            "(got $prior_scale)"))
+    obs_sigma === nothing || obs_sigma > 0 ||
+        throw(ArgumentError("FGPGMSolver: obs_sigma must be positive " *
+                            "(got $obs_sigma)"))
+    (gp_lengthscale === nothing) == (gp_variance === nothing) ||
+        throw(ArgumentError(
+            "FGPGMSolver: supply BOTH gp_lengthscale and gp_variance to fix " *
+            "the GP hyperparameters, or neither to estimate them per state " *
+            "by marginal likelihood."))
+    FGPGMSolver(n_samples, n_warmup, Float64(gamma),
+                gp_lengthscale === nothing ? nothing : Float64(gp_lengthscale),
+                gp_variance === nothing ? nothing : Float64(gp_variance),
+                obs_sigma === nothing ? nothing : Float64(obs_sigma),
+                Float64(prior_scale), Float64(target_accept),
+                rng_seed, verbose)
+end
 
 # ─── RKHS solver ───────────────────────────────────────────────────
 

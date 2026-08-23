@@ -88,6 +88,66 @@ function penalty_matrix(a::BSplineApproximator)
 end
 
 """
+    build_tensor_bspline_evaluator(a::TensorBSplineApproximator, params_k)
+
+Build the two-argument callable `f(x, y)` for a tensor-product spline from
+the column-major coefficient grid `params_k = vec(C)`, `C[i, j] = f(x_i, y_j)`.
+
+The construction is the tensor product of the SAME univariate machinery
+`BSplineApproximator` uses (`build_bspline_evaluator`: natural cubic
+interpolation THROUGH the values, linear extrapolation outside the knots):
+each x-column `C[:, j]` is interpolated in x once at build time; per call,
+the `nknots_y` line values `sⱼ(x)` are interpolated in y. Because both
+stages interpolate through values, the surface agrees exactly with the
+univariate evaluator on every grid line —
+`f(x, y_j) = CubicSpline(C[:, j], knots_x)(x)` and
+`f(x_i, y) = CubicSpline(C[i, :], knots_y)(y)` — and extrapolates linearly
+per margin, matching the univariate behavior. Eltype-generic in both
+`params_k` and `(x, y)`, so ForwardDiff Duals propagate through either.
+"""
+function build_tensor_bspline_evaluator(a::TensorBSplineApproximator,
+                                        params_k::AbstractVector)
+    nx, ny = a.nknots_x, a.nknots_y
+    knots_x = collect(range(a.domain_x[1], a.domain_x[2], length=nx))
+    knots_y = collect(range(a.domain_y[1], a.domain_y[2], length=ny))
+    C = reshape(params_k, nx, ny)
+    col_splines = [build_bspline_evaluator(knots_x, C[:, j]) for j in 1:ny]
+    function tensor_eval(x, y)
+        line_vals = [s(x) for s in col_splines]
+        build_bspline_evaluator(knots_y, line_vals)(y)
+    end
+    tensor_eval
+end
+
+"""
+    penalty_matrix(a::TensorBSplineApproximator)
+
+Kronecker-sum roughness penalty on the column-major coefficient grid:
+
+    S = I_ny ⊗ S_x + anisotropy · (S_y ⊗ I_nx)
+
+where `S_x`, `S_y` are the univariate natural-cubic `∫(f'')²` penalties
+(`spline_penalty_matrix`) on unit-interval knot grids, exactly as
+`penalty_matrix(::BSplineApproximator)` builds them. With `β = vec(C)` and
+the x index fastest, `β' (I_ny ⊗ S_x) β = Σⱼ C[:, j]' S_x C[:, j]`
+penalizes roughness along x only, and `β' (S_y ⊗ I_nx) β =
+Σᵢ C[i, :]' S_y C[i, :]` penalizes roughness along y only; `anisotropy` is
+their fixed relative weight under the single per-approximator λ.
+
+The null space is the intersection of "every column affine in x" with
+"every row affine in y": the bilinear surfaces
+`C[i, j] = a + b·x_i + c·y_j + d·x_i·y_j` (rank `nx·ny − 4`).
+"""
+function penalty_matrix(a::TensorBSplineApproximator)
+    nx, ny = a.nknots_x, a.nknots_y
+    Sx = spline_penalty_matrix(collect(range(0.0, 1.0, length=nx)))
+    Sy = spline_penalty_matrix(collect(range(0.0, 1.0, length=ny)))
+    S = kron(Matrix{Float64}(I, ny, ny), Sx) .+
+        a.anisotropy .* kron(Sy, Matrix{Float64}(I, nx, nx))
+    (S + S') ./ 2
+end
+
+"""
     penalty_matrix(a::NeuralApproximator)
 
 Returns scaled identity matrix for L2 regularization when `penalty_weight > 0`,
@@ -159,15 +219,18 @@ function penalty_matrix(a::GPApproximator)
 end
 
 """
-    build_gp_evaluator(a::GPApproximator, params)
+    _gp_mean_interpolant(a, values)
 
-Build a callable that evaluates the GP predictive mean at any input x:
-  f(x) = k(x, X)' K⁻¹ f_X
-where f_X are the function values at inducing points (= params).
+Kernel predictive-mean interpolant through `values` at `a.inducing_points`:
+  f(x) = k(x, X)' K⁻¹ values
+Shared by `GPApproximator` (whose parameters ARE the inducing values) and
+`ShapeConstrainedGPApproximator` (whose constrained values β = Σ·d(γ) are
+interpolated the same way). `a` needs the fields `kernel`, `lengthscale`,
+`variance`, `K_inv`, and `inducing_points`.
 """
-function build_gp_evaluator(a::GPApproximator, params::AbstractVector)
+function _gp_mean_interpolant(a, values::AbstractVector)
     kfunc = _kernel_func(a.kernel, a.lengthscale, a.variance)
-    weights = a.K_inv * params  # precompute α = K⁻¹ f
+    weights = a.K_inv * values  # precompute α = K⁻¹ f
     x_ind = a.inducing_points
     raw = xv -> sum(kfunc(xv, x_ind[j]) * weights[j] for j in eachindex(x_ind))
     # Outside the inducing-point range the kernel decays and the predictive
@@ -191,15 +254,32 @@ function build_gp_evaluator(a::GPApproximator, params::AbstractVector)
 end
 
 """
-    _adapt_gp_hyperparams!(a::GPApproximator, beta_k) -> Bool
+    build_gp_evaluator(a::GPApproximator, params)
+
+Build a callable that evaluates the GP predictive mean at any input x:
+  f(x) = k(x, X)' K⁻¹ f_X
+where f_X are the function values at inducing points (= params).
+"""
+build_gp_evaluator(a::GPApproximator, params::AbstractVector) =
+    _gp_mean_interpolant(a, params)
+
+"""
+    _adapt_gp_hyperparams!(a, beta_k) -> Bool
 
 Empirical-Bayes update of the kernel hyperparameters DURING a fit: choose
 (ℓ, σ²) maximizing the GP log marginal likelihood of the current inducing
 values `beta_k` (small fixed nugget), then rebuild `K`/`K_inv`. Called by
 the LAML/GCV loops when `a.adapt` (no user-supplied lengthscale). Returns
 whether the hyperparameters changed materially.
+
+For `ShapeConstrainedGPApproximator` the caller passes the IMPLIED inducing
+values `β = Σ·d(γ)` (see `gamma_to_inducing_values`), not the unconstrained
+γ — the marginal likelihood is over function values, and a kernel change
+does not move the values the interpolant passes through.
 """
-function _adapt_gp_hyperparams!(a::GPApproximator, beta_k::AbstractVector)
+function _adapt_gp_hyperparams!(a::Union{GPApproximator,
+                                         ShapeConstrainedGPApproximator},
+                                beta_k::AbstractVector)
     a.adapt || return false
     n = a.n_inducing
     v = var(beta_k)
@@ -238,21 +318,70 @@ function _adapt_gp_hyperparams!(a::GPApproximator, beta_k::AbstractVector)
 
     a.lengthscale = best_ℓ
     a.variance = best_σ²
-    kf = _kernel_func(a.kernel, best_ℓ, best_σ²)
-    K = _build_kernel_matrix(kf, x)
-    scale = max(maximum(abs, K), 1.0)
-    K_inv = nothing
-    for jit in (1e-8, 1e-6, 1e-4)
-        F = cholesky(Symmetric(K + jit * scale * I), check=false)
-        if issuccess(F)
-            K_inv = Matrix(inv(F)); break
-        end
-    end
-    K_inv === nothing && (K_inv = pinv(K + 1e-4 * scale * I))
-    a.K = K
-    a.K_inv = 0.5 * (K_inv + K_inv')
+    a.K, a.K_inv = _gp_kernel_matrices(a.kernel, best_ℓ, best_σ², x)
     true
 end
+
+# ─── Shape-constrained GP: evaluator and penalty ──────────────────
+
+"""
+    gamma_to_inducing_values(a::ShapeConstrainedGPApproximator, gamma)
+
+Transform unconstrained parameters γ to inducing-point values β = Σ * d,
+where `d` passes the free (linear) components through unchanged and applies
+`softplus` to the rest — the same `_apply_constraint_transform` used by the
+B-spline and SPDE paths.
+"""
+gamma_to_inducing_values(a::ShapeConstrainedGPApproximator,
+                         gamma::AbstractVector) =
+    a.Sigma * _apply_constraint_transform(a.constraint, gamma)
+
+"""
+    build_constrained_gp_evaluator(a::ShapeConstrainedGPApproximator, gamma)
+
+Build a callable evaluator from unconstrained parameters γ.
+
+Applies the SCOP-spline reparameterization: inducing-point values are
+computed as `β = Σ · _apply_constraint_transform(γ)` (free components
+linear, the rest softplus'd), then interpolated with the GP predictive-mean
+formula (`_gp_mean_interpolant`, shared with `GPApproximator`), including
+its linear extrapolation outside the inducing range. Shape constraints are
+enforced at the inducing values; the kernel interpolation between points
+may slightly overshoot.
+
+For zero-at-endpoint constraints the interpolant is centered by subtracting
+its value at the pinned endpoint — a constant shift that preserves
+monotonicity exactly and pins f(endpoint) = 0 despite the jittered K⁻¹
+(mirroring `build_constrained_bspline_evaluator`).
+"""
+function build_constrained_gp_evaluator(a::ShapeConstrainedGPApproximator,
+                                        gamma::AbstractVector)
+    beta = gamma_to_inducing_values(a, gamma)
+    core = _gp_mean_interpolant(a, beta)
+    offset = if a.constraint in (:inc_zero_left, :dec_zero_left)
+        core(a.domain[1])
+    elseif a.constraint in (:inc_zero_right, :dec_zero_right)
+        core(a.domain[2])
+    else
+        nothing
+    end
+    offset === nothing ? core : (x -> core(x) - offset)
+end
+
+"""
+    penalty_matrix(a::ShapeConstrainedGPApproximator)
+
+Pya & Wood (2015) SCOP first-difference penalty on the unconstrained γ,
+exactly as `penalty_matrix(::ShapeConstrainedBSplineApproximator)`: the
+free level (and the slope-like component for curvature constraints) lies in
+the penalty null space, so λ→∞ shrinks toward a maximally smooth member of
+the constraint family without biasing the level. The GP kernel is used for
+evaluation only — using the prior precision K⁻¹ as the penalty would suffer
+the same narrow-eigenvalue-spectrum LAML problem documented at
+`penalty_matrix(::GPApproximator)`.
+"""
+penalty_matrix(a::ShapeConstrainedGPApproximator) =
+    _scop_difference_penalty(a.constraint, nparams(a))
 
 # ─── SPDE (Matérn) FEM matrices and evaluation ────────────────────
 
@@ -424,16 +553,7 @@ fixed-ramp limit.
 function penalty_matrix(a::ShapeConstrainedSPDEApproximator)
     if a.penalty == :difference
         # P&W SCOP difference penalty on γ, exactly as in the SCBSpline path.
-        np = nparams(a)
-        skip = _penalty_skip_indices(a.constraint, np)
-        idxs = [i for i in 1:np if !(i in skip)]
-        n_c = length(idxs)
-        D = zeros(max(n_c - 1, 0), np)
-        for r in 1:(n_c - 1)
-            D[r, idxs[r]]   = -1.0
-            D[r, idxs[r+1]] =  1.0
-        end
-        return D' * D
+        return _scop_difference_penalty(a.constraint, nparams(a))
     end
 
     # :gamma_matern — build the SPDE penalty in mesh-value space
@@ -814,14 +934,20 @@ _penalty_skip_indices(constraint::Symbol, np::Int) =
     constraint in (:inc_concave, :dec_convex)                    ? (1, np) :
     constraint in (:increasing, :decreasing)                     ? (1,)    : ()
 
-function penalty_matrix(a::ShapeConstrainedBSplineApproximator)
-    np = nparams(a)
-    # First-order difference penalty over the curvature-carrying components
-    # only, per Pya & Wood (2015): their D starts the differences from β̃₂
-    # for monotone smooths and from β̃₃ for curvature-constrained smooths.
-    # Free level/slope components live in the penalty null space — shrinking
-    # them with λ would bias the function's level, not its wiggliness.
-    skip = _penalty_skip_indices(a.constraint, np)
+"""
+    _scop_difference_penalty(constraint, np) -> Matrix{Float64}
+
+Pya & Wood (2015) SCOP first-difference penalty `DᵀD` on the unconstrained
+γ: the chain of first differences runs over the curvature-carrying
+components only, per `_penalty_skip_indices` — their D starts the
+differences from β̃₂ for monotone smooths and from β̃₃ for
+curvature-constrained smooths. Free level/slope components live in the
+penalty null space — shrinking them with λ would bias the function's level,
+not its wiggliness. Shared by the shape-constrained B-spline, SPDE
+(`:difference` mode), and GP penalty matrices.
+"""
+function _scop_difference_penalty(constraint::Symbol, np::Int)
+    skip = _penalty_skip_indices(constraint, np)
     idxs = [i for i in 1:np if !(i in skip)]
     n_c = length(idxs)
     D = zeros(max(n_c - 1, 0), np)
@@ -831,6 +957,9 @@ function penalty_matrix(a::ShapeConstrainedBSplineApproximator)
     end
     D' * D
 end
+
+penalty_matrix(a::ShapeConstrainedBSplineApproximator) =
+    _scop_difference_penalty(a.constraint, nparams(a))
 
 
 # ═══════════════════════════════════════════════════════════════════════

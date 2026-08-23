@@ -129,22 +129,7 @@ function _magi_build_uf(prob, theta)
         np = nparams(approx)
         params_k = theta[offset+1:offset+np]
         offset += np
-        if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2], length=approx.nknots))
-            push!(uf_entries, approx.name => build_bspline_evaluator(knots_x, params_k))
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            push!(uf_entries, approx.name => build_constrained_bspline_evaluator(approx, params_k))
-        elseif approx isa COMONetApproximator
-            push!(uf_entries, approx.name => build_comonet_evaluator(approx, params_k))
-        elseif approx isa SPDEApproximator
-            push!(uf_entries, approx.name => build_spde_evaluator(approx.mesh_points, params_k))
-        elseif approx isa ShapeConstrainedSPDEApproximator
-            push!(uf_entries, approx.name => build_constrained_spde_evaluator(approx, params_k))
-        elseif approx isa GPApproximator
-            push!(uf_entries, approx.name => build_gp_evaluator(approx, params_k))
-        elseif approx isa NeuralApproximator
-            push!(uf_entries, approx.name => build_neural_evaluator(approx, params_k))
-        end
+        push!(uf_entries, approx.name => build_evaluator(approx, params_k))
     end
     merge(NamedTuple(uf_entries), prob.known_params)
 end
@@ -205,9 +190,14 @@ function _magi_logposterior(ld::MAGILogDensity, v::AbstractVector{T}) where T
         nk = nparams(approx)
         pk = @view theta[offset+1:offset+nk]
         offset += nk
+        # Non-built-in (custom protocol) types take the generic branch too;
+        # built-in treatment is unchanged (see _BUILTIN_APPROX_TYPES).
         if approx isa BSplineApproximator || approx isa ShapeConstrainedBSplineApproximator ||
            approx isa GPApproximator || approx isa COMONetApproximator ||
-           approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator
+           approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator ||
+           approx isa ShapeConstrainedGPApproximator ||
+           approx isa TensorBSplineApproximator ||
+           !(approx isa _BUILTIN_APPROX_TYPES)
             S = penalty_matrix(approx)
             if S !== nothing
                 lp += -T(0.5) / T(ld.prior_scale) * dot(pk, T.(S) * pk)
@@ -451,22 +441,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
         np = nparams(approx)
         params_k = map_beta[offset+1:offset+np]
         offset += np
-        if approx isa BSplineApproximator
-            knots_x = collect(range(approx.domain[1], approx.domain[2], length=approx.nknots))
-            uf_evals[approx.name] = build_bspline_evaluator(knots_x, params_k)
-        elseif approx isa ShapeConstrainedBSplineApproximator
-            uf_evals[approx.name] = build_constrained_bspline_evaluator(approx, params_k)
-        elseif approx isa COMONetApproximator
-            uf_evals[approx.name] = build_comonet_evaluator(approx, params_k)
-        elseif approx isa SPDEApproximator
-            uf_evals[approx.name] = build_spde_evaluator(approx.mesh_points, params_k)
-        elseif approx isa ShapeConstrainedSPDEApproximator
-            uf_evals[approx.name] = build_constrained_spde_evaluator(approx, params_k)
-        elseif approx isa GPApproximator
-            uf_evals[approx.name] = build_gp_evaluator(approx, params_k)
-        elseif approx isa NeuralApproximator
-            uf_evals[approx.name] = build_neural_evaluator(approx, params_k)
-        end
+        uf_evals[approx.name] = build_evaluator(approx, params_k)
     end
 
     ca_entries = Pair{Symbol, Any}[]

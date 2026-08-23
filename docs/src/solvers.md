@@ -1,6 +1,6 @@
 # Solvers
 
-PartiallySpecifiedModels.jl provides 22 solvers for fitting partially specified models. Solvers are passed as the second argument to `solve`:
+PartiallySpecifiedModels.jl provides 23 solvers for fitting partially specified models. Solvers are passed as the second argument to `solve`:
 
 ```@example solvers
 using PartiallySpecifiedModels # hide
@@ -25,13 +25,17 @@ println("Data loss: ", round(sol.data_loss, digits=4), ", EDF: ", round(sol.edf,
 
 Penalized Iteratively Reweighted Least Squares (P-IRLS) with **Laplace Approximate Marginal Likelihood** for automatic smoothing parameter selection. The default and recommended solver for B-spline approximators. For Gaussian data, LAML is equivalent to REML.
 
+For non-Gaussian likelihoods the default smoothing criterion (`criterion=:working`) is PQL-flavored: smoothing parameters are calibrated on the Gaussian working model of the IRLS loop via a Pearson-dispersion-scaled Fellner–Schall update. The opt-in `criterion=:laplace` instead maximizes the actual family's full Laplace-approximate marginal likelihood, `ℓ(β̂) − ½β̂ᵀS_λβ̂ + ½log|S_λ|₊ − ½log|JᵀW̃J + S_λ| + (Mp/2)log 2π` (Wood 2011; Wood, Pya & Säfken 2016), using the generalized Fellner–Schall update of Wood & Fasiolo (2017) plus Newton refinement. Prefer `:laplace` for count data with low means (Poisson μ ≲ 10), where the working-model approximation is most biased. It supports `Poisson`, `NegativeBinomial` (dispersion fixed at the supplied `theta`), and `TruncatedNormal` (fixed `lower`/`sigma`); `CustomLikelihood` is rejected because it declares no normalized density or dispersion. For `Gaussian` data `:laplace` reduces exactly to the profiled-REML criterion, so results are identical to the default. `sol.convergence.criterion` records which criterion ran and `sol.convergence.laml` the criterion value at the fit.
+
+Both `LAML` and `GCVSolver` (and `CollocationLAML`) accept `jac=:forwarddiff` to compute the working-model Jacobian of the predictions by forward-mode AD (`ForwardDiff`) straight through the ODE/map/DDE solve instead of the default adaptive central finite differences (`jac=:fd`): exact to solver precision and roughly an order of magnitude faster per Jacobian (one chunked Dual sweep replaces 2·p perturbed solves), with an automatic per-iteration fallback to finite differences if the Dual-valued solve fails. For `CollocationLAML` the option also covers the pointwise state Jacobian and the ∂F/∂β block of the collocation residual, preserving the failure-sentinel convention exactly (failed collocation points keep a large residual and a zero Jacobian; the sentinel is never differentiated).
+
 ```@docs
 LAML
 ```
 
 ### GCVSolver
 
-Penalized IRLS with **Generalized Cross-Validation** for smoothing parameter selection. An alternative to LAML that minimizes leave-one-out prediction error.
+Penalized IRLS with **Generalized Cross-Validation** for smoothing parameter selection. An alternative to LAML that minimizes leave-one-out prediction error. With `criterion=:ncv` it instead minimizes **neighbourhood cross-validation** (NCV; Wood 2024), which leaves out a temporal neighbourhood of `ncv_width` time steps around each point — the recommended criterion when residuals are short-range autocorrelated, where ordinary GCV undersmooths. With `search=:reuse` the whole λ-search is evaluated from a single whitening + eigendecomposition per IRLS iteration (the classical ddefit / Demmler–Reinsch trick, several-fold faster for larger bases) instead of one O(p³) solve per candidate λ — an exact reformulation of the default `search=:direct` scores, with automatic fallback to the direct path when `J'WJ` is near-singular; GCV criterion only.
 
 ```@docs
 GCVSolver
@@ -73,6 +77,14 @@ GP-based gradient matching using the **product-of-experts** formulation of Donde
 AdaptiveGradientMatching
 ```
 
+### FGPGMSolver
+
+**Fast GP-based gradient matching** (Wenk et al. 2019). One product-of-experts density over the latent states AND parameters jointly — data expert, GP prior, and ODE expert `N(f_k | D_k x̃_k, A_k + γI)` — sampled by single-chain adaptive Metropolis-within-Gibbs with the GP hyperparameters fixed beforehand by per-state marginal likelihood. Sits between [`AdaptiveGradientMatching`](@ref)'s population MCMC (cheaper: no temperature ladder, no γ sampling) and [`ODINSolver`](@ref)'s pure optimisation (unlike ODIN, it returns genuine posterior samples in `convergence.chains`). Gaussian likelihoods only.
+
+```@docs
+FGPGMSolver
+```
+
 ### BNGSolver
 
 **Ensemble Bayesian gradient matching** (Bonnaffé & Coulson 2023). Smooth-then-match under a variance-marginalized log-posterior, repeated over `k_obs` residual-bootstrap resamples × `k_proc` restarts; unknown functions are posterior-weighted ensemble means with pointwise uncertainty in `convergence.ensemble_std`. Fast (no ODE integration) and suitable for complex dynamics.
@@ -86,6 +98,18 @@ BNGSolver
 ### AdamSolver
 
 Gradient-based optimization through the ODE solver using the **Adam** optimizer. This is the standard approach for Universal Differential Equations (UDEs). Works with all approximator types including neural networks.
+
+By default, gradients are computed with ForwardDiff through the ODE solve, whose cost grows with the number of parameters. For continuous ODE problems you can opt into **adjoint sensitivities** instead by loading SciMLSensitivity and setting `sensealg`:
+
+```julia
+using SciMLSensitivity   # activates the adjoint extension
+sol = solve(prob, AdamSolver(sensealg=:auto))                 # validated default
+sol = solve(prob, AdamSolver(                # compiled tape: branch-free MLP
+          sensealg=InterpolatingAdjoint(     # dynamics ONLY — silently wrong
+              autojacvec=ReverseDiffVJP(true))))   # on spline evaluators
+```
+
+`sensealg=:auto` uses `InterpolatingAdjoint(autojacvec=ReverseDiffVJP(false))`, which re-tapes the dynamics at every step and is therefore safe for spline evaluators (their knot-interval lookup branches on the state). For branch-free dynamics — pure `Lux.Dense`/`tanh` MLP approximators — the compiled tape `ReverseDiffVJP(true)` is several times faster and becomes competitive with (and beyond ~1000 parameters faster than) ForwardDiff; for small parameter counts ForwardDiff generally remains fastest. `GaussAdjoint`/`QuadratureAdjoint` were observed to mis-differentiate spline-parameterized dynamics in testing — validate gradients against ForwardDiff before trusting them, and avoid `EnzymeVJP()` here (the closure-based dynamics wrapper is not Enzyme-compatible). The adjoint backend supports continuous ODE problems only (not discrete maps or DDEs) and the same loss families as the default path; `sol.convergence.backend` records which gradient backend ran.
 
 ```@docs
 AdamSolver
@@ -108,6 +132,16 @@ DerivativeFreeSolver
 ```
 
 ## Probabilistic Numerics Solvers
+
+All three Kalman-filter-based solvers in this family (`RodeoSolver`,
+`DaltonSolver`, `PseudoMarginalSolver`) accept an opt-in
+`sqrt_filter=true` keyword that runs the filter/smoother recursions in
+square-root (Cholesky/QR) form — the numerically canonical formulation of
+modern probabilistic ODE solvers (Krämer & Hennig, JMLR 2024). Covariances
+are propagated as triangular factors, so they stay positive semidefinite
+by construction; prefer it at high `n_deriv` (≥ 5) or with very fine step
+grids. The default (`false`) uses the standard covariance recursion
+unchanged.
 
 ### RodeoSolver
 
@@ -219,6 +253,7 @@ RKHSSolver
 | Quick baseline | [`TwoStageSolver`](@ref) |
 | Integration-free derivative matching | [`GradientMatching`](@ref) |
 | GP-based gradient matching (MAP or MCMC) | [`AdaptiveGradientMatching`](@ref) |
+| GP gradient matching with posterior samples, one chain | [`FGPGMSolver`](@ref) |
 | Ensemble gradient matching with uncertainty | [`BNGSolver`](@ref) |
 | Neural network approximators | [`AdamSolver`](@ref) |
 | Robust neural fitting | [`MultipleShootingSolver`](@ref) |
@@ -264,7 +299,8 @@ having to reshape `data_times`/`data_values`.
 
 Masked data is supported by **all but four** solvers: [`LAML`](@ref),
 [`GCVSolver`](@ref), [`CollocationLAML`](@ref), [`GradientMatching`](@ref),
-[`AdaptiveGradientMatching`](@ref), [`TwoStageSolver`](@ref),
+[`AdaptiveGradientMatching`](@ref), [`FGPGMSolver`](@ref),
+[`TwoStageSolver`](@ref),
 [`BNGSolver`](@ref), [`ODINSolver`](@ref), [`RKHSSolver`](@ref),
 [`IntegralMatchingSolver`](@ref), [`AdamSolver`](@ref),
 [`MultipleShootingSolver`](@ref), [`DerivativeFreeSolver`](@ref),

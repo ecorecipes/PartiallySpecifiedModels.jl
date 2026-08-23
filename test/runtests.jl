@@ -7,6 +7,40 @@ using Random
 using OrdinaryDiffEq
 using StableRNGs
 
+# ─── Custom approximator for the "approximator extension protocol" testset ──
+# Struct and method definitions must live at top level; the tests themselves
+# are in the testset at the bottom of the file. PolyApproximator implements
+# the full four-function extension interface (see docs/src/extending.md):
+# f(x) = Σ βⱼ x^(j-1), with a ridge penalty on the curvature coefficients.
+struct PolyApproximator <: PartiallySpecifiedModels.AbstractApproximator
+    name::Symbol
+    domain::Tuple{Float64, Float64}
+    degree::Int
+end
+PartiallySpecifiedModels.nparams(a::PolyApproximator) = a.degree + 1
+PartiallySpecifiedModels.initial_params(a::PolyApproximator) = zeros(a.degree + 1)
+function PartiallySpecifiedModels.penalty_matrix(a::PolyApproximator)
+    S = zeros(a.degree + 1, a.degree + 1)
+    for j in 3:(a.degree + 1)
+        S[j, j] = 1.0
+    end
+    S
+end
+function PartiallySpecifiedModels.build_evaluator(a::PolyApproximator, params_k)
+    coeffs = collect(params_k)   # eltype-generic: params_k may be Dual-valued
+    function poly_eval(x)
+        acc = coeffs[end]
+        for j in (length(coeffs) - 1):-1:1
+            acc = acc * x + coeffs[j]
+        end
+        acc
+    end
+    poly_eval
+end
+
+# A type implementing none of the interface, for the fallback-error test.
+struct NotAnApproximator end
+
 @testset "PartiallySpecifiedModels.jl" begin
 
     # Deterministic suite: all unseeded rand/randn sites below draw from
@@ -899,22 +933,16 @@ using StableRNGs
         r_map = sol_mcmc.unknown_functions[:r](5.0)
         @test abs(r_map - 0.3) < 0.2
 
-        # Reproducibility under a fixed seed (the AGM/BNG `rng_seed` pattern;
-        # MCMCSolver carries no rng_seed field, so seed the global stream its
-        # AdvancedHMC sampler draws from). The stream is saved and restored
-        # around the pair so the rest of this order-coupled suite sees
-        # exactly the draws it saw before.
-        rng_state_mcmc = copy(Random.default_rng())
-        Random.seed!(2718)
+        # Reproducibility under the solver's own rng_seed field (AGM/BNG
+        # convention): same seed → identical chains, and the global stream
+        # is never touched, so this order-coupled suite is unaffected.
         sol_mcmc_a = solve(prob_mcmc, MCMCSolver(n_samples=50, n_warmup=25,
-                                                 verbose=false))
-        Random.seed!(2718)
+                                                 rng_seed=2718, verbose=false))
         sol_mcmc_b = solve(prob_mcmc, MCMCSolver(n_samples=50, n_warmup=25,
-                                                 verbose=false))
+                                                 rng_seed=2718, verbose=false))
         @test Array(sol_mcmc_a.convergence) == Array(sol_mcmc_b.convergence)
         @test sol_mcmc_a.unknown_functions[:r](5.0) ==
               sol_mcmc_b.unknown_functions[:r](5.0)
-        copy!(Random.default_rng(), rng_state_mcmc)
 
         # The masked-data solves below also draw from the global stream, so
         # save and restore it too — the rest of this suite is order-coupled.
@@ -1896,21 +1924,18 @@ using StableRNGs
         # short chain: generous tolerance, but a do-nothing sampler fails it
         @test abs(sol_pm.unknown_functions[:r](5.0) - 0.25) < 0.25
 
-        # Reproducibility under a fixed seed (see the MCMCSolver testset:
-        # PseudoMarginalSolver has no rng_seed field either, and its
-        # particle/FFBS draws come from Random.default_rng()). Stream saved
-        # and restored so downstream unseeded draws are unchanged.
-        rng_state_pm = copy(Random.default_rng())
-        Random.seed!(31415)
+        # Reproducibility under the solver's own rng_seed field (AGM/BNG
+        # convention): same seed → identical chains, and the global stream
+        # is never touched, so this order-coupled suite is unaffected.
         sol_pm_a = solve(prob_pm, PseudoMarginalSolver(
-            n_samples=50, n_warmup=25, n_steps=50, verbose=false))
-        Random.seed!(31415)
+            n_samples=50, n_warmup=25, n_steps=50, rng_seed=31415,
+            verbose=false))
         sol_pm_b = solve(prob_pm, PseudoMarginalSolver(
-            n_samples=50, n_warmup=25, n_steps=50, verbose=false))
+            n_samples=50, n_warmup=25, n_steps=50, rng_seed=31415,
+            verbose=false))
         @test Array(sol_pm_a.convergence) == Array(sol_pm_b.convergence)
         @test sol_pm_a.unknown_functions[:r](5.0) ==
               sol_pm_b.unknown_functions[:r](5.0)
-        copy!(Random.default_rng(), rng_state_pm)
     end
 
     @testset "DDE support — delay exponential decay" begin
@@ -2195,6 +2220,50 @@ using StableRNGs
             n_generations=6, prior=:box, verbose=false))
         @test abs(sol_abc_box.unknown_functions[:f](3.0) - 1.5) < 0.6
         @test_throws ErrorException solve(prob_abc, ABCSolver(prior=:bogus))
+
+        # rng_seed parity (W1): the sampler owns its stream, so a fixed
+        # seed reproduces the run exactly without touching the global RNG.
+        sol_abc_s1 = solve(prob_abc, ABCSolver(n_particles=40,
+            n_generations=3, rng_seed=11, verbose=false))
+        sol_abc_s2 = solve(prob_abc, ABCSolver(n_particles=40,
+            n_generations=3, rng_seed=11, verbose=false))
+        @test sol_abc_s1.parameters == sol_abc_s2.parameters
+    end
+
+    @testset "rng_seed parity — VI and EKI" begin
+        # VariationalSolver/EnsembleKalmanSolver historically hard-coded
+        # Xoshiro(42); the new rng_seed field must default to 42 (behavior
+        # preserved) while making the stream controllable.
+        @test VariationalSolver().rng_seed == 42
+        @test EnsembleKalmanSolver().rng_seed == 42
+
+        decay_seed!(du, u, p, t) = (du[1] = -p.f(u[1]))
+        t_sd = collect(0.0:1.0:8.0)
+        data_sd = reshape(5.0 .* exp.(-0.5 .* t_sd) .+ 0.02, :, 1)
+        uf_sd = BSplineApproximator(:f, (0.0, 6.0), 5)
+        prob_sd = PSMProblem(decay_seed!, [5.0], (0.0, 8.0), [uf_sd];
+            data_times=t_sd, data_values=data_sd, obs_to_state=[1],
+            known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+
+        # same seed → identical; explicit 42 ≡ the default
+        eki = (seed; kw...) -> solve(prob_sd, EnsembleKalmanSolver(
+            n_ensemble=20, n_iterations=5, rng_seed=seed); kw...)
+        sol_e1 = eki(7); sol_e2 = eki(7)
+        @test sol_e1.parameters == sol_e2.parameters
+        sol_e42 = eki(42)
+        sol_edef = solve(prob_sd, EnsembleKalmanSolver(n_ensemble=20,
+            n_iterations=5))
+        @test sol_e42.parameters == sol_edef.parameters
+        # a different seed draws a different ensemble
+        @test eki(8).parameters != sol_e1.parameters
+
+        vi = seed -> solve(prob_sd, VariationalSolver(maxiters=100,
+            rng_seed=seed, verbose=false))
+        sol_v1 = vi(7); sol_v2 = vi(7)
+        @test sol_v1.parameters == sol_v2.parameters
+        sol_vdef = solve(prob_sd, VariationalSolver(maxiters=100, verbose=false))
+        @test vi(42).parameters == sol_vdef.parameters
     end
 
     @testset "ABCSolver — NaN-masked observation" begin
@@ -5105,6 +5174,2224 @@ using StableRNGs
             @test isapprox(s_nm.convergence.sigma2, s_np.convergence.sigma2;
                            rtol=0.02)
         end
+    end
+
+    @testset "approximator extension protocol" begin
+        import Lux
+
+        # (d) All 7 built-in types round-trip through build_evaluator:
+        # evaluator from initial_params, called at the domain midpoint,
+        # returns a finite number.
+        builtins = PartiallySpecifiedModels.AbstractApproximator[
+            BSplineApproximator(:f, (0.0, 1.0), 6),
+            ShapeConstrainedBSplineApproximator(:f, (0.0, 1.0), 8, :increasing),
+            SPDEApproximator(:f, (0.0, 1.0), 10),
+            ShapeConstrainedSPDEApproximator(:f, (0.0, 1.0), 8, :increasing),
+            GPApproximator(:f, (0.0, 1.0), 6; kernel=:matern52),
+            COMONetApproximator(:f, (0.0, 1.0), (8, 8), :increasing),
+            NeuralApproximator(:f, Lux.Chain(Lux.Dense(1, 4, tanh), Lux.Dense(4, 1));
+                               domain=(0.0, 1.0), rng_seed=42),
+        ]
+        for a in builtins
+            p0 = initial_params(a)
+            @test length(p0) == nparams(a)
+            ev = build_evaluator(a, p0)
+            v = ev(0.5)
+            @test v isa Number && isfinite(v)
+        end
+
+        # (c) Fallback error for a type implementing nothing: names all four
+        # interface functions and points at the docs page.
+        @test_throws ErrorException build_evaluator(NotAnApproximator(), Float64[])
+        err = try
+            build_evaluator(NotAnApproximator(), Float64[])
+        catch e
+            e
+        end
+        msg = sprint(showerror, err)
+        @test occursin("NotAnApproximator", msg)
+        for fn in ("nparams", "initial_params", "penalty_matrix", "build_evaluator")
+            @test occursin(fn, msg)
+        end
+        @test occursin("Custom approximators", msg)
+
+        # Custom PolyApproximator basics: interface methods and evaluator
+        pa = PolyApproximator(:f, (0.0, 1.0), 2)
+        @test nparams(pa) == 3
+        @test initial_params(pa) == zeros(3)
+        Spa = penalty_matrix(pa)
+        @test size(Spa) == (3, 3)
+        @test Spa[3, 3] == 1.0 && Spa[1, 1] == 0.0  # constants/lines unpenalized
+        @test build_evaluator(pa, [1.0, 2.0, 3.0])(0.5) ≈ 1.0 + 2.0 * 0.5 + 3.0 * 0.25
+
+        # Decay problem du = -f(u) with true f(u) = 0.7u, noise-free data.
+        # u ranges over [exp(-2.8), 1] ⊂ (0, 1], so f is a line inside the
+        # PolyApproximator's model class and should be recovered.
+        poly_decay!(du, u, p, t) = (du[1] = -p.f(u[1]))
+        ts_poly = collect(0.0:0.25:4.0)
+        obs_poly = reshape(exp.(-0.7 .* ts_poly), :, 1)
+        mk_poly() = PSMProblem(poly_decay!, [1.0], (0.0, 4.0),
+            [PolyApproximator(:f, (0.0, 1.0), 2)];
+            data_times=ts_poly, data_values=obs_poly, obs_to_state=[1],
+            likelihood=Gaussian(), solver=Tsit5())
+
+        # (a) AdamSolver (through-the-solver autodiff: exercises the
+        # Dual-safety of the custom evaluator)
+        sol_adam = solve(mk_poly(), AdamSolver(maxiters=1000, lr=0.02, verbose=false))
+        f_adam = sol_adam.unknown_functions[:f]
+        @test isfinite(sol_adam.data_loss)
+        @test sol_adam.data_loss < 0.05
+        @test abs(f_adam(0.5) - 0.35) < 0.1
+        @test abs(f_adam(0.9) - 0.63) < 0.15
+
+        # (b) DerivativeFreeSolver
+        sol_df = solve(mk_poly(), DerivativeFreeSolver(maxiters=4000, verbose=false))
+        f_df = sol_df.unknown_functions[:f]
+        @test isfinite(sol_df.data_loss)
+        @test sol_df.data_loss < 0.05
+        @test abs(f_df(0.5) - 0.35) < 0.1
+    end
+
+    @testset "custom-type penalties in whitelist solvers (W12)" begin
+        # The six per-type penalty sites (TwoStage, IntegralMatching, MAGI,
+        # AGM, Rodeo, Dalton) fall back to generic penalty_matrix(approx)
+        # for non-built-in types. Discriminator: pre-change, a custom
+        # type's penalty was silently ignored there, so lambda_smooth had
+        # NO effect on the fit — these assertions fail on pre-change code.
+        # TwoStage and IntegralMatching are tested end-to-end (cheap);
+        # MAGI/AGM/Rodeo/Dalton share the identical fallback pattern.
+        decay_w12!(du, u, p, t) = (du[1] = -p.f(u[1]))
+        t_w12 = collect(0.0:0.4:4.0)
+        d_w12 = reshape(2.0 .* exp.(-0.5 .* t_w12), :, 1)
+        mk12 = () -> PSMProblem(decay_w12!, [2.0], (0.0, 4.0),
+            [PolyApproximator(:f, (0.0, 2.0), 2)];
+            data_times=t_w12, data_values=d_w12, obs_to_state=[1],
+            known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+
+        # PolyApproximator's penalty is a ridge on the curvature (x^2)
+        # coefficient, so a huge lambda_smooth must crush |beta_3| in the
+        # penalized fit relative to the unpenalized one.
+        sol_ts0 = solve(mk12(), TwoStageSolver(lambda_smooth=0.0,
+            maxiters=800, verbose=false))
+        sol_tsP = solve(mk12(), TwoStageSolver(lambda_smooth=1e4,
+            maxiters=800, verbose=false))
+        @test sol_ts0.parameters != sol_tsP.parameters
+        @test abs(sol_tsP.parameters[3]) < abs(sol_ts0.parameters[3])
+
+        sol_im0 = solve(mk12(), IntegralMatchingSolver(lambda_smooth=0.0,
+            maxiters=800, verbose=false))
+        sol_imP = solve(mk12(), IntegralMatchingSolver(lambda_smooth=1e4,
+            maxiters=800, verbose=false))
+        @test sol_im0.parameters != sol_imP.parameters
+        @test abs(sol_imP.parameters[3]) < abs(sol_im0.parameters[3])
+    end
+
+    # ─── TensorBSplineApproximator (bivariate tensor-product spline) ──
+
+    @testset "TensorBSplineApproximator — construction and validation" begin
+        # inverted / degenerate domains, per margin
+        @test_throws ArgumentError TensorBSplineApproximator(
+            :g, (1.0, 0.0), (0.0, 1.0), 5, 5)
+        @test_throws ArgumentError TensorBSplineApproximator(
+            :g, (0.0, 1.0), (2.0, 2.0), 5, 5)
+        # nknots < 3 per margin (cubic interpolation floor, as univariate)
+        @test_throws ArgumentError TensorBSplineApproximator(
+            :g, (0.0, 1.0), (0.0, 1.0), 2, 5)
+        @test_throws ArgumentError TensorBSplineApproximator(
+            :g, (0.0, 1.0), (0.0, 1.0), 5, 2)
+        # anisotropy must be positive and finite
+        @test_throws ArgumentError TensorBSplineApproximator(
+            :g, (0.0, 1.0), (0.0, 1.0), 5, 5; anisotropy=0.0)
+        @test_throws ArgumentError TensorBSplineApproximator(
+            :g, (0.0, 1.0), (0.0, 1.0), 5, 5; anisotropy=-1.0)
+        @test_throws ArgumentError TensorBSplineApproximator(
+            :g, (0.0, 1.0), (0.0, 1.0), 5, 5; anisotropy=Inf)
+
+        a = TensorBSplineApproximator(:g, (0.0, 2.0), (1.0, 3.0), 5, 4)
+        @test nparams(a) == 20
+        @test initial_params(a) == zeros(20)
+
+        # initial surface sampled on the knot grid, column-major (x fastest)
+        a2 = TensorBSplineApproximator(:g, (0.0, 2.0), (1.0, 3.0), 5, 4;
+                                       initial=(x, y) -> x + 10y)
+        th = initial_params(a2)
+        xs = range(0.0, 2.0, length=5)
+        ys = range(1.0, 3.0, length=4)
+        @test th[2] ≈ xs[2] + 10ys[1]      # grid index (2, 1)
+        @test th[6] ≈ xs[1] + 10ys[2]      # grid index (1, 2): x fastest
+        a3 = TensorBSplineApproximator(:g, (0.0, 1.0), (0.0, 1.0), 3, 3;
+                                       initial=2.5)
+        @test all(initial_params(a3) .== 2.5)
+        # string names accepted, matching the univariate constructors
+        @test TensorBSplineApproximator("g", (0.0, 1.0), (0.0, 1.0), 3, 3).name == :g
+    end
+
+    @testset "TensorBSplineApproximator — evaluator matches univariate machinery" begin
+        using ForwardDiff
+        nx, ny = 6, 5
+        a = TensorBSplineApproximator(:g, (0.0, 3.0), (-1.0, 2.0), nx, ny)
+        C = randn(StableRNG(1), nx, ny)
+        f = build_evaluator(a, vec(C))
+        kx = collect(range(0.0, 3.0, length=nx))
+        ky = collect(range(-1.0, 2.0, length=ny))
+
+        # interpolates the coefficient grid exactly
+        @test maximum(abs(f(kx[i], ky[j]) - C[i, j])
+                      for i in 1:nx, j in 1:ny) < 1e-10
+
+        # The univariate BSpline evaluator is interpolation-THROUGH-VALUES
+        # (CubicSpline with linear extrapolation), and the tensor evaluator
+        # mirrors it per margin — so on every grid line the surface must
+        # agree exactly with a univariate evaluator built from the
+        # corresponding coefficient slice, inside AND outside the domain.
+        for j in (1, 3, ny)
+            s = PartiallySpecifiedModels.build_bspline_evaluator(kx, C[:, j])
+            for x in (-0.5, 0.2, 1.7, 3.0, 3.8)
+                @test f(x, ky[j]) ≈ s(x) atol=1e-9
+            end
+        end
+        for i in (1, 4, nx)
+            s = PartiallySpecifiedModels.build_bspline_evaluator(ky, C[i, :])
+            for y in (-1.6, -0.3, 0.9, 2.0, 2.5)
+                @test f(kx[i], y) ≈ s(y) atol=1e-9
+            end
+        end
+
+        # Dual-safe in the parameters …
+        g1 = ForwardDiff.gradient(b -> build_evaluator(a, b)(1.1, 0.4), vec(C))
+        @test all(isfinite, g1)
+        # … matching finite differences
+        h = 1e-6
+        for k in (1, 13, 30)
+            e_k = [i == k ? 1.0 : 0.0 for i in 1:(nx * ny)]
+            fd = (build_evaluator(a, vec(C) .+ h .* e_k)(1.1, 0.4) -
+                  build_evaluator(a, vec(C) .- h .* e_k)(1.1, 0.4)) / (2h)
+            @test g1[k] ≈ fd atol=1e-6
+        end
+        # Dual-safe in the states (autodiff ODE solvers evaluate at Dual u)
+        g2 = ForwardDiff.gradient(v -> f(v[1], v[2]), [1.1, 0.4])
+        @test all(isfinite, g2)
+        # nested: Dual params of a Dual-state derivative (through-the-solver
+        # training with stiff autodiff Jacobians)
+        g3 = ForwardDiff.gradient(
+            b -> ForwardDiff.derivative(x -> build_evaluator(a, b)(x, 0.4), 1.1),
+            vec(C))
+        @test all(isfinite, g3)
+    end
+
+    @testset "TensorBSplineApproximator — Kronecker-sum penalty" begin
+        nx, ny = 6, 5
+        a1 = TensorBSplineApproximator(:g, (0.0, 3.0), (-1.0, 2.0), nx, ny)
+        a100 = TensorBSplineApproximator(:g, (0.0, 3.0), (-1.0, 2.0), nx, ny;
+                                         anisotropy=100.0)
+        S1 = penalty_matrix(a1)
+        S100 = penalty_matrix(a100)
+        @test size(S1) == (nx * ny, nx * ny)
+        @test issymmetric(S1)
+        ev = eigvals(Symmetric(S1))
+        @test minimum(ev) > -1e-10           # PSD
+
+        # Null space: with 2nd-derivative marginal penalties, S annihilates
+        # exactly the surfaces whose columns are affine in x AND rows affine
+        # in y — the bilinear family a + b·x + c·y + d·x·y (on the unit
+        # square, where penalty_matrix builds its knots).
+        xs = range(0.0, 1.0, length=nx)
+        ys = range(0.0, 1.0, length=ny)
+        for (α, β, γ, δ) in ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0),
+                             (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0),
+                             (2.0, -1.0, 0.5, 3.0))
+            v = vec([α + β * x + γ * y + δ * x * y for x in xs, y in ys])
+            @test norm(S1 * v) < 1e-8
+        end
+        # … and nothing more: rank is exactly nx·ny − 4
+        @test count(x -> x > 1e-8 * maximum(ev), ev) == nx * ny - 4
+
+        # Orientation w.r.t. the column-major vec layout: a surface rough in
+        # x ONLY is penalized by the x-term only (quadratic form invariant
+        # under anisotropy), while a surface rough in y ONLY scales linearly
+        # with anisotropy.
+        vx = vec([sin(6x) for x in xs, y in ys])  # varies in x, flat in y
+        vy = vec([sin(6y) for x in xs, y in ys])  # flat in x, varies in y
+        @test dot(vx, S1 * vx) > 1.0
+        @test dot(vy, S1 * vy) > 1.0
+        @test dot(vx, S100 * vx) ≈ dot(vx, S1 * vx) rtol=1e-10
+        @test dot(vy, S100 * vy) ≈ 100.0 * dot(vy, S1 * vy) rtol=1e-10
+    end
+
+    @testset "TensorBSplineApproximator — end-to-end recovery (Wood 2001 predation surface)" begin
+        # Rosenzweig–MacArthur predator–prey with an unknown BIVARIATE
+        # interaction g(N, P) = 0.6·N·P/(1 + 0.4·N): Holling II in prey,
+        # linear in predator — genuinely non-separable. Logistic prey
+        # growth keeps the system on a bounded limit cycle (with pure
+        # exponential prey growth this model diverges), so the orbit
+        # sweeps a data-rich loop through the (N, P) plane.
+        g_true_2d(N, P) = 0.6 * N * P / (1 + 0.4 * N)
+        function pp_true!(du, u, p, t)
+            g = g_true_2d(u[1], u[2])
+            du[1] = u[1] * (1 - u[1] / 6.0) - g
+            du[2] = 0.5 * g - 0.25 * u[2]
+        end
+        sol_true2d = OrdinaryDiffEq.solve(
+            ODEProblem(pp_true!, [1.0, 1.5], (0.0, 40.0)), Tsit5(),
+            saveat=0.5, abstol=1e-10, reltol=1e-10)
+        traj2d = reduce(hcat, sol_true2d.u)'
+        ts2d = collect(sol_true2d.t)
+        data2d = traj2d .+ 0.03 .* randn(StableRNG(11), size(traj2d))
+
+        function pp2d!(du, u, p, t)
+            g = p.g(u[1], u[2])
+            du[1] = u[1] * (1 - u[1] / 6.0) - g
+            du[2] = p.e * g - p.m * u[2]
+        end
+        mk2d() = PSMProblem(pp2d!, [1.0, 1.5], (0.0, 40.0),
+            [TensorBSplineApproximator(:g, (0.0, 3.0), (0.5, 3.0), 5, 5;
+                                       initial=(N, P) -> 0.3 * N * P)];
+            data_times=ts2d, data_values=data2d, obs_to_state=[1, 2],
+            known_params=(e=0.5, m=0.25), likelihood=Gaussian(),
+            solver=Tsit5())
+        prob2d = mk2d()
+
+        # A 1-D orbit only identifies the surface near the visited region:
+        # test at actual trajectory states across the cycle's phases.
+        test_pts = [(traj2d[i, 1], traj2d[i, 2]) for i in (10, 25, 40, 55, 70)]
+
+        # Reference: data loss of the initial bilinear mass-action surface
+        beta0 = PartiallySpecifiedModels.build_initial_params(prob2d)
+        loss0 = PartiallySpecifiedModels.weighted_data_loss(
+            prob2d, PartiallySpecifiedModels.simulate(prob2d, beta0))
+
+        # (a) AdamSolver — ForwardDiff through the ODE solve (Dual params
+        # AND Dual states through the two-argument evaluator)
+        sol_adam = solve(prob2d, AdamSolver(maxiters=400, lr=0.05))
+        @test sol_adam.data_loss < 1.5           # observed ≈ 0.67
+        @test sol_adam.data_loss < loss0 / 20    # loss0 ≈ 81
+        g_adam = sol_adam.unknown_functions[:g]
+        for (N, P) in test_pts
+            # observed rel. errors 0.02–0.13
+            @test abs(g_adam(N, P) - g_true_2d(N, P)) < 0.25 * g_true_2d(N, P)
+        end
+
+        # (b) LAML — finite-difference Jacobian through the ODE solve plus
+        # the Kronecker-sum penalty with automatic λ. The default
+        # data-driven initial λ oversmooths this strongly nonlinear
+        # oscillator; starting light (initial_lambda, warmup — the LAML
+        # docstring's guidance for strongly nonlinear models) recovers the
+        # surface to ≈1% at the tested states.
+        sol_laml = solve(prob2d,
+                         LAML(maxiters=60, warmup=10, initial_lambda=0.01))
+        @test sol_laml.data_loss < 1.0           # observed ≈ 0.14
+        g_laml = sol_laml.unknown_functions[:g]
+        for (N, P) in test_pts
+            # observed rel. errors ≤ 0.01
+            @test abs(g_laml(N, P) - g_true_2d(N, P)) < 0.15 * g_true_2d(N, P)
+        end
+
+        # (c) a higher fixed penalty produces a SMOOTHER surface: β'Sβ
+        # collapses under penalty_weight (the smoothness assertion is made
+        # on the fixed-λ solver because LAML's λ automation would make a
+        # λ-vs-λ comparison brittle)
+        S2d = penalty_matrix(prob2d.approximators[1])
+        sol_pen = solve(mk2d(),
+                        AdamSolver(maxiters=300, lr=0.05, penalty_weight=50.0))
+        rough_unpen = dot(sol_adam.parameters, S2d * sol_adam.parameters)
+        rough_pen = dot(sol_pen.parameters, S2d * sol_pen.parameters)
+        @test rough_pen < 0.01 * rough_unpen     # observed 1221 → 0.011
+
+        # (d) DerivativeFreeSolver completes and recovers the surface
+        sol_dfree = solve(prob2d, DerivativeFreeSolver(maxiters=3000))
+        @test sol_dfree.data_loss < 3.0          # observed ≈ 1.1
+        g_dfree = sol_dfree.unknown_functions[:g]
+        for (N, P) in test_pts[[2, 4]]
+            # observed rel. errors ≤ 0.04
+            @test abs(g_dfree(N, P) - g_true_2d(N, P)) < 0.25 * g_true_2d(N, P)
+        end
+
+        # (e) the univariate confidence-band machinery REJECTS the tensor
+        # surface loudly instead of erroring obscurely on `.domain`
+        @test_throws ArgumentError confidence_band(sol_laml, prob2d)
+    end
+
+    @testset "TensorBSplineApproximator — GCV recovery and bootstrap-band gating" begin
+        # Milder monotone 2-state decay problem: GCV's IRLS linearization
+        # is well behaved here (on the oscillatory cycle above it needs the
+        # same care as for univariate splines).
+        g_true_dec(N, P) = 0.5 * N * P / (1 + 0.5 * N)
+        function dec_true!(du, u, p, t)
+            g = g_true_dec(u[1], u[2])
+            du[1] = -g
+            du[2] = 0.2 * g - 0.1 * u[2]
+        end
+        sol_true_d = OrdinaryDiffEq.solve(
+            ODEProblem(dec_true!, [2.5, 1.5], (0.0, 12.0)), Tsit5(),
+            saveat=0.25, abstol=1e-10, reltol=1e-10)
+        traj_d = reduce(hcat, sol_true_d.u)'
+        ts_d = collect(sol_true_d.t)
+        data_d = traj_d .+ 0.01 .* randn(StableRNG(3), size(traj_d))
+        function dec!(du, u, p, t)
+            g = p.g(u[1], u[2])
+            du[1] = -g
+            du[2] = p.e * g - p.m * u[2]
+        end
+        prob_d = PSMProblem(dec!, [2.5, 1.5], (0.0, 12.0),
+            [TensorBSplineApproximator(:g, (0.0, 3.0), (0.0, 2.0), 5, 5;
+                                       initial=(N, P) -> 0.2 * N * P)];
+            data_times=ts_d, data_values=data_d, obs_to_state=[1, 2],
+            known_params=(e=0.2, m=0.1), likelihood=Gaussian(),
+            solver=Tsit5())
+
+        sol_gcv = solve(prob_d, GCVSolver(maxiters=60))
+        @test sol_gcv.data_loss < 0.5            # observed ≈ 0.10
+        g_gcv = sol_gcv.unknown_functions[:g]
+        # early-trajectory states, where g is well identified (late in the
+        # decay g → 0 and relative error stops being meaningful)
+        for i in (5, 15)
+            N, P = traj_d[i, 1], traj_d[i, 2]
+            # observed rel. errors ≤ 0.01
+            @test abs(g_gcv(N, P) - g_true_dec(N, P)) < 0.15 * g_true_dec(N, P)
+        end
+
+        # bootstrap: parameter/trajectory intervals work, but the UNIVARIATE
+        # unknown-function band is skipped with a warning rather than
+        # silently mis-gridding the bivariate surface
+        sol_dfree = solve(prob_d, DerivativeFreeSolver(maxiters=400))
+        res = @test_logs (:warn, r"bivariate") match_mode=:any bootstrap(
+            sol_dfree, prob_d, DerivativeFreeSolver(maxiters=200);
+            nboot=3, rng=StableRNG(5))
+        @test res.n_success >= 3
+        @test !haskey(res.ci_uf, :g)
+    end
+
+    @testset "ShapeConstrainedGPApproximator — construction" begin
+        a = ShapeConstrainedGPApproximator(:f, (0.0, 5.0), 8, :increasing)
+        @test a.name == :f
+        @test nparams(a) == 8
+        @test a.constraint == :increasing
+        @test a.adapt                     # no lengthscale supplied → adaptive
+        @test length(a.inducing_points) == 8
+        @test length(initial_params(a)) == 8
+
+        # Explicit hyperparameters are fixed for the whole fit (never adapted)
+        a_fix = ShapeConstrainedGPApproximator(:g, (0.0, 5.0), 8, :decreasing;
+                                               lengthscale=1.0, kernel=:matern52)
+        @test !a_fix.adapt
+        @test a_fix.lengthscale == 1.0
+        @test a_fix.kernel == :matern52
+
+        # Zero-at-endpoint constraints drop one parameter, like the SCOP
+        # B-spline/SPDE siblings
+        a_z = ShapeConstrainedGPApproximator(:h, (0.0, 1.0), 8, :inc_zero_left)
+        @test nparams(a_z) == 7
+
+        # Penalty: P&W first-difference penalty on γ with the free level in
+        # the null space (PSD, rank-deficient)
+        S = penalty_matrix(a)
+        @test size(S) == (8, 8)
+        @test all(e -> e > -1e-10, eigvals(Symmetric(S)))
+        @test all(iszero, S[1, :])        # free level γ₁ unpenalized
+
+        # Validation
+        @test_throws ArgumentError ShapeConstrainedGPApproximator(
+            :f, (0.0, 1.0), 8, :bad_constraint)
+        @test_throws ArgumentError ShapeConstrainedGPApproximator(
+            :f, (1.0, 0.0), 8, :increasing)
+        @test_throws ArgumentError ShapeConstrainedGPApproximator(
+            :f, (0.0, 1.0), 3, :increasing)
+    end
+
+    @testset "ShapeConstrainedGPApproximator — constraint by construction" begin
+        # For ANY parameter vector the reparameterized evaluator satisfies its
+        # constraint: exactly at the inducing values (β = Σ·d(γ) is built to)
+        # and on a fine grid up to the small between-point wiggle of kernel
+        # interpolation (the SCOP-SPDE cubic has the same caveat; observed
+        # ≤ 0.6% of the function range for the N(0,1) draws used here;
+        # the margin grows with the draw scale, so the 1% tolerance below
+        # is calibrated to THESE seeded draws, not a universal bound).
+        rng = StableRNG(7)
+        grid = collect(range(0.0, 2.0, length=401))
+        for c in (:increasing, :decreasing, :convex, :concave)
+            ac = ShapeConstrainedGPApproximator(:f, (0.0, 2.0), 8, c)
+            for trial in 1:5
+                γ = randn(rng, nparams(ac))
+                β = PartiallySpecifiedModels.gamma_to_inducing_values(ac, γ)
+                f = build_evaluator(ac, γ)
+                vals = [f(x) for x in grid]
+                rangev = maximum(vals) - minimum(vals)
+                if c == :increasing
+                    @test all(diff(β) .>= 0)              # exact at nodes
+                    @test all(diff(vals) .>= -0.01 * rangev)
+                elseif c == :decreasing
+                    @test all(diff(β) .<= 0)
+                    @test all(diff(vals) .<= 0.01 * rangev)
+                elseif c == :convex
+                    @test all(diff(diff(β)) .>= -1e-10)
+                    @test all(diff(diff(vals)) .>= -2e-3 * rangev)
+                else # :concave
+                    @test all(diff(diff(β)) .<= 1e-10)
+                    @test all(diff(diff(vals)) .<= 2e-3 * rangev)
+                end
+            end
+        end
+
+        # Zero-at-endpoint: pinned exactly (constant centering shift) and
+        # still monotone
+        a_z = ShapeConstrainedGPApproximator(:f, (0.0, 2.0), 8, :inc_zero_left)
+        γz = randn(rng, nparams(a_z))
+        fz = build_evaluator(a_z, γz)
+        @test abs(fz(0.0)) < 1e-10
+        valz = [fz(x) for x in grid]
+        @test all(diff(valz) .>= -0.01 * (maximum(valz) - minimum(valz)))
+    end
+
+    @testset "ShapeConstrainedGPApproximator — Dual-safety" begin
+        import ForwardDiff
+        a = ShapeConstrainedGPApproximator(:f, (0.0, 2.0), 6, :increasing)
+        γ = randn(StableRNG(3), nparams(a))
+        # Gradient w.r.t. the parameters (autodiff solvers differentiate the
+        # objective through build_evaluator)
+        g = ForwardDiff.gradient(
+            p -> sum(build_evaluator(a, p)(x) for x in 0.0:0.5:2.0), γ)
+        @test all(isfinite, g)
+        @test any(!iszero, g)
+        # Derivative w.r.t. the input (stiff-solver Jacobians pass Dual x),
+        # covering both extrapolation branches and the interior
+        f = build_evaluator(a, γ)
+        for x in (-0.5, 1.0, 2.5)
+            @test isfinite(ForwardDiff.derivative(f, x))
+        end
+        @test ForwardDiff.derivative(f, 1.0) >= -1e-8  # monotone increasing
+    end
+
+    @testset "ShapeConstrainedGPApproximator — monotone recovery (LAML/Adam)" begin
+        # Saturating uptake du = -f(u), f(u) = u/(1+u): monotone increasing
+        # truth with sparse noisy data. The discriminating pair: the
+        # UNCONSTRAINED GP fit chases the noise into a non-monotone f (assert
+        # it does — otherwise this test proves nothing), while the constrained
+        # fit cannot violate monotonicity by construction AND recovers the
+        # truth more accurately.
+        f_true_gp(u) = u / (1 + u)
+        function uptake_gp!(du, u, p, t)
+            du[1] = -p.f(u[1])
+        end
+        ode_gp = ODEProblem((du, u, p, t) -> (du[1] = -f_true_gp(u[1])),
+                            [2.0], (0.0, 8.0))
+        traj_gp = OrdinaryDiffEq.solve(ode_gp, Tsit5(); abstol=1e-10, reltol=1e-10)
+        rng = StableRNG(5)
+        ts_gp = collect(range(0.0, 8.0, length=12))
+        data_gp = reshape([traj_gp(t)[1] for t in ts_gp] .+
+                          0.10 .* randn(rng, 12), :, 1)
+
+        mk_gp(approx) = PSMProblem(uptake_gp!, [2.0], (0.0, 8.0), [approx];
+            data_times=ts_gp, data_values=data_gp, obs_to_state=[1],
+            known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+
+        grid = collect(range(0.05, 2.0, length=200))
+        # Worst decrease as a fraction of the fitted range (positive ⇒ the
+        # fit is non-monotone somewhere on the grid)
+        function viol_frac(fh)
+            vals = [fh(x) for x in grid]
+            -minimum(diff(vals)) / (maximum(vals) - minimum(vals))
+        end
+
+        sol_u = solve(mk_gp(GPApproximator(:f, (0.0, 2.2), 8;
+                                           initial=x -> 0.3 * x)),
+                      LAML(maxiters=40, verbose=false))
+        prob_c = mk_gp(ShapeConstrainedGPApproximator(:f, (0.0, 2.2), 8,
+                           :increasing; initial=x -> 0.3 * x))
+        sol_c = solve(prob_c, LAML(maxiters=40, verbose=false))
+        fu = sol_u.unknown_functions[:f]
+        fc = sol_c.unknown_functions[:f]
+
+        # Unconstrained fit genuinely violates monotonicity (observed 0.0079)
+        @test viol_frac(fu) > 0.003
+        # Constrained fit is monotone (observed strictly increasing,
+        # viol_frac ≈ -0.001; tolerance covers between-point kernel wiggle)
+        @test viol_frac(fc) < 1e-3
+        # ...and recovers the truth (observed maxerr 0.107, meanerr 0.054 on
+        # a truth range of ≈ 0.65)
+        errs_c = [abs(fc(x) - f_true_gp(x)) for x in grid]
+        @test maximum(errs_c) < 0.15
+        @test sum(errs_c) / length(errs_c) < 0.08
+        # ...more accurately than the unconstrained fit (0.054 vs 0.104 mean)
+        errs_u = [abs(fu(x) - f_true_gp(x)) for x in grid]
+        @test sum(errs_c) < sum(errs_u)
+
+        # Confidence band treats the constrained GP like its SCOP siblings
+        # (finite-difference ∂f/∂γ through _eval_approx_at)
+        bands = confidence_band(sol_c, prob_c)
+        @test haskey(bands, :f)
+        @test all(isfinite, bands[:f].se)
+        @test all(bands[:f].lower .<= bands[:f].upper)
+
+        # AdamSolver end-to-end through the same build_evaluator protocol
+        # (observed maxerr 0.117, monotone)
+        sol_a = solve(mk_gp(ShapeConstrainedGPApproximator(:f, (0.0, 2.2), 8,
+                                :increasing; initial=x -> 0.3 * x)),
+                      AdamSolver(maxiters=300, lr=0.05))
+        fa = sol_a.unknown_functions[:f]
+        @test viol_frac(fa) < 1e-3
+        @test maximum(abs(fa(x) - f_true_gp(x)) for x in grid) < 0.2
+    end
+
+    @testset "LAML full Laplace criterion (construction + Gaussian reduction)" begin
+        # Construction validation: criterion is checked at construction
+        @test LAML().criterion == :working
+        @test LAML(criterion=:laplace).criterion == :laplace
+        @test_throws ArgumentError LAML(criterion=:reml)
+
+        # CustomLikelihood is rejected under :laplace with an informative
+        # error (its loglik_scalar declares neither a normalizer nor a
+        # dispersion, both of which the full criterion needs).
+        rng = Xoshiro(20260819)
+        data_times = collect(0.0:0.5:10.0)
+        data_values = reshape(exp.(0.1 .* data_times) .+
+                              0.01 .* randn(rng, length(data_times)), :, 1)
+        exp_growth!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        mk_lik(lik) = PSMProblem(exp_growth!, [1.0], (0.0, 10.0),
+            [BSplineApproximator(:r, (0.0, 5.0), 5; initial=x -> 0.05)];
+            data_times=data_times, data_values=data_values,
+            obs_to_state=[1], likelihood=lik, solver=Tsit5())
+        err = try
+            solve(mk_lik(CustomLikelihood((y, μ) -> -0.5 * (y - μ)^2)),
+                  LAML(maxiters=5, criterion=:laplace))
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("does not support CustomLikelihood", err.msg)
+
+        # Gaussian reduction: for Gaussian data the full Laplace criterion
+        # with σ² profiled out IS the profiled-REML criterion (algebra in
+        # laml_objective's Gaussian branch), and in code the two criteria
+        # take the identical path — so λ̂ trajectory, objective and fit must
+        # coincide to machine precision.
+        prob_g = mk_lik(Gaussian())
+        sol_w = solve(prob_g, LAML(maxiters=30, verbose=false))
+        sol_l = solve(prob_g, LAML(maxiters=30, verbose=false,
+                                   criterion=:laplace))
+        @test sol_l.smoothing_params ≈ sol_w.smoothing_params rtol=1e-12
+        @test sol_l.objective ≈ sol_w.objective rtol=1e-12
+        @test sol_l.fitted_values ≈ sol_w.fitted_values rtol=1e-12
+        rgrid = range(0.5, 4.0, length=20)
+        @test [sol_l.unknown_functions[:r](x) for x in rgrid] ≈
+              [sol_w.unknown_functions[:r](x) for x in rgrid] rtol=1e-12
+
+        # Criterion is recorded, existing convergence keys are all intact,
+        # and the reported criterion value (profiled REML here) is the same
+        # finite number under both settings.
+        @test sol_w.convergence.criterion == :working
+        @test sol_l.convergence.criterion == :laplace
+        for k in (:V_beta, :sigma2, :converged, :iterations, :reason,
+                  :laml_failures, :criterion, :laml)
+            @test haskey(sol_w.convergence, k)
+        end
+        @test isfinite(sol_l.convergence.laml)
+        @test sol_l.convergence.laml ≈ sol_w.convergence.laml rtol=1e-12
+    end
+
+    @testset "LAML full Laplace criterion (objective value + FS scale)" begin
+        using PartiallySpecifiedModels: laml_objective,
+                                        estimate_smoothing_params,
+                                        spline_penalty_matrix, _safe_inv
+        # Deterministic (RNG-free) Poisson working state on a linear hat
+        # design: y is a fixed rounded pattern whose Pearson dispersion
+        # against the fit is ≈ 1.10 > 1, so the two criteria measurably
+        # disagree about λ while everything stays pure linear algebra.
+        n, nk = 40, 6
+        knots = collect(0.0:1.0:5.0)
+        xs = collect(range(0.0, 5.0, length=n))
+        hat(x, k) = max(0.0, 1.0 - abs(x - k))
+        J = [hat(xs[i], knots[j]) for i in 1:n, j in 1:nk]
+        S = spline_penalty_matrix(knots)
+        w = ones(n)
+        mu0 = 2.0 .+ 1.5 .* sin.(xs)
+        y = max.(round.(mu0 .+ 2.0 .* sin.(17.3 .* xs)), 0.0)
+
+        # β̂ at FIXED small λ by penalized IRLS for the actual Poisson family
+        # (identity link on a linear design ⟹ pseudodata z = y exactly).
+        lam_fix = 0.05
+        S_lam = lam_fix .* S
+        beta = _safe_inv(J' * Diagonal(w) * J + S_lam) * (J' * (w .* y))
+        mu = J * beta
+        for _ in 1:300
+            W_it = [w[i] / max(abs(mu[i]), 1e-6) for i in 1:n]
+            beta = _safe_inv(J' * Diagonal(W_it) * J + S_lam) *
+                   (J' * (W_it .* y))
+            mu = J * beta
+        end
+        W = [w[i] / max(abs(mu[i]), 1e-6) for i in 1:n]
+        @test all(mu .> 0.5)   # fitted means healthy (observed 0.87–3.37)
+
+        # Objective correctness: the solver's criterion (laml_objective, the
+        # exact quantity reported as sol.convergence.laml) against the
+        # Wood (2011) formula computed independently here:
+        #   V = ℓ(β̂) − ½β̂'S_λβ̂ + ½log|S_λ|₊ − ½log|J'WJ + S_λ| + (Mp/2)log 2π
+        # with W the Fisher weights 1/μ̂ (expected Hessian). Observed
+        # agreement 6.5e-10 (the residual is laml_objective's 1e-10
+        # stabilizing ridge inside _log_det_pd); atol=1e-6 leaves ~1000x
+        # headroom while catching any dropped or mis-scaled term.
+        V_solver, = laml_objective(Poisson(), beta, J, W, w, y, mu,
+                                   [S], [0], [nk], [log(lam_fix)], nk)
+        logfact(k) = sum(log.(1:Int(k)); init=0.0)
+        ll = sum(w[i] * (y[i] * log(mu[i]) - mu[i] - logfact(y[i]))
+                 for i in 1:n)
+        pen = lam_fix * dot(beta, S * beta)
+        ev = eigvals(Symmetric(S))
+        tolS = 1e-10 * maximum(abs.(ev))
+        rS = count(e -> e > tolS, ev)
+        logdetSplus = rS * log(lam_fix) + sum(log(e) for e in ev if e > tolS)
+        logdetH = logdet(cholesky(Symmetric(J' * Diagonal(W) * J + S_lam)))
+        V_direct = ll - 0.5 * pen + 0.5 * logdetSplus - 0.5 * logdetH +
+                   0.5 * (nk - rS) * log(2π)
+        @test V_solver ≈ V_direct atol=1e-6
+
+        # FS-scale discriminator: from the same frozen working state,
+        # :working calibrates FS by the Pearson dispersion φ̂ ≈ 1.10 (and
+        # skips Newton) while :laplace uses unit dispersion plus Newton
+        # refinement of V. Observed λ̂: 4.247 vs 3.213 (ratio 1.32). The
+        # computation is deterministic — no RNG, no ODE solves — so a
+        # ratio floor of 1.05 is safe against BLAS/platform variation.
+        pearson = sum((y[i] - mu[i])^2 / mu[i] for i in 1:n) / (n - rS)
+        @test pearson > 1.02   # the mechanism the discrimination relies on
+        lam_w, = estimate_smoothing_params(J, W, w, y, mu, beta,
+            [S], [0], [nk], nk; family=Poisson(), rho_init=[0.0],
+            criterion=:working)
+        lam_l, = estimate_smoothing_params(J, W, w, y, mu, beta,
+            [S], [0], [nk], nk; family=Poisson(), rho_init=[0.0],
+            criterion=:laplace)
+        @test isfinite(lam_l[1]) && lam_l[1] > 0
+        @test lam_w[1] / lam_l[1] > 1.05
+    end
+
+    @testset "LAML full Laplace criterion (count-data end-to-end)" begin
+        # Logistic growth observed as low-mean counts (μ ∈ [1, 7.96]) —
+        # exactly the regime where the Gaussian working approximation is
+        # worst. The unknown per-capita rate g(u) = r₀(1 − u/K) is fitted
+        # from Poisson observations. Data are deterministic: a fixed-seed
+        # Xoshiro drives an inversion sampler, and the solver itself is
+        # RNG-free, so both fits below are reproducible.
+        r0, K = 0.6, 8.0
+        tsl = collect(0.0:0.4:12.0)
+        tsol = OrdinaryDiffEq.solve(
+            ODEProblem((du, u, p, t) -> du[1] = r0 * (1 - u[1] / K) * u[1],
+                       [1.0], (0.0, 12.0)),
+            Tsit5(); saveat=tsl, abstol=1e-10, reltol=1e-10)
+        mu_true = [tsol.u[i][1] for i in eachindex(tsl)]
+        function rpois(rng, m)
+            L = exp(-m); k = 0; p = 1.0
+            while true
+                p *= rand(rng)
+                p <= L && return k
+                k += 1
+            end
+        end
+        growth!(du, u, p, t) = (du[1] = p.g(u[1]) * u[1])
+        mk_count(y, lik) = PSMProblem(growth!, [1.0], (0.0, 12.0),
+            [BSplineApproximator(:g, (0.3, 9.0), 6; initial=x -> 0.3)];
+            data_times=tsl, data_values=reshape(y, :, 1), obs_to_state=[1],
+            likelihood=lik, solver=Tsit5())
+        gtrue(x) = r0 * (1 - x / K)
+        gx = range(1.0, 7.5, length=40)
+        errs(s) = [abs(s.unknown_functions[:g](x) - gtrue(x)) for x in gx]
+
+        # Poisson: this draw's sample Pearson dispersion against the truth
+        # is 1.41, so the :working criterion (φ̂-scaled FS) lands on a
+        # visibly larger λ̂ than the full Laplace criterion.
+        rng_p = Xoshiro(1)
+        y_p = Float64[rpois(rng_p, m) for m in mu_true]
+        sol_pw = solve(mk_count(y_p, Poisson()),
+                       LAML(maxiters=40, verbose=false))
+        sol_pl = solve(mk_count(y_p, Poisson()),
+                       LAML(maxiters=40, verbose=false, criterion=:laplace))
+        # Honest reporting: :laplace runs to convergence and records itself
+        @test sol_pl.convergence.converged
+        @test sol_pl.convergence.criterion == :laplace
+        @test sol_pw.convergence.criterion == :working
+        @test isfinite(sol_pl.convergence.laml)
+        # Recovery of the truth under :laplace (observed maxerr 0.069,
+        # meanerr 0.029 on a truth range of ≈ 0.53 over [1, 7.5])
+        @test maximum(errs(sol_pl)) < 0.15
+        @test sum(errs(sol_pl)) / length(gx) < 0.06
+        # ...and it DIFFERS measurably from :working in λ̂: observed
+        # λ̂_working = 5.86e6 vs λ̂_laplace = 2.59e6, |Δlog λ̂| = 0.816 —
+        # the fits themselves nearly coincide here (the truth is linear in
+        # u, i.e. in the penalty null space, so both smooth heavily), which
+        # is what makes the λ̂ contrast the deterministic discriminator.
+        # Floor of 0.1 leaves 8x headroom in log terms.
+        @test sol_pl.smoothing_params[1] != sol_pw.smoothing_params[1]
+        @test abs(log(sol_pl.smoothing_params[1] /
+                      sol_pw.smoothing_params[1])) > 0.1
+
+        # NegativeBinomial end-to-end with :laplace: fixed dispersion
+        # θ = 8 in the family object, correctly specified data. Observed:
+        # converged, λ̂ = 6.66e6, maxerr 0.061, meanerr 0.041, V = −71.6.
+        rng_nb = Xoshiro(1)
+        th = 8
+        y_nb = Float64[rpois(rng_nb,
+                             m * (-sum(log(rand(rng_nb)) for _ in 1:th) / th))
+                       for m in mu_true]
+        sol_nb = solve(mk_count(y_nb, NegativeBinomial(Float64(th))),
+                       LAML(maxiters=40, verbose=false, criterion=:laplace))
+        @test sol_nb.convergence.converged
+        @test sol_nb.convergence.criterion == :laplace
+        @test isfinite(sol_nb.convergence.laml)
+        @test maximum(errs(sol_nb)) < 0.15
+        @test sum(errs(sol_nb)) / length(gx) < 0.09
+    end
+
+    @testset "GCVSolver criterion=:ncv (neighbourhood CV, Wood 2024)" begin
+        PSM = PartiallySpecifiedModels
+
+        # ── Construction validation ──
+        @test_throws ArgumentError GCVSolver(criterion=:foo)
+        @test_throws ArgumentError GCVSolver(criterion=:loocv)
+        @test_throws ArgumentError GCVSolver(ncv_width=-1)
+        @test_throws ArgumentError GCVSolver(criterion=:ncv, ncv_width=-3)
+        @test GCVSolver().criterion == :gcv                  # default unchanged
+        @test GCVSolver(criterion=:ncv).ncv_width == 2
+        @test GCVSolver(criterion=:ncv, ncv_width=0) isa GCVSolver  # 0 = LOOCV
+
+        # ── Neighbourhood construction (obs-major flattening: index
+        # k = (oi−1)·n_times + ti; δ never crosses component blocks and
+        # never contains masked rows) ──
+        nt_w6 = 12
+        w_w6 = fill(1.0, 2 * nt_w6)
+        w_w6[5] = 0.0                       # masked cell, component 1, t=5
+        @test PSM._ncv_neighbourhood(1, nt_w6, w_w6, 2) == [1, 2, 3]
+        @test PSM._ncv_neighbourhood(12, nt_w6, w_w6, 2) == [10, 11, 12]
+        @test PSM._ncv_neighbourhood(6, nt_w6, w_w6, 2) == [4, 6, 7, 8]
+        @test PSM._ncv_neighbourhood(13, nt_w6, w_w6, 2) == [13, 14, 15]
+        @test PSM._ncv_neighbourhood(24, nt_w6, w_w6, 2) == [22, 23, 24]
+        @test PSM._ncv_neighbourhood(8, nt_w6, w_w6, 0) == [8]
+
+        # ── EXACTNESS: Woodbury downdate == brute-force drop-refit-predict
+        # on a fixed working model (StableRNG), interior + edge points +
+        # a masked cell inside a neighbourhood ──
+        rng_w6 = StableRNG(42)
+        n_w6 = 2 * nt_w6
+        p_w6 = 5
+        J_w6 = randn(rng_w6, n_w6, p_w6)
+        z_w6 = randn(rng_w6, n_w6)
+        wv_w6 = rand(rng_w6, n_w6) .+ 0.5
+        wv_w6[5] = 0.0
+        S_w6 = Matrix(0.7I, p_w6, p_w6)
+        A_w6 = J_w6' * Diagonal(wv_w6) * J_w6 + S_w6
+        chol_w6 = cholesky(Symmetric(A_w6))
+        beta_w6 = chol_w6 \ (J_w6' * (wv_w6 .* z_w6))
+        zhat_w6 = PSM._ncv_loo_predictions(J_w6, wv_w6, z_w6, chol_w6,
+                                           beta_w6, nt_w6, 2)
+        # Brute force: drop δ(i)'s rows, re-solve the penalized LS, predict
+        function brute_w6(i, width)
+            delta = PSM._ncv_neighbourhood(i, nt_w6, wv_w6, width)
+            keep = setdiff(1:n_w6, delta)
+            Jk = J_w6[keep, :]; wk = wv_w6[keep]; zk = z_w6[keep]
+            bk = (Jk' * Diagonal(wk) * Jk + S_w6) \ (Jk' * (wk .* zk))
+            dot(J_w6[i, :], bk)
+        end
+        @test abs(zhat_w6[1] - brute_w6(1, 2)) < 1e-8    # left edge, truncated δ
+        @test abs(zhat_w6[12] - brute_w6(12, 2)) < 1e-8  # right edge of block 1
+        @test abs(zhat_w6[7] - brute_w6(7, 2)) < 1e-8    # interior
+        @test abs(zhat_w6[6] - brute_w6(6, 2)) < 1e-8    # δ contains masked cell 5
+        @test abs(zhat_w6[13] - brute_w6(13, 2)) < 1e-8  # block-2 edge (no bleed)
+        @test isnan(zhat_w6[5])                          # masked row: no score
+        @test maximum(abs(zhat_w6[i] - brute_w6(i, 2))
+                      for i in 1:n_w6 if wv_w6[i] > 0) < 1e-8
+
+        # ── ncv_width=0 equals exact leave-one-out CV (classic shortcut
+        # ẑ_i^{−i} = z_i − (z_i − ẑ_i)/(1 − h_ii), h_ii = w_i J_i A⁻¹ J_i') ──
+        zh0_w6 = PSM._ncv_loo_predictions(J_w6, wv_w6, z_w6, chol_w6,
+                                          beta_w6, nt_w6, 0)
+        fitted_w6 = J_w6 * beta_w6
+        @test maximum(begin
+                          h = wv_w6[i] * dot(J_w6[i, :], chol_w6 \ J_w6[i, :])
+                          loo = z_w6[i] - (z_w6[i] - fitted_w6[i]) / (1 - h)
+                          abs(loo - zh0_w6[i])
+                      end for i in 1:n_w6 if wv_w6[i] > 0) < 1e-8
+
+        # ── _ncv_score equals the manually assembled weighted mean ──
+        V_w6, beta_sc_w6, _, _ = PSM._ncv_score(J_w6, wv_w6, z_w6, S_w6,
+                                                nt_w6, 2)
+        Vb_w6 = sum(wv_w6[i] * (z_w6[i] - zhat_w6[i])^2
+                    for i in 1:n_w6 if wv_w6[i] > 0) /
+                count(>(0), wv_w6)
+        @test abs(V_w6 - Vb_w6) < 1e-8
+        @test norm(beta_sc_w6 - beta_w6) < 1e-6   # same fit (modulo tiny ridge)
+
+        # ── End-to-end setup shared by the remaining blocks ──
+        r_true_w6(N) = 0.5 * (1.0 - N / 10.0)
+        function logistic_w6!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+        end
+        sol_true_w6 = OrdinaryDiffEq.solve(
+            ODEProblem(logistic_w6!, [1.0], (0.0, 15.0), (; r=r_true_w6)),
+            Tsit5(); saveat=0.2, abstol=1e-10, reltol=1e-10)
+        t_w6 = collect(sol_true_w6.t)
+        truth_w6 = [u[1] for u in sol_true_w6.u]
+        nN_w6 = length(t_w6)                     # 76 points
+
+        # AR(1) observation noise: e_t = 0.7 e_{t−1} + ε_t, ε ~ N(0, 0.08²),
+        # stationary start. Short-range positive autocorrelation is exactly
+        # the regime where ordinary GCV/LOOCV undersmooths (Wood 2024 §5).
+        rho_ar_w6 = 0.7
+        sige_w6 = 0.08
+        rng_ar_w6 = StableRNG(1)
+        e_w6 = zeros(nN_w6)
+        e_w6[1] = sige_w6 / sqrt(1 - rho_ar_w6^2) * randn(rng_ar_w6)
+        for i in 2:nN_w6
+            e_w6[i] = rho_ar_w6 * e_w6[i-1] + sige_w6 * randn(rng_ar_w6)
+        end
+        data_w6 = truth_w6 .+ e_w6
+        mk_prob_w6(vals) = PSMProblem(logistic_w6!, [1.0], (0.0, 15.0),
+            [BSplineApproximator(:r, (0.0, 12.0), 8)];
+            data_times=t_w6, data_values=reshape(vals, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PSM.Gaussian())
+        prob_ar_w6 = mk_prob_w6(max.(data_w6, 0.01))
+
+        # ── Default equivalence: GCVSolver() ≡ GCVSolver(criterion=:gcv)
+        # (the :gcv path is byte-identical pre/post refactor; the existing
+        # GCVSolver testsets pin the pre-change behavior itself) ──
+        sol_gdef_w6 = solve(prob_ar_w6, GCVSolver(maxiters=30))
+        sol_gexp_w6 = solve(prob_ar_w6, GCVSolver(maxiters=30, criterion=:gcv))
+        @test sol_gdef_w6.smoothing_params == sol_gexp_w6.smoothing_params
+        @test sol_gdef_w6.objective == sol_gexp_w6.objective
+        @test sol_gdef_w6.convergence.gcv == sol_gexp_w6.convergence.gcv
+        @test sol_gdef_w6.convergence.criterion == :gcv
+        @test isfinite(sol_gdef_w6.convergence.gcv)
+        @test isnan(sol_gdef_w6.convergence.ncv)
+
+        # ── THE DISCRIMINATOR: under AR(1) residuals :gcv undersmooths,
+        # :ncv (width 3 ≳ correlation length) does not. Observed (StableRNG
+        # seed 1, this exact config): λ̂_gcv = 6.57e-4, λ̂_ncv = 2.61e4
+        # (ratio 4.0e7), trajectory MSE vs noise-free truth 1.84e-3 (gcv)
+        # vs 8.95e-4 (ncv), r-function MSE 2.85e-4 vs 1.42e-6. The 2×
+        # λ-margin below has ~7 orders of magnitude of headroom; every
+        # step of the pipeline (StableRNG data, FD Jacobians, grid +
+        # golden-section, Cholesky) is deterministic, and seeds 2 and 3
+        # gave ratios 472 and 5.1e4 with the same error ordering. The
+        # effect SIZE is seed-dependent (some seeds give ratios near 1),
+        # so the 2× margin is protected by the pinned seed, not
+        # universal; the MSE ordering held on every seed tried. ──
+        sol_ncv_w6 = solve(prob_ar_w6,
+                           GCVSolver(maxiters=30, criterion=:ncv, ncv_width=3))
+        lam_g_w6 = sol_gdef_w6.smoothing_params[1]
+        lam_n_w6 = sol_ncv_w6.smoothing_params[1]
+        @test lam_n_w6 > 2 * lam_g_w6
+        trajmse_w6(s) = sum(abs2, s.fitted_values[:, 1] .- truth_w6) / nN_w6
+        @test trajmse_w6(sol_ncv_w6) < trajmse_w6(sol_gdef_w6)
+        rgrid_w6 = 0.5:0.25:9.5
+        rmse_w6(s) = sum(abs2, s.unknown_functions[:r](x) - r_true_w6(x)
+                         for x in rgrid_w6) / length(rgrid_w6)
+        @test rmse_w6(sol_ncv_w6) < rmse_w6(sol_gdef_w6)
+        @test sol_ncv_w6.convergence.criterion == :ncv
+        @test isfinite(sol_ncv_w6.convergence.ncv)
+        @test isnan(sol_ncv_w6.convergence.gcv)
+        # Determinism: an identical re-run reproduces λ̂ exactly
+        sol_ncv2_w6 = solve(prob_ar_w6,
+                            GCVSolver(maxiters=30, criterion=:ncv, ncv_width=3))
+        @test sol_ncv2_w6.smoothing_params == sol_ncv_w6.smoothing_params
+        @test sol_ncv2_w6.convergence.ncv == sol_ncv_w6.convergence.ncv
+
+        # ── Masked data: NCV run completes and honors masking (NaN cells
+        # are excluded from the score sum and from every neighbourhood) ──
+        data_mask_w6 = copy(max.(data_w6, 0.01))
+        data_mask_w6[10] = NaN
+        data_mask_w6[30] = NaN
+        data_mask_w6[31] = NaN
+        sol_mask_w6 = solve(mk_prob_w6(data_mask_w6),
+                            GCVSolver(maxiters=15, criterion=:ncv, ncv_width=3))
+        @test sol_mask_w6 isa PSMSolution
+        @test isfinite(sol_mask_w6.data_loss)
+        @test isfinite(sol_mask_w6.convergence.ncv)
+        @test all(isfinite, sol_mask_w6.fitted_values)
+    end
+
+    # ─── W7: FGPGMSolver (Wenk et al. 2019, fast GP gradient matching) ──
+
+    @testset "FGPGMSolver — construction validation" begin
+        # Mirror ODIN's validation style: ArgumentError with the reason.
+        @test_throws ArgumentError FGPGMSolver(target_accept=1.5)
+        @test_throws ArgumentError FGPGMSolver(target_accept=0.0)
+        @test_throws ArgumentError FGPGMSolver(gamma=-1.0)
+        @test_throws ArgumentError FGPGMSolver(gamma=0.0)
+        @test_throws ArgumentError FGPGMSolver(n_samples=0)
+        @test_throws ArgumentError FGPGMSolver(n_warmup=-1)
+        @test_throws ArgumentError FGPGMSolver(prior_scale=0.0)
+        @test_throws ArgumentError FGPGMSolver(obs_sigma=-0.1)
+        # one-of-two GP hyperparameters is an error (ODIN convention:
+        # both to fix them, neither to estimate per state)
+        @test_throws ArgumentError FGPGMSolver(gp_lengthscale=1.0)
+        @test_throws ArgumentError FGPGMSolver(gp_variance=1.0)
+        alg_fg = FGPGMSolver()
+        @test alg_fg.gamma == 0.1
+        @test alg_fg.target_accept == 0.234
+        @test alg_fg.rng_seed === nothing
+    end
+
+    @testset "FGPGMSolver — exponential decay recovery" begin
+        # du/dt = -f(u), f(x) = 0.5x with a B-spline stand-in.
+        decay_fg!(du, u, p, t) = (du[1] = -p.f(u[1]))
+        rng_fg = Random.Xoshiro(42)
+        sol_true_fg = OrdinaryDiffEq.solve(
+            ODEProblem(decay_fg!, [5.0], (0.0, 10.0), (; f=x -> 0.5*x)),
+            Tsit5(); saveat=0.5)
+        t_fg = collect(sol_true_fg.t)
+        data_fg = [sol_true_fg.u[i][1] + 0.05*randn(rng_fg) for i in 1:length(t_fg)]
+        uf_fg = BSplineApproximator(:f, (0.0, 6.0), 6)
+        prob_fg = PSMProblem(decay_fg!, [5.0], (0.0, 10.0), [uf_fg];
+            data_times=t_fg, data_values=reshape(max.(data_fg, 0.01), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_fg = solve(prob_fg, FGPGMSolver(n_samples=3000, n_warmup=3000,
+                                            rng_seed=7, verbose=false))
+
+        @test sol_fg isa PSMSolution
+        @test isfinite(sol_fg.objective)
+        @test isfinite(sol_fg.data_loss)
+        @test haskey(sol_fg.unknown_functions, :f)
+        # Posterior-mean recovery of f(x) = 0.5x. Observed errors at this
+        # seed: 0.005 / 0.047 / 0.13 — assert with ~2.5x headroom.
+        f_fg = sol_fg.unknown_functions[:f]
+        @test abs(f_fg(1.5) - 0.75) < 0.35
+        @test abs(f_fg(3.0) - 1.5) < 0.25
+        @test abs(f_fg(4.5) - 2.25) < 0.35
+
+        # Honest convergence keys (MagiSolver convention: a fixed-budget
+        # sampler never claims convergence) + sampler-appropriate extras.
+        c_fg = sol_fg.convergence
+        @test c_fg.method == :fgpgm
+        @test c_fg.sampler == :metropolis_within_gibbs
+        @test c_fg.converged == false
+        @test c_fg.reason == :maxiters
+        @test c_fg.iterations == 6000
+        @test c_fg.chains isa MCMCChains.Chains
+        @test size(c_fg.chains, 1) == 3000       # n_samples retained draws
+        @test size(c_fg.beta_samples) == (3000, nparams(uf_fg))
+        # GP hyperparameters were estimated per state by marginal likelihood
+        hp_fg = c_fg.gp_hyperparams[1]
+        @test hp_fg.σ² > 0 && hp_fg.ℓ > 0 && hp_fg.σn² > 0
+        @test hp_fg.observed
+        # Warmup adaptation lands post-warmup acceptance in a broad band
+        # around target_accept = 0.234 (deterministic under rng_seed=7;
+        # observed 0.20 / 0.29 at this seed).
+        @test all(a -> 0.1 < a < 0.6, c_fg.accept_rates.x)
+        @test 0.1 < c_fg.accept_rates.theta < 0.6
+
+        # Reproducibility (W1 convention): the sampler owns its stream —
+        # same rng_seed → identical run, and the global RNG is untouched.
+        probe_fg = rand(copy(Random.default_rng()), 3)
+        sol_fg_a = solve(prob_fg, FGPGMSolver(n_samples=200, n_warmup=200,
+                                              rng_seed=5))
+        sol_fg_b = solve(prob_fg, FGPGMSolver(n_samples=200, n_warmup=200,
+                                              rng_seed=5))
+        @test sol_fg_a.parameters == sol_fg_b.parameters
+        @test sol_fg_a.convergence.beta_samples ==
+              sol_fg_b.convergence.beta_samples
+        @test sol_fg_a.unknown_functions[:f](3.0) ==
+              sol_fg_b.unknown_functions[:f](3.0)
+        @test rand(copy(Random.default_rng()), 3) == probe_fg
+
+        # Fixed-hyperparameter path (both supplied, ODIN convention:
+        # σn² assumed at 0.01·gp_variance).
+        sol_fg_fix = solve(prob_fg, FGPGMSolver(n_samples=200, n_warmup=200,
+            gp_lengthscale=2.0, gp_variance=4.0, rng_seed=5))
+        @test sol_fg_fix.convergence.gp_hyperparams[1].ℓ == 2.0
+        @test sol_fg_fix.convergence.gp_hyperparams[1].σn² == 0.04
+        @test isfinite(sol_fg_fix.objective)
+
+        # Non-Gaussian likelihoods are rejected informatively (the data
+        # expert is a Gaussian quadratic form) — MagiSolver style.
+        prob_fg_pois = PSMProblem(decay_fg!, [5.0], (0.0, 10.0), [uf_fg];
+            data_times=t_fg, data_values=reshape(max.(data_fg, 0.01), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Poisson())
+        err_fg = try
+            solve(prob_fg_pois, FGPGMSolver(n_samples=5, n_warmup=5))
+            nothing
+        catch e
+            e
+        end
+        @test err_fg isa ErrorException
+        @test occursin("Gaussian likelihoods only", err_fg.msg)
+    end
+
+    @testset "FGPGMSolver — masked observations" begin
+        decay_fgm!(du, u, p, t) = (du[1] = -p.f(u[1]))
+        t_fgm = collect(0.0:0.5:10.0)
+        u_fgm = 5.0 .* exp.(-0.5 .* t_fgm) .+
+                0.05 .* randn(Random.Xoshiro(3), length(t_fgm))
+        d_fgm = reshape(max.(u_fgm, 0.01), :, 1)
+        w_fgm = ones(length(t_fgm), 1)
+        d_fgm[5, 1] = NaN;  w_fgm[5, 1] = 0.0
+        d_fgm[12, 1] = NaN; w_fgm[12, 1] = 0.0
+        uf_fgm = BSplineApproximator(:f, (0.0, 6.0), 6)
+        prob_fgm = PSMProblem(decay_fgm!, [5.0], (0.0, 10.0), [uf_fgm];
+            data_times=t_fgm, data_values=d_fgm, data_weights=w_fgm,
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_fgm = solve(prob_fgm, FGPGMSolver(n_samples=1500, n_warmup=1500,
+                                              rng_seed=13))
+        @test isfinite(sol_fgm.objective)
+        @test isfinite(sol_fgm.data_loss)
+        @test all(isfinite, sol_fgm.convergence.beta_samples)
+        @test abs(sol_fgm.unknown_functions[:f](3.0) - 1.5) < 0.4
+
+        # Everything masked is not a fit — say so (ODIN/MCMC convention).
+        prob_fgall = PSMProblem(decay_fgm!, [5.0], (0.0, 10.0), [uf_fgm];
+            data_times=t_fgm, data_values=d_fgm,
+            data_weights=zeros(length(t_fgm), 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        err_fgall = try
+            solve(prob_fgall, FGPGMSolver(n_samples=5, n_warmup=5))
+            nothing
+        catch e
+            e
+        end
+        @test err_fgall isa ErrorException
+        @test occursin("masked", err_fgall.msg)
+    end
+
+    @testset "FGPGMSolver — multi-state and unobserved state" begin
+        # x1' = x2, x2' = -k(x1) with k(x) = x (harmonic restoring force).
+        k_fg(x) = x
+        osc_fg!(du, u, p, t) = (du[1] = u[2]; du[2] = -p.k(u[1]))
+        sol_true_ofg = OrdinaryDiffEq.solve(
+            ODEProblem((du, u, p, t) -> (du[1] = u[2]; du[2] = -k_fg(u[1])),
+                       [1.5, 0.0], (0.0, 8.0)), Tsit5(); saveat=0.25)
+        t_ofg = collect(sol_true_ofg.t)
+        rng_ofg = Random.Xoshiro(7)
+        pos_ofg = [sol_true_ofg(tt)[1] for tt in t_ofg] .+
+                  0.03 .* randn(rng_ofg, length(t_ofg))
+        vel_ofg = [sol_true_ofg(tt)[2] for tt in t_ofg] .+
+                  0.03 .* randn(rng_ofg, length(t_ofg))
+        uf_ofg = BSplineApproximator(:k, (-2.0, 2.0), 7)
+
+        # Both states observed: joint sampling over two state blocks + θ.
+        prob_ofg2 = PSMProblem(osc_fg!, [1.5, 0.0], (0.0, 8.0), [uf_ofg];
+            data_times=t_ofg, data_values=hcat(pos_ofg, vel_ofg),
+            obs_to_state=[1, 2], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_ofg2 = solve(prob_ofg2, FGPGMSolver(n_samples=3000, n_warmup=3000,
+                                                rng_seed=11))
+        errs_ofg2 = [abs(sol_ofg2.unknown_functions[:k](x) - k_fg(x))
+                     for x in -1.4:0.2:1.4]
+        # Observed max error 0.033 at this seed; 6x headroom.
+        @test maximum(errs_ofg2) < 0.2
+        @test length(sol_ofg2.convergence.accept_rates.x) == 2
+        @test all(isfinite, sol_ofg2.convergence.accept_rates.x)
+
+        # Velocity unobserved: sampled block with borrowed GP prior + ODE
+        # experts, no data term (ODIN precedent).
+        prob_ofg1 = PSMProblem(osc_fg!, [1.5, 0.0], (0.0, 8.0), [uf_ofg];
+            data_times=t_ofg, data_values=reshape(pos_ofg, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_ofg1 = solve(prob_ofg1, FGPGMSolver(n_samples=3000, n_warmup=3000,
+                                                rng_seed=11))
+        errs_ofg1 = [abs(sol_ofg1.unknown_functions[:k](x) - k_fg(x))
+                     for x in -1.4:0.2:1.4]
+        # Observed max error 0.162 at this seed; ~2x headroom.
+        @test maximum(errs_ofg1) < 0.35
+        @test sol_ofg1.convergence.gp_hyperparams[2].observed == false
+        @test isfinite(sol_ofg1.data_loss)
+    end
+
+    # ─── W8: square-root (QR-based) Kalman filtering ──────────────────
+    #
+    # Opt-in `sqrt_filter=true` on RodeoSolver / DaltonSolver /
+    # PseudoMarginalSolver runs the probabilistic-ODE Kalman recursions on
+    # right Cholesky/QR factors (P = RᵀR) instead of covariances
+    # (src/sqrt_kalman.jl; Krämer & Hennig JMLR 2024 / Kailath et al. array
+    # algorithms). Default `false` leaves the standard code paths untouched.
+
+    @testset "Square-root Kalman — construction and default equivalence" begin
+        PSM = PartiallySpecifiedModels
+
+        # Validated opt-in kwarg, default false on all three consumers.
+        @test RodeoSolver().sqrt_filter == false
+        @test DaltonSolver().sqrt_filter == false
+        @test PseudoMarginalSolver().sqrt_filter == false
+        @test RodeoSolver(sqrt_filter=true).sqrt_filter == true
+        @test DaltonSolver(sqrt_filter=true).sqrt_filter == true
+        @test PseudoMarginalSolver(sqrt_filter=true, inner_method=:ffbs).sqrt_filter == true
+        # Typed kwarg: non-Bool values are rejected at construction.
+        @test_throws TypeError RodeoSolver(sqrt_filter=:yes)
+        @test_throws TypeError DaltonSolver(sqrt_filter=1.0)
+        @test_throws TypeError PseudoMarginalSolver(sqrt_filter=:yes)
+
+        # `sqrt_filter=false` takes the standard code path exactly (the
+        # delegation branch is never entered): identical output to a call
+        # that does not pass the keyword at all, and no factor keys.
+        logis_sq!(du, u, p, t) = (du[1] = 0.5 * u[1] * (1 - u[1] / 10.0))
+        f_def = PSM.probsolve_filter(logis_sq!, nothing, [0.1], (0.0, 10.0),
+                                     50, 3, [1.0])
+        f_off = PSM.probsolve_filter(logis_sq!, nothing, [0.1], (0.0, 10.0),
+                                     50, 3, [1.0]; sqrt_filter=false)
+        @test f_def["μ_filt"] == f_off["μ_filt"]
+        @test f_def["Σ_filt"] == f_off["Σ_filt"]
+        @test f_def["ssq"] == f_off["ssq"]
+        @test !haskey(f_def, "R_filt")
+
+        # sqrt output carries the factors, and they reconstruct the stored
+        # covariances exactly (Σ = RᵀR by definition of the representation).
+        f_sq = PSM.probsolve_filter(logis_sq!, nothing, [0.1], (0.0, 10.0),
+                                    50, 3, [1.0]; sqrt_filter=true)
+        @test haskey(f_sq, "R_filt") && haskey(f_sq, "R_pred") && haskey(f_sq, "R_Q")
+        @test all(f_sq["Σ_filt"][n] == f_sq["R_filt"][n]' * f_sq["R_filt"][n]
+                  for n in 1:51)
+    end
+
+    @testset "Square-root Kalman — parity with the standard filter" begin
+        PSM = PartiallySpecifiedModels
+        logis_par!(du, u, p, t) = (du[1] = 0.5 * u[1] * (1 - u[1] / 10.0))
+        lv_par!(du, u, p, t) = (du[1] = 1.5*u[1] - u[1]*u[2];
+                                du[2] = -3.0*u[2] + u[1]*u[2])
+
+        # Filter parity, q=3 moderate steps: means to 1e-10, covariances to
+        # 1e-8 relative, calibrated diffusion to 1e-10 relative.
+        # (Measured: 1.9e-14 / 4.0e-12 / 2e-19.)
+        fs = PSM.probsolve_filter(logis_par!, nothing, [0.1], (0.0, 10.0),
+                                  100, 3, [1.0])
+        fq = PSM.probsolve_filter(logis_par!, nothing, [0.1], (0.0, 10.0),
+                                  100, 3, [1.0]; sqrt_filter=true)
+        @test maximum(maximum(abs.(fs["μ_filt"][n] .- fq["μ_filt"][n]))
+                      for n in 1:101) < 1e-10
+        @test maximum(maximum(abs.(fs["Σ_filt"][n] .- fq["Σ_filt"][n])) /
+                      max(maximum(abs.(fs["Σ_filt"][n])), 1e-30)
+                      for n in 2:101) < 1e-8
+        @test abs(fs["ssq"] - fq["ssq"]) / fs["ssq"] < 1e-10
+
+        # Smoother parity at q=2 (measured 1.5e-10 / 1.9e-8). At higher q /
+        # finer steps the comparison is limited by the STANDARD smoother's
+        # own `+1e-12·I` jitter on Σ_pred, which the square-root gain (pure
+        # triangular solves) does not need — the paths then differ by the
+        # jitter's perturbation of G, not by an error in the sqrt pass.
+        fs2 = PSM.probsolve_filter(logis_par!, nothing, [0.1], (0.0, 10.0),
+                                   50, 2, [1.0])
+        fq2 = PSM.probsolve_filter(logis_par!, nothing, [0.1], (0.0, 10.0),
+                                   50, 2, [1.0]; sqrt_filter=true)
+        ms2, Ss2 = PSM.probsolve_smooth(fs2, 1)
+        mq2, Sq2 = PSM.probsolve_smooth(fq2, 1)
+        @test maximum(maximum(abs.(ms2[n][1] .- mq2[n][1])) for n in 1:51) < 1e-7
+        @test maximum(maximum(abs.(Ss2[n][1] .- Sq2[n][1])) /
+                      max(maximum(abs.(Ss2[n][1])), 1e-30) for n in 2:51) < 1e-6
+
+        # Log-evidence parity (log-evidence read off the triangular factor,
+        # 2·Σ log|diag S_R|, must equal the standard Cholesky value).
+        # Measured: fenrir 2.0e-8, basic 1.1e-7, dalton 1.4e-9,
+        # ssq/calib_acc 8.9e-12 relative.
+        sol_lv = OrdinaryDiffEq.solve(
+            ODEProblem(lv_par!, [1.0, 1.0], (0.0, 10.0)), Tsit5(),
+            saveat=collect(0.5:0.5:9.5))
+        tobs_lv = collect(sol_lv.t)
+        data_lv = Matrix(hcat([sol_lv[k, :] for k in 1:2]...))
+        args_lv = (lv_par!, nothing, [1.0, 1.0], (0.0, 10.0), 100, 3,
+                   [1.0, 1.0], data_lv, tobs_lv, [1, 2], 0.05)
+        @test isapprox(PSM.fenrir_loglik(args_lv...),
+                       PSM.fenrir_loglik(args_lv...; sqrt_filter=true);
+                       atol=1e-6, rtol=1e-7)
+        @test isapprox(PSM.basic_loglik(args_lv...),
+                       PSM.basic_loglik(args_lv...; sqrt_filter=true);
+                       atol=1e-5, rtol=1e-7)
+        @test isapprox(PSM._dalton_loglik(args_lv...),
+                       PSM._dalton_loglik(args_lv...; sqrt_filter=true);
+                       atol=1e-6, rtol=1e-7)
+
+        # DALTON's calibration triple (logZ, σ̂², calib_acc) — the inputs to
+        # its closed-form quasi-MLE rescale — must match across paths.
+        ref_s = PSM._dalton_reference(lv_par!, nothing, [1.0, 1.0],
+                                      (0.0, 10.0), 100, 3, [1.0, 1.0])
+        ref_q = PSM._dalton_reference(lv_par!, nothing, [1.0, 1.0],
+                                      (0.0, 10.0), 100, 3, [1.0, 1.0];
+                                      sqrt_filter=true)
+        @test isapprox(ref_s[1], ref_q[1]; atol=1e-5, rtol=1e-8)   # logZ
+        @test abs(ref_s[2] - ref_q[2]) / ref_s[2] < 1e-9           # ssq
+        @test abs(ref_s[3] - ref_q[3]) / ref_s[3] < 1e-9           # calib_acc
+    end
+
+    @testset "Square-root Kalman — stress at high IBM order" begin
+        PSM = PartiallySpecifiedModels
+        lv_st!(du, u, p, t) = (du[1] = 1.5*u[1] - u[1]*u[2];
+                               du[2] = -3.0*u[2] + u[1]*u[2])
+
+        # STANDARD-path degradation (the discriminator): at n_deriv=7 with
+        # small steps the standard recursion Σ⁺ = Σ − KHΣ demonstrably
+        # loses positive-semidefiniteness — strictly negative eigenvalues
+        # appear in the filtered covariances (the COUNT is BLAS/machine-
+        # specific — 25 on the machine that wrote this, 8 on the reviewer's;
+        # worst eigenvalue −3.4e-10 on both — so only n_indef > 0 is
+        # asserted). Honest caveat, stated plainly: no in-package
+        # configuration was found where this degradation is CATASTROPHIC
+        # (NaN / hard cholesky failure) — the violations stay at rounding
+        # level relative to ‖Σ‖ (~1e-16·‖Σ‖) and the existing band-aids
+        # (0.5(Σ+Σ') symmetrization, the adaptive jitter in logpdf_mvn, the
+        # jitter escalation in _pm_mvn_sample, and the cholesky→pinv
+        # fallbacks) absorb them.
+        f_std7 = PSM.probsolve_filter(lv_st!, nothing, [1.0, 1.0],
+                                      (0.0, 10.0), 2000, 7, [1.0, 1.0])
+        n_indef = count(minimum(eigvals(Symmetric(f_std7["Σ_filt"][n]))) < -1e-12
+                        for n in 2:2001)
+        @test n_indef > 0
+
+        # sqrt path at the same configuration: finite everywhere and the
+        # means track the standard filter's (measured 7e-5 at q=7).
+        f_sq7 = PSM.probsolve_filter(lv_st!, nothing, [1.0, 1.0],
+                                     (0.0, 10.0), 2000, 7, [1.0, 1.0];
+                                     sqrt_filter=true)
+        @test all(all(isfinite, m) for m in f_sq7["μ_filt"])
+        @test all(all(isfinite, R) for R in f_sq7["R_filt"])
+        @test maximum(maximum(abs.(f_std7["μ_filt"][n] .- f_sq7["μ_filt"][n]))
+                      for n in 1:2001) < 1e-2
+
+        # PSD-by-construction at n_deriv=5: every reconstructed filter and
+        # predict covariance is a Gram matrix RᵀR, so its eigenvalues are
+        # nonnegative up to the rounding of forming/eigensolving the
+        # product (measured: ≥ −3.6e-21 relative; bound 1e-12 relative).
+        f_sq5 = PSM.probsolve_filter(lv_st!, nothing, [1.0, 1.0],
+                                     (0.0, 10.0), 500, 5, [1.0, 1.0];
+                                     sqrt_filter=true)
+        psd_ok(Σ) = (ev = eigvals(Symmetric(Σ));
+                     minimum(ev) >= -1e-12 * max(maximum(abs, ev), 1.0))
+        @test all(psd_ok(f_sq5["Σ_filt"][n]) for n in 2:501)
+        @test all(psd_ok(f_sq5["Σ_pred"][n]) for n in 2:501)
+
+        # The square-root smoother stays finite and PSD there too.
+        _, Ssm5 = PSM.probsolve_smooth(f_sq5, 2)
+        @test all(psd_ok(Ssm5[n][k]) for n in 1:501, k in 1:2)
+    end
+
+    @testset "Square-root Kalman — FFBS sampling under sqrt" begin
+        PSM = PartiallySpecifiedModels
+        logis_ff!(du, u, p, t) = (du[1] = 0.5 * u[1] * (1 - u[1] / 10.0))
+
+        # Factor-based FFBS is supported: backward draws use the
+        # PSD-by-construction covariance factors (no jitter escalation).
+        # Distributional check: empirical mean/variance of the sampled value
+        # coordinate match the smoothing posterior.
+        filt_ff = PSM.probsolve_filter(logis_ff!, nothing, [0.5], (0.0, 10.0),
+                                       50, 3, [1.0]; sqrt_filter=true)
+        mu_ff, S_ff = PSM.probsolve_smooth(filt_ff, 1)
+        rng_ff = Random.Xoshiro(1)
+        n_draw = 1500
+        vals_ff = zeros(n_draw, 51)
+        for s in 1:n_draw
+            X = PSM._pm_sample_traj(filt_ff, rng_ff)
+            @assert length(X) == 51
+            for n in 1:51
+                vals_ff[s, n] = X[n][1]
+            end
+        end
+        @test all(isfinite, vals_ff)
+        worst_m_ff = 0.0
+        worst_v_ff = 0.0
+        for n in 2:51
+            m_emp = mean(vals_ff[:, n])
+            v_emp = sum(abs2, vals_ff[:, n] .- m_emp) / (n_draw - 1)
+            m_th = mu_ff[n][1][1]
+            v_th = S_ff[n][1][1, 1]
+            sd_th = sqrt(max(v_th, 1e-30))
+            worst_m_ff = max(worst_m_ff, abs(m_emp - m_th) / max(sd_th, 1e-12))
+            worst_v_ff = max(worst_v_ff, abs(v_emp - v_th) / max(v_th, 1e-12))
+        end
+        @test worst_m_ff < 0.15   # measured ≈ 0.02 (in posterior-sd units)
+        @test worst_v_ff < 0.25   # measured ≈ 0.05 (relative)
+
+        # And the two samplers estimate the same marginal likelihood
+        # (unbiasedness preserved): compare _pm_loglik_hat across seeds.
+        data_ff = reshape([0.6, 1.2, 2.5, 4.5, 6.8, 8.5], :, 1)
+        t_ff = collect(1.0:1.5:9.0)
+        ll_s = mean(PSM._pm_loglik_hat(logis_ff!, [0.5], (0.0, 10.0), 50, 3,
+                                       [1.0], data_ff, t_ff, [1], 0.05, 64,
+                                       Random.Xoshiro(s)) for s in 1:10)
+        ll_q = mean(PSM._pm_loglik_hat(logis_ff!, [0.5], (0.0, 10.0), 50, 3,
+                                       [1.0], data_ff, t_ff, [1], 0.05, 64,
+                                       Random.Xoshiro(s); sqrt_filter=true)
+                    for s in 1:10)
+        @test abs(ll_s - ll_q) < 0.05   # measured ≈ 5e-5, MC sd ≈ 1e-3
+    end
+
+    @testset "Square-root Kalman — end-to-end solver fits" begin
+        PSM = PartiallySpecifiedModels
+
+        # DaltonSolver: same problem as the "DaltonSolver — exponential
+        # decay" testset. The two likelihoods agree to ~1e-9, but the
+        # NelderMead → L-BFGS(FD-gradient) optimizer amplifies sub-1e-8
+        # objective differences into slightly different (equally good)
+        # optima, so the recovered functions agree to ~4e-3 rather than
+        # 1e-6 (measured max |Δf| = 3.7e-3, Δobjective = 3.3e-5). Both fits
+        # must recover the truth to the original testset's tolerance.
+        decay_sq!(du, u, p, t) = (du[1] = -p.f(u[1]))
+        rng_dsq = Random.Xoshiro(42)
+        sol_true_dsq = OrdinaryDiffEq.solve(
+            ODEProblem(decay_sq!, [5.0], (0.0, 10.0), (; f=x -> 0.5*x)),
+            Tsit5(); saveat=0.5)
+        t_dsq = collect(sol_true_dsq.t)
+        data_dsq = [sol_true_dsq.u[i][1] + 0.05*randn(rng_dsq)
+                    for i in 1:length(t_dsq)]
+        uf_dsq = BSplineApproximator(:f, (0.0, 6.0), 8)
+        prob_dsq = PSMProblem(decay_sq!, [5.0], (0.0, 10.0), [uf_dsq];
+            data_times=t_dsq, data_values=reshape(max.(data_dsq, 0.01), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_d_std = solve(prob_dsq, DaltonSolver(n_steps=100, maxiters=50,
+                                                 verbose=false))
+        sol_d_sq = solve(prob_dsq, DaltonSolver(n_steps=100, maxiters=50,
+                                                verbose=false, sqrt_filter=true))
+        @test sol_d_sq isa PSMSolution
+        @test isfinite(sol_d_sq.objective)
+        @test abs(sol_d_sq.unknown_functions[:f](3.0) - 1.5) < 0.35
+        @test maximum(abs(sol_d_std.unknown_functions[:f](x) -
+                          sol_d_sq.unknown_functions[:f](x))
+                      for x in 0.5:0.5:5.5) < 0.05
+        @test abs(sol_d_std.objective - sol_d_sq.objective) < 1e-2
+
+        # RodeoSolver: same problem as the "Rodeo solver (B-spline)"
+        # testset (with a pinned rng). Measured max |Δr| = 1.7e-5.
+        growth_sq!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        rng_rsq = Random.Xoshiro(7)
+        t_rsq = collect(0.0:0.25:5.0)
+        data_rsq = reshape(2.0 .* exp.(0.3 .* t_rsq) .+
+                           0.05 .* randn(rng_rsq, length(t_rsq)), :, 1)
+        uf_rsq = BSplineApproximator(:r, (1.5, 10.0), 6; initial=0.5)
+        prob_rsq = PSMProblem(growth_sq!, [2.0], (0.0, 5.0), [uf_rsq];
+            data_times=t_rsq, data_values=data_rsq,
+            obs_to_state=[1], solver=Tsit5())
+        sol_r_std = solve(prob_rsq, RodeoSolver(n_steps=100, n_deriv=3,
+                                                maxiters=100, obs_var=0.01,
+                                                verbose=false))
+        sol_r_sq = solve(prob_rsq, RodeoSolver(n_steps=100, n_deriv=3,
+                                               maxiters=100, obs_var=0.01,
+                                               verbose=false, sqrt_filter=true))
+        @test sol_r_sq isa PSMSolution
+        @test abs(sol_r_sq.unknown_functions[:r](3.0) - 0.3) < 0.15
+        @test maximum(abs(sol_r_std.unknown_functions[:r](x) -
+                          sol_r_sq.unknown_functions[:r](x))
+                      for x in 2.0:0.5:8.0) < 0.01
+        @test abs(sol_r_std.objective - sol_r_sq.objective) < 1e-2
+
+        # PseudoMarginalSolver under sqrt (:ffbs inner method is supported
+        # via factor-based backward sampling): runs, finite, valid chain,
+        # and reproducible under the solver-owned rng_seed.
+        r_true_psq(N) = 0.5 * (1.0 - N / 10.0)
+        logis_psq!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        rng_psq = Random.Xoshiro(42)
+        sol_true_psq = OrdinaryDiffEq.solve(
+            ODEProblem(logis_psq!, [1.0], (0.0, 15.0), (; r=r_true_psq)),
+            Tsit5(); saveat=1.0)
+        t_psq = collect(sol_true_psq.t)
+        data_psq = [sol_true_psq.u[i][1] + 0.1*randn(rng_psq)
+                    for i in 1:length(t_psq)]
+        uf_psq = BSplineApproximator(:r, (0.0, 12.0), 6)
+        prob_psq = PSMProblem(logis_psq!, [1.0], (0.0, 15.0), [uf_psq];
+            data_times=t_psq, data_values=reshape(max.(data_psq, 0.01), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian())
+        sol_p_sq = solve(prob_psq, PseudoMarginalSolver(
+            n_samples=50, n_warmup=25, n_steps=50, rng_seed=31415,
+            verbose=false, sqrt_filter=true))
+        @test sol_p_sq isa PSMSolution
+        @test sol_p_sq.convergence isa MCMCChains.Chains
+        @test size(sol_p_sq.convergence, 1) == 50
+        @test all(isfinite, Array(sol_p_sq.convergence))
+        sol_p_sq2 = solve(prob_psq, PseudoMarginalSolver(
+            n_samples=50, n_warmup=25, n_steps=50, rng_seed=31415,
+            verbose=false, sqrt_filter=true))
+        @test Array(sol_p_sq.convergence) == Array(sol_p_sq2.convergence)
+    end
+
+    # ─── AdamSolver adjoint-sensitivity backend (SciMLSensitivity ext) ──
+    #
+    # The opt-in `sensealg` gradient backend: continuous adjoint
+    # sensitivities via the PartiallySpecifiedModelsSciMLSensitivityExt
+    # package extension (trigger: SciMLSensitivity only — its internal
+    # vjps use ReverseDiff, a hard dep of SciMLSensitivity, so no Zygote
+    # is involved). The parity tests are the correctness contract: the
+    # extension mirrors the ForwardDiff loss paths (masking, penalty,
+    # loss=:auto, u0-as-function, 1e10 sentinel) and must agree with them
+    # by value (rtol 1e-10) and by gradient (rtol 1e-5).
+    @testset "AdamSolver adjoint backend (sensealg)" begin
+        using SciMLSensitivity
+        using ForwardDiff
+        import Lux
+        PSM = PartiallySpecifiedModels
+
+        # Shared spline problem: exponential growth with unknown rate fn
+        growth_aj!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        t_aj = collect(range(0.0, 5.0, length=30))
+        y_aj = reshape(exp.(0.3 .* t_aj), :, 1)
+        mk_spline_prob() = PSMProblem(growth_aj!, [1.0], (0.0, 5.0),
+            [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+            data_times=t_aj, data_values=y_aj, obs_to_state=[1],
+            likelihood=Gaussian(), solver=Tsit5(), abstol=1e-8, reltol=1e-8)
+
+        # The extension must be active under the test environment
+        @test Base.get_extension(PSM,
+            :PartiallySpecifiedModelsSciMLSensitivityExt) !== nothing
+
+        @testset "gradient parity — spline (penalty and mask)" begin
+            prob = mk_spline_prob()
+            beta = PSM.initial_params(prob.approximators[1]) .+
+                   0.05 .* randn(StableRNG(11), 6)
+            f = b -> PSM.adam_loss_mse(prob, b, 0.5)
+            l_fd = f(beta)
+            g_fd = ForwardDiff.gradient(f, beta)
+            l_aj, g_aj = PSM._adam_adjoint_loss_grad(prob, beta, :mse, 0.5,
+                                                     :auto)
+            @test isapprox(l_aj, l_fd; rtol=1e-10)
+            @test isapprox(g_aj, g_fd; rtol=1e-5)
+
+            # Masked cells (NaN datum + zero weight) contribute nothing
+            y_mask = copy(y_aj); y_mask[5, 1] = NaN
+            w_mask = ones(size(y_aj)); w_mask[9, 1] = 0.0
+            prob_m = PSMProblem(growth_aj!, [1.0], (0.0, 5.0),
+                [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+                data_times=t_aj, data_values=y_mask, data_weights=w_mask,
+                obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5(),
+                abstol=1e-8, reltol=1e-8)
+            fm = b -> PSM.adam_loss_mse(prob_m, b, 0.0)
+            l_fdm = fm(beta)
+            g_fdm = ForwardDiff.gradient(fm, beta)
+            l_ajm, g_ajm = PSM._adam_adjoint_loss_grad(prob_m, beta, :mse,
+                                                       0.0, :auto)
+            @test isapprox(l_ajm, l_fdm; rtol=1e-10)
+            @test isapprox(g_ajm, g_fdm; rtol=1e-5)
+        end
+
+        @testset "gradient parity — Poisson loss" begin
+            prob_p = PSMProblem(growth_aj!, [1.0], (0.0, 5.0),
+                [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+                data_times=t_aj, data_values=round.(y_aj), obs_to_state=[1],
+                likelihood=Poisson(), solver=Tsit5(),
+                abstol=1e-8, reltol=1e-8)
+            beta = PSM.initial_params(prob_p.approximators[1]) .+
+                   0.05 .* randn(StableRNG(12), 6)
+            fp = b -> PSM.adam_loss_poisson(prob_p, b, 0.0)
+            l_fd = fp(beta)
+            g_fd = ForwardDiff.gradient(fp, beta)
+            l_aj, g_aj = PSM._adam_adjoint_loss_grad(prob_p, beta, :poisson,
+                                                     0.0, :auto)
+            @test isapprox(l_aj, l_fd; rtol=1e-10)
+            @test isapprox(g_aj, g_fd; rtol=1e-5)
+        end
+
+        @testset "gradient parity — u0 as a function of p" begin
+            prob_u = PSMProblem(growth_aj!, p -> [1.0 + 0.5 * p.r(1.0)],
+                (0.0, 5.0),
+                [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+                data_times=t_aj, data_values=y_aj, obs_to_state=[1],
+                likelihood=Gaussian(), solver=Tsit5(),
+                abstol=1e-8, reltol=1e-8)
+            beta = PSM.initial_params(prob_u.approximators[1]) .+
+                   0.05 .* randn(StableRNG(13), 6)
+            fu = b -> PSM.adam_loss_mse(prob_u, b, 0.0)
+            l_fd = fu(beta)
+            g_fd = ForwardDiff.gradient(fu, beta)
+            l_aj, g_aj = PSM._adam_adjoint_loss_grad(prob_u, beta, :mse,
+                                                     0.0, :auto)
+            @test isapprox(l_aj, l_fd; rtol=1e-10)
+            @test isapprox(g_aj, g_fd; rtol=1e-5)
+        end
+
+        # Neural parity + timing on a 321-parameter MLP UDE
+        @testset "gradient parity and timing — neural (321 params)" begin
+            decay_aj!(du, u, p, t) = (du[1] = -p.f(u[1]) * u[1])
+            sol_true = OrdinaryDiffEq.solve(
+                ODEProblem((du, u, p, t) -> (du[1] = -0.5 * u[1] * u[1]),
+                           [5.0], (0.0, 10.0)), Tsit5(); saveat=0.5)
+            rng_aj = StableRNG(7)
+            y_nn = reshape([u[1] + 0.1 * randn(rng_aj) for u in sol_true.u],
+                           :, 1)
+            model = Lux.Chain(Lux.Dense(1, 16, tanh),
+                              Lux.Dense(16, 16, tanh), Lux.Dense(16, 1))
+            uf = NeuralApproximator(:f, model; domain=(0.0, 5.0),
+                                    rng_seed=42)
+            prob_nn = PSMProblem(decay_aj!, [5.0], (0.0, 10.0), [uf];
+                data_times=collect(sol_true.t), data_values=y_nn,
+                obs_to_state=[1], solver=Tsit5())
+            beta = PSM.neural_init_params(uf, Random.Xoshiro(42))
+            @test length(beta) == 321
+
+            fn = b -> PSM.adam_loss_mse(prob_nn, b, 0.0)
+            l_fd = fn(beta)
+            g_fd = ForwardDiff.gradient(fn, beta)
+            # Compiled tape: valid here (tanh MLP dynamics are branch-free)
+            salg = InterpolatingAdjoint(autojacvec=ReverseDiffVJP(true))
+            l_aj, g_aj = PSM._adam_adjoint_loss_grad(prob_nn, beta, :mse,
+                                                     0.0, salg)
+            @test isapprox(l_aj, l_fd; rtol=1e-10)
+            @test isapprox(g_aj, g_fd; rtol=1e-5)
+
+            # Timing sanity (not a benchmark). Representative measurements
+            # (M-series laptop, n=321): compiled-tape adjoint ~0.018 s/grad
+            # vs ForwardDiff 0.0065-0.073 s/grad (ForwardDiff timing varies
+            # with chunking/GC state); at n=1153 adjoint 0.058 vs
+            # ForwardDiff 0.072 s/grad; the non-compiled tape (:auto) is
+            # ~4x slower than the compiled one. Assert loosely to stay
+            # robust on loaded CI machines.
+            t_adj = minimum(@elapsed PSM._adam_adjoint_loss_grad(
+                                prob_nn, beta, :mse, 0.0, salg)
+                            for _ in 1:3)
+            t_fwd = minimum(@elapsed ForwardDiff.gradient(fn, beta)
+                            for _ in 1:3)
+            @info "AdamSolver adjoint timing (n=321)" t_adj t_fwd ratio =
+                t_adj / t_fwd
+            # Loose bound only: ForwardDiff per-gradient time varies ~10×
+            # with chunking/GC on shared hardware, and a timing flake fails
+            # the whole suite. The real numbers are in the @info line.
+            @test t_adj < 10 * t_fwd
+        end
+
+        # End-to-end neural UDE fit through solve() with the adjoint
+        # backend (smaller sibling of "AdamSolver with NeuralApproximator")
+        @testset "end-to-end neural fit with sensealg" begin
+            decay_e2e!(du, u, p, t) = (du[1] = -p.f(u[1]) * u[1])
+            sol_true = OrdinaryDiffEq.solve(
+                ODEProblem((du, u, p, t) -> (du[1] = -0.5 * u[1] * u[1]),
+                           [5.0], (0.0, 10.0)), Tsit5(); saveat=0.5)
+            rng_e2e = StableRNG(21)
+            y_e2e = reshape([u[1] + 0.1 * randn(rng_e2e)
+                             for u in sol_true.u], :, 1)
+            model = Lux.Chain(Lux.Dense(1, 8, tanh), Lux.Dense(8, 1))
+            uf = NeuralApproximator(:f, model; domain=(0.0, 5.0),
+                                    rng_seed=42)
+            prob_e2e = PSMProblem(decay_e2e!, [5.0], (0.0, 10.0), [uf];
+                data_times=collect(sol_true.t), data_values=y_e2e,
+                obs_to_state=[1], solver=Tsit5())
+            sol = solve(prob_e2e, AdamSolver(lr=0.02, maxiters=400,
+                sensealg=InterpolatingAdjoint(
+                    autojacvec=ReverseDiffVJP(true))))
+            @test sol.convergence.backend == :adjoint
+            # Recovery comparable to the ForwardDiff-path testset (which
+            # runs 1000 iters and asserts < 0.15/0.25); at 400 iters the
+            # fit is slightly looser, so use its outer band throughout.
+            @test sol.data_loss < 1.0
+            fhat = sol.unknown_functions[:f]
+            for x in (0.5, 1.0, 2.0)
+                @test abs(fhat(x) - 0.5 * x) < 0.25
+            end
+        end
+
+        @testset "default path untouched and rejections" begin
+            prob = mk_spline_prob()
+            sol_fd = solve(prob, AdamSolver(maxiters=5, lr=0.01))
+            @test sol_fd.convergence.backend == :forwarddiff
+            sol_fdiff = solve(prob, AdamSolver(maxiters=3, lr=0.01,
+                                               autodiff=false))
+            @test sol_fdiff.convergence.backend == :finitediff
+            sol_aj = solve(prob, AdamSolver(maxiters=5, lr=0.01,
+                                            sensealg=:auto))
+            @test sol_aj.convergence.backend == :adjoint
+
+            # Discrete maps have no ODE solve to adjoint
+            prob_disc = PSMProblem(growth_aj!, [1.0], (0.0, 5.0),
+                [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+                data_times=collect(0.0:1.0:5.0),
+                data_values=reshape(exp.(0.1 .* collect(0.0:1.0:5.0)), :, 1),
+                obs_to_state=[1], discrete=true)
+            err = try
+                solve(prob_disc, AdamSolver(maxiters=2, sensealg=:auto))
+                nothing
+            catch e; e; end
+            @test err isa ErrorException
+            @test occursin("discrete-time", err.msg)
+
+            # DDE problems go through adam_solve_dde, not the adjoint path
+            prob_dde = PSMProblem(growth_aj!, [1.0], (0.0, 5.0),
+                [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+                data_times=t_aj, data_values=y_aj, obs_to_state=[1],
+                delays=[1.0], history=(p, t) -> [1.0])
+            err = try
+                solve(prob_dde, AdamSolver(maxiters=2, sensealg=:auto))
+                nothing
+            catch e; e; end
+            @test err isa ErrorException
+            @test occursin("delays", err.msg)
+
+            # Forward sensitivity algorithms are rejected (adjoint-only)
+            err = try
+                solve(prob, AdamSolver(maxiters=2,
+                                       sensealg=ForwardDiffSensitivity()))
+                nothing
+            catch e; e; end
+            @test err isa ErrorException
+            @test occursin("not an adjoint", err.msg)
+
+            # Unknown sensealg symbol
+            err = try
+                solve(prob, AdamSolver(maxiters=2, sensealg=:bogus))
+                nothing
+            catch e; e; end
+            @test err isa ErrorException
+            @test occursin("unknown sensealg symbol", err.msg)
+
+            # Junk sensealg values fall through the extension to the stub
+            err = try
+                solve(prob, AdamSolver(maxiters=2, sensealg="junk"))
+                nothing
+            catch e; e; end
+            @test err isa ErrorException
+            @test occursin("not a valid adjoint specification", err.msg)
+
+            # Unsupported likelihood family: same rejection as the
+            # ForwardDiff path (AdamSolver supports Gaussian/Poisson only)
+            prob_nb = PSMProblem(growth_aj!, [1.0], (0.0, 5.0),
+                [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+                data_times=t_aj, data_values=y_aj, obs_to_state=[1],
+                likelihood=NegativeBinomial(10.0))
+            err = try
+                solve(prob_nb, AdamSolver(maxiters=2, sensealg=:auto))
+                nothing
+            catch e; e; end
+            @test err isa ErrorException
+            @test occursin("no loss for", err.msg)
+        end
+
+        # The stub must fire when the extension is NOT loaded: spawn julia
+        # on the package environment and assert the informative error. This
+        # works because extension activation requires the trigger package to
+        # be LOADED, not merely installed somewhere on the LOAD_PATH stack —
+        # the subprocess never runs `using SciMLSensitivity`, so a global-env
+        # install cannot activate the extension. (The subprocess does need
+        # the package-dir Manifest to exist, which dev checkouts and CI
+        # buildpkg both guarantee.)
+        @testset "stub error without the extension (subprocess)" begin
+            pkgdir_psm = dirname(dirname(pathof(PartiallySpecifiedModels)))
+            code = """
+            using PartiallySpecifiedModels
+            growth!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+            prob = PSMProblem(growth!, [1.0], (0.0, 1.0),
+                [BSplineApproximator(:r, (0.5, 2.0), 4)];
+                data_times=[0.0, 0.5, 1.0],
+                data_values=reshape([1.0, 1.1, 1.2], :, 1),
+                obs_to_state=[1])
+            try
+                solve(prob, AdamSolver(maxiters=2, sensealg=:auto))
+                print("NO_ERROR")
+            catch e
+                msg = sprint(showerror, e)
+                print(occursin("SciMLSensitivity", msg) &&
+                      occursin("not loaded", msg) ? "STUB_OK" : "WRONG_ERROR")
+            end
+            """
+            out = read(`$(Base.julia_cmd()) --project=$(pkgdir_psm)
+                        --startup-file=no -e $code`, String)
+            @test endswith(out, "STUB_OK")
+        end
+    end
+
+    # ─── W10: GCVSolver search=:reuse (ddefit EScv one-decomposition trick) ──
+
+    @testset "GCVSolver search=:reuse — one-decomposition fast GCV" begin
+        PSM = PartiallySpecifiedModels
+
+        # ── Construction validation ──
+        @test_throws ArgumentError GCVSolver(search=:fast)
+        @test_throws ArgumentError GCVSolver(search=:eigen)
+        # :reuse is a pure-GCV trick: NCV's neighbourhood downdates need
+        # A(λ)⁻¹ per λ, incompatible with one decomposition — rejected.
+        @test_throws ArgumentError GCVSolver(search=:reuse, criterion=:ncv)
+        @test GCVSolver().search == :direct                    # default unchanged
+        @test GCVSolver(search=:reuse).search == :reuse
+        @test GCVSolver(search=:direct, criterion=:ncv) isa GCVSolver
+
+        # ── SCORE EQUIVALENCE: reuse family vs direct _gcv_score on fixed
+        # working models. The reuse scorer replicates the direct scorer's
+        # λ-dependent stability ridge exactly (per-argmax-segment pencil),
+        # so agreement is limited only by the factorization roundoff:
+        #  · full-rank S: ~1e-15 relative at ALL λ across the RHO bounds;
+        #  · rank-deficient S: the penalty null-space eigenvalues of the
+        #    whitened pencil are O(1e-12) (the replicated ridge) and carry
+        #    the absolute O(eps·‖K‖) error of any double-precision
+        #    eigendecomposition, so agreement degrades as λ·eps once
+        #    λ ≳ 1e15 — measured (Xoshiro(7) fixtures of this shape):
+        #    ≤9e-11 for ρ ≤ 15, ~1e-8 at ρ = 20, ~3e-4 over the full
+        #    range to ρ = 40 (λ = 2.4e17, essentially-infinite smoothing
+        #    where the direct path's trA/β are themselves conditioning-
+        #    limited — the direct SCORE proper stays more stable there,
+        #    so the loose full-range pin reflects reuse-side eps·λ
+        #    growth in a region no search ever selects).
+        #    Pinned below with ≥10× margins: 1e-10 for ρ ∈ [RHO_MIN, 13],
+        #    1e-6 to ρ = 20, 5e-3 full range.
+        rng_w10 = StableRNG(7)
+        n_w10, p_w10 = 60, 12
+        J_w10 = randn(rng_w10, n_w10, p_w10)
+        z_w10 = randn(rng_w10, n_w10)
+        ones_w10 = ones(n_w10)
+        Z0_w10 = zeros(p_w10, p_w10)
+        # B-spline-style second-difference penalty: 2-dim null space
+        D_w10 = zeros(p_w10 - 2, p_w10)
+        for i in 1:p_w10-2
+            D_w10[i, i] = 1.0; D_w10[i, i+1] = -2.0; D_w10[i, i+2] = 1.0
+        end
+        S_rd_w10 = D_w10' * D_w10
+        @test rank(S_rd_w10) == p_w10 - 2
+        S_fr_w10 = Matrix(1.0I, p_w10, p_w10) .+
+                   0.1 .* (x -> x' * x)(randn(rng_w10, p_w10, p_w10) ./ sqrt(p_w10))
+        wv_w10 = rand(rng_w10, n_w10) .+ 0.3
+        wm_w10 = copy(wv_w10)
+        wm_w10[3] = 0.0; wm_w10[17] = 0.0; wm_w10[44] = 0.0   # masked rows
+        nm_w10 = count(>(0), wm_w10)
+
+        # worst relative disagreement (score AND tr(A) AND β̂) over 20 λ
+        function reuse_worst_w10(w, n, S_base, S_pen; rho_hi=PSM.RHO_MAX)
+            fam = PSM._gcv_reuse_family(J_w10, w, z_w10, S_base, S_pen,
+                                        n, 1.4)
+            fam === nothing && return Inf
+            worst = 0.0
+            for lam in exp.(range(PSM.RHO_MIN, rho_hi, length=20))
+                gf, bf, _, tf = fam(lam)
+                gd, bd, _, td = PSM._gcv_score(J_w10, w, z_w10,
+                                               S_base .+ lam .* S_pen, n, 1.4)
+                worst = max(worst,
+                            abs(gf - gd) / max(abs(gd), 1e-300),
+                            abs(tf - td) / max(td, 1e-300),
+                            norm(bf - bd) / max(norm(bd), 1e-300))
+            end
+            worst
+        end
+
+        # well-conditioned (full-rank S): full RHO span at 1e-10
+        @test reuse_worst_w10(ones_w10, n_w10, Z0_w10, S_fr_w10) < 1e-10
+        # rank-deficient / weighted / masked / nonzero fixed penalty
+        # (coordinate-descent shape): graded pins per the conditioning
+        # analysis above
+        for (w, n) in ((ones_w10, n_w10), (wv_w10, n_w10), (wm_w10, nm_w10))
+            @test reuse_worst_w10(w, n, Z0_w10, S_rd_w10; rho_hi=13.0) < 1e-10
+            @test reuse_worst_w10(w, n, Z0_w10, S_rd_w10; rho_hi=20.0) < 1e-6
+            @test reuse_worst_w10(w, n, Z0_w10, S_rd_w10) < 5e-3
+        end
+        S_baseK_w10 = 3.7 .* Matrix(1.0I, p_w10, p_w10)
+        @test reuse_worst_w10(wv_w10, n_w10, S_baseK_w10, S_rd_w10;
+                              rho_hi=13.0) < 1e-10
+        @test reuse_worst_w10(wv_w10, n_w10, S_baseK_w10, S_rd_w10) < 5e-3
+
+        # ── Rank-deficient penalty null space: EDF contribution is 1 per
+        # null direction (dᵢ ≈ 0 ⟹ 1/(1+λdᵢ) ≈ 1), verified against the
+        # direct score at large-but-moderate λ where the fit is otherwise
+        # fully smoothed: tr(A) ↓ but stays ≥ null-space dim = 2.
+        fam_rd_w10 = PSM._gcv_reuse_family(J_w10, ones_w10, z_w10,
+                                           Z0_w10, S_rd_w10, n_w10, 1.4)
+        _, _, _, trA_f_w10 = fam_rd_w10(1e6)
+        _, _, _, trA_d_w10 = PSM._gcv_score(J_w10, ones_w10, z_w10,
+                                            1e6 .* S_rd_w10, n_w10, 1.4)
+        @test abs(trA_f_w10 - trA_d_w10) < 1e-8
+        @test 2.0 < trA_f_w10 < 2.1
+
+        # ── Degraded case, unit level: near-singular A ⟹ family refuses
+        # (returns nothing) instead of whitening garbage ──
+        J_sing_w10 = randn(rng_w10, 8, p_w10)       # n = 8 < p = 12
+        @test PSM._gcv_reuse_family(J_sing_w10, ones(8), randn(rng_w10, 8),
+                                    Z0_w10, S_rd_w10, 8, 1.4) === nothing
+
+        # ── End-to-end equivalence, single λ: logistic growth ──
+        r_true_w10(N) = 0.5 * (1.0 - N / 10.0)
+        logi_w10!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        st_w10 = OrdinaryDiffEq.solve(
+            ODEProblem(logi_w10!, [1.0], (0.0, 15.0), (; r=r_true_w10)),
+            Tsit5(); saveat=0.2, abstol=1e-10, reltol=1e-10)
+        t_w10 = collect(st_w10.t)
+        truth_w10 = [u[1] for u in st_w10.u]
+        data_w10 = max.(truth_w10 .+
+                        0.05 .* randn(StableRNG(11), length(t_w10)), 0.01)
+        mk_w10(res, times, vals) = PSMProblem(logi_w10!, [1.0], (0.0, 15.0),
+            [BSplineApproximator(:r, (0.0, 12.0), res)];
+            data_times=times, data_values=reshape(vals, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PSM.Gaussian())
+        prob_e2e_w10 = mk_w10(8, t_w10, data_w10)
+        sol_d_w10 = solve(prob_e2e_w10, GCVSolver(maxiters=25))
+        sol_r_w10 = solve(prob_e2e_w10, GCVSolver(maxiters=25, search=:reuse))
+        # λ̂ agreement within the golden-section search tolerance: the two
+        # paths see bit-different scores (~1e-13 relative in the benign
+        # region), so iterates can part ways only below the search tol.
+        # Measured: |Δ log λ̂| = 8e-7, objective/GCV relΔ ≈ 6e-9, fitted
+        # values within 5e-9. Pinned with ~100× margin.
+        @test abs(log(sol_d_w10.smoothing_params[1]) -
+                  log(sol_r_w10.smoothing_params[1])) < 1e-4
+        @test abs(sol_d_w10.objective - sol_r_w10.objective) <
+              1e-6 * max(abs(sol_d_w10.objective), 1.0)
+        @test maximum(abs.(sol_d_w10.fitted_values .-
+                           sol_r_w10.fitted_values)) < 1e-6
+        @test abs(sol_d_w10.convergence.gcv - sol_r_w10.convergence.gcv) <
+              1e-6 * abs(sol_d_w10.convergence.gcv)
+        # identical convergence-info structure
+        @test keys(sol_d_w10.convergence) == keys(sol_r_w10.convergence)
+        @test sol_d_w10.convergence.criterion == :gcv
+        @test sol_r_w10.convergence.criterion == :gcv
+
+        # ── End-to-end, multi-λ (two approximators ⟹ coordinate descent
+        # with one decomposition per coordinate per sweep) ──
+        two_uf_w10!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1] - p.g(u[1]))
+        pt_w10 = ODEProblem((du, u, p, t) -> (du[1] = 0.4u[1] - 0.05u[1]),
+                            [1.0], (0.0, 5.0))
+        st2_w10 = OrdinaryDiffEq.solve(pt_w10, Tsit5(); saveat=0.25)
+        tt2_w10 = collect(st2_w10.t)
+        dv2_w10 = reshape([st2_w10(t)[1] for t in tt2_w10] .+
+                          0.02 .* randn(StableRNG(7), length(tt2_w10)), :, 1)
+        prob2_w10 = PSMProblem(two_uf_w10!, [1.0], (0.0, 5.0),
+            [BSplineApproximator(:r, (0.5, 6.0), 5; initial=x -> 0.3),
+             BSplineApproximator(:g, (0.5, 6.0), 5; initial=x -> 0.03x)];
+            data_times=tt2_w10, data_values=dv2_w10, obs_to_state=[1],
+            known_params=NamedTuple(), likelihood=PSM.Gaussian(),
+            solver=Tsit5())
+        sol2_d_w10 = solve(prob2_w10, GCVSolver(maxiters=15))
+        sol2_r_w10 = solve(prob2_w10, GCVSolver(maxiters=15, search=:reuse))
+        @test length(sol2_r_w10.smoothing_params) == 2
+        @test all(abs.(log.(sol2_d_w10.smoothing_params) .-
+                       log.(sol2_r_w10.smoothing_params)) .< 1e-4)
+        @test abs(sol2_d_w10.objective - sol2_r_w10.objective) <
+              1e-6 * max(abs(sol2_d_w10.objective), 1.0)
+        @test maximum(abs.(sol2_d_w10.fitted_values .-
+                           sol2_r_w10.fitted_values)) < 1e-6
+
+        # ── Degraded case, end-to-end: 8 data points, 20-knot basis ⟹
+        # J'WJ rank ≤ 8 < p ⟹ the reuse guard trips every IRLS iteration
+        # and the search runs the byte-identical direct scorer, so the two
+        # fits must be EXACTLY equal (and finite) ──
+        tt_s_w10 = collect(range(0.0, 15.0, length=8))
+        st_s_w10 = OrdinaryDiffEq.solve(
+            ODEProblem(logi_w10!, [1.0], (0.0, 15.0), (; r=r_true_w10)),
+            Tsit5(); saveat=tt_s_w10, abstol=1e-10, reltol=1e-10)
+        d_s_w10 = max.([u[1] for u in st_s_w10.u] .+
+                       0.05 .* randn(StableRNG(3), 8), 0.01)
+        prob_s_w10 = mk_w10(20, tt_s_w10, d_s_w10)
+        sol_sd_w10 = solve(prob_s_w10, GCVSolver(maxiters=8))
+        sol_sr_w10 = solve(prob_s_w10, GCVSolver(maxiters=8, search=:reuse))
+        @test sol_sr_w10.smoothing_params == sol_sd_w10.smoothing_params
+        @test sol_sr_w10.objective == sol_sd_w10.objective
+        @test isfinite(sol_sr_w10.objective)
+        @test all(isfinite, sol_sr_w10.fitted_values)
+
+        # ── Timing (comment-only, per the W9 flake-review guidance):
+        # search-only microbenchmark (grid 50 + golden section, minimum of
+        # 7 runs, warmed, second-difference penalty, this machine):
+        #   p=20 n=100: direct 2.1ms, reuse 1.0ms (2.0×)
+        #   p=30 n=150: direct 4.8ms, reuse 1.5ms (3.3×)
+        #   p=40 n=200: direct 8.7ms, reuse 2.5ms (3.5×)
+        #   p=60 n=300: direct 20.0ms, reuse 5.4ms (3.7×)
+        # Full multi-λ solve (prob2 above, m=2): 1.02s → 0.15s (~7×; the
+        # coordinate sweep multiplies the per-λ solve count, so reuse
+        # helps most there). At package-typical p ≈ 8–15 the win per IRLS
+        # iteration is real but modest (~2×); the feature matters for
+        # large bases and multi-approximator coordinate descent.
+    end
+
+    @testset "W11: jac=:forwarddiff prediction Jacobians" begin
+        import ForwardDiff
+        import Lux
+        PSM = PartiallySpecifiedModels
+
+        # ── Construction validation on all three solvers ──
+        @test_throws ArgumentError LAML(jac=:bogus)
+        @test_throws ArgumentError GCVSolver(jac=:bogus)
+        @test_throws ArgumentError CollocationLAML(jac=:bogus)
+        # Default is :fd on all three — the historical FD path stays the
+        # default and is pinned byte-identical below.
+        @test LAML().jac === :fd
+        @test GCVSolver().jac === :fd
+        @test CollocationLAML().jac === :fd
+        @test LAML(jac=:forwarddiff).jac === :forwarddiff
+
+        # ── Shared smooth logistic problem (BSpline) ──
+        r_true_w11(N) = 0.8 * (1.0 - N / 2.0)
+        function logi_w11!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+        end
+        tt_w11 = collect(range(0.0, 10.0, length=25))
+        st_w11 = OrdinaryDiffEq.solve(
+            ODEProblem((du, u, p, t) -> (du[1] = r_true_w11(u[1]) * u[1]),
+                       [0.2], (0.0, 10.0)), Tsit5();
+            saveat=tt_w11, abstol=1e-10, reltol=1e-10)
+        # Seed choice is deliberate (see the LAML end-to-end block below):
+        # on this draw both Jacobian backends land on the same LAML optimum.
+        dat_w11 = reshape([u[1] for u in st_w11.u] .+
+                          0.02 .* randn(StableRNG(4), 25), :, 1)
+        mk_w11(; data=dat_w11, weights=nothing) = PSMProblem(
+            logi_w11!, [0.2], (0.0, 10.0),
+            [BSplineApproximator(:r, (0.0, 2.5), 8)];
+            data_times=tt_w11, data_values=data,
+            (weights === nothing ? (;) : (; data_weights=weights))...)
+        prob_w11 = mk_w11()
+        b0_w11 = PSM.build_initial_params(prob_w11)
+        np_w11 = length(b0_w11)
+
+        # ── Jacobian agreement, FD vs ForwardDiff (smooth ODE) ──
+        f0_w11 = vec(PSM.simulate(prob_w11, b0_w11))
+        J_fd_w11 = zeros(25, np_w11)
+        J_ad_w11 = zeros(25, np_w11)
+        cfg_w11 = PSM._fd_jacobian_config(np_w11)
+        PSM.compute_jacobian!(J_fd_w11, prob_w11, b0_w11, f0_w11, 25, 1;
+                              dam=fill(1e-8, np_w11))
+        PSM.compute_jacobian!(J_ad_w11, prob_w11, b0_w11, f0_w11, 25, 1;
+                              dam=fill(1e-8, np_w11),
+                              jac=:forwarddiff, fd_cfg=cfg_w11)
+        @test all(isfinite, J_ad_w11)
+        # FD's own error bound (truncation + integration noise); measured
+        # agreement here is ~4e-11 relative.
+        scale_w11 = maximum(abs, J_ad_w11)
+        @test maximum(abs, J_fd_w11 - J_ad_w11) < 1e-6 * max(scale_w11, 1.0)
+        # Silent-fallback detector (see the DDE variant below): a permanent
+        # AD→FD fallback would make this diff EXACTLY 0.0; genuine AD
+        # leaves FD truncation noise (~4e-11 measured).
+        @test maximum(abs, J_fd_w11 - J_ad_w11) > 0
+
+        # Default path untouched: jac=:fd through the keyword is EXACTLY the
+        # implicit default (same code path, same adaptive steps).
+        J_fd2_w11 = zeros(25, np_w11)
+        PSM.compute_jacobian!(J_fd2_w11, prob_w11, b0_w11, f0_w11, 25, 1;
+                              dam=fill(1e-8, np_w11), jac=:fd)
+        @test J_fd2_w11 == J_fd_w11
+
+        # ── Analytic case: discrete linear map u_{t+1} = g(1)·u_t ──
+        # pred_t = g^t·u_0 with g = Σ cⱼBⱼ(1), so ∂pred_t/∂cⱼ = t·g^{t-1}·Bⱼ(1)
+        # in closed form. No integrator → AD must hit machine precision while
+        # FD carries its truncation error.
+        function linmap_w11!(un, u, p, t)
+            un[1] = p.g(1.0) * u[1]
+        end
+        ttd_w11 = collect(0.0:1.0:8.0)
+        probd_w11 = PSMProblem(linmap_w11!, [1.0], (0.0, 8.0),
+                               [BSplineApproximator(:g, (0.0, 2.0), 6;
+                                                    initial=x -> 0.9)];
+                               data_times=ttd_w11,
+                               data_values=reshape(fill(1.0, 9), :, 1),
+                               discrete=true)
+        bd_w11 = PSM.build_initial_params(probd_w11)
+        npd_w11 = length(bd_w11)
+        g0_w11 = PSM.build_evaluator(probd_w11.approximators[1], bd_w11)(1.0)
+        Bj_w11 = ForwardDiff.gradient(
+            c -> PSM.build_evaluator(probd_w11.approximators[1], c)(1.0),
+            bd_w11)
+        J_an_w11 = zeros(9, npd_w11)
+        for (i, t) in enumerate(ttd_w11), j in 1:npd_w11
+            J_an_w11[i, j] = t == 0.0 ? 0.0 : t * g0_w11^(t - 1) * Bj_w11[j]
+        end
+        f0d_w11 = vec(PSM.simulate(probd_w11, bd_w11))
+        J_fdd_w11 = zeros(9, npd_w11)
+        J_add_w11 = zeros(9, npd_w11)
+        PSM.compute_jacobian!(J_fdd_w11, probd_w11, bd_w11, f0d_w11, 9, 1;
+                              dam=fill(1e-8, npd_w11))
+        PSM.compute_jacobian!(J_add_w11, probd_w11, bd_w11, f0d_w11, 9, 1;
+                              dam=fill(1e-8, npd_w11), jac=:forwarddiff,
+                              fd_cfg=PSM._fd_jacobian_config(npd_w11))
+        # Measured: AD 4.4e-16 (machine), FD 8.2e-11 (its truncation error)
+        @test maximum(abs, J_add_w11 - J_an_w11) < 1e-12
+        @test maximum(abs, J_fdd_w11 - J_an_w11) < 1e-8
+        @test maximum(abs, J_add_w11 - J_an_w11) <
+              maximum(abs, J_fdd_w11 - J_an_w11)
+
+        # ── Neural approximator agreement ──
+        nn_w11 = Lux.Chain(Lux.Dense(1 => 4, tanh), Lux.Dense(4 => 1))
+        probn_w11 = PSMProblem(logi_w11!, [0.2], (0.0, 10.0),
+                               [NeuralApproximator(:r, nn_w11; rng_seed=7)];
+                               data_times=tt_w11, data_values=dat_w11)
+        bn_w11 = PSM.build_initial_params(probn_w11)
+        npn_w11 = length(bn_w11)
+        f0n_w11 = vec(PSM.simulate(probn_w11, bn_w11))
+        J_fdn_w11 = zeros(25, npn_w11)
+        J_adn_w11 = zeros(25, npn_w11)
+        PSM.compute_jacobian!(J_fdn_w11, probn_w11, bn_w11, f0n_w11, 25, 1;
+                              dam=fill(1e-8, npn_w11))
+        PSM.compute_jacobian!(J_adn_w11, probn_w11, bn_w11, f0n_w11, 25, 1;
+                              dam=fill(1e-8, npn_w11), jac=:forwarddiff,
+                              fd_cfg=PSM._fd_jacobian_config(npn_w11))
+        @test all(isfinite, J_adn_w11)
+        @test maximum(abs, J_fdn_w11 - J_adn_w11) <
+              1e-4 * max(maximum(abs, J_adn_w11), 1.0)   # measured 1.6e-7
+
+        # ── Masked cells: rows are computed for masked cells too (masking
+        #    is applied downstream through the weights), identically in
+        #    both backends ──
+        datm_w11 = copy(dat_w11); datm_w11[5] = NaN
+        wm_w11 = ones(25, 1); wm_w11[9] = 0.0
+        probm_w11 = mk_w11(data=datm_w11, weights=wm_w11)
+        f0m_w11 = vec(PSM.simulate(probm_w11, b0_w11))
+        J_fdm_w11 = zeros(25, np_w11)
+        J_adm_w11 = zeros(25, np_w11)
+        PSM.compute_jacobian!(J_fdm_w11, probm_w11, b0_w11, f0m_w11, 25, 1;
+                              dam=fill(1e-8, np_w11))
+        PSM.compute_jacobian!(J_adm_w11, probm_w11, b0_w11, f0m_w11, 25, 1;
+                              dam=fill(1e-8, np_w11), jac=:forwarddiff,
+                              fd_cfg=PSM._fd_jacobian_config(np_w11))
+        @test all(isfinite, J_adm_w11)
+        @test !all(iszero, J_adm_w11[5, :])   # masked rows still populated
+        @test !all(iszero, J_adm_w11[9, :])
+        @test maximum(abs, J_fdm_w11 - J_adm_w11) <
+              1e-6 * max(maximum(abs, J_adm_w11), 1.0)
+
+        # ── End-to-end equivalence: LAML ──
+        # Measured on this draw: fitted-values maxdiff 4.2e-8,
+        # |log θ ratio| 2.5e-6, data_loss rel diff 4.7e-7, criterion diff
+        # 1.5e-5 — the two backends land on the SAME optimum. Honest caveat
+        # (why the seed is pinned): an 8-seed scan showed that on ~half the
+        # draws of THIS near-linear-r problem the IRLS accept/reject
+        # branching diverges to different Fellner–Schall fixed points in the
+        # flat heavy-smoothing regime (λ̂ ratios up to e^12, in BOTH
+        # directions — sometimes :fd attains the better LAML criterion,
+        # sometimes :forwarddiff). That is path sensitivity of the IRLS/FS
+        # iteration itself, not Jacobian error: the Jacobians agree to 1e-6
+        # relative (pinned above) on every draw, and GCVSolver — whose λ is
+        # selected by a global grid+golden search per iteration rather than
+        # an FS fixed-point path — agrees to |log λ ratio| < 6e-3 on ALL
+        # eight seeds.
+        sol_lf_w11 = solve(mk_w11(), LAML(maxiters=20))
+        sol_la_w11 = solve(mk_w11(), LAML(maxiters=20, jac=:forwarddiff))
+        @test maximum(abs, sol_lf_w11.fitted_values -
+                           sol_la_w11.fitted_values) < 1e-4
+        @test abs(log(sol_la_w11.smoothing_params[1] /
+                      sol_lf_w11.smoothing_params[1])) < 0.05
+        @test abs(sol_la_w11.data_loss - sol_lf_w11.data_loss) <
+              1e-3 * max(sol_lf_w11.data_loss, 1e-8)
+
+        # ── End-to-end equivalence: GCVSolver ──
+        sol_gf_w11 = solve(mk_w11(), GCVSolver(maxiters=12))
+        sol_ga_w11 = solve(mk_w11(), GCVSolver(maxiters=12, jac=:forwarddiff))
+        # Measured: fitted-values maxdiff 2.7e-6, |log λ ratio| 1.0e-3
+        # (within the golden-section search tolerance).
+        @test maximum(abs, sol_gf_w11.fitted_values -
+                           sol_ga_w11.fitted_values) < 1e-4
+        @test abs(log(sol_ga_w11.smoothing_params[1] /
+                      sol_gf_w11.smoothing_params[1])) < 0.05
+
+        # ── End-to-end equivalence: CollocationLAML ──
+        sol_cf_w11 = solve(mk_w11(), CollocationLAML(maxiters=15,
+                                                     n_continuation=4))
+        sol_ca_w11 = solve(mk_w11(), CollocationLAML(maxiters=15,
+                                                     n_continuation=4,
+                                                     jac=:forwarddiff))
+        # Measured: fitted-values maxdiff 3.9e-9, data_loss rel diff 6e-8.
+        @test maximum(abs, sol_cf_w11.fitted_values -
+                           sol_ca_w11.fitted_values) < 1e-5
+        @test abs(sol_ca_w11.data_loss - sol_cf_w11.data_loss) <
+              1e-4 * max(sol_cf_w11.data_loss, 1e-8)
+
+        # ── THE critical test: collocation failure-mask preservation ──
+        # sqrt(u) throws DomainError at collocation points whose state is
+        # negative; the residual there must hold the sentinel in BOTH
+        # backends, the sentinel must never be differenced/differentiated
+        # (the fix-campaign regression this guards produced ~1e12 Jacobian
+        # entries), and the zero-block structure must be IDENTICAL.
+        function sq_dyn_w11!(du, u, p, t)
+            du[1] = p.h(sqrt(u[1]))
+        end
+        ttc_w11 = collect(range(0.0, 4.0, length=9))
+        datc_w11 = reshape([1.0, 0.8, -0.5, 0.6, -0.3, 0.5, 0.4, 0.35, 0.3],
+                           :, 1)
+        probc_w11 = PSMProblem(sq_dyn_w11!, [1.0], (0.0, 4.0),
+                               [BSplineApproximator(:h, (0.0, 1.5), 5)];
+                               data_times=ttc_w11, data_values=datc_w11)
+        alpha_c_w11 = reshape(copy(vec(datc_w11)), :, 1)
+        beta_c_w11 = PSM.build_initial_params(probc_w11)
+        D_c_w11 = PSM.build_diff_matrix(ttc_w11)
+        _, Ffail_w11 = PSM.eval_ode_rhs_masked(probc_w11, ttc_w11,
+                                               alpha_c_w11, beta_c_w11)
+        @test findall(Ffail_w11) == [3, 5]   # the documented failure mask
+        r_fd_w11, Jc_fd_w11 = PSM.collocation_residual_jacobian(
+            probc_w11, ttc_w11, alpha_c_w11, beta_c_w11, D_c_w11, 1.0,
+            ones(9))
+        r_ad_w11, Jc_ad_w11 = PSM.collocation_residual_jacobian(
+            probc_w11, ttc_w11, alpha_c_w11, beta_c_w11, D_c_w11, 1.0,
+            ones(9); jac=:forwarddiff,
+            fd_cfg=PSM._fd_jacobian_config(length(beta_c_w11)))
+        # Residual path is shared: identical, sentinel present at failed pts
+        @test r_fd_w11 == r_ad_w11
+        @test any(x -> abs(x) > 1e5, r_fd_w11)          # sentinel present
+        # β-block rows at failed points are exactly zero in BOTH backends
+        n_alpha_c = 9
+        for i in findall(Ffail_w11)
+            @test all(iszero, Jc_fd_w11[9 + i, n_alpha_c+1:end])
+            @test all(iszero, Jc_ad_w11[9 + i, n_alpha_c+1:end])
+        end
+        # Zero-pattern of the β-block is IDENTICAL across backends
+        @test (Jc_fd_w11[:, n_alpha_c+1:end] .== 0.0) ==
+              (Jc_ad_w11[:, n_alpha_c+1:end] .== 0.0)
+        # No fabricated ~1e12 slopes anywhere (the regression guard)
+        @test maximum(abs, Jc_fd_w11) < 1e10
+        @test maximum(abs, Jc_ad_w11) < 1e10
+        # Away from failed points the two backends agree
+        @test maximum(abs, Jc_fd_w11 - Jc_ad_w11) < 1e-10
+        # End-to-end on the failure problem: both backends complete
+        sol_cff_w11 = solve(probc_w11, CollocationLAML(maxiters=8,
+                                                       n_continuation=3))
+        sol_caf_w11 = solve(probc_w11, CollocationLAML(maxiters=8,
+                                                       n_continuation=3,
+                                                       jac=:forwarddiff))
+        @test all(isfinite, sol_cff_w11.fitted_values)
+        @test all(isfinite, sol_caf_w11.fitted_values)
+
+        # ── Discrete-collocation branch of the AD state/β blocks ──
+        function ricker_w11!(un, u, p, t)
+            un[1] = u[1] * exp(p.g(u[1]))
+        end
+        ttr_w11 = collect(0.0:1.0:8.0)
+        datr_w11 = reshape(0.5 .+ 0.4 .* rand(StableRNG(11), 9), :, 1)
+        probr_w11 = PSMProblem(ricker_w11!, [0.5], (0.0, 8.0),
+                               [BSplineApproximator(:g, (0.0, 2.0), 5)];
+                               data_times=ttr_w11, data_values=datr_w11,
+                               discrete=true)
+        alphar_w11 = reshape(copy(vec(datr_w11)), :, 1)
+        betar_w11 = PSM.build_initial_params(probr_w11)
+        rr1_w11, Jr1_w11 = PSM.collocation_residual_jacobian(
+            probr_w11, ttr_w11, alphar_w11, betar_w11,
+            PSM.build_diff_matrix(ttr_w11), 1.0, ones(9))
+        rr2_w11, Jr2_w11 = PSM.collocation_residual_jacobian(
+            probr_w11, ttr_w11, alphar_w11, betar_w11,
+            PSM.build_diff_matrix(ttr_w11), 1.0, ones(9);
+            jac=:forwarddiff,
+            fd_cfg=PSM._fd_jacobian_config(length(betar_w11)))
+        @test rr1_w11 == rr2_w11        # residual path is backend-independent
+        # measured 2.7e-6 — the FD path's own one-sided truncation error
+        @test maximum(abs, Jr1_w11 - Jr2_w11) < 1e-4
+
+        # ── DDE support: MethodOfSteps is Dual-safe (decision: SUPPORTED,
+        #    with the same per-iteration FD fallback as the ODE path) ──
+        function dde_w11!(du, u, h, p, t)
+            ud = h(p, t - 1.0)
+            du[1] = -p.f(ud[1])
+        end
+        ttdd_w11 = collect(range(0.5, 6.0, length=12))
+        probdd_w11 = PSMProblem(dde_w11!, [1.0], (0.0, 6.0),
+                                [BSplineApproximator(:f, (-1.5, 1.5), 6)];
+                                data_times=ttdd_w11,
+                                data_values=reshape(
+                                    [exp(-0.4t) for t in ttdd_w11], :, 1),
+                                delays=[1.0])
+        bdd_w11 = PSM.build_initial_params(probdd_w11)
+        npdd_w11 = length(bdd_w11)
+        f0dd_w11 = vec(PSM.simulate(probdd_w11, bdd_w11))
+        Jd_fd_w11 = zeros(12, npdd_w11)
+        Jd_ad_w11 = zeros(12, npdd_w11)
+        PSM.compute_jacobian!(Jd_fd_w11, probdd_w11, bdd_w11, f0dd_w11, 12, 1;
+                              dam=fill(1e-8, npdd_w11))
+        PSM.compute_jacobian!(Jd_ad_w11, probdd_w11, bdd_w11, f0dd_w11, 12, 1;
+                              dam=fill(1e-8, npdd_w11), jac=:forwarddiff,
+                              fd_cfg=PSM._fd_jacobian_config(npdd_w11))
+        @test all(isfinite, Jd_ad_w11)
+        @test maximum(abs, Jd_fd_w11 - Jd_ad_w11) <
+              1e-6 * max(maximum(abs, Jd_ad_w11), 1.0)   # measured 2.2e-11
+        # Silent-fallback detector: if the AD path permanently fell back
+        # to FD, both Jacobians would be FD from identical fresh state and
+        # the diff would be EXACTLY 0.0. FD truncation noise guarantees a
+        # nonzero gap whenever AD genuinely ran (measured 1.3e-10 here).
+        @test maximum(abs, Jd_fd_w11 - Jd_ad_w11) > 0
+        sol_dfd_w11 = solve(probdd_w11, LAML(maxiters=10))
+        sol_dad_w11 = solve(probdd_w11, LAML(maxiters=10, jac=:forwarddiff))
+        @test maximum(abs, sol_dfd_w11.fitted_values -
+                           sol_dad_w11.fitted_values) < 1e-4  # measured 5.8e-7
+
+        # ── Timing (comment-only, per the W9 flake-review guidance):
+        # per-Jacobian microbenchmark (25 data points, logistic BSpline
+        # problem, minimum of 5 warmed runs, this machine):
+        #   p=8:  fd 0.57ms  forwarddiff 0.04ms  (14.0×)
+        #   p=15: fd 1.09ms  forwarddiff 0.08ms  (13.9×)
+        #   p=25: fd 1.80ms  forwarddiff 0.12ms  (15.6×)
+        # The FD path pays 2·p ODE solves per Jacobian; the AD path pays
+        # ⌈p/chunk⌉ chunked Dual solves (chunk ≤ 12), hence the ~order-of-
+        # magnitude win. End-to-end (LAML maxiters=20 on the problem above):
+        # 6.1s → 0.04s; GCVSolver: 1.1s → 0.01s; CollocationLAML: 2.5s →
+        # 0.65s (its Jacobian is dominated by the pointwise state blocks).
     end
 
 end

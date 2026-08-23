@@ -16,11 +16,13 @@ AbstractApproximator
 ```
 
 - [`BSplineApproximator`](@ref)
+- [`TensorBSplineApproximator`](@ref)
 - [`ShapeConstrainedBSplineApproximator`](@ref)
 - [`SPDEApproximator`](@ref)
 - [`ShapeConstrainedSPDEApproximator`](@ref)
 - [`NeuralApproximator`](@ref)
 - [`GPApproximator`](@ref)
+- [`ShapeConstrainedGPApproximator`](@ref)
 - [`COMONetApproximator`](@ref)
 
 ### Shape-Constraint Constants
@@ -43,6 +45,7 @@ Detailed documentation for each solver is on the [Solvers](solvers.md) page.
 - [`TwoStageSolver`](@ref)
 - [`BNGSolver`](@ref)
 - [`AdaptiveGradientMatching`](@ref)
+- [`FGPGMSolver`](@ref)
 - [`AdamSolver`](@ref)
 - [`MultipleShootingSolver`](@ref)
 - [`DerivativeFreeSolver`](@ref)
