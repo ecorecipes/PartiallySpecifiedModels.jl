@@ -1913,6 +1913,28 @@ residual autocorrelation is suspected (check `residual_diagnostics`).
   Must be ≥ 0; `ncv_width=0` gives exact leave-one-out CV. Choose it
   to cover the residual correlation length (e.g. the lag at which the
   residual ACF dies off). Ignored when `criterion=:gcv`.
+- `search`: `:direct` (default) evaluates every λ in the GCV search with
+  its own O(p³) penalized solve — the historical behavior, byte-identical
+  to before this option existed. `:reuse` is the classical ddefit /
+  Demmler–Reinsch speed trick (gcv.c `EasySmooth`/`EScv`): one expensive
+  whitening + eigendecomposition per IRLS iteration, after which every λ
+  in the grid + golden-section search costs only O(np) diagonal
+  arithmetic. It is a pure reformulation, not an approximation — scores
+  match `:direct` to ~1e-12 relative everywhere λ selection actually
+  happens (the stability ridge of the direct scorer is replicated
+  exactly; only at the essentially-infinite-smoothing extreme,
+  λ ≳ 1e15 with rank-deficient penalties, does agreement degrade to
+  ~1e-6, where the direct path's own trA/β are conditioning-limited
+  too), so the selected λ̂ agrees within the
+  search tolerance, and the returned fit always goes through the same
+  final PCLS solve as `:direct`. When `A = J'WJ` (plus any fixed
+  penalties) is near-singular the fast path falls back to the direct
+  scorer for that IRLS iteration (debug-level log note). With multiple
+  approximators the coordinate-descent λ search reuses one
+  decomposition per coordinate per sweep. Only `criterion=:gcv` is
+  supported: the NCV neighbourhood downdates need `A(λ)⁻¹` at every λ,
+  which is genuinely incompatible with the one-decomposition trick, so
+  `search=:reuse` with `criterion=:ncv` is rejected at construction.
 - `verbose`: print progress
 
 # Convergence info
@@ -1932,19 +1954,31 @@ struct GCVSolver
     gamma::Float64
     criterion::Symbol
     ncv_width::Int
+    search::Symbol
     verbose::Bool
 end
 
 function GCVSolver(; n_grid::Int=50, maxiters::Int=50, tol::Float64=1e-6,
                      gamma::Float64=1.4, criterion::Symbol=:gcv,
-                     ncv_width::Int=2, verbose::Bool=false)
+                     ncv_width::Int=2, search::Symbol=:direct,
+                     verbose::Bool=false)
     criterion in (:gcv, :ncv) ||
         throw(ArgumentError("GCVSolver: criterion must be :gcv or :ncv " *
                             "(got $(repr(criterion)))"))
     ncv_width >= 0 ||
         throw(ArgumentError("GCVSolver: ncv_width must be ≥ 0 " *
                             "(got $ncv_width; 0 = leave-one-out CV)"))
-    GCVSolver(n_grid, maxiters, tol, gamma, criterion, ncv_width, verbose)
+    search in (:direct, :reuse) ||
+        throw(ArgumentError("GCVSolver: search must be :direct or :reuse " *
+                            "(got $(repr(search)))"))
+    !(search === :reuse && criterion === :ncv) ||
+        throw(ArgumentError("GCVSolver: search=:reuse supports only " *
+                            "criterion=:gcv — the NCV neighbourhood downdates " *
+                            "need A(λ)⁻¹ at every λ, which is incompatible " *
+                            "with the one-decomposition reuse trick; use " *
+                            "search=:direct with criterion=:ncv"))
+    GCVSolver(n_grid, maxiters, tol, gamma, criterion, ncv_width, search,
+              verbose)
 end
 
 # ─── Two-stage solver (Wood 2001 / deGradInfer) ───────────────────
