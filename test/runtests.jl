@@ -41,6 +41,69 @@ end
 # A type implementing none of the interface, for the fallback-error test.
 struct NotAnApproximator end
 
+# ─── Two-block approximator for the "N0: penalty_blocks" testset ──
+# f(x) = β₁·sin(ωx) + β₂·cos(ωx) + Σⱼ βⱼ₊₂·hatⱼ(x): a rough two-parameter
+# Fourier block under a ridge penalty (range 1:2 — BELOW the historical
+# np ≥ 3 gate, which multi-block types may bypass) plus a piecewise-linear
+# hat-basis block under a second-difference penalty (range 3:np).
+# penalty_matrix is the fixed-weight block-diagonal merge for the single-λ
+# consumers, per the penalty_blocks contract.
+struct TwoBlockApproximator <: PartiallySpecifiedModels.AbstractApproximator
+    name::Symbol
+    domain::Tuple{Float64, Float64}
+    nknots::Int
+    omega::Float64
+end
+PartiallySpecifiedModels.nparams(a::TwoBlockApproximator) = 2 + a.nknots
+PartiallySpecifiedModels.initial_params(a::TwoBlockApproximator) =
+    zeros(2 + a.nknots)
+function PartiallySpecifiedModels.penalty_blocks(a::TwoBlockApproximator)
+    S1 = Matrix{Float64}(I, 2, 2)
+    S2 = spline_penalty_matrix(collect(range(0.0, 1.0, length=a.nknots)))
+    Tuple{Matrix{Float64}, UnitRange{Int}}[(S1, 1:2), (S2, 3:(2 + a.nknots))]
+end
+function PartiallySpecifiedModels.penalty_matrix(a::TwoBlockApproximator)
+    np = 2 + a.nknots
+    S = zeros(np, np)
+    for (Sb, r) in PartiallySpecifiedModels.penalty_blocks(a)
+        S[r, r] .= Sb
+    end
+    S
+end
+function PartiallySpecifiedModels.build_evaluator(a::TwoBlockApproximator,
+                                                  params_k)
+    lo, hi = a.domain
+    nk = a.nknots
+    om = a.omega
+    h = (hi - lo) / (nk - 1)
+    coeffs = params_k   # eltype-generic: may be Dual-valued
+    function twoblock_eval(x)
+        u = (x - lo) / h
+        j = clamp(floor(Int, u), 0, nk - 2)
+        t = u - j
+        coeffs[1] * sin(om * x) + coeffs[2] * cos(om * x) +
+            coeffs[3 + j] * (1 - t) + coeffs[4 + j] * t
+    end
+    twoblock_eval
+end
+
+# Malformed penalty_blocks variants for the build_penalty_matrices
+# validation tests (the validator touches only nparams + penalty_blocks).
+struct BadBlocksApproximator <: PartiallySpecifiedModels.AbstractApproximator
+    name::Symbol
+    kind::Symbol   # :overlap | :out_of_range | :size_mismatch | :asymmetric
+end
+PartiallySpecifiedModels.nparams(a::BadBlocksApproximator) = 6
+PartiallySpecifiedModels.initial_params(a::BadBlocksApproximator) = zeros(6)
+function PartiallySpecifiedModels.penalty_blocks(a::BadBlocksApproximator)
+    I3 = Matrix{Float64}(I, 3, 3)
+    a.kind === :overlap       ? [(I3, 1:3), (I3, 3:5)] :
+    a.kind === :out_of_range  ? [(Matrix{Float64}(I, 4, 4), 4:7)] :
+    a.kind === :size_mismatch ? [(Matrix{Float64}(I, 2, 2), 1:3)] :
+    a.kind === :strided        ? [(I3, 1:2:5)] :
+                                [([1.0 2.0; 0.0 1.0], 1:2)]
+end
+
 @testset "PartiallySpecifiedModels.jl" begin
 
     # Deterministic suite: all unseeded rand/randn sites below draw from
@@ -7392,6 +7455,366 @@ struct NotAnApproximator end
         # magnitude win. End-to-end (LAML maxiters=20 on the problem above):
         # 6.1s → 0.04s; GCVSolver: 1.1s → 0.01s; CollocationLAML: 2.5s →
         # 0.65s (its Jacobian is dominated by the pointwise state blocks).
+    end
+
+    # ─── N0: penalty_blocks — multiple penalty blocks per approximator ──
+
+    @testset "N0: penalty_blocks" begin
+        PSM = PartiallySpecifiedModels
+
+        @testset "penalty_blocks default equivalence" begin
+            a_pb = BSplineApproximator(:f, (0.0, 1.0), 10)
+            pb = penalty_blocks(a_pb)
+            @test pb isa Vector{Tuple{Matrix{Float64}, UnitRange{Int}}}
+            @test length(pb) == 1
+            @test pb[1][1] == penalty_matrix(a_pb)
+            @test pb[1][2] == 1:10
+
+            # np < 3 gate (moved from build_penalty_matrices into the
+            # default method): a 2-parameter type with a non-nothing
+            # penalty_matrix still contributes no default block.
+            p2 = PolyApproximator(:h, (0.0, 1.0), 1)
+            @test penalty_matrix(p2) !== nothing
+            @test penalty_blocks(p2) ==
+                  Tuple{Matrix{Float64}, UnitRange{Int}}[]
+
+            # penalty_matrix === nothing ⟹ no blocks
+            import Lux
+            model_pb = Lux.Chain(Lux.Dense(1, 4, tanh), Lux.Dense(4, 1))
+            na0 = NeuralApproximator(:g, model_pb; rng_seed=42)
+            @test penalty_matrix(na0) === nothing   # penalty_weight = 0
+            @test isempty(penalty_blocks(na0))
+            naw = NeuralApproximator(:g, model_pb; rng_seed=42,
+                                     penalty_weight=0.1)
+            pbw = penalty_blocks(naw)
+            @test length(pbw) == 1 && pbw[1][2] == 1:nparams(naw)
+        end
+
+        @testset "build_penalty_matrices enumeration (old semantics)" begin
+            # Two penalized approximators with an unpenalized-by-gate
+            # 2-param type between them: the enumerated lists must match
+            # the historical (per-approximator, np ≥ 3, S ≠ nothing)
+            # semantics exactly.
+            dyn_pb!(du, u, p, t) = (du[1] = 0.0)
+            r_pb = BSplineApproximator(:r, (0.0, 1.0), 8)
+            h_pb = PolyApproximator(:h, (0.0, 1.0), 1)  # 2 params ⟹ gated
+            g_pb = BSplineApproximator(:g, (0.0, 1.0), 6)
+            prob_pb = PSMProblem(dyn_pb!, [1.0], (0.0, 1.0),
+                [r_pb, h_pb, g_pb];
+                data_times=[0.0, 0.5, 1.0],
+                data_values=reshape(zeros(3), :, 1),
+                obs_to_state=[1], known_params=NamedTuple(),
+                likelihood=PSM.Gaussian())
+            S_list_pb, offs_pb, nks_pb = PSM.build_penalty_matrices(prob_pb)
+            @test length(S_list_pb) == 2
+            @test S_list_pb[1] == penalty_matrix(r_pb)
+            @test S_list_pb[2] == penalty_matrix(g_pb)
+            @test offs_pb == [0, 10]  # g starts after r's 8 + h's 2 params
+            @test nks_pb == [8, 6]    # block sizes
+
+            # Multi-block type PRECEDED by another approximator: this is
+            # the one case that exercises the global-offset composition
+            # `approx_offset + first(local_range) - 1` on a range whose
+            # first index is not 1. A slip here silently mis-assigns λ to
+            # the wrong coefficients.
+            t_pb = BSplineApproximator(:t, (0.0, 1.0), 5)
+            tb_pb = TwoBlockApproximator(:f, (0.0, 3.0), 6, 6.0)
+            prob_pb2 = PSMProblem(dyn_pb!, [1.0], (0.0, 1.0), [t_pb, tb_pb];
+                data_times=[0.0, 0.5, 1.0],
+                data_values=reshape(zeros(3), :, 1),
+                obs_to_state=[1], known_params=NamedTuple(),
+                likelihood=PSM.Gaussian())
+            S_pb2, offs_pb2, nks_pb2 = PSM.build_penalty_matrices(prob_pb2)
+            # t: one block at 0 (5 params); f: ridge on local 1:2 ⟹ global
+            # offset 5, spline on local 3:8 ⟹ global offset 5 + 3 - 1 = 7
+            @test offs_pb2 == [0, 5, 7]
+            @test nks_pb2 == [5, 2, 6]
+            @test length(S_pb2) == 3
+            # blocks land inside their own approximator's coefficient span
+            @test offs_pb2[3] + nks_pb2[3] == nparams(t_pb) + nparams(tb_pb)
+        end
+
+        @testset "build_penalty_matrices validation" begin
+            dyn_pb!(du, u, p, t) = (du[1] = 0.0)
+            mkprob_pb(a) = PSMProblem(dyn_pb!, [1.0], (0.0, 1.0), [a];
+                data_times=[0.0, 0.5, 1.0],
+                data_values=reshape(zeros(3), :, 1),
+                obs_to_state=[1], known_params=NamedTuple(),
+                likelihood=PSM.Gaussian())
+            @test_throws ArgumentError PSM.build_penalty_matrices(
+                mkprob_pb(BadBlocksApproximator(:bad, :overlap)))
+            err_pb = try
+                PSM.build_penalty_matrices(
+                    mkprob_pb(BadBlocksApproximator(:bad, :overlap)))
+                nothing
+            catch e; e; end
+            @test err_pb isa ArgumentError
+            @test occursin(":bad", err_pb.msg)      # names the approximator
+            @test occursin("disjoint", err_pb.msg)  # explains the rule
+            @test_throws ArgumentError PSM.build_penalty_matrices(
+                mkprob_pb(BadBlocksApproximator(:bad, :out_of_range)))
+            @test_throws ArgumentError PSM.build_penalty_matrices(
+                mkprob_pb(BadBlocksApproximator(:bad, :size_mismatch)))
+            @test_throws ArgumentError PSM.build_penalty_matrices(
+                mkprob_pb(BadBlocksApproximator(:bad, :asymmetric)))
+            # Strided/non-contiguous ranges must be REJECTED, not silently
+            # reinterpreted: a block is recorded as (offset, length), so
+            # 1:2:5 would become the contiguous 1:3 and penalize the wrong
+            # coefficients.
+            @test_throws ArgumentError PSM.build_penalty_matrices(
+                mkprob_pb(BadBlocksApproximator(:bad, :strided)))
+        end
+
+        # ── Shared two-block fixture: linear forcing problem du = f(t),
+        # u(t) = ∫₀ᵗ f. Chosen over a decay du = −r(u)·u because the model
+        # is LINEAR in the coefficients: the prediction Jacobian is exact
+        # and constant, the IRLS is deterministic, and the two blocks are
+        # identifiable by construction — 6 hats (spacing 0.5) cannot track
+        # the ω = 6 carrier (period ≈ 1.05), so the Fourier block must
+        # carry it. The two blocks then want genuinely different smoothing:
+        # the ridge sees two strongly-identified Fourier coefficients it
+        # can barely improve on (λ₁ settles at the larger value), while the
+        # hat part is a linear trend plus a gentle arch — nearly in the
+        # curvature penalty's null space, so λ₂ goes small. Measured
+        # λ = [3.72e-4, 6.69e-5], i.e. λ₁ ≈ 5.6 λ₂, matching the
+        # log(λ₁/λ₂) > 0.5 assertion below. ──
+        om_n0 = 6.0
+        a_n0 = TwoBlockApproximator(:f, (0.0, 3.0), 6, om_n0)
+        f_true_n0(t) = 0.8 * sin(om_n0 * t) + 1.0 + 0.5 * t +
+                       0.3 * sin(pi * t / 3.0)
+        F_true_n0(t) = 0.8 * (1.0 - cos(om_n0 * t)) / om_n0 + t +
+                       0.25 * t^2 +
+                       0.3 * (3.0 / pi) * (1.0 - cos(pi * t / 3.0))
+        dyn_n0!(du, u, p, t) = (du[1] = p.f(t))
+        tt_n0 = collect(range(0.0, 3.0, length=61))
+        dv_n0 = reshape(F_true_n0.(tt_n0) .+
+                        0.01 .* randn(StableRNG(42), length(tt_n0)), :, 1)
+        prob_n0 = PSMProblem(dyn_n0!, [0.0], (0.0, 3.0), [a_n0];
+                             data_times=tt_n0, data_values=dv_n0,
+                             obs_to_state=[1], known_params=NamedTuple(),
+                             likelihood=PSM.Gaussian())
+        S_n0, offs_n0, nks_n0 = PSM.build_penalty_matrices(prob_n0)
+
+        @testset "two-block LAML fit: per-block smoothing parameters" begin
+            # One approximator, TWO enumerated blocks at the right offsets
+            @test offs_n0 == [0, 2]
+            @test nks_n0 == [2, 6]
+            # jac=:forwarddiff because THIS FIXTURE'S EVALUATOR IS ONLY C⁰
+            # (the hat basis indexes via floor/clamp), not because the
+            # penalty is multi-block. The kink makes adaptive step control
+            # inject noise into the FD prediction Jacobian, and the λ
+            # search then stalls at a NON-STATIONARY point while reporting
+            # converged=true: under FD the fit lands 8.3 nats BELOW the
+            # exact profiled-REML optimum (β̂₁ ≈ 0.51-0.54, sup-error
+            # 0.38-0.47, varying with the dependency versions in play);
+            # under AD it lands exactly ON the global optimum
+            # V* = 252.2294 (β̂₁ = 0.801, sup-error 0.0118). A single-block
+            # control on this same C⁰ basis fails under FD just as badly
+            # (gap 0.002-9.3 nats), and a C² B-spline analogue is clean
+            # under FD at one AND two blocks — so this is evaluator
+            # smoothness, NOT a multi-block property. Custom approximators
+            # with kinks or branches should prefer jac=:forwarddiff
+            # regardless of how many penalty blocks they declare.
+            sol_n0 = solve(prob_n0, LAML(maxiters=80, jac=:forwarddiff))
+            lam_n0 = sol_n0.smoothing_params
+            # TWO per-block smoothing parameters, finite, and genuinely
+            # different (measured λ = [3.72e-4, 6.69e-5]: log-ratio 1.71,
+            # pinned at > 0.5 — deterministic under StableRNG(42), with
+            # only BLAS-level wiggle remaining)
+            @test length(lam_n0) == 2
+            @test all(isfinite, lam_n0) && all(>(0), lam_n0)
+            @test log(lam_n0[1] / lam_n0[2]) > 0.5
+            # Recovery of the truth (measured sup-error 0.0118 on [0, 3]
+            # against a signal of range ≈ [0.2, 3.3]; pinned with ~8×)
+            fh_n0 = sol_n0.unknown_functions[:f]
+            g_n0 = collect(range(0.0, 3.0, length=49))
+            @test maximum(abs.(fh_n0.(g_n0) .- f_true_n0.(g_n0))) < 0.1
+            # The rough block's leading coefficient (truth 0.8;
+            # measured 0.801)
+            @test abs(sol_n0.parameters.f[1] - 0.8) < 0.1
+            @test sol_n0.convergence.converged
+        end
+
+        # Exact prediction Jacobian of the LINEAR forcing model: column j
+        # is the trajectory under the j-th unit coefficient vector (u0 = 0).
+        np_n0 = nparams(a_n0)
+        J_n0 = zeros(length(tt_n0), np_n0)
+        for j in 1:np_n0
+            ej_n0 = zeros(np_n0); ej_n0[j] = 1.0
+            J_n0[:, j] = PSM.simulate(prob_n0, ej_n0)[:, 1]
+        end
+
+        @testset "two-block LAML gradient matches finite differences" begin
+            # The suite's frozen-working-model FD harness (see "LAML
+            # gradient matches finite differences" above), with the two
+            # blocks coming from ONE approximator via build_penalty_matrices
+            # — the T11-class objective/gradient desync detector for the
+            # per-block enumeration (including the rank-2 ridge block below
+            # the historical np ≥ 3 gate: Mp = 8 − (2 + 4) = 2).
+            using PartiallySpecifiedModels: laml_objective, laml_gradient,
+                                            build_S_lambda, _safe_inv
+            n_g = length(tt_n0)
+            w_g = ones(n_g)
+            y_g2 = dv_n0[:, 1]
+            function fd_vs_analytic_n0(family, yv, W, rho)
+                S_lam = build_S_lambda(S_n0, offs_n0, nks_n0, rho, np_n0)
+                beta = _safe_inv(J_n0' * Diagonal(W) * J_n0 + S_lam) *
+                       (J_n0' * (W .* yv))
+                mu = J_n0 * beta
+                _, H, _, sigma2 = laml_objective(family, beta, J_n0, W, w_g,
+                                                 yv, mu, S_n0, offs_n0,
+                                                 nks_n0, rho, np_n0)
+                g = laml_gradient(family, beta, S_n0, offs_n0, nks_n0,
+                                  rho, np_n0, H, sigma2)
+                h = 1e-4
+                gfd = map(eachindex(rho)) do k
+                    rp = copy(rho); rp[k] += h
+                    rm = copy(rho); rm[k] -= h
+                    Vp, = laml_objective(family, beta, J_n0, W, w_g, yv, mu,
+                                         S_n0, offs_n0, nks_n0, rp, np_n0)
+                    Vm, = laml_objective(family, beta, J_n0, W, w_g, yv, mu,
+                                         S_n0, offs_n0, nks_n0, rm, np_n0)
+                    (Vp - Vm) / (2h)
+                end
+                (g, collect(gfd))
+            end
+            # Same tolerance rationale as the harness above: observed
+            # agreement ≤ 3e-5 relative; rtol 1e-3 catches any O(1) slip.
+            for rho in ([-2.0, 1.0], [0.0, 0.0], [3.0, -1.0], [5.0, 4.0])
+                g, gfd = fd_vs_analytic_n0(Gaussian(), y_g2, w_g, rho)
+                @test g ≈ gfd rtol=1e-3 atol=1e-6
+            end
+            # Non-Gaussian branch (identity link ⟹ IRLS weights 1/μ,
+            # frozen at count-like pseudo-data)
+            y_pois_n0 = max.(round.(4.0 .* (y_g2 .+ 1.0)), 1.0)
+            W_pois_n0 = 1.0 ./ y_pois_n0
+            for rho in ([-1.0, 2.0], [2.0, 0.0])
+                g, gfd = fd_vs_analytic_n0(Poisson(), y_pois_n0,
+                                           W_pois_n0, rho)
+                @test g ≈ gfd rtol=1e-3 atol=1e-6
+            end
+        end
+
+        @testset "two-block GCV: direct vs reuse" begin
+            n_gc = length(tt_n0)
+            w_gc = ones(n_gc)
+            z_gc = dv_n0[:, 1]
+            m_gc = length(S_n0)
+            # VALUE-basis working model J_v[i,j] = ϕⱼ(tᵢ) for the
+            # score-level equivalence (search equivalence is a property of
+            # the machinery, not of one working model — and the integral
+            # basis has cond(J'J) near the reuse-path whitening guard,
+            # which limits agreement to ~1e-6 for no diagnostic gain).
+            J_v = zeros(n_gc, np_n0)
+            for j in 1:np_n0
+                ej_v = zeros(np_n0); ej_v[j] = 1.0
+                phi_v = PSM.build_evaluator(a_n0, ej_v)
+                J_v[:, j] = phi_v.(tt_n0)
+            end
+
+            # ── Per-λ score equivalence on the W10 pencil shapes, at BLOCK
+            # granularity: the shared pencil λ·ΣₗSₗ plus each coordinate's
+            # (S_base = other block at fixed ρ, S_pen = this block) — the
+            # exact matrices the reuse factory builds inside
+            # _coordinate_gcv. Measured worst relative disagreement
+            # (score, tr(A), β̂ over 20 λ, ρ ≤ 13): 2.1e-7 — the embedded
+            # single-block pencils have a 6-dim whitened null space whose
+            # replicated stability ridge carries λ·eps error (the W10
+            # rank-deficient analysis; a block-wiring error would be O(1)).
+            # Pinned with ~50× margin.
+            pencils_gc = Any[(zeros(np_n0, np_n0),
+                              PSM.build_S_lambda(S_n0, offs_n0, nks_n0,
+                                                 zeros(m_gc), np_n0))]
+            rho_cur_gc = [1.3, -2.1]
+            for k in 1:m_gc
+                idx = [j for j in 1:m_gc if j != k]
+                push!(pencils_gc,
+                      (PSM.build_S_lambda(S_n0[idx], offs_n0[idx],
+                                          nks_n0[idx], rho_cur_gc[idx],
+                                          np_n0),
+                       PSM.build_S_lambda(S_n0[k:k], offs_n0[k:k],
+                                          nks_n0[k:k], [0.0], np_n0)))
+            end
+            navail_gc = 0
+            for (S_base, S_pen) in pencils_gc
+                fam = PSM._gcv_reuse_family(J_v, w_gc, z_gc, S_base, S_pen,
+                                            n_gc, 1.4)
+                fam === nothing && continue
+                navail_gc += 1
+                worst = 0.0
+                for lam in exp.(range(PSM.RHO_MIN, 13.0, length=20))
+                    gf, bf, _, tf = fam(lam)
+                    gd, bd, _, td = PSM._gcv_score(J_v, w_gc, z_gc,
+                                                   S_base .+ lam .* S_pen,
+                                                   n_gc, 1.4)
+                    worst = max(worst,
+                                abs(gf - gd) / max(abs(gd), 1e-300),
+                                abs(tf - td) / max(td, 1e-300),
+                                norm(bf - bd) / max(norm(bd), 1e-300))
+                end
+                @test worst < 1e-5
+            end
+            @test navail_gc == 3   # all three pencils took the fast path
+
+            # ── Fixed-working-model multi-λ coordinate descent over the
+            # two blocks of ONE approximator: direct scorer vs the reuse
+            # family factory must find the same optimum (measured
+            # |Δρ| = 8.5e-4 — golden-section paths may part ways below the
+            # search tolerance — and |ΔGCV| relative 1.6e-14).
+            scorer_gc = S_lam -> PSM._gcv_score(J_v, w_gc, z_gc, S_lam,
+                                                n_gc, 1.4)
+            fac_gc = function (rv, k)
+                idx = [j for j in 1:m_gc if j != k]
+                PSM._gcv_reuse_family(J_v, w_gc, z_gc,
+                    PSM.build_S_lambda(S_n0[idx], offs_n0[idx],
+                                       nks_n0[idx], rv[idx], np_n0),
+                    PSM.build_S_lambda(S_n0[k:k], offs_n0[k:k],
+                                       nks_n0[k:k], [0.0], np_n0),
+                    n_gc, 1.4)
+            end
+            rd_gc, _, gd_gc, _ = PSM._coordinate_gcv(
+                scorer_gc, S_n0, offs_n0, nks_n0, np_n0,
+                [0.0, 0.0], 1e-6; sweeps=4)
+            rr_gc, _, gr_gc, _ = PSM._coordinate_gcv(
+                scorer_gc, S_n0, offs_n0, nks_n0, np_n0,
+                [0.0, 0.0], 1e-6; sweeps=4, family_factory=fac_gc)
+            @test abs(gd_gc - gr_gc) < 1e-8 * max(abs(gd_gc), 1e-300)
+            @test maximum(abs.(rd_gc .- rr_gc)) < 0.1
+
+            # ── End-to-end: both searches complete the full IRLS solve
+            # with TWO per-block λs, recover the truth, and agree at the
+            # W10 conventions. jac=:forwarddiff again for the fixture's C⁰
+            # basis (see the LAML testset above), not for any multi-block
+            # reason: the kink-driven FD Jacobian noise perturbs the two
+            # searches' working models differently, and the ridge-block
+            # coordinate is nearly flat in GCV (shrinking two strongly-
+            # identified coefficients has no bias–variance sweet spot), so
+            # score-level differences flip golden-section basins and IRLS
+            # feedback amplifies them to O(1) λ̂ disagreements. A C²
+            # B-spline analogue tracks fine under plain FD at two blocks,
+            # as does the pre-existing W10 two-approximator test. With AD
+            # the working models are identical and the searches track:
+            # measured |Δ log λ̂| = 9.1e-6, objective relΔ 5.1e-9, fitted
+            # gap 1.7e-6, both sup-errors 0.0102 — ~100× margins per W10.
+            sd_gc = solve(prob_n0, GCVSolver(maxiters=15,
+                                             jac=:forwarddiff))
+            sr_gc = solve(prob_n0, GCVSolver(maxiters=15, search=:reuse,
+                                             jac=:forwarddiff))
+            g_gc = collect(range(0.3, 2.7, length=49))
+            for s in (sd_gc, sr_gc)
+                @test length(s.smoothing_params) == 2
+                @test all(isfinite, s.smoothing_params)
+                @test all(>(0), s.smoothing_params)
+                fh = s.unknown_functions[:f]
+                @test maximum(abs.(fh.(g_gc) .- f_true_n0.(g_gc))) < 0.1
+            end
+            @test all(abs.(log.(sd_gc.smoothing_params) .-
+                           log.(sr_gc.smoothing_params)) .< 1e-3)
+            @test abs(sd_gc.objective - sr_gc.objective) <
+                  1e-6 * max(abs(sd_gc.objective), 1.0)
+            @test maximum(abs.(sd_gc.fitted_values .-
+                               sr_gc.fitted_values)) < 1e-4
+        end
     end
 
 end

@@ -3,8 +3,10 @@
 # `build_evaluator` is the single dispatch point through which every solver
 # turns an approximator plus its coefficient block into a callable unknown
 # function. Together with `nparams`, `initial_params`, and `penalty_matrix`
-# it forms the complete interface a custom approximator type must implement;
-# see docs/src/extending.md ("Custom approximators") for the contracts and a
+# it forms the complete interface a custom approximator type must implement
+# (plus the OPTIONAL fifth function `penalty_blocks`, below, for types that
+# carry several independently-smoothed penalty blocks); see
+# docs/src/extending.md ("Custom approximators") for the contracts and a
 # worked example.
 
 # The nine built-in approximator types. Six solvers (TwoStage,
@@ -112,3 +114,45 @@ build_evaluator(approx::SPDEApproximator, params_k) =
 
 build_evaluator(approx::ShapeConstrainedSPDEApproximator, params_k) =
     build_constrained_spde_evaluator(approx, params_k)
+
+"""
+    penalty_blocks(approx) -> Vector{Tuple{Matrix{Float64}, UnitRange{Int}}}
+
+Quadratic penalty blocks of an approximator as `(S, local_range)` pairs.
+Under the penalized-likelihood solvers (`LAML`, `GCVSolver`,
+`CollocationLAML`, `GradientMatching`, `ProfileLikelihoodSolver`) each
+block receives its OWN smoothing parameter — the total penalty is
+`Σ_k λ_k β[r_k]' S_k β[r_k]` with every `λ_k` estimated jointly by
+LAML/GCV. This is the optional fifth function of the approximator
+extension protocol; types with a single roughness penalty need only
+`penalty_matrix` and get the default below.
+
+Contract: ranges are LOCAL to the approximator's own coefficient block
+(within `1:nparams(approx)`) and MUST be pairwise disjoint — the
+per-block generalized determinant `log|S_λ|₊` in laml.jl is exact only
+for non-overlapping blocks; `build_penalty_matrices` validates this and
+throws an `ArgumentError` otherwise. Each `S` must be
+`length(range) × length(range)`, symmetric positive semi-definite
+(possibly a zero matrix).
+
+Default: the single block `(penalty_matrix(approx), 1:nparams(approx))`,
+or no blocks (`[]`) when `penalty_matrix` returns `nothing` OR
+`nparams(approx) < 3`. The `np ≥ 3` inclusion gate was historically
+applied inside `build_penalty_matrices`; it lives in this default method
+so the default path is unchanged while custom multi-block types remain
+free to declare small blocks (e.g. a 2-parameter ridge).
+
+Types overriding `penalty_blocks` should usually also provide a
+CONSISTENT `penalty_matrix` — the block-diagonal merge of the blocks
+with fixed weights — because the single-λ consumers (the
+gradient-matching/probabilistic-numerics per-type penalty sites and the
+MCMC/VI/ABC prior builder) read `penalty_matrix` only and apply ONE
+weight to the whole approximator.
+"""
+function penalty_blocks(approx)
+    np = nparams(approx)
+    S = penalty_matrix(approx)
+    (S === nothing || np < 3) &&
+        return Tuple{Matrix{Float64}, UnitRange{Int}}[]
+    Tuple{Matrix{Float64}, UnitRange{Int}}[(S, 1:np)]
+end

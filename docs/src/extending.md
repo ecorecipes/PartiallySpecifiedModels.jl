@@ -89,7 +89,8 @@ All 23 solvers use `nparams` (parameter layout), `initial_params` (starting valu
 | Solver family | `penalty_matrix` used for |
 |:---|:---|
 | Penalized likelihood (`LAML`, `GCVSolver`, `CollocationLAML`) | Smoothing-parameter estimation (LAML/GCV); an SPD-restricted penalty is required for EDF computation |
-| Gradient matching (`GradientMatching`, `TwoStageSolver`, `AdaptiveGradientMatching`, `BNGSolver`, `IntegralMatchingSolver`) | Fixed-λ smoothing penalty added to the matching loss |
+| Gradient matching (`TwoStageSolver`, `AdaptiveGradientMatching`, `BNGSolver`, `IntegralMatchingSolver`) | Fixed-λ smoothing penalty added to the matching loss |
+| Gradient matching, estimated λ (`GradientMatching`) | Smoothing-parameter estimation, like the penalized-likelihood family |
 | Through-the-solver (`AdamSolver`, `MultipleShootingSolver`, `DerivativeFreeSolver`) | Optional penalty term (`penalty_weight`) |
 | Probabilistic numerics (`RodeoSolver`, `DaltonSolver`) | Smoothing penalty inside the marginal-likelihood objective |
 | Bayesian (`MCMCSolver`, `MagiSolver`, `VariationalSolver`, `PseudoMarginalSolver`, `ABCSolver`) | Gaussian prior precision on the coefficients |
@@ -103,13 +104,52 @@ Three caveats for custom types:
 - The adaptive GP hyperparameter refitting inside `LAML`/`GCVSolver` is specific to `GPApproximator`; custom types keep whatever structure their four methods define.
 - `confidence_band` (diagnostics) evaluates approximators through its own restricted mechanism and supports only the built-in basis-expansion types — custom types (like `NeuralApproximator`/`COMONetApproximator`) are not supported there and will error.
 
-One further subtlety: the `LAML` penalty assembly only includes a term when
-the approximator has at least 3 parameters, so a 1–2 parameter custom type
-is effectively unpenalized under `LAML` even if its `penalty_matrix` is
-nonzero.
+One further subtlety: the default penalty enumeration only includes a term
+when the approximator has at least 3 parameters (the gate lives in the
+default `penalty_blocks` method), so a 1–2 parameter custom type is
+effectively unpenalized under `LAML`/`GCVSolver` even if its
+`penalty_matrix` is nonzero — unless it overrides `penalty_blocks`, which
+may declare blocks of any size.
+
+## Optional: multiple penalty blocks (`penalty_blocks`)
+
+A type whose coefficients naturally split into parts that should be
+smoothed *independently* can implement the optional fifth protocol
+function, `penalty_blocks(a)`, returning a vector of
+`(S, local_range)` pairs. Under the penalized-likelihood solvers
+(`LAML`, `GCVSolver`, `CollocationLAML`, `GradientMatching`,
+`ProfileLikelihoodSolver`) each block then receives its **own** smoothing
+parameter, estimated jointly, and `PSMSolution.smoothing_params` carries
+one entry per block. Ranges are local to the approximator's coefficient
+block and must be pairwise disjoint; each `S` must be
+`length(range) × length(range)`, symmetric PSD. The default method
+returns the single block `(penalty_matrix(a), 1:nparams(a))` (or none,
+under the gate above), so single-penalty types need not care.
+
+Types overriding `penalty_blocks` should usually also provide a
+consistent `penalty_matrix` — the block-diagonal merge of the blocks with
+fixed weights — because the single-λ consumers (the per-type penalty
+sites in `TwoStageSolver`/`IntegralMatchingSolver`/`MagiSolver`/
+`AdaptiveGradientMatching`/`RodeoSolver`/`DaltonSolver`, and the
+MCMC/VI/ABC prior builder) read `penalty_matrix` only and apply one
+weight to the whole approximator.
+
+Two practical notes. Block validity (contiguous, in-range, correctly
+sized, symmetric, pairwise disjoint) is checked when a penalized-
+likelihood solver assembles the penalties, not at `PSMProblem`
+construction — so a malformed `penalty_blocks` is simply inert under the
+solvers that never read it. And if your evaluator is not smooth in its
+argument — a kink from `floor`/`clamp` indexing, a branch on the input —
+prefer `jac=:forwarddiff` on `LAML`/`GCVSolver`/`CollocationLAML`: the
+default finite-difference prediction Jacobian picks up adaptive-step
+noise at the kink, and the smoothing search can then stall well short of
+the optimum while still reporting convergence. This is a property of
+evaluator smoothness, independent of how many penalty blocks you
+declare.
 
 If you pass an approximator type that does not implement the interface, `build_evaluator` fails with an error listing the four required functions.
 
 ```@docs
 build_evaluator
+penalty_blocks
 ```

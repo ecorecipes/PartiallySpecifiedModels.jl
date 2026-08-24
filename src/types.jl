@@ -2872,7 +2872,15 @@ Result of fitting a PSM.
   deviance here, so for non-Gaussian families `data_loss` is a descriptive
   SSE and NOT the quantity the solver optimised (that is `objective`)
 - `edf`: estimated degrees of freedom
-- `smoothing_params`: vector of estimated smoothing parameters λ
+- `smoothing_params`: vector of estimated smoothing parameters λ. For the
+  penalized-likelihood solvers (LAML, GCVSolver, CollocationLAML,
+  GradientMatching) there is ONE entry per penalty BLOCK, in the
+  enumeration order of `build_penalty_matrices` (approximators in problem
+  order; within an approximator, blocks in the order its `penalty_blocks`
+  returns them). With only single-block approximators — the default —
+  this is one entry per penalized approximator, as historically; an
+  unpenalized approximator (no blocks) contributes no entry, and a
+  multi-block approximator contributes one entry per block
 - `fitted_values`: predicted values at data times (n_times × n_obs)
 - `unknown_functions`: Dict of name => callable evaluator
 - `convergence`: convergence information. For the iterative optimisers
