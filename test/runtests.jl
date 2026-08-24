@@ -7817,4 +7817,646 @@ end
         end
     end
 
+
+    # ─── SingleIndexApproximator (nested inner direction + outer smooth) ──
+
+    @testset "SingleIndexApproximator — construction and validation" begin
+        # p, nknots, xi, anchor, constraint
+        @test_throws ArgumentError SingleIndexApproximator(:g, 1, 8)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 2)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 3;
+                                                           constraint=:increasing)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8; xi=0.0)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8; xi=-1.0)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8; xi=Inf)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8; anchor=0)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8; anchor=3)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8;
+                                                           constraint=:wiggly)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8;
+                                                           inner_ridge=-1.0)
+        # states must be p distinct positive indices
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8; states=[1])
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8; states=[2, 2])
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8; states=[0, 1])
+
+        # index_stats validation: shape, symmetry, PSD, non-degenerate
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8;
+            index_stats=([0.0], Matrix(1.0I, 2, 2)))
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8;
+            index_stats=(zeros(2), Matrix(1.0I, 3, 3)))
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8;
+            index_stats=(zeros(2), [1.0 0.5; 0.1 1.0]))
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8;
+            index_stats=(zeros(2), [1.0 2.0; 2.0 1.0]))     # eigenvalue −1
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8;
+            index_stats=(zeros(2), zeros(2, 2)))            # zero trace
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8;
+            index_stats=zeros(2))                           # not a pair
+        # a singular but non-zero-trace Σ̂ is ACCEPTED (the evaluator floors
+        # aᵀΣ̂a, so a rank-deficient reference covariance is usable)
+        @test SingleIndexApproximator(:g, 2, 8;
+            index_stats=(zeros(2), [1.0 1.0; 1.0 1.0])) isa SingleIndexApproximator
+
+        stats2 = ([1.0, 2.0], [1.0 0.2; 0.2 2.0])
+        a = SingleIndexApproximator(:g, 2, 8; index_stats=stats2)
+        @test a.name == :g
+        @test a.p == 2
+        @test a.anchor == 1
+        @test a.constraint == :none
+        @test a.domain == (-2.0, 2.0)                       # (−xi, xi)
+        @test a.states == [1, 2]
+        @test nparams(a) == 1 + 8                           # p−1 loadings + outer
+        @test initial_params(a)[1] == 1.0                   # equal weights
+        @test initial_params(a)[2:end] == zeros(8)
+        # free mode keeps all p loadings
+        af = SingleIndexApproximator(:g, 3, 8; anchor=nothing,
+                                     index_stats=(zeros(3), Matrix(1.0I, 3, 3)))
+        @test nparams(af) == 3 + 8
+        @test initial_params(af)[1:3] == ones(3)
+        # a shape-constrained outer smooth follows the SCOP parameter count,
+        # including the zero-endpoint reduction
+        ac = SingleIndexApproximator(:g, 2, 8; constraint=:increasing,
+                                     index_stats=stats2)
+        @test nparams(ac) == 1 + 8
+        acz = SingleIndexApproximator(:g, 2, 8; constraint=:inc_zero_left,
+                                      index_stats=stats2)
+        @test nparams(acz) == 1 + 7
+        # xi widens the outer knot span
+        @test SingleIndexApproximator(:g, 2, 8; xi=5.0,
+                                      index_stats=stats2).domain == (-5.0, 5.0)
+        # an initial outer curve is sampled on the standardized knot grid
+        ai = SingleIndexApproximator(:g, 2, 5; index_stats=stats2,
+                                     initial=z -> 3.0 + z)
+        @test initial_params(ai)[2:end] ≈ [1.0, 2.0, 3.0, 4.0, 5.0]
+        # explicit starting direction, rescaled by the anchor entry
+        al = SingleIndexApproximator(:g, 3, 5; index_stats=(zeros(3), Matrix(1.0I, 3, 3)),
+                                     initial_loadings=[2.0, 1.0, -3.0])
+        @test initial_params(al)[1:2] ≈ [0.5, -1.5]
+        @test_throws ArgumentError SingleIndexApproximator(:g, 3, 5;
+            index_stats=(zeros(3), Matrix(1.0I, 3, 3)), initial_loadings=[1.0, 2.0])
+        @test_throws ArgumentError SingleIndexApproximator(:g, 3, 5;
+            index_stats=(zeros(3), Matrix(1.0I, 3, 3)),
+            initial_loadings=[0.0, 1.0, 1.0])   # zero anchor entry
+        # string names accepted, matching the other constructors
+        @test SingleIndexApproximator("g", 2, 8; index_stats=stats2).name == :g
+        # an unresolved approximator refuses to build an evaluator rather
+        # than silently standardizing against a made-up default
+        @test_throws ErrorException build_evaluator(
+            SingleIndexApproximator(:g, 2, 8), zeros(9))
+    end
+
+    @testset "SingleIndexApproximator — index geometry and identification" begin
+        μ̂ = [1.0, 2.0, -0.5]
+        Σ̂ = [2.0 0.3 0.1; 0.3 1.0 -0.2; 0.1 -0.2 0.5]
+        θ_out = collect(range(-1.0, 1.5, length=7))
+
+        # ── anchored mode: a[anchor] ≡ 1, and the evaluator is exactly the
+        # outer smooth composed with the standardized index
+        a1 = SingleIndexApproximator(:g, 3, 7; anchor=2, index_stats=(μ̂, Σ̂))
+        θ = vcat([0.4, -0.7], θ_out)
+        @test index_loadings(a1, θ) == [0.4, 1.0, -0.7]
+        f1 = build_evaluator(a1, θ)
+        s1 = build_evaluator(a1.outer, θ_out)
+        av = [0.4, 1.0, -0.7]
+        for u in ([1.0, 2.0, 0.0], [-1.0, 3.0, 2.0], [5.0, -4.0, 1.5])
+            z = (dot(av, u) - dot(av, μ̂)) / sqrt(dot(av, Σ̂ * av))
+            @test f1(u...) ≈ s1(z) atol=1e-12
+        end
+        # wrong arity is refused loudly
+        @test_throws ArgumentError f1(1.0, 2.0)
+
+        # ── free mode: z is invariant under a → c·a. For c a power of two
+        # every scaling is exact in floating point, so the evaluator is
+        # BIT-identical; for a general c it agrees to roundoff.
+        a2 = SingleIndexApproximator(:g, 3, 7; anchor=nothing, index_stats=(μ̂, Σ̂))
+        θf = vcat([0.6, 0.4, -0.2], θ_out)
+        ff = build_evaluator(a2, θf)
+        f2 = build_evaluator(a2, vcat(2.0 .* θf[1:3], θ_out))
+        f37 = build_evaluator(a2, vcat(3.7 .* θf[1:3], θ_out))
+        pts = [[1.0, 2.0, 0.0], [-1.0, 3.0, 2.0], [5.0, -4.0, 1.5], [0.0, 0.0, 0.0]]
+        @test all(ff(u...) === f2(u...) for u in pts)
+        @test maximum(abs(ff(u...) - f37(u...)) for u in pts) < 1e-12
+        # …and reporting normalizes ‖a‖ = 1 with a positive first loading
+        @test norm(index_loadings(a2, θf)) ≈ 1.0
+        @test index_loadings(a2, θf) ≈ [0.6, 0.4, -0.2] ./ norm([0.6, 0.4, -0.2])
+        @test index_loadings(a2, vcat(-2.0 .* θf[1:3], θ_out)) ≈
+              index_loadings(a2, θf)
+
+        # ── the aᵀΣ̂a guard: a direction in the null space of a singular Σ̂
+        # still yields a finite index, and the floor is proportional to ‖a‖²
+        # so it does NOT break the exact scale invariance.
+        Σ0 = [1.0 1.0; 1.0 1.0]
+        a3 = SingleIndexApproximator(:g, 2, 7; anchor=nothing,
+                                     index_stats=([0.0, 0.0], Σ0))
+        θn = vcat([1.0, -1.0], θ_out)         # exactly in the null space of Σ0
+        fn = build_evaluator(a3, θn)
+        fn2 = build_evaluator(a3, vcat([4.0, -4.0], θ_out))
+        @test isfinite(fn(1.0, 0.0))
+        @test all(fn(u, v) === fn2(u, v) for (u, v) in
+                  ((1.0, 0.0), (0.0, 1.0), (2.5, -3.5)))
+    end
+
+    @testset "SingleIndexApproximator — Dual safety in params and inputs" begin
+        using ForwardDiff
+        μ̂ = [1.0, 2.0]
+        Σ̂ = [2.0 0.3; 0.3 1.0]
+        a = SingleIndexApproximator(:g, 2, 7; index_stats=(μ̂, Σ̂))
+        θ = vcat([0.7], collect(range(-1.0, 1.5, length=7)) .+ 0.1 .* (1:7))
+        f = build_evaluator(a, θ)
+
+        # inside [−xi, xi] and out in BOTH linear-extrapolation branches
+        for u in ([1.0, 2.0], [40.0, 40.0], [-40.0, -40.0])
+            g1 = ForwardDiff.gradient(b -> build_evaluator(a, b)(u...), θ)
+            @test all(isfinite, g1)
+            h = 1e-6
+            for k in (1, 2, 5)
+                e_k = [i == k ? 1.0 : 0.0 for i in eachindex(θ)]
+                fd = (build_evaluator(a, θ .+ h .* e_k)(u...) -
+                      build_evaluator(a, θ .- h .* e_k)(u...)) / (2h)
+                @test g1[k] ≈ fd atol=1e-5
+            end
+            g2 = ForwardDiff.gradient(v -> f(v[1], v[2]), u)
+            @test all(isfinite, g2)
+            # nested: Dual params of a Dual-state derivative (stiff autodiff
+            # Jacobians inside through-the-solver training)
+            g3 = ForwardDiff.gradient(
+                b -> ForwardDiff.derivative(x -> build_evaluator(a, b)(x, u[2]), u[1]), θ)
+            @test all(isfinite, g3)
+        end
+        # the index really does move with the states inside the knot span
+        @test norm(ForwardDiff.gradient(v -> f(v[1], v[2]), [1.0, 2.0])) > 1e-6
+
+        # the same holds for a shape-constrained outer smooth
+        ac = SingleIndexApproximator(:g, 2, 7; constraint=:increasing,
+                                     index_stats=(μ̂, Σ̂))
+        θc = vcat([0.7], randn(StableRNG(21), 7))
+        @test all(isfinite, ForwardDiff.gradient(
+            b -> build_evaluator(ac, b)(1.0, 2.0), θc))
+        @test all(isfinite, ForwardDiff.gradient(
+            v -> build_evaluator(ac, θc)(v[1], v[2]), [1.0, 2.0]))
+    end
+
+    @testset "SingleIndexApproximator — penalty blocks and merged penalty" begin
+        stats2 = ([0.0, 0.0], [1.0 0.2; 0.2 1.0])
+        a = SingleIndexApproximator(:g, 2, 8; inner_ridge=0.05, index_stats=stats2)
+        blocks = penalty_blocks(a)
+        @test length(blocks) == 2
+        @test blocks[1][2] == 1:1                    # the free loading
+        @test blocks[2][2] == 2:9                    # the outer coefficients
+        @test size(blocks[1][1]) == (1, 1)
+        @test size(blocks[2][1]) == (8, 8)
+        # disjoint, and together they tile the whole coefficient block
+        @test isempty(intersect(blocks[1][2], blocks[2][2]))
+        @test length(blocks[1][2]) + length(blocks[2][2]) == nparams(a)
+        for (S, _) in blocks
+            # numerically symmetric to the tolerance build_penalty_matrices
+            # itself enforces (the spline penalty is H'B⁻¹H, symmetric up to
+            # roundoff), and positive semi-definite
+            @test maximum(abs.(S .- S')) < 1e-8 * max(maximum(abs.(S)), 1.0)
+            @test minimum(eigvals(Symmetric(S))) > -1e-8
+        end
+        # the outer block is EXACTLY the univariate spline penalty on the
+        # same knot count (reuse by composition, not duplication)
+        @test blocks[2][1] ≈ penalty_matrix(BSplineApproximator(:g, (-2.0, 2.0), 8))
+        # …and with a shape constraint, exactly the SCOP difference penalty
+        ac = SingleIndexApproximator(:g, 2, 8; constraint=:increasing,
+                                     index_stats=stats2)
+        @test penalty_blocks(ac)[2][1] ≈ penalty_matrix(
+            ShapeConstrainedBSplineApproximator(:g, (-2.0, 2.0), 8, :increasing))
+
+        # merged penalty_matrix = block diagonal with the FIXED inner weight
+        S = penalty_matrix(a)
+        @test size(S) == (9, 9)
+        @test issymmetric(S)
+        @test S[1, 1] == 0.05
+        @test all(S[1, 2:end] .== 0.0)
+        @test S[2:end, 2:end] ≈ blocks[2][1]
+        @test minimum(eigvals(Symmetric(S))) > -1e-8
+
+        # build_penalty_matrices validates and lays the blocks out globally
+        a_free = SingleIndexApproximator(:h, 2, 6; anchor=nothing,
+                                         index_stats=(zeros(2), Matrix(1.0I, 2, 2)))
+        prob_pb = PSMProblem((du, u, p, t) -> (du[1] = p.g(u[1], u[2]) +
+                                                       p.h(u[1], u[2]);
+                                               du[2] = -0.1 * u[2]; nothing),
+            [1.0, 1.0], (0.0, 1.0), [a, a_free];
+            data_times=[0.0, 0.5, 1.0], data_values=ones(3, 2), obs_to_state=[1, 2],
+            likelihood=Gaussian(), solver=Tsit5())
+        S_list, offs, nks = PartiallySpecifiedModels.build_penalty_matrices(prob_pb)
+        @test length(S_list) == 4
+        @test offs == [0, 1, 9, 11]
+        @test nks == [1, 8, 2, 6]
+
+        # index_loadings reads THIS approximator's block, not the whole
+        # coefficient vector. Without the length check it silently returned
+        # loadings decoded from whichever approximator came first.
+        @test_throws ArgumentError index_loadings(a_free,
+                                                  zeros(sum(nparams, prob_pb.approximators)))
+        err_il = try
+            index_loadings(a_free, zeros(sum(nparams, prob_pb.approximators)))
+            nothing
+        catch e; e; end
+        @test occursin("coefficient block", err_il.msg)
+        # the correct slice works
+        @test length(index_loadings(a_free, zeros(nparams(a_free)))) == 2
+    end
+
+    @testset "SingleIndexApproximator — free mode warns under LAML/GCV" begin
+        # anchor=nothing leaves the data term exactly flat along a → c·a, so
+        # the inner ridge is minimized by ‖a‖ → 0 and a λ-estimating solver
+        # collapses the loadings while the data loss still looks fine. That
+        # silent path is now broken by a warning at solve entry.
+        dyn_w!(du, u, p, t) = (du[1] = -p.f(u[1], u[2]) * u[1];
+                               du[2] = -0.2 * u[2]; nothing)
+        tw = collect(0.0:0.25:3.0)
+        refw = OrdinaryDiffEq.solve(
+            ODEProblem((du, u, p, t) -> (du[1] = -0.3 * u[1]; du[2] = -0.2 * u[2];
+                                         nothing),
+                       [2.0, 1.0], (0.0, 3.0)), Tsit5(), saveat=0.25)
+        dw = reduce(hcat, refw.u)'
+        aw = SingleIndexApproximator(:f, 2, 6; anchor=nothing,
+                                     index_stats=(zeros(2), Matrix(1.0I, 2, 2)))
+        prob_w = PSMProblem(dyn_w!, [2.0, 1.0], (0.0, 3.0), [aw];
+            data_times=tw, data_values=dw, obs_to_state=[1, 2],
+            known_params=NamedTuple(), likelihood=PSM.Gaussian())
+        @test_logs (:warn, r"anchor=nothing") match_mode=:any begin
+            solve(prob_w, LAML(maxiters=3))
+        end
+        @test_logs (:warn, r"anchor=nothing") match_mode=:any begin
+            solve(prob_w, GCVSolver(maxiters=3))
+        end
+        # the default anchored mode must NOT warn
+        aa = SingleIndexApproximator(:f, 2, 6;
+                                     index_stats=(zeros(2), Matrix(1.0I, 2, 2)))
+        prob_a = PSMProblem(dyn_w!, [2.0, 1.0], (0.0, 3.0), [aa];
+            data_times=tw, data_values=dw, obs_to_state=[1, 2],
+            known_params=NamedTuple(), likelihood=PSM.Gaussian())
+        @test_logs min_level=Base.CoreLogging.Warn match_mode=:any begin
+            solve(prob_a, LAML(maxiters=3))
+        end
+    end
+
+    # ── The recovery / discriminator fixture ───────────────────────────
+    #
+    # Damped predator–prey whose unknown per-capita prey growth is a
+    # SINGLE INDEX of both states, r(N, P) = s₀(0.6N + 0.4P) with a
+    # sigmoidal s₀. Two properties matter and both are deliberate:
+    #
+    #  * the orbit CHANGES DIRECTION along the path, which is what identifies
+    #    the loadings. The condition that defeats identification is
+    #    COLLINEARITY — states moving along an affinely straight line, where
+    #    rescaling `a` is absorbed into s₀. Monotonicity alone does NOT do
+    #    it: measured on monotone-decay versions of this model, where every
+    #    coordinate AND the index decrease monotonically, the loading is
+    #    still recovered to ~2% (0.654 vs 2/3), because a curved path keeps
+    #    changing its tangent direction.
+    #  * the orbit runs roughly ALONG the index direction, so each index
+    #    LEVEL SET crosses the state box far from the visited curve. Those
+    #    crossings are the off-orbit states whose index value the data DO
+    #    pin down — exactly where a full interaction surface has nothing to
+    #    go on and a single index does.
+    si_s0(v) = 0.55 - 1.0 * v^2 / (0.9 + v^2)
+    si_true(N, Pd) = si_s0(0.6 * N + 0.4 * Pd)
+    function si_true!(du, u, p, t)
+        du[1] = u[1] * si_true(u[1], u[2])
+        du[2] = u[2] * (0.4 * u[1] - 0.4 - 0.12 * u[2])
+        nothing
+    end
+    function si_psm!(du, u, p, t)
+        du[1] = u[1] * p.f(u[1], u[2])
+        du[2] = u[2] * (p.c * u[1] - p.m - p.d * u[2])
+        nothing
+    end
+    si_ref = OrdinaryDiffEq.solve(
+        ODEProblem(si_true!, [3.0, 0.25], (0.0, 40.0)), Tsit5(),
+        saveat=0.4, abstol=1e-10, reltol=1e-10)
+    si_traj = reduce(hcat, si_ref.u)'
+    si_ts = collect(si_ref.t)
+    si_data = si_traj .+ 0.02 .* randn(StableRNG(31), size(si_traj))
+    si_prob(a) = PSMProblem(si_psm!, [3.0, 0.25], (0.0, 40.0), [a];
+        data_times=si_ts, data_values=si_data, obs_to_state=[1, 2],
+        known_params=(c=0.4, m=0.4, d=0.12), likelihood=Gaussian(),
+        solver=Tsit5())
+
+    @testset "SingleIndexApproximator — reference statistics are fixed" begin
+        # data whose two states have very different means/spreads
+        ts_fx = collect(0.0:0.25:6.0)
+        y_fx = hcat(2.0 .+ sin.(ts_fx), 5.0 .+ 3.0 .* cos.(0.7 .* ts_fx))
+        dyn_fx! = (du, u, p, t) -> (du[1] = -0.1 * u[1] + p.g(u[1], u[2]);
+                                    du[2] = -0.05 * u[2]; nothing)
+        mkfx(a) = PSMProblem(dyn_fx!, [2.0, 8.0], (0.0, 6.0), [a];
+            data_times=ts_fx, data_values=y_fx, obs_to_state=[1, 2],
+            likelihood=Gaussian(), solver=Tsit5())
+
+        prob_fx = mkfx(SingleIndexApproximator(:g, 2, 6))
+        rfx = prob_fx.approximators[1]
+        # resolution happened at problem construction, from the data
+        @test rfx.mu !== nothing
+        @test rfx.Sigma !== nothing
+        @test rfx.mu[1] ≈ mean(y_fx[:, 1]) rtol=0.05
+        @test rfx.mu[2] ≈ mean(y_fx[:, 2]) rtol=0.05
+        vcol(v) = sum(abs2, v .- mean(v)) / (length(v) - 1)
+        @test rfx.Sigma[1, 1] ≈ vcol(y_fx[:, 1]) rtol=0.25
+        @test rfx.Sigma[2, 2] ≈ vcol(y_fx[:, 2]) rtol=0.25
+        @test issymmetric(rfx.Sigma)
+        @test minimum(eigvals(Symmetric(rfx.Sigma))) > -1e-8
+
+        # The statistics do NOT depend on the fitted trajectory. Build an
+        # evaluator, run a fit that moves the trajectory a long way, then
+        # rebuild it: BIT-identical, because the struct is immutable and
+        # nothing in any solve path touches (μ̂, Σ̂).
+        prob_mv = si_prob(SingleIndexApproximator(:f, 2, 8; xi=2.5,
+                                                  initial=z -> -0.05 - 0.1z))
+        a_mv = prob_mv.approximators[1]
+        θ_mv = PartiallySpecifiedModels.build_initial_params(prob_mv)
+        pts_mv = [(1.0, 0.5), (3.0, 0.25), (9.0, 12.0)]
+        before = build_evaluator(a_mv, θ_mv)
+        vals_before = [before(x, y) for (x, y) in pts_mv]
+        μ_before, Σ_before = copy(a_mv.mu), copy(a_mv.Sigma)
+        pred0 = PartiallySpecifiedModels.simulate(prob_mv, θ_mv)
+        sol_mv = solve(prob_mv, LAML(maxiters=40, warmup=10, initial_lambda=0.01))
+        @test prob_mv.approximators[1] === a_mv        # never swapped out
+        @test a_mv.mu == μ_before                      # never mutated
+        @test a_mv.Sigma == Σ_before
+        after = build_evaluator(a_mv, θ_mv)
+        @test [after(x, y) for (x, y) in pts_mv] == vals_before
+        # …and the fit really did move the trajectory, so this is not vacuous
+        @test maximum(abs.(sol_mv.fitted_values .- pred0)) > 0.1
+
+        # user-supplied statistics are never overwritten, and re-wrapping a
+        # resolved approximator (the bootstrap path) is idempotent
+        fixed = ([0.0, 0.0], [1.0 0.0; 0.0 1.0])
+        rfix = mkfx(SingleIndexApproximator(:g, 2, 6; index_stats=fixed)).approximators[1]
+        @test rfix.mu == [0.0, 0.0]
+        @test rfix.Sigma == Matrix(1.0I, 2, 2)
+        again = mkfx(rfx).approximators[1]
+        @test again.mu == rfx.mu
+        @test again.Sigma == rfx.Sigma
+        @test mkfx(deepcopy(rfx)).approximators[1].Sigma == rfx.Sigma
+
+        # `states` selects which states the p arguments standardize against
+        rsel = mkfx(SingleIndexApproximator(:g, 2, 6; states=[2, 1])).approximators[1]
+        @test rsel.mu ≈ reverse(rfx.mu) rtol=1e-8
+        # an unobserved state contributes its u0 value and a diffuse scale
+        dyn3! = (du, u, p, t) -> (du[1] = -0.1 * u[1] + p.g(u[1], u[3]);
+                                  du[2] = -0.05 * u[2]; du[3] = -0.02 * u[3]; nothing)
+        prob3 = PSMProblem(dyn3!, [2.0, 8.0, 4.0], (0.0, 6.0),
+            [SingleIndexApproximator(:g, 2, 6; states=[1, 3])];
+            data_times=ts_fx, data_values=y_fx, obs_to_state=[1, 2],
+            likelihood=Gaussian(), solver=Tsit5())
+        r3 = prob3.approximators[1]
+        @test r3.mu[2] == 4.0
+        @test r3.Sigma[2, 2] == 16.0
+        @test r3.Sigma[1, 2] == 0.0
+    end
+
+    @testset "SingleIndexApproximator — recovery of loadings and curve" begin
+        prob_si = si_prob(SingleIndexApproximator(:f, 2, 10; xi=2.5,
+                                                  initial=z -> -0.05 - 0.1z))
+        a_si = prob_si.approximators[1]
+
+        # (a) LAML — the inner ridge and the outer roughness get SEPARATE
+        # smoothing parameters, estimated jointly.
+        sol_l = solve(prob_si, LAML(maxiters=60, warmup=10, initial_lambda=0.01))
+        @test length(sol_l.smoothing_params) == 2
+        @test all(isfinite, sol_l.smoothing_params)
+        @test all(>(0), sol_l.smoothing_params)
+        @test sol_l.smoothing_params[1] != sol_l.smoothing_params[2]
+        @test sol_l.data_loss < 0.2                 # observed 0.0770
+        load_l = index_loadings(a_si, sol_l.parameters)
+        @test load_l[1] == 1.0                      # anchored exactly
+        @test abs(load_l[2] - 2/3) < 0.15           # observed 0.65244 vs 0.667
+        f_l = sol_l.unknown_functions[:f]
+        err_l = [abs(f_l(si_traj[i, 1], si_traj[i, 2]) -
+                     si_true(si_traj[i, 1], si_traj[i, 2]))
+                 for i in 1:size(si_traj, 1)]
+        @test sqrt(mean(abs2, err_l)) < 0.01        # observed 0.00157
+        @test maximum(err_l) < 0.03
+
+        # (b) AdamSolver — ForwardDiff through the ODE solve, i.e. Dual
+        # parameters AND Dual states through the p-argument evaluator.
+        sol_a = solve(si_prob(SingleIndexApproximator(:f, 2, 10; xi=2.5,
+                                                      initial=z -> -0.05 - 0.1z)),
+                      AdamSolver(maxiters=500, lr=0.03))
+        @test sol_a.data_loss < 1.2                 # observed ≈ 0.75
+        f_a = sol_a.unknown_functions[:f]
+        err_a = [abs(f_a(si_traj[i, 1], si_traj[i, 2]) -
+                     si_true(si_traj[i, 1], si_traj[i, 2]))
+                 for i in 1:size(si_traj, 1)]
+        @test sqrt(mean(abs2, err_a)) < 0.05
+    end
+
+    @testset "SingleIndexApproximator — off-orbit against the tensor surface" begin
+        # THE DISCRIMINATOR. Both types are fitted to the SAME data with the
+        # SAME solver and settings, and both fit the data about equally well.
+        # They are then compared at states that (i) lie ≥ 0.5 away from every
+        # visited state, and (ii) carry an index value the data DID observe.
+        prob_si = si_prob(SingleIndexApproximator(:f, 2, 10; xi=2.5,
+                                                  initial=z -> -0.05 - 0.1z))
+        a_si = prob_si.approximators[1]
+        sol_si = solve(prob_si, LAML(maxiters=60, warmup=10, initial_lambda=0.01))
+        nlo, nhi = extrema(si_traj[:, 1])
+        plo, phi = extrema(si_traj[:, 2])
+        prob_tp = si_prob(TensorBSplineApproximator(:f, (nlo, nhi), (plo, phi),
+                                                    5, 5; initial=(N, Pd) -> 0.0))
+        sol_tp = solve(prob_tp, LAML(maxiters=60, warmup=10, initial_lambda=0.01))
+        f_si = sol_si.unknown_functions[:f]
+        f_tp = sol_tp.unknown_functions[:f]
+
+        # fairness: the tensor is not handicapped — it fits the data as well
+        # and carries MORE coefficients (25 against 11)
+        @test nparams(prob_tp.approximators[1]) > nparams(a_si)
+        @test abs(sol_tp.data_loss - sol_si.data_loss) <
+              0.1 * max(sol_si.data_loss, 1e-12)
+
+        zvals = 0.6 .* si_traj[:, 1] .+ 0.4 .* si_traj[:, 2]
+        zlo, zhi = extrema(zvals)
+        mind(N, Pd) = minimum(sqrt((si_traj[i, 1] - N)^2 + (si_traj[i, 2] - Pd)^2)
+                              for i in 1:size(si_traj, 1))
+        off = [(N, Pd) for N in range(nlo, nhi, length=21),
+                           Pd in range(plo, phi, length=21)
+               if zlo <= 0.6N + 0.4Pd <= zhi && mind(N, Pd) > 0.5]
+        @test length(off) >= 8              # the region is not empty
+
+        e_si = [abs(f_si(N, Pd) - si_true(N, Pd)) for (N, Pd) in off]
+        e_tp = [abs(f_tp(N, Pd) - si_true(N, Pd)) for (N, Pd) in off]
+        # observed: RMSE 0.00421 (single index) against 0.02678 (tensor),
+        # max 0.00954 against 0.06097 — a factor of ~6 either way. The gap
+        # survives dropping the index-observed filter: over ALL off-orbit
+        # points it is 0.0256 vs 0.0815, and over points whose index the
+        # data NEVER observed 0.0285 vs 0.0898 — both ~3.2x. So the filter
+        # selects where the single index is most accurate in absolute
+        # terms; it does not manufacture the ordering.
+        @test sqrt(mean(abs2, e_si)) < 0.5 * sqrt(mean(abs2, e_tp))
+        @test maximum(e_si) < 0.5 * maximum(e_tp)
+        @test maximum(e_si) < 0.04
+        # …while ON the orbit they are comparable, so the gap above really is
+        # about extrapolating off it and not about a worse fit overall
+        on_si = [abs(f_si(si_traj[i, 1], si_traj[i, 2]) -
+                     si_true(si_traj[i, 1], si_traj[i, 2]))
+                 for i in 1:size(si_traj, 1)]
+        on_tp = [abs(f_tp(si_traj[i, 1], si_traj[i, 2]) -
+                     si_true(si_traj[i, 1], si_traj[i, 2]))
+                 for i in 1:size(si_traj, 1)]
+        @test sqrt(mean(abs2, on_si)) < sqrt(mean(abs2, on_tp))
+        @test sqrt(mean(abs2, on_tp)) < 0.02
+
+        # HONEST SCOPE NOTE. What this establishes is MODEL MATCH, not orbit
+        # geometry: si_true IS an index, and the index model wins because of
+        # that. Rebuilding this same fixture with non-index truths reverses
+        # the ranking by a comparable or larger margin — an additive
+        # two-ridge truth gives 0.314 (single index) against 0.054 (tensor)
+        # off-orbit, a multiplicative interaction 0.207 against 0.070.
+        # Mitigating fact: the misspecification is NOT silent — on both
+        # non-index truths the single index's data_loss was 27-66% worse
+        # than the tensor's, so the in-sample fit flags the wrong choice.
+        # One asymmetry in this comparison: the single index carries TWO
+        # smoothing parameters (penalty_blocks) while the tensor's
+        # Kronecker-sum penalty carries one. Unconditionally in the single
+        # index's favour: wherever p > 2, no tensor type exists at all.
+        # (Note also that null-space collapse is NOT the distinguishing
+        # mechanism: on THIS fixture the fitted tensor retains only ~1.7% of
+        # its variation outside the penalty's bilinear null space, versus
+        # ~11.7% for the single index — collapse is how the tensor LOSES
+        # here.)
+    end
+
+    @testset "SingleIndexApproximator — three states, shape constraint, bands" begin
+        # (a) p = 3: an index over three states, where no tensor type exists
+        function si3_true!(du, u, p, t)
+            g = 0.4 + 0.5 * tanh(0.5 * u[1] + 0.3 * u[2] + 0.2 * u[3] - 1.5)
+            du[1] = -u[1] * g
+            du[2] = 0.5 * u[1] * g - 0.3 * u[2]
+            du[3] = 0.3 * u[2] - 0.2 * u[3]
+            nothing
+        end
+        ref3 = OrdinaryDiffEq.solve(
+            ODEProblem(si3_true!, [4.0, 0.5, 0.2], (0.0, 12.0)), Tsit5(),
+            saveat=0.3, abstol=1e-10, reltol=1e-10)
+        tr3 = reduce(hcat, ref3.u)'
+        ts3 = collect(ref3.t)
+        d3 = tr3 .+ 0.02 .* randn(StableRNG(41), size(tr3))
+        function si3!(du, u, p, t)
+            g = p.g(u[1], u[2], u[3])
+            du[1] = -u[1] * g
+            du[2] = p.a * u[1] * g - p.b * u[2]
+            du[3] = p.b * u[2] - p.c * u[3]
+            nothing
+        end
+        prob3 = PSMProblem(si3!, [4.0, 0.5, 0.2], (0.0, 12.0),
+            [SingleIndexApproximator(:g, 3, 8; xi=2.5, initial=z -> 0.6)];
+            data_times=ts3, data_values=d3, obs_to_state=[1, 2, 3],
+            known_params=(a=0.5, b=0.3, c=0.2), likelihood=Gaussian(),
+            solver=Tsit5())
+        a3 = prob3.approximators[1]
+        @test nparams(a3) == 2 + 8
+        sol3 = solve(prob3, LAML(maxiters=50, warmup=8, initial_lambda=0.01))
+        @test length(sol3.smoothing_params) == 2
+        @test sol3.data_loss < 0.5
+        g3 = sol3.unknown_functions[:g]
+        g3true(u) = 0.4 + 0.5 * tanh(0.5u[1] + 0.3u[2] + 0.2u[3] - 1.5)
+        err3 = [abs(g3(tr3[i, :]...) - g3true(tr3[i, :])) for i in 1:size(tr3, 1)]
+        @test sqrt(mean(abs2, err3)) < 0.05
+
+        # (b) a shape-constrained outer smooth is monotone BY CONSTRUCTION,
+        # for arbitrary parameter vectors — the SCOP guarantee, inherited
+        # unchanged from ShapeConstrainedBSplineApproximator
+        rng_sc = StableRNG(43)
+        for constraint in (:increasing, :decreasing)
+            asc = SingleIndexApproximator(:g, 2, 9; constraint=constraint,
+                                          index_stats=(zeros(2), Matrix(1.0I, 2, 2)))
+            for _ in 1:5
+                θsc = vcat([0.8], 1.5 .* randn(rng_sc, 9))
+                curve = [PartiallySpecifiedModels._eval_approx_at(asc, θsc, z)
+                         for z in range(-2.5, 2.5, length=60)]
+                d = diff(curve)
+                @test (constraint == :increasing ? minimum(d) > -1e-10 :
+                                                   maximum(d) < 1e-10)
+            end
+        end
+        # …and it recovers a monotone-index truth end to end
+        prob_sc = si_prob(SingleIndexApproximator(:f, 2, 9; xi=2.5,
+                                                  constraint=:decreasing,
+                                                  initial=z -> -0.05 - 0.1z))
+        a_sc = prob_sc.approximators[1]
+        sol_sc = solve(prob_sc, LAML(maxiters=60, warmup=10, initial_lambda=0.01))
+        @test sol_sc.data_loss < 0.3
+        f_sc = sol_sc.unknown_functions[:f]
+        @test sqrt(mean(abs2, [abs(f_sc(si_traj[i, 1], si_traj[i, 2]) -
+                                   si_true(si_traj[i, 1], si_traj[i, 2]))
+                               for i in 1:size(si_traj, 1)])) < 0.03
+        # the fitted response really is decreasing in the index
+        curve_sc = [PartiallySpecifiedModels._eval_approx_at(
+                        a_sc, Float64.(collect(sol_sc.parameters)), z)
+                    for z in range(-2.5, 2.5, length=40)]
+        @test maximum(diff(curve_sc)) < 1e-10
+
+        # (c) confidence_band serves the OUTER curve over the standardized
+        # index — the univariate payoff the tensor surface cannot have
+        prob_cb = si_prob(SingleIndexApproximator(:f, 2, 10; xi=2.5,
+                                                  initial=z -> -0.05 - 0.1z))
+        sol_cb = solve(prob_cb, LAML(maxiters=40, warmup=10, initial_lambda=0.01))
+        band = confidence_band(sol_cb, prob_cb)
+        @test haskey(band, :f)
+        @test extrema(band[:f].grid) == (-2.5, 2.5)
+        @test all(isfinite, band[:f].fitted)
+        @test all(isfinite, band[:f].se)
+        @test all(band[:f].se .>= 0)
+        @test all(band[:f].lower .<= band[:f].fitted)
+        @test all(band[:f].fitted .<= band[:f].upper)
+        # the band is the OUTER curve, i.e. exactly what _eval_approx_at gives
+        @test band[:f].fitted ≈ [PartiallySpecifiedModels._eval_approx_at(
+                                     prob_cb.approximators[1],
+                                     Float64.(collect(sol_cb.parameters)), z)
+                                 for z in band[:f].grid]
+
+        # (d) bootstrap produces a real (non-NaN) band for the outer curve
+        res_b = bootstrap(sol_cb, prob_cb,
+                          AdamSolver(maxiters=60, lr=0.05); nboot=4,
+                          rng=StableRNG(45))
+        @test res_b.n_success >= 3
+        @test haskey(res_b.ci_uf, :f)
+        @test all(isfinite, res_b.ci_uf[:f].lower)
+        @test all(isfinite, res_b.ci_uf[:f].upper)
+    end
+
+    @testset "SingleIndexApproximator — sibling registration" begin
+        # In the union, so the SIX per-type penalty whitelists must list it
+        # explicitly — the generic non-built-in fallback will NOT fire for it.
+        @test SingleIndexApproximator <:
+              PartiallySpecifiedModels._BUILTIN_APPROX_TYPES
+
+        # Behavioral check where it is cheap: the gradient-matching solvers
+        # really do apply the merged penalty (a large λ flattens the outer
+        # curve's roughness).
+        S_si = penalty_matrix(si_prob(
+            SingleIndexApproximator(:f, 2, 9; xi=2.5)).approximators[1])
+        rough(sol) = dot(sol.parameters, S_si * sol.parameters)
+        for alg in (λ -> TwoStageSolver(maxiters=150, lambda_smooth=λ),
+                    λ -> IntegralMatchingSolver(maxiters=150, lambda_smooth=λ))
+            p0 = si_prob(SingleIndexApproximator(:f, 2, 9; xi=2.5,
+                                                 initial=z -> -0.05 - 0.1z))
+            pP = si_prob(SingleIndexApproximator(:f, 2, 9; xi=2.5,
+                                                 initial=z -> -0.05 - 0.1z))
+            s0_ = solve(p0, alg(0.0))
+            sP_ = solve(pP, alg(50.0))
+            @test s0_.parameters != sP_.parameters
+            @test rough(sP_) < rough(s0_)
+        end
+
+        # The remaining four whitelists (AGM — whose smoothing_lambda is not
+        # a user-facing keyword — plus MAGI, rodeo and DALTON, which sit
+        # inside Kalman/HMC objectives far too slow to gate a unit test on)
+        # cannot be exercised end-to-end here. But the campaign's recurring
+        # failure mode is precisely a type landing on some sibling sites and
+        # not others, so assert the registration at each site directly.
+        src_dir = dirname(pathof(PartiallySpecifiedModels))
+        for f in ("two_stage_solver.jl", "integral_matching_solver.jl",
+                  "magi_solver.jl", "adaptive_gradient_matching.jl",
+                  "rodeo_solver.jl", "dalton_solver.jl")
+            @test occursin("SingleIndexApproximator", read(joinpath(src_dir, f), String))
+        end
+    end
+
 end

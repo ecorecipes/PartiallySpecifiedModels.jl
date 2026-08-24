@@ -197,6 +197,7 @@ function _magi_logposterior(ld::MAGILogDensity, v::AbstractVector{T}) where T
            approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator ||
            approx isa ShapeConstrainedGPApproximator ||
            approx isa TensorBSplineApproximator ||
+           approx isa SingleIndexApproximator ||
            !(approx isa _BUILTIN_APPROX_TYPES)
             S = penalty_matrix(approx)
             if S !== nothing

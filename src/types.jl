@@ -1046,6 +1046,395 @@ function initial_params(a::COMONetApproximator)
     return params
 end
 
+# ─── Single-index approximator ────────────────────────────────────
+
+"""
+    SingleIndexApproximator(name, p, nknots; anchor=1, constraint=:none,
+                            xi=2.0, index_stats=nothing, inner_ridge=1e-4,
+                            states=nothing, initial=nothing)
+
+Unknown function of SEVERAL states through ONE learned direction:
+
+    f(u₁, …, u_p) = s(z),    z = (aᵀu − aᵀμ̂) / √(aᵀΣ̂a)
+
+with the loadings `a` and the univariate outer smooth `s` estimated
+JOINTLY. This is the nested-effects construction of Fasiolo et al.
+(arXiv:2511.19234; R package *gamFactory*): a smooth composed with a
+learned inner transformation, both fitted under LAML with separate
+smoothing parameters (see [`penalty_blocks`](@ref)).
+
+# Why a single index rather than a tensor surface
+
+[`TensorBSplineApproximator`](@ref) fits a full interaction surface
+`f(x, y)`, but a dynamical orbit is a thin 1-D manifold in state space:
+the data identify the surface only along the trajectory, and off-orbit
+the fit is unconstrained (worse still as the number of arguments grows).
+A single index needs variation only ALONG the learned direction, which
+orbit data supply. The loadings are directly interpretable and the outer
+smooth is univariate, so [`confidence_band`](@ref) serves it (evaluating
+the OUTER curve over the standardized index) where the tensor surface has
+no univariate band at all.
+
+# The standardization statistics are FIXED
+
+`(μ̂, Σ̂)` are reference statistics of the index variables, computed ONCE
+and never touched again. The paper standardizes the inner transform over
+the covariate sample; here the "covariate" of a state-dependent `f` is
+the TRAJECTORY, which moves during fitting — standardizing against it
+would add derivative paths through the standardization and let the
+geometry of `z` drift under the optimizer. Instead:
+
+- `index_stats = (mu, Sigma)` fixes them explicitly (`mu` of length `p`,
+  `Sigma` a `p × p` symmetric positive semi-definite matrix with positive
+  trace). Use this whenever you know the operating range.
+- `index_stats = nothing` (default) leaves them UNRESOLVED on the bare
+  approximator, and `PSMProblem` construction fills them in from the data
+  (see below), returning a resolved copy. The struct is immutable, so once
+  resolved the statistics cannot change — no in-loop adaptation, and
+  `bootstrap`'s `deepcopy` of the approximators carries the same values.
+  Building an evaluator from an unresolved approximator is an error rather
+  than a silent default.
+
+Resolution from data smooths each observed state column with the package's
+GCV smoothing spline (`smooth_and_differentiate`) and takes the mean and
+sample covariance of the smoothed index states. A state that carries no
+observation contributes its `u0` value as the mean and a diffuse scale
+`max(|μ̂ⱼ|, 1)` as its standard deviation, with zero cross-covariance. The
+same diffuse fallback also applies to an OBSERVED state whose empirical
+spread is degenerate (a near-constant column): its variance becomes
+`max(|μ̂ⱼ|, 1)²`, which for a state observed near 100 means ≈1e4 and so
+flattens that coordinate's contribution to the index by ~100×. Pass
+`index_stats` explicitly if you want a near-constant state to carry its
+measured scale instead.
+`aᵀΣ̂a` is additionally floored at `1e-8 · tr(Σ̂)/p · ‖a‖²` inside the
+evaluator — a floor proportional to `‖a‖²` so the guard cannot break the
+exact scale invariance below.
+
+`states` names the state indices the `p` arguments correspond to; it is
+used ONLY to derive `(μ̂, Σ̂)` from data and defaults to `1:p`. If your
+dynamics pass a different selection — `p.f(u[2], u[4])` — pass
+`states=[2, 4]` (or supply `index_stats` directly).
+
+# Identification
+
+`z` is invariant under `a → c·a` for `c > 0`, so the radial direction of
+the loadings is EXACTLY flat — poison for the LAML log-determinant and for
+any Newton step. The default `anchor = 1` removes it in the classical
+single-index way: `a[anchor] ≡ 1` is not a parameter, the block stores the
+remaining `p − 1` free loadings, and both the scale AND the sign of the
+index are fixed. **The anchor variable must genuinely load on the index**
+— anchoring a variable whose true loading is ~0 forces the other loadings
+to blow up. Pass `anchor = k` to anchor a different argument.
+
+`anchor = nothing` keeps all `p` loadings and leans on the inner ridge to
+regularize the flat direction; `index_loadings` then reports `a` scaled to
+`‖a‖ = 1` with a positive-first-loading sign convention.
+
+!!! warning "Free mode degenerates under LAML/GCVSolver"
+    The flat direction is exactly flat in the DATA term, so a ridge on `a`
+    is minimized by `‖a‖ → 0`. Under a solver that also estimates λ this
+    collapses: a measured `LAML` fit went from `‖a‖ = 1.41` at
+    initialization to `‖a‖ = 5.7e-6`, with an inner λ of 6.3e5 and a data
+    loss indistinguishable from the anchored fit. Free mode is for the
+    flat-objective solvers (`AdamSolver`, `DerivativeFreeSolver`,
+    `MCMCSolver`); `LAML` and `GCVSolver` emit a warning if they meet it.
+    Anchored mode is the default for this reason.
+
+The loadings also need the state path to CHANGE DIRECTION. What defeats
+identification is collinearity — states moving along an affinely straight
+line, where rescaling `a` is absorbed into `s`. Monotonicity alone does
+not: on decay fixtures where every coordinate and the index itself
+decrease monotonically, the loadings were still recovered to ~2%, because
+a curved path keeps changing its tangent direction.
+
+# Arguments
+- `name`: symbol for the unknown function, called as `p.name(u1, …, up)`
+- `p`: number of index arguments (≥ 2)
+- `nknots`: knots of the outer smooth (≥ 3; ≥ 4 when `constraint ≠ :none`)
+- `anchor`: index in `1:p` pinned to 1, or `nothing` (default `1`)
+- `constraint`: `:none` (default) or any of [`SHAPE_CONSTRAINTS`](@ref) —
+  the outer smooth is then the SCOP-spline construction of Pya & Wood
+  (2015), reusing `ShapeConstrainedBSplineApproximator` verbatim
+- `xi`: the outer smooth's knots span `[−xi, xi]` in STANDARDIZED units
+  (default 2.0), with linear extrapolation outside, as everywhere else in
+  the package
+- `index_stats`: `(mu, Sigma)` or `nothing` (resolve from data)
+- `inner_ridge`: fixed weight of the inner ridge in the merged
+  `penalty_matrix` read by the single-λ consumers (default 1e-4). Under
+  `LAML`/`GCVSolver` the inner ridge is a penalty BLOCK with its own
+  estimated λ, so this value is irrelevant there
+- `states`: state indices of the `p` arguments (default `1:p`)
+- `initial`: optional initial outer curve `z -> s(z)` or a constant
+- `initial_loadings`: optional starting direction, a length-`p` vector.
+  Default `nothing` starts from EQUAL weights (`a = 1` everywhere,
+  including the anchor). In anchored mode the vector is rescaled by its
+  anchor entry, which must be non-zero
+
+# On initializing the direction from the data
+
+Seeding `a` by regressing smoothed state derivatives on the states — the
+average-derivative estimator, which is consistent for `y = s(aᵀx)` — was
+implemented and measured, and it is NOT the default because in a PSM the
+state derivative is a SUM of known terms and the unknown function, so the
+regression is contaminated. On the two recovery fixtures in the test
+suite it produced a WRONG-SIGNED direction on one and, on the other,
+turned an `AdamSolver` fit of loss 0.24 into one of loss 8.84; under
+`LAML` it changed nothing (identical fits from either start). Equal
+weights is therefore the default, and `initial_loadings` is there for the
+case where you actually know a plausible direction.
+
+# Example
+```julia
+uf = SingleIndexApproximator(:g, 2, 8)          # g(N, P) = s(a₁N + a₂P)
+predprey!(du, u, p, t) = begin
+    g = p.g(u[1], u[2])
+    du[1] = u[1] * (1 - u[1] / 6) - g
+    du[2] = p.e * g - p.m * u[2]
+end
+```
+
+# Reference
+Fasiolo, M. et al. Nested effects for generalized additive models.
+arXiv:2511.19234.
+"""
+struct SingleIndexApproximator{O<:AbstractApproximator} <: AbstractApproximator
+    name::Symbol
+    p::Int
+    nknots::Int
+    anchor::Union{Int, Nothing}
+    constraint::Symbol
+    xi::Float64
+    inner_ridge::Float64
+    # Domain of the STANDARDIZED index (−xi, xi). Present so the generic
+    # `confidence_band` / bootstrap gridding machinery, which reads
+    # `approx.domain`, grids the outer curve.
+    domain::Tuple{Float64, Float64}
+    states::Vector{Int}
+    outer::O
+    # Reference statistics — `nothing` until resolved. IMMUTABLE once set.
+    mu::Union{Nothing, Vector{Float64}}
+    Sigma::Union{Nothing, Matrix{Float64}}
+    # Optional user-supplied starting direction, stored as the FREE loadings
+    # (length `_si_n_inner`); `nothing` means equal weights.
+    loadings_init::Union{Nothing, Vector{Float64}}
+end
+
+"""
+    _si_validate_index_stats(name, p, index_stats) -> (mu, Sigma)
+
+Validate a user-supplied `(mu, Sigma)` pair: correct sizes, symmetric,
+positive semi-definite, and with strictly positive trace (a zero Σ̂ would
+make every standardized index infinite).
+"""
+function _si_validate_index_stats(name::Symbol, p::Int, index_stats)
+    (index_stats isa Tuple && length(index_stats) == 2) || throw(ArgumentError(
+        "SingleIndexApproximator(:$name): index_stats must be a tuple " *
+        "(mu::Vector, Sigma::Matrix), got $(typeof(index_stats))"))
+    mu = Float64.(collect(index_stats[1]))
+    Sig = Matrix{Float64}(index_stats[2])
+    length(mu) == p || throw(ArgumentError(
+        "SingleIndexApproximator(:$name): index_stats mu has length " *
+        "$(length(mu)) but p = $p"))
+    size(Sig) == (p, p) || throw(ArgumentError(
+        "SingleIndexApproximator(:$name): index_stats Sigma is " *
+        "$(size(Sig, 1))×$(size(Sig, 2)) but p = $p"))
+    scale = max(maximum(abs, Sig), 1.0)
+    maximum(abs.(Sig .- Sig')) <= 1e-8 * scale || throw(ArgumentError(
+        "SingleIndexApproximator(:$name): index_stats Sigma is not symmetric"))
+    Sig = (Sig .+ Sig') ./ 2
+    minimum(eigvals(Symmetric(Sig))) >= -1e-8 * scale || throw(ArgumentError(
+        "SingleIndexApproximator(:$name): index_stats Sigma is not positive " *
+        "semi-definite"))
+    tr(Sig) > 0 || throw(ArgumentError(
+        "SingleIndexApproximator(:$name): index_stats Sigma has zero trace; " *
+        "the standardized index would be undefined"))
+    mu, Sig
+end
+
+function SingleIndexApproximator(name::Union{Symbol,String},
+                                 p::Int,
+                                 nknots::Int;
+                                 anchor::Union{Int,Nothing}=1,
+                                 constraint::Symbol=:none,
+                                 xi::Real=2.0,
+                                 index_stats=nothing,
+                                 inner_ridge::Real=1e-4,
+                                 states::Union{Nothing,AbstractVector{<:Integer}}=nothing,
+                                 initial=nothing,
+                                 initial_loadings::Union{Nothing,AbstractVector{<:Real}}=nothing)
+    name_s = Symbol(name)
+    p >= 2 || throw(ArgumentError(
+        "SingleIndexApproximator(:$name_s) needs p ≥ 2 index arguments " *
+        "(got $p); a single-argument unknown function is an ordinary " *
+        "BSplineApproximator"))
+    constraint == :none || constraint in SHAPE_CONSTRAINTS || throw(ArgumentError(
+        "SingleIndexApproximator(:$name_s): unknown constraint :$constraint. " *
+        "Must be :none or one of $SHAPE_CONSTRAINTS"))
+    nknots >= 3 || throw(ArgumentError(
+        "SingleIndexApproximator(:$name_s) needs nknots ≥ 3 for the outer " *
+        "cubic smooth (got $nknots)"))
+    constraint == :none || nknots >= 4 || throw(ArgumentError(
+        "SingleIndexApproximator(:$name_s) needs nknots ≥ 4 for a " *
+        "shape-constrained outer smooth (got $nknots)"))
+    ξ = Float64(xi)
+    (isfinite(ξ) && ξ > 0) || throw(ArgumentError(
+        "SingleIndexApproximator(:$name_s): xi must be positive and finite, " *
+        "got $xi"))
+    anchor === nothing || (1 <= anchor <= p) || throw(ArgumentError(
+        "SingleIndexApproximator(:$name_s): anchor must lie in 1:$p or be " *
+        "nothing, got $anchor"))
+    ridge = Float64(inner_ridge)
+    (isfinite(ridge) && ridge >= 0) || throw(ArgumentError(
+        "SingleIndexApproximator(:$name_s): inner_ridge must be finite and " *
+        "non-negative, got $inner_ridge"))
+    st = states === nothing ? collect(1:p) : Int.(collect(states))
+    length(st) == p || throw(ArgumentError(
+        "SingleIndexApproximator(:$name_s): states has $(length(st)) entries " *
+        "but p = $p"))
+    (all(>=(1), st) && allunique(st)) || throw(ArgumentError(
+        "SingleIndexApproximator(:$name_s): states must be distinct positive " *
+        "state indices, got $st"))
+
+    dom = (-ξ, ξ)
+    outer = if constraint == :none
+        BSplineApproximator(name_s, dom, nknots; initial=initial)
+    else
+        ShapeConstrainedBSplineApproximator(name_s, dom, nknots, constraint;
+                                            initial=initial)
+    end
+
+    mu, Sig = index_stats === nothing ? (nothing, nothing) :
+              _si_validate_index_stats(name_s, p, index_stats)
+
+    lo = if initial_loadings === nothing
+        nothing
+    else
+        v = Float64.(collect(initial_loadings))
+        length(v) == p || throw(ArgumentError(
+            "SingleIndexApproximator(:$name_s): initial_loadings has " *
+            "$(length(v)) entries but p = $p"))
+        all(isfinite, v) || throw(ArgumentError(
+            "SingleIndexApproximator(:$name_s): initial_loadings must be finite"))
+        if anchor === nothing
+            v
+        else
+            v[anchor] != 0 || throw(ArgumentError(
+                "SingleIndexApproximator(:$name_s): initial_loadings[$anchor] " *
+                "is zero, but the anchored parameterization fixes " *
+                "a[$anchor] = 1 and rescales the direction by it"))
+            v = v ./ v[anchor]
+            [v[i] for i in 1:p if i != anchor]
+        end
+    end
+
+    SingleIndexApproximator(name_s, p, nknots, anchor, constraint, ξ, ridge,
+                            dom, st, outer, mu, Sig, lo)
+end
+
+"""Number of FREE inner loadings: `p − 1` when anchored, `p` otherwise."""
+_si_n_inner(a::SingleIndexApproximator) = a.anchor === nothing ? a.p : a.p - 1
+
+nparams(a::SingleIndexApproximator) = _si_n_inner(a) + nparams(a.outer)
+
+function initial_params(a::SingleIndexApproximator)
+    ni = _si_n_inner(a)
+    # Equal weights (a = 1 in every coordinate, including the anchor) unless
+    # the user supplied `initial_loadings`. See the constructor docstring for
+    # why the data-driven average-derivative seed is NOT the default.
+    inner = a.loadings_init === nothing ? ones(ni) : copy(a.loadings_init)
+    vcat(inner, initial_params(a.outer))
+end
+
+# ─── Resolving the fixed index statistics at problem construction ──
+
+"""
+    _resolve_index_stats(approx, u0, data_times, data_values, data_weights,
+                         obs_to_state) -> approx
+
+Hook called once per approximator by the `PSMProblem` constructor. Every
+type but [`SingleIndexApproximator`](@ref) is returned untouched; a
+single-index approximator whose reference statistics are still `nothing`
+is replaced by a RESOLVED COPY carrying `(μ̂, Σ̂)` derived from the data.
+Already-resolved approximators are returned unchanged, so re-wrapping a
+problem (as `bootstrap` does) is idempotent.
+"""
+_resolve_index_stats(approx::AbstractApproximator, u0, data_times,
+                     data_values, data_weights, obs_to_state) = approx
+
+function _resolve_index_stats(a::SingleIndexApproximator, u0,
+                              data_times::Vector{Float64},
+                              data_values::Matrix{Float64},
+                              data_weights::Matrix{Float64},
+                              obs_to_state::Vector{Int})
+    a.mu === nothing || return a          # user-supplied: never overwritten
+
+    p = a.p
+    u0v = u0 isa AbstractVector ? Float64.(collect(u0)) : nothing
+    K = max(maximum(obs_to_state), maximum(a.states),
+            u0v === nothing ? 0 : length(u0v))
+    observed = Set(obs_to_state)
+    # An index state outside the model's state vector would silently index
+    # past u0 below; name it here instead.
+    u0v === nothing || maximum(a.states) <= length(u0v) || throw(ArgumentError(
+        "SingleIndexApproximator(:$(a.name)): states $(a.states) reference " *
+        "a state index beyond the $(length(u0v))-element u0"))
+    any(s -> s in observed, a.states) || u0v !== nothing || throw(ArgumentError(
+        "SingleIndexApproximator(:$(a.name)): none of the index states " *
+        "$(a.states) is observed and u0 is a function, so the reference " *
+        "statistics (μ̂, Σ̂) cannot be derived. Pass index_stats=(mu, Sigma)."))
+
+    # Smooth the observed columns once — the same GCV smoothing spline the
+    # gradient-matching solvers use. Noise in the raw data would inflate Σ̂
+    # and shrink every standardized index toward zero.
+    ys, _ = try
+        smooth_and_differentiate(data_times, data_values, obs_to_state, K;
+                                 weights=data_weights)
+    catch e
+        _is_program_error(e) && rethrow()
+        @warn("SingleIndexApproximator(:$(a.name)): could not smooth the data " *
+              "to derive the reference statistics (μ̂, Σ̂); falling back to " *
+              "u0-centred diffuse statistics. Pass index_stats=(mu, Sigma) " *
+              "to control them.", exception = e, maxlog = 1)
+        nothing, nothing
+    end
+
+    mu = zeros(p)
+    M = ys === nothing ? nothing : Matrix{Float64}(undef, size(ys, 1), p)
+    for j in 1:p
+        s = a.states[j]
+        if ys !== nothing && s in observed
+            M[:, j] = ys[:, s]
+            mu[j] = mean(@view M[:, j])
+        else
+            v = u0v === nothing ? 0.0 : u0v[s]
+            mu[j] = v
+            M === nothing || (M[:, j] .= v)
+        end
+    end
+
+    Sig = if M !== nothing && size(M, 1) >= 2
+        Matrix(cov(M))
+    else
+        zeros(p, p)
+    end
+    # Any index coordinate with no (or degenerate) empirical spread gets a
+    # diffuse scale and no cross-covariance: an unobserved state must not
+    # make Σ̂ singular in its direction.
+    for j in 1:p
+        if !(isfinite(Sig[j, j])) || Sig[j, j] <= 1e-12 * max(abs(mu[j])^2, 1.0)
+            Sig[j, :] .= 0.0
+            Sig[:, j] .= 0.0
+            Sig[j, j] = max(abs(mu[j]), 1.0)^2
+        end
+    end
+    all(isfinite, Sig) || (Sig = Matrix(Diagonal([max(abs(m), 1.0)^2 for m in mu])))
+    Sig = (Sig .+ Sig') ./ 2
+
+    SingleIndexApproximator(a.name, a.p, a.nknots, a.anchor, a.constraint,
+                            a.xi, a.inner_ridge, a.domain, a.states, a.outer,
+                            mu, Sig, a.loadings_init)
+end
+
 # ─── Likelihood types ──────────────────────────────────────────────
 
 """
@@ -2762,11 +3151,26 @@ function PSMProblem(dynamics!, u0, tspan,
 
     kwargs = Dict{Symbol, Any}(pairs(solver_kwargs)...)
 
+    t_f = Float64.(data_times)
+    y_f = Float64.(data_values)
+
+    # Types carrying FIXED reference statistics derived from the data (so
+    # far only SingleIndexApproximator) resolve them here, exactly once,
+    # and are replaced by resolved copies. Every other type is returned
+    # untouched by the hook, so the approximator vector — and its element
+    # type — is unchanged for all existing models.
+    approximators = if any(a -> a isa SingleIndexApproximator, approximators)
+        [_resolve_index_stats(a, u0, t_f, y_f, w, obs_to_state)
+         for a in approximators]
+    else
+        approximators
+    end
+
     PSMProblem(dynamics!, u0,
                (Float64(tspan[1]), Float64(tspan[2])),
                approximators,
-               Float64.(data_times),
-               Float64.(data_values),
+               t_f,
+               y_f,
                w,
                obs_to_state,
                known_params,

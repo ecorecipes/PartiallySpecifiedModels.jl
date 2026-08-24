@@ -154,7 +154,18 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
     # Build UF evaluation grids (approximators without a domain — e.g. a
     # NeuralApproximator constructed without one — cannot be gridded)
     uf_grids = Dict{Symbol, Vector{Float64}}()
+    # Approximators whose FITTED callable is not the univariate function the
+    # band grids. A SingleIndexApproximator's callable takes p arguments, so
+    # its band is taken from the OUTER curve over the standardized index —
+    # recorded here as (approximator, coefficient range) so each replicate
+    # can rebuild that curve from its own parameters.
+    uf_special = Dict{Symbol, Tuple{Any, UnitRange{Int}}}()
+    _uf_offset = 0
     for approx in prob.approximators
+        _uf_range = (_uf_offset + 1):(_uf_offset + nparams(approx))
+        _uf_offset = last(_uf_range)
+        approx isa SingleIndexApproximator && (uf_special[approx.name] =
+            (approx, _uf_range))
         if approx isa TensorBSplineApproximator
             # Bivariate surface: the UF band machinery grids one variable
             # and calls the evaluator with one argument. Skip its band
@@ -173,6 +184,14 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
         uf_grids[approx.name] = collect(range(lo, hi, length=uf_ngrid))
     end
     uf_names = collect(keys(uf_grids))
+
+    # One-argument band curve for `name` in a bootstrap replicate.
+    _boot_uf_curve(name, sol_b) =
+        haskey(uf_special, name) ?
+            (x -> _eval_approx_at(uf_special[name][1],
+                                  Float64.(sol_b.parameters[uf_special[name][2]]),
+                                  x)) :
+            sol_b.unknown_functions[name]
 
     n_p = length(sol.parameters)
 
@@ -220,7 +239,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                 for name in uf_names
                     grid = uf_grids[name]
                     if haskey(sol_boot.unknown_functions, name)
-                        f = sol_boot.unknown_functions[name]
+                        f = _boot_uf_curve(name, sol_boot)
                         uf_vals[name] = Float64[(try; f(x); catch; NaN; end) for x in grid]
                     end
                 end
@@ -310,7 +329,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
 
             for (name, grid) in uf_grids
                 if haskey(sol_boot.unknown_functions, name)
-                    f = sol_boot.unknown_functions[name]
+                    f = _boot_uf_curve(name, sol_boot)
                     for (k, x) in enumerate(grid)
                         val = try; f(x); catch; NaN; end
                         uf_samples[name][k, n_success] = val

@@ -1143,3 +1143,169 @@ function penalty_matrix(a::COMONetApproximator)
     np = nparams(a)
     return a.penalty_weight * I(np) |> Matrix{Float64}
 end
+
+# ═══════════════════════════════════════════════════════════════════════
+# Single index: inner loadings composed with a univariate outer smooth
+# ═══════════════════════════════════════════════════════════════════════
+#
+# f(u₁, …, u_p) = s(z), z = (aᵀu − aᵀμ̂)/√(aᵀΣ̂a). The coefficient block is
+# [free loadings; outer smooth coefficients], and the outer smooth is a
+# REAL BSplineApproximator (or ShapeConstrainedBSplineApproximator) over
+# [−xi, xi] held in the `outer` field — so every piece of the univariate
+# machinery, including the whole SCOP-spline construction, is reused by
+# composition rather than duplicated, and no existing type's behavior can
+# be perturbed by this one.
+
+"""
+    _si_loadings(a::SingleIndexApproximator, params_k) -> Vector
+
+The full length-`p` loading vector implied by a coefficient block. In
+anchored mode the stored parameters are the `p − 1` free loadings and
+`a[anchor]` is a hard 1; in free mode they are the loadings themselves.
+Eltype-generic, so `ForwardDiff.Dual` parameters propagate.
+"""
+function _si_loadings(a::SingleIndexApproximator, params_k::AbstractVector)
+    ni = _si_n_inner(a)
+    inner = params_k[1:ni]
+    a.anchor === nothing && return inner
+    k = a.anchor
+    T = eltype(inner)
+    [i == k ? one(T) : inner[i < k ? i : i - 1] for i in 1:a.p]
+end
+
+"""
+    index_loadings(a::SingleIndexApproximator, params) -> Vector{Float64}
+
+Report the fitted index direction from a full coefficient vector (e.g.
+`sol.parameters` restricted to this approximator's block).
+
+In anchored mode the loadings are returned on the anchor's own scale
+(`a[anchor] = 1`), which is what makes them directly comparable across
+fits. In free mode — where `z` is invariant under `a → c·a`, so the
+returned scale would otherwise be arbitrary — they are normalized to
+`‖a‖ = 1` with the sign fixed so the first non-negligible loading is
+positive.
+"""
+function index_loadings(a::SingleIndexApproximator, params::AbstractVector)
+    # `params` is this approximator's block, not the whole coefficient
+    # vector: without the check, a multi-approximator fit silently reports
+    # loadings read from whichever approximator happens to come first.
+    length(params) == nparams(a) || throw(ArgumentError(
+        "index_loadings(:$(a.name)): expected this approximator's own " *
+        "coefficient block of length $(nparams(a)), got $(length(params)). " *
+        "For a multi-approximator problem, slice the fitted vector to " *
+        "this approximator's range first."))
+    load = Float64.(_si_loadings(a, params))
+    a.anchor === nothing || return load
+    nrm = norm(load)
+    nrm > 0 || return load
+    load = load ./ nrm
+    k = findfirst(v -> abs(v) > 1e-8, load)
+    (k !== nothing && load[k] < 0) && (load = -load)
+    load
+end
+
+"""
+    build_single_index_evaluator(a::SingleIndexApproximator, params_k)
+
+Build the `p`-ARGUMENT callable `f(u₁, …, u_p) = s(z)` with
+`z = (aᵀu − aᵀμ̂)/√(aᵀΣ̂a)`.
+
+`(μ̂, Σ̂)` are the approximator's FIXED reference statistics; the evaluator
+never recomputes them, so the geometry of `z` is identical at every
+iteration of every solver no matter where the trajectory goes. `aᵀΣ̂a` is
+floored at `1e-8 · tr(Σ̂)/p · ‖a‖²`, a guard proportional to `‖a‖²` so it
+scales exactly like the numerator and therefore preserves the exact
+invariance of `z` under `a → c·a` (`c > 0`) even when it binds.
+
+Dual-safe in BOTH the parameters and the inputs: the loadings, the
+standardization, and the outer evaluator are all eltype-generic, which
+autodiff solvers and stiff ODE integrators with autodiff Jacobians
+require (states arrive as `Dual`s).
+"""
+function build_single_index_evaluator(a::SingleIndexApproximator,
+                                      params_k::AbstractVector)
+    (a.mu === nothing || a.Sigma === nothing) && error(
+        "SingleIndexApproximator(:$(a.name)): the reference statistics " *
+        "(μ̂, Σ̂) are unresolved. They are filled in by PSMProblem " *
+        "construction from the data; to build an evaluator from a bare " *
+        "approximator, construct it with index_stats=(mu, Sigma).")
+
+    ni = _si_n_inner(a)
+    load = _si_loadings(a, params_k)
+    outer_eval = build_evaluator(a.outer, params_k[(ni + 1):end])
+
+    μ̂, Σ̂, p = a.mu, a.Sigma, a.p
+    q = dot(load, Σ̂ * load)
+    floor_rel = 1e-8 * tr(Σ̂) / p
+    denom = sqrt(max(q, floor_rel * dot(load, load)))
+    centre = dot(load, μ̂)
+    nm = a.name
+
+    function single_index_eval(u...)
+        length(u) == p || throw(ArgumentError(
+            "SingleIndexApproximator(:$nm) is a function of $p arguments " *
+            "but was called with $(length(u)); the dynamics must pass " *
+            "exactly $p states, e.g. p.$nm(u[1], …, u[$p])"))
+        z = (sum(load[i] * u[i] for i in 1:p) - centre) / denom
+        outer_eval(z)
+    end
+    single_index_eval
+end
+
+"""
+    penalty_matrix(a::SingleIndexApproximator)
+
+Block-diagonal merge of the two penalties with FIXED relative weights:
+`inner_ridge · I` on the free loadings, and the outer smooth's own
+roughness penalty (`∫(s'')²` on unit knots, or the Pya & Wood SCOP
+first-difference penalty when the outer smooth is shape-constrained) on
+the outer coefficients.
+
+This is the single-λ view read by the gradient-matching and
+probabilistic-numerics penalty sites and by the MCMC/VI/ABC prior
+builder, which apply ONE weight per approximator. The
+penalized-likelihood solvers instead read [`penalty_blocks`](@ref) and
+give the inner and outer penalties SEPARATE smoothing parameters, in
+which case `inner_ridge` is irrelevant.
+"""
+function penalty_matrix(a::SingleIndexApproximator)
+    ni = _si_n_inner(a)
+    no = nparams(a.outer)
+    S = zeros(ni + no, ni + no)
+    for i in 1:ni
+        S[i, i] = a.inner_ridge
+    end
+    So = penalty_matrix(a.outer)
+    So === nothing || (S[(ni + 1):end, (ni + 1):end] .= So)
+    (S .+ S') ./ 2
+end
+
+"""
+    penalty_blocks(a::SingleIndexApproximator)
+
+Two disjoint blocks — the nested-effects structure of Fasiolo et al.
+(arXiv:2511.19234), where the inner transformation and the outer smooth
+carry independent smoothing parameters estimated jointly under LAML:
+
+1. `(I, 1:n_inner)` — a ridge on the free loadings. In anchored mode this
+   is a genuine, well-posed shrinkage of the index direction toward the
+   anchor variable, and its λ is identified by the marginal likelihood.
+   It also keeps the penalized Hessian non-singular when a loading is
+   weakly identified.
+2. `(S_outer, n_inner+1:end)` — the outer smooth's roughness penalty,
+   exactly as the corresponding univariate approximator supplies it.
+
+In free (`anchor = nothing`) mode the DATA term is exactly flat along
+`a → c·a`, so block 1 is minimized by `‖a‖ → 0`: use anchored mode with
+`LAML`/`GCVSolver` and keep free mode for the flat-objective solvers.
+"""
+function penalty_blocks(a::SingleIndexApproximator)
+    ni = _si_n_inner(a)
+    no = nparams(a.outer)
+    blocks = Tuple{Matrix{Float64}, UnitRange{Int}}[
+        (Matrix{Float64}(I, ni, ni), 1:ni)]
+    So = penalty_matrix(a.outer)
+    So === nothing || push!(blocks, (Matrix{Float64}(So), (ni + 1):(ni + no)))
+    blocks
+end
