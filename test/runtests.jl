@@ -5231,8 +5231,41 @@ end
             # PRE-FIX (measured): λ 0.0867 (masked) vs 0.5658 (pruned) —
             # 85% relative error — and EDF 2.691 vs 2.199 (22%).
             # POST-FIX: 2.7e-4 and 1.7e-5.
+            #
+            # λ tolerance WIDENED 0.02 -> 0.05 when `smoothing_params` was
+            # changed to report the θ β was actually fitted at (rather than
+            # the last, untested Fellner-Schall proposal — see the
+            # `theta_fit` comment in solver.jl). This is a REAL change, not
+            # a papered-over one, and it is one-sided: the MASKED fit's λ is
+            # bit-identical before and after (0.5658567355454274); only the
+            # PRUNED fit moved, 0.5658007 -> 0.5455690, so masked-vs-pruned
+            # agreement went from 9.9e-5 to 3.6e-2. The pre-fix closeness
+            # was coincidence — both sides happened to report proposals that
+            # nearly matched. Three things say the new value is the better
+            # one: on the pruned problem it attains a HIGHER LAML criterion
+            # than the number it replaced (74.172972 vs 74.172875); λ is
+            # barely identified here, that same 3.6% λ move buying only
+            # 9.6e-5 of criterion; and the quantities the denominator bug
+            # actually corrupted still agree tightly — EDF to 0.28% and σ̂²
+            # to 0.031% (both still asserted at rtol=0.02 below), with
+            # `data_loss` agreeing to 0.06% (3 significant figures). 0.05
+            # still separates fixed from broken by 17x (the bug gave 85%).
+            #
+            # The 3.6% gap is an artifact of the DEFAULT FD Jacobian, not of
+            # masking: under jac=:forwarddiff the same masked-vs-pruned
+            # comparison agrees to 5.9e-9 both before and after this fix.
+            # That is asserted below at rtol=1e-6, keeping a genuinely tight
+            # guard on λ equivalence — the 0.05 line above has only 1.4x
+            # headroom and would not catch a small regression on its own.
             @test isapprox(s_nm.smoothing_params[1], s_np.smoothing_params[1];
-                           rtol=0.02)
+                           rtol=0.05)
+            s_nm_fd = solve(mk_n(ts_n, vals_n, w_n),
+                            LAML(maxiters=40, verbose=false, jac=:forwarddiff))
+            s_np_fd = solve(mk_n(ts_n[keep_n], reshape(clean_n[keep_n], :, 1),
+                                 ones(length(keep_n), 1)),
+                            LAML(maxiters=40, verbose=false, jac=:forwarddiff))
+            @test isapprox(s_nm_fd.smoothing_params[1],
+                           s_np_fd.smoothing_params[1]; rtol=1e-6)
             @test isapprox(s_nm.edf, s_np.edf; rtol=0.02)
             @test isapprox(s_nm.convergence.sigma2, s_np.convergence.sigma2;
                            rtol=0.02)
@@ -9171,6 +9204,145 @@ end
         for s in (:TransformedCovariateApproximator, :lag_weights,
                   :smoothing_inertia, :transformed_covariate)
             @test s in names(PartiallySpecifiedModels)
+        end
+    end
+
+    @testset "LAML — reported λ̂ and β̂ are mutually consistent" begin
+        PSM = PartiallySpecifiedModels
+
+        # β̂ is the penalized MLE at λ̂ if and only if it is a FIXED POINT of
+        # the PCLS step at λ̂: one penalized-least-squares solve of the
+        # working linear model formed AT β̂, using B(λ̂), returns β̂ again.
+        # This refits β at `sol.smoothing_params` with the solver's own
+        # machinery (`_pcls_augmented_solve` — the same call `pcls_step`
+        # makes inside the IRLS loop) and reports how far it moves, relative
+        # to ‖β̂‖.
+        #
+        # This is not decoration. The IRLS loop carries THREE θ vectors (see
+        # the `theta_fit` comment in solver.jl) and used to report the
+        # newest Fellner-Schall PROPOSAL, which at loop exit is untested and
+        # is sometimes one the accept block explicitly rejected. On the
+        # two-λ fixture below that made `smoothing_params` disagree with
+        # `parameters` badly enough that this refit moved β by 77% of ‖β̂‖
+        # (measured), and the reported `objective` was 7.3e7 against a
+        # `data_loss` of 0.89 — the penalty evaluated at a λ the
+        # coefficients had never seen.
+        function pcls_refit_move(prob, sol)
+            beta = Float64.(vec(sol.parameters))
+            n_times = length(prob.data_times)
+            n_obs = length(prob.obs_to_state)
+            n_data = n_times * n_obs
+            n_p = length(beta)
+
+            S_list, uf_offsets, uf_nk = PSM.build_penalty_matrices(prob)
+            B = zeros(n_p, n_p)
+            for l in eachindex(S_list)
+                off, nk = uf_offsets[l], uf_nk[l]
+                for i in 1:nk, j in 1:nk
+                    B[off+i, off+j] += sol.smoothing_params[l] * S_list[l][i, j]
+                end
+            end
+
+            pred = PSM.simulate(prob, beta)
+            y = zeros(n_data); w = zeros(n_data); f = zeros(n_data)
+            k = 1
+            for oi in 1:n_obs, ti in 1:n_times
+                yv, wv = prob.data_values[ti, oi], prob.data_weights[ti, oi]
+                if PSM._usable(yv, wv)
+                    y[k] = yv; w[k] = wv
+                end
+                f[k] = pred[ti, oi]
+                k += 1
+            end
+
+            J = zeros(n_data, n_p)
+            PSM.compute_jacobian!(J, prob, beta, f, n_times, n_obs;
+                                  dam=fill(1e-8, n_p), jac=:fd)
+            w_irls = PSM.irls_weights(prob.likelihood, y, f, w)
+            z = y .- f .+ J * beta
+            beta_star = PSM._pcls_augmented_solve(J, z, B, w_irls)
+            norm(beta_star .- beta) / max(norm(beta), 1e-12)
+        end
+
+        # The reported tuple must be ONE coherent set: `objective` is
+        # ½(data_loss + β̂'S^λ̂β̂) using the SAME λ̂ and β̂ the solution
+        # reports. Guards against "fixing" the reported λ̂ alone while
+        # leaving the θ-dependent scalars computed at the other θ.
+        function reported_penalty(prob, sol)
+            beta = Float64.(vec(sol.parameters))
+            S_list, uf_offsets, uf_nk = PSM.build_penalty_matrices(prob)
+            p = 0.0
+            for l in eachindex(S_list)
+                off, nk = uf_offsets[l], uf_nk[l]
+                bl = beta[off+1:off+nk]
+                p += sol.smoothing_params[l] * dot(bl, S_list[l] * bl)
+            end
+            p
+        end
+
+        # ── Discriminating fixture: two penalized splines (hence two λ) on a
+        #    Lotka-Volterra system. The noise draws are hardcoded so the fit
+        #    is identical across Julia/RNG versions. Converged, so β̂ really
+        #    is stationary and the fixed-point test is not confounded by
+        #    truncation.
+        noise_H = [-0.60448, 0.36713, -0.25198, 2.28400, -1.68664,
+                   -0.22035, -1.89084]
+        noise_L = [-1.13449, 1.36343, 0.20909, 0.48198, 0.80718,
+                   -0.14331, -0.08570]
+        r_true_lv(H) = 0.7 * exp(-H / 60)
+        function lv_true_f1!(du, u, p, t)
+            H, L = u
+            du[1] = r_true_lv(H) * H - 0.01 * H * L
+            du[2] = 0.01 * H * L - 0.25 * L
+        end
+        function lv_2s!(du, u, p, t)
+            H, L = u
+            du[1] = p.r(H) * H - p.α * H * L
+            du[2] = p.α * H * L - p.δ(L) * L
+        end
+        dtimes_lv = collect(range(0.5, 13.5, length=7))
+        st_lv = OrdinaryDiffEq.solve(
+            ODEProblem(lv_true_f1!, [30.0, 40.0], (0.0, 14.0)), Tsit5();
+            saveat=dtimes_lv, abstol=1e-8, reltol=1e-8)
+        dvals_lv = hcat([st_lv(t)[1] for t in dtimes_lv] .+ 0.3 .* noise_H,
+                        [st_lv(t)[2] for t in dtimes_lv] .+ 0.3 .* noise_L)
+        prob_lv2 = PSMProblem(lv_2s!, [30.0, 40.0], (0.0, 14.0),
+            [BSplineApproximator(:r, (0.0, 80.0), 6; initial=x -> 0.4),
+             BSplineApproximator(:δ, (0.0, 100.0), 5; initial=x -> 0.25)];
+            data_times=dtimes_lv, data_values=dvals_lv, obs_to_state=[1, 2],
+            known_params=(α=0.01,), likelihood=Gaussian(), solver=Tsit5())
+        sol_lv2 = solve(prob_lv2, LAML(maxiters=60, verbose=false, warmup=3))
+
+        @test sol_lv2.convergence.converged
+        # Measured: 1.0e-3 with the fix, 0.77 without it — a 760x gap, so
+        # 1e-2 discriminates with a wide margin on both sides.
+        @test pcls_refit_move(prob_lv2, sol_lv2) < 1e-2
+        @test sol_lv2.objective ≈
+              0.5 * (sol_lv2.data_loss +
+                     reported_penalty(prob_lv2, sol_lv2)) rtol=1e-8
+        # …and the reported penalty is commensurate with the fit rather than
+        # dwarfing it: 0.0153 against a data loss of 0.888 (measured).
+        @test reported_penalty(prob_lv2, sol_lv2) < sol_lv2.data_loss
+
+        # ── The same invariant on two ordinary single-λ fixtures, so a
+        #    future regression is caught broadly and on both Jacobian
+        #    backends. Measured moves: 1.2e-8 (:fd) and 4.0e-9
+        #    (:forwarddiff).
+        Random.seed!(1234)
+        dt_eg = collect(0.0:0.5:10.0)
+        dv_eg = reshape(exp.(0.2 .* dt_eg) .+ 0.01 .* randn(length(dt_eg)), :, 1)
+        growth_f1!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        prob_eg = PSMProblem(growth_f1!, [1.0], (0.0, 10.0),
+            [BSplineApproximator(:r, (0.0, 5.0), 5; initial=x -> 0.05)];
+            data_times=dt_eg, data_values=dv_eg, obs_to_state=[1],
+            likelihood=Gaussian(), solver=Tsit5())
+        for alg_f1 in (LAML(maxiters=30, verbose=false),
+                       LAML(maxiters=30, verbose=false, jac=:forwarddiff))
+            sol_eg = solve(prob_eg, alg_f1)
+            @test pcls_refit_move(prob_eg, sol_eg) < 1e-4
+            @test sol_eg.objective ≈
+                  0.5 * (sol_eg.data_loss +
+                         reported_penalty(prob_eg, sol_eg)) rtol=1e-8
         end
     end
 
