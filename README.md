@@ -17,7 +17,7 @@ PartiallySpecifiedModels.jl provides a unified interface for specifying and fitt
 - **Basis function approximators** (B-splines, shape-constrained splines, Gaussian processes): fewer parameters, automatic smoothing via LAML/GCV, interpretable, and easy to constrain (monotonicity, convexity, positivity).
 - **Neural network approximators** (Lux.jl networks, COMONet): more flexible for high-dimensional or complex functional forms, compatible with gradient-based UDE-style training.
 
-The package builds on the [SciML ecosystem](https://sciml.ai/) and supports 23 fitting algorithms, 7 approximator types, 5 likelihood families, and 14 shape constraint types.
+The package builds on the [SciML ecosystem](https://sciml.ai/) and supports 23 fitting algorithms, 11 approximator types, 5 likelihood families, and 14 shape constraint types.
 
 ## Installation
 
@@ -116,10 +116,14 @@ PartiallySpecifiedModels.jl provides 23 solvers spanning penalized likelihood, g
 |-------------|-------------|------------|
 | `BSplineApproximator` | Cubic B-spline basis | Spline coefficients |
 | `ShapeConstrainedBSplineApproximator` | SCOP-spline (Pya & Wood 2015) | Constrained coefficients |
+| `TensorBSplineApproximator` | Bivariate tensor-product spline `f(x, y)` | Surface values on the knot grid |
+| `SingleIndexApproximator` | `f(u₁,…,u_p) = s(z)`, `z` the standardized index `aᵀu`: nested inner direction + outer smooth | Loadings + outer coefficients |
+| `TransformedCovariateApproximator` | `f(t) = s(z(t))`, `z` a standardized learned transform (adaptive exponential smoothing or distributed lag) of an exogenous covariate | Transform parameters + outer coefficients |
 | `SPDEApproximator` | Matérn SPDE penalty (Lindgren et al. 2011) | Mesh node values |
 | `ShapeConstrainedSPDEApproximator` | SPDE + shape constraints | Constrained mesh values |
 | `NeuralApproximator` | Lux.jl neural network | Network weights |
 | `GPApproximator` | Gaussian process | GP hyperparameters |
+| `ShapeConstrainedGPApproximator` | GP + SCOP shape constraints | Constrained inducing values |
 | `COMONetApproximator` | Constrained monotone network | exp(W) weights |
 
 ## Features

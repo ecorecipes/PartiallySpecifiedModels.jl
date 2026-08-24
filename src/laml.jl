@@ -107,7 +107,9 @@ function laml_objective(family::AbstractLikelihood,
 
     pen = dot(beta, S_lambda * beta)
 
-    # Exact for non-overlapping penalty blocks (one block per approximator):
+    # Exact for non-overlapping penalty blocks (guaranteed: by default one
+    # block per approximator, and `build_penalty_matrices` rejects any
+    # overlapping ranges a multi-block `penalty_blocks` type could declare):
     #   log|S_λ|₊ = Σ_k [ r_k·ρ_k + log|S_k|₊ ].
     # Eigen-decomposing the COMBINED S_λ with a relative tolerance let the
     # effective rank drop when λ's across blocks differed by ≳1e10,
@@ -598,8 +600,9 @@ end
 Indices of parameters not covered by any penalty block: approximators whose
 `penalty_matrix` is `nothing` (e.g. `NeuralApproximator` with
 `penalty_weight = 0`) or whose block was dropped for having fewer than 3
-parameters (see `build_penalty_matrices`). Returns an empty vector for
-pure-spline problems.
+parameters (the `np < 3` gate in the default `penalty_blocks` method), plus
+any local indices a multi-block `penalty_blocks` type leaves outside every
+declared range. Returns an empty vector for pure-spline problems.
 """
 function _unpenalized_indices(offsets::Vector{Int}, nknots_list::Vector{Int},
                               n_p::Int)

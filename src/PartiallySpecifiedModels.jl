@@ -10,8 +10,10 @@ shooting, adaptive gradient matching, rodeo, MCMC/HMC, MAGI, BNG, DALTON,
 pseudo-marginal, GCV, two-stage, derivative-free, variational, ABC-SMC,
 integral matching, profile likelihood, ensemble Kalman, ODIN, FGPGM, and
 RKHS)
-and 7 approximator types (B-spline, shape-constrained B-spline, SPDE,
-shape-constrained SPDE, neural network, Gaussian process, and COMONet).
+and 11 approximator types (B-spline, shape-constrained B-spline, tensor-product
+B-spline, single index, transformed covariate, SPDE, shape-constrained SPDE,
+neural network, Gaussian process, shape-constrained Gaussian process, and
+COMONet).
 
 Uses Laplace Approximate Marginal Likelihood (LAML) for automatic smoothing
 parameter estimation, following:
@@ -149,6 +151,9 @@ include("bootstrap.jl")
 # Exports — types
 export AbstractApproximator, BSplineApproximator, NeuralApproximator, GPApproximator, SPDEApproximator
 export TensorBSplineApproximator
+export SingleIndexApproximator, index_loadings
+export TransformedCovariateApproximator, lag_weights, smoothing_inertia,
+       transformed_covariate
 export ShapeConstrainedBSplineApproximator, ShapeConstrainedSPDEApproximator, SHAPE_CONSTRAINTS
 export ShapeConstrainedGPApproximator
 export COMONetApproximator, COMONET_CONSTRAINTS
@@ -166,7 +171,7 @@ export FGPGMSolver
 
 # Exports — functions
 export solve, simulate, predict
-export spline_penalty_matrix, penalty_matrix
+export spline_penalty_matrix, penalty_matrix, penalty_blocks
 export nparams, initial_params, build_evaluator
 export optimize_spde_range, with_range_param
 export residual_diagnostics, durbin_watson, residual_acf, semivariogram

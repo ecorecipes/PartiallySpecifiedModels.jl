@@ -1,6 +1,6 @@
 # Approximators
 
-PartiallySpecifiedModels.jl provides eight approximator types for representing unknown functions in dynamical systems. Each approximator is a callable object that maps scalar inputs to scalar outputs and is fitted as part of the model (the tensor-product approximator takes two scalar inputs).
+PartiallySpecifiedModels.jl provides eleven approximator types for representing unknown functions in dynamical systems. Each approximator is a callable object that maps scalar inputs to scalar outputs and is fitted as part of the model (the tensor-product approximator takes two scalar inputs; the single-index approximator takes `p`; the transformed-covariate approximator takes time).
 
 ## BSplineApproximator
 
@@ -57,6 +57,146 @@ Works with the through-the-solver and penalized-likelihood solvers (`AdamSolver`
 
 ```@docs
 TensorBSplineApproximator
+```
+
+## SingleIndexApproximator
+
+Unknown function of **several** states through **one learned direction**,
+``f(u_1, \dots, u_p) = s(z)`` with ``z = (a^\top u - a^\top \hat\mu)/\sqrt{a^\top \hat\Sigma a}``.
+The loadings ``a`` and the univariate outer smooth ``s`` are estimated jointly — the
+nested-effects construction of Fasiolo et al. (arXiv:2511.19234), where the inner
+transformation and the outer smooth carry separate smoothing parameters under LAML.
+
+```@example approx
+approx_si = SingleIndexApproximator(:f, 2, 10; xi = 2.5,
+                                    initial = z -> -0.05 - 0.1 * z)
+```
+
+With `index_stats = nothing` (the default) this approximator is **unresolved**:
+its standardization statistics are filled in at `PSMProblem` construction, which
+stores a *resolved copy*. Read fitted results back through the problem's own
+object — `prob.approximators[1]`, or `sol.unknown_functions[:f]` — since calling
+`build_evaluator` on the bare `approx_si` above raises an error telling you so.
+Pass `index_stats = (mu, Sigma)` if you would rather resolve it up front.
+
+- **`2`**: number of index arguments (`p`), called as `p.f(u[1], u[2])`
+- **`10`**: knots of the outer smooth, placed on ``[-\xi, \xi]`` in **standardized** units
+- **`anchor`** (keyword, default `1`): `a[anchor] ≡ 1` is not a parameter, which fixes both the scale and the sign of the index. The anchor variable must genuinely load
+- **`constraint`** (keyword, default `:none`): any of [`SHAPE_CONSTRAINTS`](@ref) makes the outer smooth the SCOP construction
+- **`index_stats`** (keyword): `(mu, Sigma)`; `nothing` (default) derives them once from the data at `PSMProblem` construction and then holds them **fixed** for the whole fit
+
+**When to prefer this to a tensor surface — and when not.** The advantage is
+**model match**, not orbit geometry. On the damped predator–prey fixture in the test suite,
+whose truth genuinely *is* an index, both types fit the data equally well but the single
+index extrapolates far better off the orbit: RMSE 0.00421 against the tensor's 0.02678 at
+off-orbit states whose index the data pin down, 0.0256 against 0.0815 over all off-orbit
+states, and 0.0112 against 0.0369 over the whole state box — with 11 coefficients where the
+tensor uses 25, recovering the true loadings to within 2%. Rebuild the same fixture with a
+truth that is *not* an index and the ranking reverses by a comparable or larger margin: an
+additive two-ridge truth gives 0.314 against the tensor's 0.054, a multiplicative
+interaction 0.207 against 0.070.
+
+So reach for a single index when you have reason to believe one direction drives the
+response (and when ``p > 2``, where no tensor type exists at all); reach for the tensor
+when you expect a genuine interaction. Usefully, **the misspecification is not silent**: on
+both non-index truths above the single index's `data_loss` was 27–66% worse than the
+tensor's, so a poor in-sample fit flags the wrong choice. One asymmetry to keep in mind when
+comparing: the single index carries **two** smoothing parameters (inner and outer) while the
+tensor's Kronecker-sum penalty carries **one**.
+
+Two honest caveats. First, the loadings need the state path to change direction. What
+defeats identification is **collinearity** — states moving along an (affinely) straight
+line in state space, where a rescaled ``a`` is absorbed into ``s``. Mere monotonicity is
+*not* enough to break it: on decay fixtures where every coordinate and the index itself
+decrease monotonically, the loadings were still recovered to 2%, because a curved path keeps
+changing its tangent direction. Second, ``\xi = 2`` covers ±2 standard deviations of the
+index; a strongly skewed orbit needs a larger `xi` (outside the knots the outer smooth
+extrapolates linearly, as everywhere else in the package).
+
+`confidence_band` works, and returns the band of the **outer curve** over the standardized
+index — the univariate payoff a tensor surface cannot offer.
+
+```@docs
+SingleIndexApproximator
+index_loadings
+```
+
+## TransformedCovariateApproximator
+
+Unknown function of **time** driven by an **exogenous covariate** through a learned
+transformation, ``f(t) = s(z(t))`` with ``z`` the standardized transform of a
+user-supplied series. Same nested-effects construction as
+[`SingleIndexApproximator`](@ref) (Fasiolo et al., arXiv:2511.19234) — a smooth
+composed with a learned inner statistic, each with its own smoothing parameter under
+LAML — but with a different inner transformation and a much simpler standardization.
+
+```@example approx
+times_tc = collect(0.0:1.0:120.0)
+temp_tc  = [18.0 + 7.0 * sin(2pi * t / 180 - pi / 3) for t in times_tc]
+approx_tc = TransformedCovariateApproximator(:beta, times_tc, temp_tc;
+                                             trans = :expsm, nknots = 8,
+                                             constraint = :increasing)
+nparams(approx_tc)   # 1 inertia parameter + 8 outer coefficients
+```
+
+In the dynamics it is a **one-argument callable of time**, the same convention every
+other time-varying unknown function in the package uses:
+
+```julia
+sir!(du, u, p, t) = begin
+    infection = p.beta(t) * u[1] * u[2] / p.N
+    du[1] = -infection
+    du[2] =  infection - p.gamma * u[2]
+end
+```
+
+- **`trans = :expsm`** — adaptive exponential smoothing,
+  ``\tilde s_i = \omega_i \tilde s_{i-1} + (1 - \omega_i) x_i`` with
+  ``\omega_i = \mathrm{logistic}(\tilde w_i^\top a)``. By default **one** parameter, a
+  constant inertia; extra columns of the covariate matrix are auxiliary covariates that
+  make the inertia adaptive. The scientific case: transmission responding to temperature
+  with a learned *thermal lag*.
+- **`trans = :lagindex`** — a distributed lag ``\sum_\ell a_\ell x(t - \ell\Delta)`` over a
+  window of `lags` samples, with the paper's **smooth-lag prior** (a first-difference
+  penalty on the lag weights) and the same anchor identification the single index uses:
+  `a[anchor] ≡ 1` fixes both the scale and the sign.
+- **`constraint`** (keyword): any of [`SHAPE_CONSTRAINTS`](@ref) makes the outer response
+  curve the SCOP construction — e.g. a response guaranteed monotone in smoothed temperature.
+- **`xi`** (keyword, default 2.0): the outer smooth spans ``[-\xi, \xi]`` in **standardized**
+  covariate units. So `domain` is *not* time, and [`confidence_band`](@ref) accordingly
+  reports the band of the **response curve** ``s(z)``, not of ``f(t)``.
+
+**Why this is the easy half of the nested construction.** The single index standardizes
+against the fitted *trajectory*, which moves during the fit, so it must freeze reference
+statistics at `PSMProblem` construction and lives in an "unresolved" state until then. Here
+the covariate is **fixed data**, so the paper's recipe — standardize the transformed series
+to mean 0 and variance 1 over the sample — applies verbatim, ``z`` depends smoothly on the
+transform parameters alone, and none of that machinery is needed: the approximator is
+complete at construction and `build_evaluator` works on a bare object.
+
+**Two practical cautions, both measured.** First, ``f(t)`` is piecewise linear in ``t``
+between covariate times, so prefer `jac = :forwarddiff` on `LAML`/`GCVSolver`/`CollocationLAML`:
+on the SIR recovery fixture in the test suite the default finite-difference prediction
+Jacobian **lands at a badly worse optimum, and in the default run configuration calls it a
+success** — between 130 and 1500 nats worse than `jac = :forwarddiff`'s 481.0 (inner
+smoothing parameter 11.56, converged), depending on the environment. The gap is not worth
+quoting precisely: the finite-difference optimum is chaotic in the exact arithmetic, shifting
+~130 nats and six orders of magnitude in the inner λ between BLAS thread counts, and it exits
+`:maxiters` under `--check-bounds=yes` while claiming convergence without it. The lesson is
+qualitative — use `:forwarddiff` here and check the convergence flag. Second, the inner
+transformation is **much more weakly identified than the response curve**. Standardization
+removes the amplitude damping that different ``\omega`` apply to the covariate, leaving only a
+phase lag: on that fixture `cor(z(ω=0.8), z(ω=0.7)) = 0.9976`. The estimator is consistent —
+``\hat\omega`` = 0.687, 0.763, 0.791 as the observation noise falls through 3.0, 1.0, 0.25
+against a truth of 0.8 — but at realistic noise LAML shrinks it toward ``\omega = 1/2``, while
+the response curve itself is recovered to an RMSE of 0.0088 on a ``\beta`` ranging over
+0.185–0.395. Read the inner parameters as a regularized summary, not a sharp estimate.
+
+```@docs
+TransformedCovariateApproximator
+lag_weights
+smoothing_inertia
+transformed_covariate
 ```
 
 ## ShapeConstrainedBSplineApproximator

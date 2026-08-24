@@ -41,6 +41,69 @@ end
 # A type implementing none of the interface, for the fallback-error test.
 struct NotAnApproximator end
 
+# ─── Two-block approximator for the "N0: penalty_blocks" testset ──
+# f(x) = β₁·sin(ωx) + β₂·cos(ωx) + Σⱼ βⱼ₊₂·hatⱼ(x): a rough two-parameter
+# Fourier block under a ridge penalty (range 1:2 — BELOW the historical
+# np ≥ 3 gate, which multi-block types may bypass) plus a piecewise-linear
+# hat-basis block under a second-difference penalty (range 3:np).
+# penalty_matrix is the fixed-weight block-diagonal merge for the single-λ
+# consumers, per the penalty_blocks contract.
+struct TwoBlockApproximator <: PartiallySpecifiedModels.AbstractApproximator
+    name::Symbol
+    domain::Tuple{Float64, Float64}
+    nknots::Int
+    omega::Float64
+end
+PartiallySpecifiedModels.nparams(a::TwoBlockApproximator) = 2 + a.nknots
+PartiallySpecifiedModels.initial_params(a::TwoBlockApproximator) =
+    zeros(2 + a.nknots)
+function PartiallySpecifiedModels.penalty_blocks(a::TwoBlockApproximator)
+    S1 = Matrix{Float64}(I, 2, 2)
+    S2 = spline_penalty_matrix(collect(range(0.0, 1.0, length=a.nknots)))
+    Tuple{Matrix{Float64}, UnitRange{Int}}[(S1, 1:2), (S2, 3:(2 + a.nknots))]
+end
+function PartiallySpecifiedModels.penalty_matrix(a::TwoBlockApproximator)
+    np = 2 + a.nknots
+    S = zeros(np, np)
+    for (Sb, r) in PartiallySpecifiedModels.penalty_blocks(a)
+        S[r, r] .= Sb
+    end
+    S
+end
+function PartiallySpecifiedModels.build_evaluator(a::TwoBlockApproximator,
+                                                  params_k)
+    lo, hi = a.domain
+    nk = a.nknots
+    om = a.omega
+    h = (hi - lo) / (nk - 1)
+    coeffs = params_k   # eltype-generic: may be Dual-valued
+    function twoblock_eval(x)
+        u = (x - lo) / h
+        j = clamp(floor(Int, u), 0, nk - 2)
+        t = u - j
+        coeffs[1] * sin(om * x) + coeffs[2] * cos(om * x) +
+            coeffs[3 + j] * (1 - t) + coeffs[4 + j] * t
+    end
+    twoblock_eval
+end
+
+# Malformed penalty_blocks variants for the build_penalty_matrices
+# validation tests (the validator touches only nparams + penalty_blocks).
+struct BadBlocksApproximator <: PartiallySpecifiedModels.AbstractApproximator
+    name::Symbol
+    kind::Symbol   # :overlap | :out_of_range | :size_mismatch | :asymmetric
+end
+PartiallySpecifiedModels.nparams(a::BadBlocksApproximator) = 6
+PartiallySpecifiedModels.initial_params(a::BadBlocksApproximator) = zeros(6)
+function PartiallySpecifiedModels.penalty_blocks(a::BadBlocksApproximator)
+    I3 = Matrix{Float64}(I, 3, 3)
+    a.kind === :overlap       ? [(I3, 1:3), (I3, 3:5)] :
+    a.kind === :out_of_range  ? [(Matrix{Float64}(I, 4, 4), 4:7)] :
+    a.kind === :size_mismatch ? [(Matrix{Float64}(I, 2, 2), 1:3)] :
+    a.kind === :strided        ? [(I3, 1:2:5)] :
+                                [([1.0 2.0; 0.0 1.0], 1:2)]
+end
+
 @testset "PartiallySpecifiedModels.jl" begin
 
     # Deterministic suite: all unseeded rand/randn sites below draw from
@@ -7392,6 +7455,1723 @@ struct NotAnApproximator end
         # magnitude win. End-to-end (LAML maxiters=20 on the problem above):
         # 6.1s → 0.04s; GCVSolver: 1.1s → 0.01s; CollocationLAML: 2.5s →
         # 0.65s (its Jacobian is dominated by the pointwise state blocks).
+    end
+
+    # ─── N0: penalty_blocks — multiple penalty blocks per approximator ──
+
+    @testset "N0: penalty_blocks" begin
+        PSM = PartiallySpecifiedModels
+
+        @testset "penalty_blocks default equivalence" begin
+            a_pb = BSplineApproximator(:f, (0.0, 1.0), 10)
+            pb = penalty_blocks(a_pb)
+            @test pb isa Vector{Tuple{Matrix{Float64}, UnitRange{Int}}}
+            @test length(pb) == 1
+            @test pb[1][1] == penalty_matrix(a_pb)
+            @test pb[1][2] == 1:10
+
+            # np < 3 gate (moved from build_penalty_matrices into the
+            # default method): a 2-parameter type with a non-nothing
+            # penalty_matrix still contributes no default block.
+            p2 = PolyApproximator(:h, (0.0, 1.0), 1)
+            @test penalty_matrix(p2) !== nothing
+            @test penalty_blocks(p2) ==
+                  Tuple{Matrix{Float64}, UnitRange{Int}}[]
+
+            # penalty_matrix === nothing ⟹ no blocks
+            import Lux
+            model_pb = Lux.Chain(Lux.Dense(1, 4, tanh), Lux.Dense(4, 1))
+            na0 = NeuralApproximator(:g, model_pb; rng_seed=42)
+            @test penalty_matrix(na0) === nothing   # penalty_weight = 0
+            @test isempty(penalty_blocks(na0))
+            naw = NeuralApproximator(:g, model_pb; rng_seed=42,
+                                     penalty_weight=0.1)
+            pbw = penalty_blocks(naw)
+            @test length(pbw) == 1 && pbw[1][2] == 1:nparams(naw)
+        end
+
+        @testset "build_penalty_matrices enumeration (old semantics)" begin
+            # Two penalized approximators with an unpenalized-by-gate
+            # 2-param type between them: the enumerated lists must match
+            # the historical (per-approximator, np ≥ 3, S ≠ nothing)
+            # semantics exactly.
+            dyn_pb!(du, u, p, t) = (du[1] = 0.0)
+            r_pb = BSplineApproximator(:r, (0.0, 1.0), 8)
+            h_pb = PolyApproximator(:h, (0.0, 1.0), 1)  # 2 params ⟹ gated
+            g_pb = BSplineApproximator(:g, (0.0, 1.0), 6)
+            prob_pb = PSMProblem(dyn_pb!, [1.0], (0.0, 1.0),
+                [r_pb, h_pb, g_pb];
+                data_times=[0.0, 0.5, 1.0],
+                data_values=reshape(zeros(3), :, 1),
+                obs_to_state=[1], known_params=NamedTuple(),
+                likelihood=PSM.Gaussian())
+            S_list_pb, offs_pb, nks_pb = PSM.build_penalty_matrices(prob_pb)
+            @test length(S_list_pb) == 2
+            @test S_list_pb[1] == penalty_matrix(r_pb)
+            @test S_list_pb[2] == penalty_matrix(g_pb)
+            @test offs_pb == [0, 10]  # g starts after r's 8 + h's 2 params
+            @test nks_pb == [8, 6]    # block sizes
+
+            # Multi-block type PRECEDED by another approximator: this is
+            # the one case that exercises the global-offset composition
+            # `approx_offset + first(local_range) - 1` on a range whose
+            # first index is not 1. A slip here silently mis-assigns λ to
+            # the wrong coefficients.
+            t_pb = BSplineApproximator(:t, (0.0, 1.0), 5)
+            tb_pb = TwoBlockApproximator(:f, (0.0, 3.0), 6, 6.0)
+            prob_pb2 = PSMProblem(dyn_pb!, [1.0], (0.0, 1.0), [t_pb, tb_pb];
+                data_times=[0.0, 0.5, 1.0],
+                data_values=reshape(zeros(3), :, 1),
+                obs_to_state=[1], known_params=NamedTuple(),
+                likelihood=PSM.Gaussian())
+            S_pb2, offs_pb2, nks_pb2 = PSM.build_penalty_matrices(prob_pb2)
+            # t: one block at 0 (5 params); f: ridge on local 1:2 ⟹ global
+            # offset 5, spline on local 3:8 ⟹ global offset 5 + 3 - 1 = 7
+            @test offs_pb2 == [0, 5, 7]
+            @test nks_pb2 == [5, 2, 6]
+            @test length(S_pb2) == 3
+            # blocks land inside their own approximator's coefficient span
+            @test offs_pb2[3] + nks_pb2[3] == nparams(t_pb) + nparams(tb_pb)
+        end
+
+        @testset "build_penalty_matrices validation" begin
+            dyn_pb!(du, u, p, t) = (du[1] = 0.0)
+            mkprob_pb(a) = PSMProblem(dyn_pb!, [1.0], (0.0, 1.0), [a];
+                data_times=[0.0, 0.5, 1.0],
+                data_values=reshape(zeros(3), :, 1),
+                obs_to_state=[1], known_params=NamedTuple(),
+                likelihood=PSM.Gaussian())
+            @test_throws ArgumentError PSM.build_penalty_matrices(
+                mkprob_pb(BadBlocksApproximator(:bad, :overlap)))
+            err_pb = try
+                PSM.build_penalty_matrices(
+                    mkprob_pb(BadBlocksApproximator(:bad, :overlap)))
+                nothing
+            catch e; e; end
+            @test err_pb isa ArgumentError
+            @test occursin(":bad", err_pb.msg)      # names the approximator
+            @test occursin("disjoint", err_pb.msg)  # explains the rule
+            @test_throws ArgumentError PSM.build_penalty_matrices(
+                mkprob_pb(BadBlocksApproximator(:bad, :out_of_range)))
+            @test_throws ArgumentError PSM.build_penalty_matrices(
+                mkprob_pb(BadBlocksApproximator(:bad, :size_mismatch)))
+            @test_throws ArgumentError PSM.build_penalty_matrices(
+                mkprob_pb(BadBlocksApproximator(:bad, :asymmetric)))
+            # Strided/non-contiguous ranges must be REJECTED, not silently
+            # reinterpreted: a block is recorded as (offset, length), so
+            # 1:2:5 would become the contiguous 1:3 and penalize the wrong
+            # coefficients.
+            @test_throws ArgumentError PSM.build_penalty_matrices(
+                mkprob_pb(BadBlocksApproximator(:bad, :strided)))
+        end
+
+        # ── Shared two-block fixture: linear forcing problem du = f(t),
+        # u(t) = ∫₀ᵗ f. Chosen over a decay du = −r(u)·u because the model
+        # is LINEAR in the coefficients: the prediction Jacobian is exact
+        # and constant, the IRLS is deterministic, and the two blocks are
+        # identifiable by construction — 6 hats (spacing 0.5) cannot track
+        # the ω = 6 carrier (period ≈ 1.05), so the Fourier block must
+        # carry it. The two blocks then want genuinely different smoothing:
+        # the ridge sees two strongly-identified Fourier coefficients it
+        # can barely improve on (λ₁ settles at the larger value), while the
+        # hat part is a linear trend plus a gentle arch — nearly in the
+        # curvature penalty's null space, so λ₂ goes small. Measured
+        # λ = [3.72e-4, 6.69e-5], i.e. λ₁ ≈ 5.6 λ₂, matching the
+        # log(λ₁/λ₂) > 0.5 assertion below. ──
+        om_n0 = 6.0
+        a_n0 = TwoBlockApproximator(:f, (0.0, 3.0), 6, om_n0)
+        f_true_n0(t) = 0.8 * sin(om_n0 * t) + 1.0 + 0.5 * t +
+                       0.3 * sin(pi * t / 3.0)
+        F_true_n0(t) = 0.8 * (1.0 - cos(om_n0 * t)) / om_n0 + t +
+                       0.25 * t^2 +
+                       0.3 * (3.0 / pi) * (1.0 - cos(pi * t / 3.0))
+        dyn_n0!(du, u, p, t) = (du[1] = p.f(t))
+        tt_n0 = collect(range(0.0, 3.0, length=61))
+        dv_n0 = reshape(F_true_n0.(tt_n0) .+
+                        0.01 .* randn(StableRNG(42), length(tt_n0)), :, 1)
+        prob_n0 = PSMProblem(dyn_n0!, [0.0], (0.0, 3.0), [a_n0];
+                             data_times=tt_n0, data_values=dv_n0,
+                             obs_to_state=[1], known_params=NamedTuple(),
+                             likelihood=PSM.Gaussian())
+        S_n0, offs_n0, nks_n0 = PSM.build_penalty_matrices(prob_n0)
+
+        @testset "two-block LAML fit: per-block smoothing parameters" begin
+            # One approximator, TWO enumerated blocks at the right offsets
+            @test offs_n0 == [0, 2]
+            @test nks_n0 == [2, 6]
+            # jac=:forwarddiff because THIS FIXTURE'S EVALUATOR IS ONLY C⁰
+            # (the hat basis indexes via floor/clamp), not because the
+            # penalty is multi-block. The kink makes adaptive step control
+            # inject noise into the FD prediction Jacobian, and the λ
+            # search then stalls at a NON-STATIONARY point while reporting
+            # converged=true: under FD the fit lands 8.3 nats BELOW the
+            # exact profiled-REML optimum (β̂₁ ≈ 0.51-0.54, sup-error
+            # 0.38-0.47, varying with the dependency versions in play);
+            # under AD it lands exactly ON the global optimum
+            # V* = 252.2294 (β̂₁ = 0.801, sup-error 0.0118). A single-block
+            # control on this same C⁰ basis fails under FD just as badly
+            # (gap 0.002-9.3 nats), and a C² B-spline analogue is clean
+            # under FD at one AND two blocks — so this is evaluator
+            # smoothness, NOT a multi-block property. Custom approximators
+            # with kinks or branches should prefer jac=:forwarddiff
+            # regardless of how many penalty blocks they declare.
+            sol_n0 = solve(prob_n0, LAML(maxiters=80, jac=:forwarddiff))
+            lam_n0 = sol_n0.smoothing_params
+            # TWO per-block smoothing parameters, finite, and genuinely
+            # different (measured λ = [3.72e-4, 6.69e-5]: log-ratio 1.71,
+            # pinned at > 0.5 — deterministic under StableRNG(42), with
+            # only BLAS-level wiggle remaining)
+            @test length(lam_n0) == 2
+            @test all(isfinite, lam_n0) && all(>(0), lam_n0)
+            @test log(lam_n0[1] / lam_n0[2]) > 0.5
+            # Recovery of the truth (measured sup-error 0.0118 on [0, 3]
+            # against a signal of range ≈ [0.2, 3.3]; pinned with ~8×)
+            fh_n0 = sol_n0.unknown_functions[:f]
+            g_n0 = collect(range(0.0, 3.0, length=49))
+            @test maximum(abs.(fh_n0.(g_n0) .- f_true_n0.(g_n0))) < 0.1
+            # The rough block's leading coefficient (truth 0.8;
+            # measured 0.801)
+            @test abs(sol_n0.parameters.f[1] - 0.8) < 0.1
+            @test sol_n0.convergence.converged
+        end
+
+        # Exact prediction Jacobian of the LINEAR forcing model: column j
+        # is the trajectory under the j-th unit coefficient vector (u0 = 0).
+        np_n0 = nparams(a_n0)
+        J_n0 = zeros(length(tt_n0), np_n0)
+        for j in 1:np_n0
+            ej_n0 = zeros(np_n0); ej_n0[j] = 1.0
+            J_n0[:, j] = PSM.simulate(prob_n0, ej_n0)[:, 1]
+        end
+
+        @testset "two-block LAML gradient matches finite differences" begin
+            # The suite's frozen-working-model FD harness (see "LAML
+            # gradient matches finite differences" above), with the two
+            # blocks coming from ONE approximator via build_penalty_matrices
+            # — the T11-class objective/gradient desync detector for the
+            # per-block enumeration (including the rank-2 ridge block below
+            # the historical np ≥ 3 gate: Mp = 8 − (2 + 4) = 2).
+            using PartiallySpecifiedModels: laml_objective, laml_gradient,
+                                            build_S_lambda, _safe_inv
+            n_g = length(tt_n0)
+            w_g = ones(n_g)
+            y_g2 = dv_n0[:, 1]
+            function fd_vs_analytic_n0(family, yv, W, rho)
+                S_lam = build_S_lambda(S_n0, offs_n0, nks_n0, rho, np_n0)
+                beta = _safe_inv(J_n0' * Diagonal(W) * J_n0 + S_lam) *
+                       (J_n0' * (W .* yv))
+                mu = J_n0 * beta
+                _, H, _, sigma2 = laml_objective(family, beta, J_n0, W, w_g,
+                                                 yv, mu, S_n0, offs_n0,
+                                                 nks_n0, rho, np_n0)
+                g = laml_gradient(family, beta, S_n0, offs_n0, nks_n0,
+                                  rho, np_n0, H, sigma2)
+                h = 1e-4
+                gfd = map(eachindex(rho)) do k
+                    rp = copy(rho); rp[k] += h
+                    rm = copy(rho); rm[k] -= h
+                    Vp, = laml_objective(family, beta, J_n0, W, w_g, yv, mu,
+                                         S_n0, offs_n0, nks_n0, rp, np_n0)
+                    Vm, = laml_objective(family, beta, J_n0, W, w_g, yv, mu,
+                                         S_n0, offs_n0, nks_n0, rm, np_n0)
+                    (Vp - Vm) / (2h)
+                end
+                (g, collect(gfd))
+            end
+            # Same tolerance rationale as the harness above: observed
+            # agreement ≤ 3e-5 relative; rtol 1e-3 catches any O(1) slip.
+            for rho in ([-2.0, 1.0], [0.0, 0.0], [3.0, -1.0], [5.0, 4.0])
+                g, gfd = fd_vs_analytic_n0(Gaussian(), y_g2, w_g, rho)
+                @test g ≈ gfd rtol=1e-3 atol=1e-6
+            end
+            # Non-Gaussian branch (identity link ⟹ IRLS weights 1/μ,
+            # frozen at count-like pseudo-data)
+            y_pois_n0 = max.(round.(4.0 .* (y_g2 .+ 1.0)), 1.0)
+            W_pois_n0 = 1.0 ./ y_pois_n0
+            for rho in ([-1.0, 2.0], [2.0, 0.0])
+                g, gfd = fd_vs_analytic_n0(Poisson(), y_pois_n0,
+                                           W_pois_n0, rho)
+                @test g ≈ gfd rtol=1e-3 atol=1e-6
+            end
+        end
+
+        @testset "two-block GCV: direct vs reuse" begin
+            n_gc = length(tt_n0)
+            w_gc = ones(n_gc)
+            z_gc = dv_n0[:, 1]
+            m_gc = length(S_n0)
+            # VALUE-basis working model J_v[i,j] = ϕⱼ(tᵢ) for the
+            # score-level equivalence (search equivalence is a property of
+            # the machinery, not of one working model — and the integral
+            # basis has cond(J'J) near the reuse-path whitening guard,
+            # which limits agreement to ~1e-6 for no diagnostic gain).
+            J_v = zeros(n_gc, np_n0)
+            for j in 1:np_n0
+                ej_v = zeros(np_n0); ej_v[j] = 1.0
+                phi_v = PSM.build_evaluator(a_n0, ej_v)
+                J_v[:, j] = phi_v.(tt_n0)
+            end
+
+            # ── Per-λ score equivalence on the W10 pencil shapes, at BLOCK
+            # granularity: the shared pencil λ·ΣₗSₗ plus each coordinate's
+            # (S_base = other block at fixed ρ, S_pen = this block) — the
+            # exact matrices the reuse factory builds inside
+            # _coordinate_gcv. Measured worst relative disagreement
+            # (score, tr(A), β̂ over 20 λ, ρ ≤ 13): 2.1e-7 — the embedded
+            # single-block pencils have a 6-dim whitened null space whose
+            # replicated stability ridge carries λ·eps error (the W10
+            # rank-deficient analysis; a block-wiring error would be O(1)).
+            # Pinned with ~50× margin.
+            pencils_gc = Any[(zeros(np_n0, np_n0),
+                              PSM.build_S_lambda(S_n0, offs_n0, nks_n0,
+                                                 zeros(m_gc), np_n0))]
+            rho_cur_gc = [1.3, -2.1]
+            for k in 1:m_gc
+                idx = [j for j in 1:m_gc if j != k]
+                push!(pencils_gc,
+                      (PSM.build_S_lambda(S_n0[idx], offs_n0[idx],
+                                          nks_n0[idx], rho_cur_gc[idx],
+                                          np_n0),
+                       PSM.build_S_lambda(S_n0[k:k], offs_n0[k:k],
+                                          nks_n0[k:k], [0.0], np_n0)))
+            end
+            navail_gc = 0
+            for (S_base, S_pen) in pencils_gc
+                fam = PSM._gcv_reuse_family(J_v, w_gc, z_gc, S_base, S_pen,
+                                            n_gc, 1.4)
+                fam === nothing && continue
+                navail_gc += 1
+                worst = 0.0
+                for lam in exp.(range(PSM.RHO_MIN, 13.0, length=20))
+                    gf, bf, _, tf = fam(lam)
+                    gd, bd, _, td = PSM._gcv_score(J_v, w_gc, z_gc,
+                                                   S_base .+ lam .* S_pen,
+                                                   n_gc, 1.4)
+                    worst = max(worst,
+                                abs(gf - gd) / max(abs(gd), 1e-300),
+                                abs(tf - td) / max(td, 1e-300),
+                                norm(bf - bd) / max(norm(bd), 1e-300))
+                end
+                @test worst < 1e-5
+            end
+            @test navail_gc == 3   # all three pencils took the fast path
+
+            # ── Fixed-working-model multi-λ coordinate descent over the
+            # two blocks of ONE approximator: direct scorer vs the reuse
+            # family factory must find the same optimum (measured
+            # |Δρ| = 8.5e-4 — golden-section paths may part ways below the
+            # search tolerance — and |ΔGCV| relative 1.6e-14).
+            scorer_gc = S_lam -> PSM._gcv_score(J_v, w_gc, z_gc, S_lam,
+                                                n_gc, 1.4)
+            fac_gc = function (rv, k)
+                idx = [j for j in 1:m_gc if j != k]
+                PSM._gcv_reuse_family(J_v, w_gc, z_gc,
+                    PSM.build_S_lambda(S_n0[idx], offs_n0[idx],
+                                       nks_n0[idx], rv[idx], np_n0),
+                    PSM.build_S_lambda(S_n0[k:k], offs_n0[k:k],
+                                       nks_n0[k:k], [0.0], np_n0),
+                    n_gc, 1.4)
+            end
+            rd_gc, _, gd_gc, _ = PSM._coordinate_gcv(
+                scorer_gc, S_n0, offs_n0, nks_n0, np_n0,
+                [0.0, 0.0], 1e-6; sweeps=4)
+            rr_gc, _, gr_gc, _ = PSM._coordinate_gcv(
+                scorer_gc, S_n0, offs_n0, nks_n0, np_n0,
+                [0.0, 0.0], 1e-6; sweeps=4, family_factory=fac_gc)
+            @test abs(gd_gc - gr_gc) < 1e-8 * max(abs(gd_gc), 1e-300)
+            @test maximum(abs.(rd_gc .- rr_gc)) < 0.1
+
+            # ── End-to-end: both searches complete the full IRLS solve
+            # with TWO per-block λs, recover the truth, and agree at the
+            # W10 conventions. jac=:forwarddiff again for the fixture's C⁰
+            # basis (see the LAML testset above), not for any multi-block
+            # reason: the kink-driven FD Jacobian noise perturbs the two
+            # searches' working models differently, and the ridge-block
+            # coordinate is nearly flat in GCV (shrinking two strongly-
+            # identified coefficients has no bias–variance sweet spot), so
+            # score-level differences flip golden-section basins and IRLS
+            # feedback amplifies them to O(1) λ̂ disagreements. A C²
+            # B-spline analogue tracks fine under plain FD at two blocks,
+            # as does the pre-existing W10 two-approximator test. With AD
+            # the working models are identical and the searches track:
+            # measured |Δ log λ̂| = 9.1e-6, objective relΔ 5.1e-9, fitted
+            # gap 1.7e-6, both sup-errors 0.0102 — ~100× margins per W10.
+            sd_gc = solve(prob_n0, GCVSolver(maxiters=15,
+                                             jac=:forwarddiff))
+            sr_gc = solve(prob_n0, GCVSolver(maxiters=15, search=:reuse,
+                                             jac=:forwarddiff))
+            g_gc = collect(range(0.3, 2.7, length=49))
+            for s in (sd_gc, sr_gc)
+                @test length(s.smoothing_params) == 2
+                @test all(isfinite, s.smoothing_params)
+                @test all(>(0), s.smoothing_params)
+                fh = s.unknown_functions[:f]
+                @test maximum(abs.(fh.(g_gc) .- f_true_n0.(g_gc))) < 0.1
+            end
+            @test all(abs.(log.(sd_gc.smoothing_params) .-
+                           log.(sr_gc.smoothing_params)) .< 1e-3)
+            @test abs(sd_gc.objective - sr_gc.objective) <
+                  1e-6 * max(abs(sd_gc.objective), 1.0)
+            @test maximum(abs.(sd_gc.fitted_values .-
+                               sr_gc.fitted_values)) < 1e-4
+        end
+    end
+
+
+    # ─── SingleIndexApproximator (nested inner direction + outer smooth) ──
+
+    @testset "SingleIndexApproximator — construction and validation" begin
+        # p, nknots, xi, anchor, constraint
+        @test_throws ArgumentError SingleIndexApproximator(:g, 1, 8)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 2)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 3;
+                                                           constraint=:increasing)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8; xi=0.0)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8; xi=-1.0)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8; xi=Inf)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8; anchor=0)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8; anchor=3)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8;
+                                                           constraint=:wiggly)
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8;
+                                                           inner_ridge=-1.0)
+        # states must be p distinct positive indices
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8; states=[1])
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8; states=[2, 2])
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8; states=[0, 1])
+
+        # index_stats validation: shape, symmetry, PSD, non-degenerate
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8;
+            index_stats=([0.0], Matrix(1.0I, 2, 2)))
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8;
+            index_stats=(zeros(2), Matrix(1.0I, 3, 3)))
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8;
+            index_stats=(zeros(2), [1.0 0.5; 0.1 1.0]))
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8;
+            index_stats=(zeros(2), [1.0 2.0; 2.0 1.0]))     # eigenvalue −1
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8;
+            index_stats=(zeros(2), zeros(2, 2)))            # zero trace
+        @test_throws ArgumentError SingleIndexApproximator(:g, 2, 8;
+            index_stats=zeros(2))                           # not a pair
+        # a singular but non-zero-trace Σ̂ is ACCEPTED (the evaluator floors
+        # aᵀΣ̂a, so a rank-deficient reference covariance is usable)
+        @test SingleIndexApproximator(:g, 2, 8;
+            index_stats=(zeros(2), [1.0 1.0; 1.0 1.0])) isa SingleIndexApproximator
+
+        stats2 = ([1.0, 2.0], [1.0 0.2; 0.2 2.0])
+        a = SingleIndexApproximator(:g, 2, 8; index_stats=stats2)
+        @test a.name == :g
+        @test a.p == 2
+        @test a.anchor == 1
+        @test a.constraint == :none
+        @test a.domain == (-2.0, 2.0)                       # (−xi, xi)
+        @test a.states == [1, 2]
+        @test nparams(a) == 1 + 8                           # p−1 loadings + outer
+        @test initial_params(a)[1] == 1.0                   # equal weights
+        @test initial_params(a)[2:end] == zeros(8)
+        # free mode keeps all p loadings
+        af = SingleIndexApproximator(:g, 3, 8; anchor=nothing,
+                                     index_stats=(zeros(3), Matrix(1.0I, 3, 3)))
+        @test nparams(af) == 3 + 8
+        @test initial_params(af)[1:3] == ones(3)
+        # a shape-constrained outer smooth follows the SCOP parameter count,
+        # including the zero-endpoint reduction
+        ac = SingleIndexApproximator(:g, 2, 8; constraint=:increasing,
+                                     index_stats=stats2)
+        @test nparams(ac) == 1 + 8
+        acz = SingleIndexApproximator(:g, 2, 8; constraint=:inc_zero_left,
+                                      index_stats=stats2)
+        @test nparams(acz) == 1 + 7
+        # xi widens the outer knot span
+        @test SingleIndexApproximator(:g, 2, 8; xi=5.0,
+                                      index_stats=stats2).domain == (-5.0, 5.0)
+        # an initial outer curve is sampled on the standardized knot grid
+        ai = SingleIndexApproximator(:g, 2, 5; index_stats=stats2,
+                                     initial=z -> 3.0 + z)
+        @test initial_params(ai)[2:end] ≈ [1.0, 2.0, 3.0, 4.0, 5.0]
+        # explicit starting direction, rescaled by the anchor entry
+        al = SingleIndexApproximator(:g, 3, 5; index_stats=(zeros(3), Matrix(1.0I, 3, 3)),
+                                     initial_loadings=[2.0, 1.0, -3.0])
+        @test initial_params(al)[1:2] ≈ [0.5, -1.5]
+        @test_throws ArgumentError SingleIndexApproximator(:g, 3, 5;
+            index_stats=(zeros(3), Matrix(1.0I, 3, 3)), initial_loadings=[1.0, 2.0])
+        @test_throws ArgumentError SingleIndexApproximator(:g, 3, 5;
+            index_stats=(zeros(3), Matrix(1.0I, 3, 3)),
+            initial_loadings=[0.0, 1.0, 1.0])   # zero anchor entry
+        # string names accepted, matching the other constructors
+        @test SingleIndexApproximator("g", 2, 8; index_stats=stats2).name == :g
+        # an unresolved approximator refuses to build an evaluator rather
+        # than silently standardizing against a made-up default
+        @test_throws ErrorException build_evaluator(
+            SingleIndexApproximator(:g, 2, 8), zeros(9))
+    end
+
+    @testset "SingleIndexApproximator — index geometry and identification" begin
+        μ̂ = [1.0, 2.0, -0.5]
+        Σ̂ = [2.0 0.3 0.1; 0.3 1.0 -0.2; 0.1 -0.2 0.5]
+        θ_out = collect(range(-1.0, 1.5, length=7))
+
+        # ── anchored mode: a[anchor] ≡ 1, and the evaluator is exactly the
+        # outer smooth composed with the standardized index
+        a1 = SingleIndexApproximator(:g, 3, 7; anchor=2, index_stats=(μ̂, Σ̂))
+        θ = vcat([0.4, -0.7], θ_out)
+        @test index_loadings(a1, θ) == [0.4, 1.0, -0.7]
+        f1 = build_evaluator(a1, θ)
+        s1 = build_evaluator(a1.outer, θ_out)
+        av = [0.4, 1.0, -0.7]
+        for u in ([1.0, 2.0, 0.0], [-1.0, 3.0, 2.0], [5.0, -4.0, 1.5])
+            z = (dot(av, u) - dot(av, μ̂)) / sqrt(dot(av, Σ̂ * av))
+            @test f1(u...) ≈ s1(z) atol=1e-12
+        end
+        # wrong arity is refused loudly
+        @test_throws ArgumentError f1(1.0, 2.0)
+
+        # ── free mode: z is invariant under a → c·a. For c a power of two
+        # every scaling is exact in floating point, so the evaluator is
+        # BIT-identical; for a general c it agrees to roundoff.
+        a2 = SingleIndexApproximator(:g, 3, 7; anchor=nothing, index_stats=(μ̂, Σ̂))
+        θf = vcat([0.6, 0.4, -0.2], θ_out)
+        ff = build_evaluator(a2, θf)
+        f2 = build_evaluator(a2, vcat(2.0 .* θf[1:3], θ_out))
+        f37 = build_evaluator(a2, vcat(3.7 .* θf[1:3], θ_out))
+        pts = [[1.0, 2.0, 0.0], [-1.0, 3.0, 2.0], [5.0, -4.0, 1.5], [0.0, 0.0, 0.0]]
+        @test all(ff(u...) === f2(u...) for u in pts)
+        @test maximum(abs(ff(u...) - f37(u...)) for u in pts) < 1e-12
+        # …and reporting normalizes ‖a‖ = 1 with a positive first loading
+        @test norm(index_loadings(a2, θf)) ≈ 1.0
+        @test index_loadings(a2, θf) ≈ [0.6, 0.4, -0.2] ./ norm([0.6, 0.4, -0.2])
+        @test index_loadings(a2, vcat(-2.0 .* θf[1:3], θ_out)) ≈
+              index_loadings(a2, θf)
+
+        # ── the aᵀΣ̂a guard: a direction in the null space of a singular Σ̂
+        # still yields a finite index, and the floor is proportional to ‖a‖²
+        # so it does NOT break the exact scale invariance.
+        Σ0 = [1.0 1.0; 1.0 1.0]
+        a3 = SingleIndexApproximator(:g, 2, 7; anchor=nothing,
+                                     index_stats=([0.0, 0.0], Σ0))
+        θn = vcat([1.0, -1.0], θ_out)         # exactly in the null space of Σ0
+        fn = build_evaluator(a3, θn)
+        fn2 = build_evaluator(a3, vcat([4.0, -4.0], θ_out))
+        @test isfinite(fn(1.0, 0.0))
+        @test all(fn(u, v) === fn2(u, v) for (u, v) in
+                  ((1.0, 0.0), (0.0, 1.0), (2.5, -3.5)))
+    end
+
+    @testset "SingleIndexApproximator — Dual safety in params and inputs" begin
+        using ForwardDiff
+        μ̂ = [1.0, 2.0]
+        Σ̂ = [2.0 0.3; 0.3 1.0]
+        a = SingleIndexApproximator(:g, 2, 7; index_stats=(μ̂, Σ̂))
+        θ = vcat([0.7], collect(range(-1.0, 1.5, length=7)) .+ 0.1 .* (1:7))
+        f = build_evaluator(a, θ)
+
+        # inside [−xi, xi] and out in BOTH linear-extrapolation branches
+        for u in ([1.0, 2.0], [40.0, 40.0], [-40.0, -40.0])
+            g1 = ForwardDiff.gradient(b -> build_evaluator(a, b)(u...), θ)
+            @test all(isfinite, g1)
+            h = 1e-6
+            for k in (1, 2, 5)
+                e_k = [i == k ? 1.0 : 0.0 for i in eachindex(θ)]
+                fd = (build_evaluator(a, θ .+ h .* e_k)(u...) -
+                      build_evaluator(a, θ .- h .* e_k)(u...)) / (2h)
+                @test g1[k] ≈ fd atol=1e-5
+            end
+            g2 = ForwardDiff.gradient(v -> f(v[1], v[2]), u)
+            @test all(isfinite, g2)
+            # nested: Dual params of a Dual-state derivative (stiff autodiff
+            # Jacobians inside through-the-solver training)
+            g3 = ForwardDiff.gradient(
+                b -> ForwardDiff.derivative(x -> build_evaluator(a, b)(x, u[2]), u[1]), θ)
+            @test all(isfinite, g3)
+        end
+        # the index really does move with the states inside the knot span
+        @test norm(ForwardDiff.gradient(v -> f(v[1], v[2]), [1.0, 2.0])) > 1e-6
+
+        # the same holds for a shape-constrained outer smooth
+        ac = SingleIndexApproximator(:g, 2, 7; constraint=:increasing,
+                                     index_stats=(μ̂, Σ̂))
+        θc = vcat([0.7], randn(StableRNG(21), 7))
+        @test all(isfinite, ForwardDiff.gradient(
+            b -> build_evaluator(ac, b)(1.0, 2.0), θc))
+        @test all(isfinite, ForwardDiff.gradient(
+            v -> build_evaluator(ac, θc)(v[1], v[2]), [1.0, 2.0]))
+    end
+
+    @testset "SingleIndexApproximator — penalty blocks and merged penalty" begin
+        stats2 = ([0.0, 0.0], [1.0 0.2; 0.2 1.0])
+        a = SingleIndexApproximator(:g, 2, 8; inner_ridge=0.05, index_stats=stats2)
+        blocks = penalty_blocks(a)
+        @test length(blocks) == 2
+        @test blocks[1][2] == 1:1                    # the free loading
+        @test blocks[2][2] == 2:9                    # the outer coefficients
+        @test size(blocks[1][1]) == (1, 1)
+        @test size(blocks[2][1]) == (8, 8)
+        # disjoint, and together they tile the whole coefficient block
+        @test isempty(intersect(blocks[1][2], blocks[2][2]))
+        @test length(blocks[1][2]) + length(blocks[2][2]) == nparams(a)
+        for (S, _) in blocks
+            # numerically symmetric to the tolerance build_penalty_matrices
+            # itself enforces (the spline penalty is H'B⁻¹H, symmetric up to
+            # roundoff), and positive semi-definite
+            @test maximum(abs.(S .- S')) < 1e-8 * max(maximum(abs.(S)), 1.0)
+            @test minimum(eigvals(Symmetric(S))) > -1e-8
+        end
+        # the outer block is EXACTLY the univariate spline penalty on the
+        # same knot count (reuse by composition, not duplication)
+        @test blocks[2][1] ≈ penalty_matrix(BSplineApproximator(:g, (-2.0, 2.0), 8))
+        # …and with a shape constraint, exactly the SCOP difference penalty
+        ac = SingleIndexApproximator(:g, 2, 8; constraint=:increasing,
+                                     index_stats=stats2)
+        @test penalty_blocks(ac)[2][1] ≈ penalty_matrix(
+            ShapeConstrainedBSplineApproximator(:g, (-2.0, 2.0), 8, :increasing))
+
+        # merged penalty_matrix = block diagonal with the FIXED inner weight
+        S = penalty_matrix(a)
+        @test size(S) == (9, 9)
+        @test issymmetric(S)
+        @test S[1, 1] == 0.05
+        @test all(S[1, 2:end] .== 0.0)
+        @test S[2:end, 2:end] ≈ blocks[2][1]
+        @test minimum(eigvals(Symmetric(S))) > -1e-8
+
+        # build_penalty_matrices validates and lays the blocks out globally
+        a_free = SingleIndexApproximator(:h, 2, 6; anchor=nothing,
+                                         index_stats=(zeros(2), Matrix(1.0I, 2, 2)))
+        prob_pb = PSMProblem((du, u, p, t) -> (du[1] = p.g(u[1], u[2]) +
+                                                       p.h(u[1], u[2]);
+                                               du[2] = -0.1 * u[2]; nothing),
+            [1.0, 1.0], (0.0, 1.0), [a, a_free];
+            data_times=[0.0, 0.5, 1.0], data_values=ones(3, 2), obs_to_state=[1, 2],
+            likelihood=Gaussian(), solver=Tsit5())
+        S_list, offs, nks = PartiallySpecifiedModels.build_penalty_matrices(prob_pb)
+        @test length(S_list) == 4
+        @test offs == [0, 1, 9, 11]
+        @test nks == [1, 8, 2, 6]
+
+        # index_loadings reads THIS approximator's block, not the whole
+        # coefficient vector. Without the length check it silently returned
+        # loadings decoded from whichever approximator came first.
+        @test_throws ArgumentError index_loadings(a_free,
+                                                  zeros(sum(nparams, prob_pb.approximators)))
+        err_il = try
+            index_loadings(a_free, zeros(sum(nparams, prob_pb.approximators)))
+            nothing
+        catch e; e; end
+        @test occursin("coefficient block", err_il.msg)
+        # the correct slice works
+        @test length(index_loadings(a_free, zeros(nparams(a_free)))) == 2
+    end
+
+    @testset "SingleIndexApproximator — free mode warns under LAML/GCV" begin
+        # anchor=nothing leaves the data term exactly flat along a → c·a, so
+        # the inner ridge is minimized by ‖a‖ → 0 and a λ-estimating solver
+        # collapses the loadings while the data loss still looks fine. That
+        # silent path is now broken by a warning at solve entry.
+        dyn_w!(du, u, p, t) = (du[1] = -p.f(u[1], u[2]) * u[1];
+                               du[2] = -0.2 * u[2]; nothing)
+        tw = collect(0.0:0.25:3.0)
+        refw = OrdinaryDiffEq.solve(
+            ODEProblem((du, u, p, t) -> (du[1] = -0.3 * u[1]; du[2] = -0.2 * u[2];
+                                         nothing),
+                       [2.0, 1.0], (0.0, 3.0)), Tsit5(), saveat=0.25)
+        dw = reduce(hcat, refw.u)'
+        aw = SingleIndexApproximator(:f, 2, 6; anchor=nothing,
+                                     index_stats=(zeros(2), Matrix(1.0I, 2, 2)))
+        prob_w = PSMProblem(dyn_w!, [2.0, 1.0], (0.0, 3.0), [aw];
+            data_times=tw, data_values=dw, obs_to_state=[1, 2],
+            known_params=NamedTuple(), likelihood=PSM.Gaussian())
+        @test_logs (:warn, r"anchor=nothing") match_mode=:any begin
+            solve(prob_w, LAML(maxiters=3))
+        end
+        @test_logs (:warn, r"anchor=nothing") match_mode=:any begin
+            solve(prob_w, GCVSolver(maxiters=3))
+        end
+        # the default anchored mode must NOT warn
+        aa = SingleIndexApproximator(:f, 2, 6;
+                                     index_stats=(zeros(2), Matrix(1.0I, 2, 2)))
+        prob_a = PSMProblem(dyn_w!, [2.0, 1.0], (0.0, 3.0), [aa];
+            data_times=tw, data_values=dw, obs_to_state=[1, 2],
+            known_params=NamedTuple(), likelihood=PSM.Gaussian())
+        @test_logs min_level=Base.CoreLogging.Warn match_mode=:any begin
+            solve(prob_a, LAML(maxiters=3))
+        end
+    end
+
+    # ── The recovery / discriminator fixture ───────────────────────────
+    #
+    # Damped predator–prey whose unknown per-capita prey growth is a
+    # SINGLE INDEX of both states, r(N, P) = s₀(0.6N + 0.4P) with a
+    # sigmoidal s₀. Two properties matter and both are deliberate:
+    #
+    #  * the orbit CHANGES DIRECTION along the path, which is what identifies
+    #    the loadings. The condition that defeats identification is
+    #    COLLINEARITY — states moving along an affinely straight line, where
+    #    rescaling `a` is absorbed into s₀. Monotonicity alone does NOT do
+    #    it: measured on monotone-decay versions of this model, where every
+    #    coordinate AND the index decrease monotonically, the loading is
+    #    still recovered to ~2% (0.654 vs 2/3), because a curved path keeps
+    #    changing its tangent direction.
+    #  * the orbit runs roughly ALONG the index direction, so each index
+    #    LEVEL SET crosses the state box far from the visited curve. Those
+    #    crossings are the off-orbit states whose index value the data DO
+    #    pin down — exactly where a full interaction surface has nothing to
+    #    go on and a single index does.
+    si_s0(v) = 0.55 - 1.0 * v^2 / (0.9 + v^2)
+    si_true(N, Pd) = si_s0(0.6 * N + 0.4 * Pd)
+    function si_true!(du, u, p, t)
+        du[1] = u[1] * si_true(u[1], u[2])
+        du[2] = u[2] * (0.4 * u[1] - 0.4 - 0.12 * u[2])
+        nothing
+    end
+    function si_psm!(du, u, p, t)
+        du[1] = u[1] * p.f(u[1], u[2])
+        du[2] = u[2] * (p.c * u[1] - p.m - p.d * u[2])
+        nothing
+    end
+    si_ref = OrdinaryDiffEq.solve(
+        ODEProblem(si_true!, [3.0, 0.25], (0.0, 40.0)), Tsit5(),
+        saveat=0.4, abstol=1e-10, reltol=1e-10)
+    si_traj = reduce(hcat, si_ref.u)'
+    si_ts = collect(si_ref.t)
+    si_data = si_traj .+ 0.02 .* randn(StableRNG(31), size(si_traj))
+    si_prob(a) = PSMProblem(si_psm!, [3.0, 0.25], (0.0, 40.0), [a];
+        data_times=si_ts, data_values=si_data, obs_to_state=[1, 2],
+        known_params=(c=0.4, m=0.4, d=0.12), likelihood=Gaussian(),
+        solver=Tsit5())
+
+    @testset "SingleIndexApproximator — reference statistics are fixed" begin
+        # data whose two states have very different means/spreads
+        ts_fx = collect(0.0:0.25:6.0)
+        y_fx = hcat(2.0 .+ sin.(ts_fx), 5.0 .+ 3.0 .* cos.(0.7 .* ts_fx))
+        dyn_fx! = (du, u, p, t) -> (du[1] = -0.1 * u[1] + p.g(u[1], u[2]);
+                                    du[2] = -0.05 * u[2]; nothing)
+        mkfx(a) = PSMProblem(dyn_fx!, [2.0, 8.0], (0.0, 6.0), [a];
+            data_times=ts_fx, data_values=y_fx, obs_to_state=[1, 2],
+            likelihood=Gaussian(), solver=Tsit5())
+
+        prob_fx = mkfx(SingleIndexApproximator(:g, 2, 6))
+        rfx = prob_fx.approximators[1]
+        # resolution happened at problem construction, from the data
+        @test rfx.mu !== nothing
+        @test rfx.Sigma !== nothing
+        @test rfx.mu[1] ≈ mean(y_fx[:, 1]) rtol=0.05
+        @test rfx.mu[2] ≈ mean(y_fx[:, 2]) rtol=0.05
+        vcol(v) = sum(abs2, v .- mean(v)) / (length(v) - 1)
+        @test rfx.Sigma[1, 1] ≈ vcol(y_fx[:, 1]) rtol=0.25
+        @test rfx.Sigma[2, 2] ≈ vcol(y_fx[:, 2]) rtol=0.25
+        @test issymmetric(rfx.Sigma)
+        @test minimum(eigvals(Symmetric(rfx.Sigma))) > -1e-8
+
+        # The statistics do NOT depend on the fitted trajectory. Build an
+        # evaluator, run a fit that moves the trajectory a long way, then
+        # rebuild it: BIT-identical, because the struct is immutable and
+        # nothing in any solve path touches (μ̂, Σ̂).
+        prob_mv = si_prob(SingleIndexApproximator(:f, 2, 8; xi=2.5,
+                                                  initial=z -> -0.05 - 0.1z))
+        a_mv = prob_mv.approximators[1]
+        θ_mv = PartiallySpecifiedModels.build_initial_params(prob_mv)
+        pts_mv = [(1.0, 0.5), (3.0, 0.25), (9.0, 12.0)]
+        before = build_evaluator(a_mv, θ_mv)
+        vals_before = [before(x, y) for (x, y) in pts_mv]
+        μ_before, Σ_before = copy(a_mv.mu), copy(a_mv.Sigma)
+        pred0 = PartiallySpecifiedModels.simulate(prob_mv, θ_mv)
+        sol_mv = solve(prob_mv, LAML(maxiters=40, warmup=10, initial_lambda=0.01))
+        @test prob_mv.approximators[1] === a_mv        # never swapped out
+        @test a_mv.mu == μ_before                      # never mutated
+        @test a_mv.Sigma == Σ_before
+        after = build_evaluator(a_mv, θ_mv)
+        @test [after(x, y) for (x, y) in pts_mv] == vals_before
+        # …and the fit really did move the trajectory, so this is not vacuous
+        @test maximum(abs.(sol_mv.fitted_values .- pred0)) > 0.1
+
+        # user-supplied statistics are never overwritten, and re-wrapping a
+        # resolved approximator (the bootstrap path) is idempotent
+        fixed = ([0.0, 0.0], [1.0 0.0; 0.0 1.0])
+        rfix = mkfx(SingleIndexApproximator(:g, 2, 6; index_stats=fixed)).approximators[1]
+        @test rfix.mu == [0.0, 0.0]
+        @test rfix.Sigma == Matrix(1.0I, 2, 2)
+        again = mkfx(rfx).approximators[1]
+        @test again.mu == rfx.mu
+        @test again.Sigma == rfx.Sigma
+        @test mkfx(deepcopy(rfx)).approximators[1].Sigma == rfx.Sigma
+
+        # `states` selects which states the p arguments standardize against
+        rsel = mkfx(SingleIndexApproximator(:g, 2, 6; states=[2, 1])).approximators[1]
+        @test rsel.mu ≈ reverse(rfx.mu) rtol=1e-8
+        # an unobserved state contributes its u0 value and a diffuse scale
+        dyn3! = (du, u, p, t) -> (du[1] = -0.1 * u[1] + p.g(u[1], u[3]);
+                                  du[2] = -0.05 * u[2]; du[3] = -0.02 * u[3]; nothing)
+        prob3 = PSMProblem(dyn3!, [2.0, 8.0, 4.0], (0.0, 6.0),
+            [SingleIndexApproximator(:g, 2, 6; states=[1, 3])];
+            data_times=ts_fx, data_values=y_fx, obs_to_state=[1, 2],
+            likelihood=Gaussian(), solver=Tsit5())
+        r3 = prob3.approximators[1]
+        @test r3.mu[2] == 4.0
+        @test r3.Sigma[2, 2] == 16.0
+        @test r3.Sigma[1, 2] == 0.0
+    end
+
+    @testset "SingleIndexApproximator — recovery of loadings and curve" begin
+        prob_si = si_prob(SingleIndexApproximator(:f, 2, 10; xi=2.5,
+                                                  initial=z -> -0.05 - 0.1z))
+        a_si = prob_si.approximators[1]
+
+        # (a) LAML — the inner ridge and the outer roughness get SEPARATE
+        # smoothing parameters, estimated jointly.
+        sol_l = solve(prob_si, LAML(maxiters=60, warmup=10, initial_lambda=0.01))
+        @test length(sol_l.smoothing_params) == 2
+        @test all(isfinite, sol_l.smoothing_params)
+        @test all(>(0), sol_l.smoothing_params)
+        @test sol_l.smoothing_params[1] != sol_l.smoothing_params[2]
+        @test sol_l.data_loss < 0.2                 # observed 0.0770
+        load_l = index_loadings(a_si, sol_l.parameters)
+        @test load_l[1] == 1.0                      # anchored exactly
+        @test abs(load_l[2] - 2/3) < 0.15           # observed 0.65244 vs 0.667
+        f_l = sol_l.unknown_functions[:f]
+        err_l = [abs(f_l(si_traj[i, 1], si_traj[i, 2]) -
+                     si_true(si_traj[i, 1], si_traj[i, 2]))
+                 for i in 1:size(si_traj, 1)]
+        @test sqrt(mean(abs2, err_l)) < 0.01        # observed 0.00157
+        @test maximum(err_l) < 0.03
+
+        # (b) AdamSolver — ForwardDiff through the ODE solve, i.e. Dual
+        # parameters AND Dual states through the p-argument evaluator.
+        sol_a = solve(si_prob(SingleIndexApproximator(:f, 2, 10; xi=2.5,
+                                                      initial=z -> -0.05 - 0.1z)),
+                      AdamSolver(maxiters=500, lr=0.03))
+        @test sol_a.data_loss < 1.2                 # observed ≈ 0.75
+        f_a = sol_a.unknown_functions[:f]
+        err_a = [abs(f_a(si_traj[i, 1], si_traj[i, 2]) -
+                     si_true(si_traj[i, 1], si_traj[i, 2]))
+                 for i in 1:size(si_traj, 1)]
+        @test sqrt(mean(abs2, err_a)) < 0.05
+    end
+
+    @testset "SingleIndexApproximator — off-orbit against the tensor surface" begin
+        # THE DISCRIMINATOR. Both types are fitted to the SAME data with the
+        # SAME solver and settings, and both fit the data about equally well.
+        # They are then compared at states that (i) lie ≥ 0.5 away from every
+        # visited state, and (ii) carry an index value the data DID observe.
+        prob_si = si_prob(SingleIndexApproximator(:f, 2, 10; xi=2.5,
+                                                  initial=z -> -0.05 - 0.1z))
+        a_si = prob_si.approximators[1]
+        sol_si = solve(prob_si, LAML(maxiters=60, warmup=10, initial_lambda=0.01))
+        nlo, nhi = extrema(si_traj[:, 1])
+        plo, phi = extrema(si_traj[:, 2])
+        prob_tp = si_prob(TensorBSplineApproximator(:f, (nlo, nhi), (plo, phi),
+                                                    5, 5; initial=(N, Pd) -> 0.0))
+        sol_tp = solve(prob_tp, LAML(maxiters=60, warmup=10, initial_lambda=0.01))
+        f_si = sol_si.unknown_functions[:f]
+        f_tp = sol_tp.unknown_functions[:f]
+
+        # fairness: the tensor is not handicapped — it fits the data as well
+        # and carries MORE coefficients (25 against 11)
+        @test nparams(prob_tp.approximators[1]) > nparams(a_si)
+        @test abs(sol_tp.data_loss - sol_si.data_loss) <
+              0.1 * max(sol_si.data_loss, 1e-12)
+
+        zvals = 0.6 .* si_traj[:, 1] .+ 0.4 .* si_traj[:, 2]
+        zlo, zhi = extrema(zvals)
+        mind(N, Pd) = minimum(sqrt((si_traj[i, 1] - N)^2 + (si_traj[i, 2] - Pd)^2)
+                              for i in 1:size(si_traj, 1))
+        off = [(N, Pd) for N in range(nlo, nhi, length=21),
+                           Pd in range(plo, phi, length=21)
+               if zlo <= 0.6N + 0.4Pd <= zhi && mind(N, Pd) > 0.5]
+        @test length(off) >= 8              # the region is not empty
+
+        e_si = [abs(f_si(N, Pd) - si_true(N, Pd)) for (N, Pd) in off]
+        e_tp = [abs(f_tp(N, Pd) - si_true(N, Pd)) for (N, Pd) in off]
+        # observed: RMSE 0.00421 (single index) against 0.02678 (tensor),
+        # max 0.00954 against 0.06097 — a factor of ~6 either way. The gap
+        # survives dropping the index-observed filter: over ALL off-orbit
+        # points it is 0.0256 vs 0.0815, and over points whose index the
+        # data NEVER observed 0.0285 vs 0.0898 — both ~3.2x. So the filter
+        # selects where the single index is most accurate in absolute
+        # terms; it does not manufacture the ordering.
+        @test sqrt(mean(abs2, e_si)) < 0.5 * sqrt(mean(abs2, e_tp))
+        @test maximum(e_si) < 0.5 * maximum(e_tp)
+        @test maximum(e_si) < 0.04
+        # …while ON the orbit they are comparable, so the gap above really is
+        # about extrapolating off it and not about a worse fit overall
+        on_si = [abs(f_si(si_traj[i, 1], si_traj[i, 2]) -
+                     si_true(si_traj[i, 1], si_traj[i, 2]))
+                 for i in 1:size(si_traj, 1)]
+        on_tp = [abs(f_tp(si_traj[i, 1], si_traj[i, 2]) -
+                     si_true(si_traj[i, 1], si_traj[i, 2]))
+                 for i in 1:size(si_traj, 1)]
+        @test sqrt(mean(abs2, on_si)) < sqrt(mean(abs2, on_tp))
+        @test sqrt(mean(abs2, on_tp)) < 0.02
+
+        # HONEST SCOPE NOTE. What this establishes is MODEL MATCH, not orbit
+        # geometry: si_true IS an index, and the index model wins because of
+        # that. Rebuilding this same fixture with non-index truths reverses
+        # the ranking by a comparable or larger margin — an additive
+        # two-ridge truth gives 0.314 (single index) against 0.054 (tensor)
+        # off-orbit, a multiplicative interaction 0.207 against 0.070.
+        # Mitigating fact: the misspecification is NOT silent — on both
+        # non-index truths the single index's data_loss was 27-66% worse
+        # than the tensor's, so the in-sample fit flags the wrong choice.
+        # One asymmetry in this comparison: the single index carries TWO
+        # smoothing parameters (penalty_blocks) while the tensor's
+        # Kronecker-sum penalty carries one. Unconditionally in the single
+        # index's favour: wherever p > 2, no tensor type exists at all.
+        # (Note also that null-space collapse is NOT the distinguishing
+        # mechanism: on THIS fixture the fitted tensor retains only ~1.7% of
+        # its variation outside the penalty's bilinear null space, versus
+        # ~11.7% for the single index — collapse is how the tensor LOSES
+        # here.)
+    end
+
+    @testset "SingleIndexApproximator — three states, shape constraint, bands" begin
+        # (a) p = 3: an index over three states, where no tensor type exists
+        function si3_true!(du, u, p, t)
+            g = 0.4 + 0.5 * tanh(0.5 * u[1] + 0.3 * u[2] + 0.2 * u[3] - 1.5)
+            du[1] = -u[1] * g
+            du[2] = 0.5 * u[1] * g - 0.3 * u[2]
+            du[3] = 0.3 * u[2] - 0.2 * u[3]
+            nothing
+        end
+        ref3 = OrdinaryDiffEq.solve(
+            ODEProblem(si3_true!, [4.0, 0.5, 0.2], (0.0, 12.0)), Tsit5(),
+            saveat=0.3, abstol=1e-10, reltol=1e-10)
+        tr3 = reduce(hcat, ref3.u)'
+        ts3 = collect(ref3.t)
+        d3 = tr3 .+ 0.02 .* randn(StableRNG(41), size(tr3))
+        function si3!(du, u, p, t)
+            g = p.g(u[1], u[2], u[3])
+            du[1] = -u[1] * g
+            du[2] = p.a * u[1] * g - p.b * u[2]
+            du[3] = p.b * u[2] - p.c * u[3]
+            nothing
+        end
+        prob3 = PSMProblem(si3!, [4.0, 0.5, 0.2], (0.0, 12.0),
+            [SingleIndexApproximator(:g, 3, 8; xi=2.5, initial=z -> 0.6)];
+            data_times=ts3, data_values=d3, obs_to_state=[1, 2, 3],
+            known_params=(a=0.5, b=0.3, c=0.2), likelihood=Gaussian(),
+            solver=Tsit5())
+        a3 = prob3.approximators[1]
+        @test nparams(a3) == 2 + 8
+        sol3 = solve(prob3, LAML(maxiters=50, warmup=8, initial_lambda=0.01))
+        @test length(sol3.smoothing_params) == 2
+        @test sol3.data_loss < 0.5
+        g3 = sol3.unknown_functions[:g]
+        g3true(u) = 0.4 + 0.5 * tanh(0.5u[1] + 0.3u[2] + 0.2u[3] - 1.5)
+        err3 = [abs(g3(tr3[i, :]...) - g3true(tr3[i, :])) for i in 1:size(tr3, 1)]
+        @test sqrt(mean(abs2, err3)) < 0.05
+
+        # (b) a shape-constrained outer smooth is monotone BY CONSTRUCTION,
+        # for arbitrary parameter vectors — the SCOP guarantee, inherited
+        # unchanged from ShapeConstrainedBSplineApproximator
+        rng_sc = StableRNG(43)
+        for constraint in (:increasing, :decreasing)
+            asc = SingleIndexApproximator(:g, 2, 9; constraint=constraint,
+                                          index_stats=(zeros(2), Matrix(1.0I, 2, 2)))
+            for _ in 1:5
+                θsc = vcat([0.8], 1.5 .* randn(rng_sc, 9))
+                curve = [PartiallySpecifiedModels._eval_approx_at(asc, θsc, z)
+                         for z in range(-2.5, 2.5, length=60)]
+                d = diff(curve)
+                @test (constraint == :increasing ? minimum(d) > -1e-10 :
+                                                   maximum(d) < 1e-10)
+            end
+        end
+        # …and it recovers a monotone-index truth end to end
+        prob_sc = si_prob(SingleIndexApproximator(:f, 2, 9; xi=2.5,
+                                                  constraint=:decreasing,
+                                                  initial=z -> -0.05 - 0.1z))
+        a_sc = prob_sc.approximators[1]
+        sol_sc = solve(prob_sc, LAML(maxiters=60, warmup=10, initial_lambda=0.01))
+        @test sol_sc.data_loss < 0.3
+        f_sc = sol_sc.unknown_functions[:f]
+        @test sqrt(mean(abs2, [abs(f_sc(si_traj[i, 1], si_traj[i, 2]) -
+                                   si_true(si_traj[i, 1], si_traj[i, 2]))
+                               for i in 1:size(si_traj, 1)])) < 0.03
+        # the fitted response really is decreasing in the index
+        curve_sc = [PartiallySpecifiedModels._eval_approx_at(
+                        a_sc, Float64.(collect(sol_sc.parameters)), z)
+                    for z in range(-2.5, 2.5, length=40)]
+        @test maximum(diff(curve_sc)) < 1e-10
+
+        # (c) confidence_band serves the OUTER curve over the standardized
+        # index — the univariate payoff the tensor surface cannot have
+        prob_cb = si_prob(SingleIndexApproximator(:f, 2, 10; xi=2.5,
+                                                  initial=z -> -0.05 - 0.1z))
+        sol_cb = solve(prob_cb, LAML(maxiters=40, warmup=10, initial_lambda=0.01))
+        band = confidence_band(sol_cb, prob_cb)
+        @test haskey(band, :f)
+        @test extrema(band[:f].grid) == (-2.5, 2.5)
+        @test all(isfinite, band[:f].fitted)
+        @test all(isfinite, band[:f].se)
+        @test all(band[:f].se .>= 0)
+        @test all(band[:f].lower .<= band[:f].fitted)
+        @test all(band[:f].fitted .<= band[:f].upper)
+        # the band is the OUTER curve, i.e. exactly what _eval_approx_at gives
+        @test band[:f].fitted ≈ [PartiallySpecifiedModels._eval_approx_at(
+                                     prob_cb.approximators[1],
+                                     Float64.(collect(sol_cb.parameters)), z)
+                                 for z in band[:f].grid]
+
+        # (d) bootstrap produces a real (non-NaN) band for the outer curve
+        res_b = bootstrap(sol_cb, prob_cb,
+                          AdamSolver(maxiters=60, lr=0.05); nboot=4,
+                          rng=StableRNG(45))
+        @test res_b.n_success >= 3
+        @test haskey(res_b.ci_uf, :f)
+        @test all(isfinite, res_b.ci_uf[:f].lower)
+        @test all(isfinite, res_b.ci_uf[:f].upper)
+    end
+
+    @testset "SingleIndexApproximator — sibling registration" begin
+        # In the union, so the SIX per-type penalty whitelists must list it
+        # explicitly — the generic non-built-in fallback will NOT fire for it.
+        @test SingleIndexApproximator <:
+              PartiallySpecifiedModels._BUILTIN_APPROX_TYPES
+
+        # Behavioral check where it is cheap: the gradient-matching solvers
+        # really do apply the merged penalty (a large λ flattens the outer
+        # curve's roughness).
+        S_si = penalty_matrix(si_prob(
+            SingleIndexApproximator(:f, 2, 9; xi=2.5)).approximators[1])
+        rough(sol) = dot(sol.parameters, S_si * sol.parameters)
+        for alg in (λ -> TwoStageSolver(maxiters=150, lambda_smooth=λ),
+                    λ -> IntegralMatchingSolver(maxiters=150, lambda_smooth=λ))
+            p0 = si_prob(SingleIndexApproximator(:f, 2, 9; xi=2.5,
+                                                 initial=z -> -0.05 - 0.1z))
+            pP = si_prob(SingleIndexApproximator(:f, 2, 9; xi=2.5,
+                                                 initial=z -> -0.05 - 0.1z))
+            s0_ = solve(p0, alg(0.0))
+            sP_ = solve(pP, alg(50.0))
+            @test s0_.parameters != sP_.parameters
+            @test rough(sP_) < rough(s0_)
+        end
+
+        # The remaining four whitelists (AGM — whose smoothing_lambda is not
+        # a user-facing keyword — plus MAGI, rodeo and DALTON, which sit
+        # inside Kalman/HMC objectives far too slow to gate a unit test on)
+        # cannot be exercised end-to-end here. But the campaign's recurring
+        # failure mode is precisely a type landing on some sibling sites and
+        # not others, so assert the registration at each site directly.
+        src_dir = dirname(pathof(PartiallySpecifiedModels))
+        for f in ("two_stage_solver.jl", "integral_matching_solver.jl",
+                  "magi_solver.jl", "adaptive_gradient_matching.jl",
+                  "rodeo_solver.jl", "dalton_solver.jl")
+            @test occursin("SingleIndexApproximator", read(joinpath(src_dir, f), String))
+        end
+    end
+
+
+    # ─── TransformedCovariateApproximator (learned transform of an
+    #     exogenous covariate + outer smooth) ─────────────────────────
+
+    @testset "TransformedCovariateApproximator — construction and validation" begin
+        TC = TransformedCovariateApproximator
+        ct_v = collect(0.0:1.0:10.0)
+        x_v = Float64[1, 2, 3, 4, 5, 4, 3, 2, 1, 2, 3]
+
+        # trans is required and must name a known transformation
+        @test_throws ArgumentError TC(:b, ct_v, x_v; trans=:ewma)
+        @test_throws ArgumentError TC(:b, ct_v, x_v; trans=:none)
+        # lags: :lagindex needs a window of at least 1, no longer than the record
+        @test_throws ArgumentError TC(:b, ct_v, x_v; trans=:lagindex, lags=0)
+        @test_throws ArgumentError TC(:b, ct_v, x_v; trans=:lagindex, lags=-2)
+        @test_throws ArgumentError TC(:b, ct_v, x_v; trans=:lagindex, lags=12)
+        # …and it is a :lagindex setting, so :expsm refuses it rather than
+        # silently ignoring a window the user thinks is in force
+        @test_throws ArgumentError TC(:b, ct_v, x_v; trans=:expsm, lags=3)
+        # same for anchor: :expsm has no scale-invariant direction to pin,
+        # so a supplied anchor is a modelling misunderstanding, not a no-op
+        @test_throws ArgumentError TC(:b, ct_v, x_v; trans=:expsm, anchor=2)
+        # X must be aligned to times, in both directions
+        @test_throws ArgumentError TC(:b, ct_v, x_v[1:5]; trans=:expsm)
+        @test_throws ArgumentError TC(:b, ct_v[1:5], x_v; trans=:expsm)
+        # auxiliary columns are an :expsm-only idea
+        @test_throws ArgumentError TC(:b, ct_v, hcat(x_v, x_v); trans=:lagindex,
+                                      lags=3)
+        # outer-smooth resolution and knot span
+        @test_throws ArgumentError TC(:b, ct_v, x_v; trans=:expsm, nknots=2)
+        @test_throws ArgumentError TC(:b, ct_v, x_v; trans=:expsm, nknots=3,
+                                      constraint=:increasing)
+        @test_throws ArgumentError TC(:b, ct_v, x_v; trans=:expsm, xi=0.0)
+        @test_throws ArgumentError TC(:b, ct_v, x_v; trans=:expsm, xi=-1.0)
+        @test_throws ArgumentError TC(:b, ct_v, x_v; trans=:expsm, xi=Inf)
+        @test_throws ArgumentError TC(:b, ct_v, x_v; trans=:expsm,
+                                      constraint=:wiggly)
+        @test_throws ArgumentError TC(:b, ct_v, x_v; trans=:expsm,
+                                      inner_ridge=-1.0)
+        # the anchor must name a lag in the window
+        @test_throws ArgumentError TC(:b, ct_v, x_v; trans=:lagindex, lags=3,
+                                      anchor=0)
+        @test_throws ArgumentError TC(:b, ct_v, x_v; trans=:lagindex, lags=3,
+                                      anchor=4)
+        # the covariate record itself: enough of it, ordered, and finite
+        @test_throws ArgumentError TC(:b, ct_v[1:2], x_v[1:2]; trans=:expsm)
+        @test_throws ArgumentError TC(:b, [0.0, 2.0, 1.0, 3.0], ones(4);
+                                      trans=:expsm)
+        @test_throws ArgumentError TC(:b, [0.0, 1.0, 1.0, 3.0], ones(4);
+                                      trans=:expsm)
+        @test_throws ArgumentError TC(:b, ct_v, replace(x_v, 3.0 => NaN);
+                                      trans=:expsm)
+
+        # ── fields and parameter counts
+        a = TC(:b, ct_v, x_v; trans=:expsm, nknots=6)
+        @test a.name == :b
+        @test a.trans == :expsm
+        @test a.domain == (-2.0, 2.0)               # (−xi, xi), NOT time
+        @test a.lags == 0
+        @test a.anchor === nothing                  # no scale invariance to fix
+        @test a.times == ct_v
+        @test nparams(a) == 1 + 6                   # ONE inertia parameter
+        @test initial_params(a) == vcat(0.0, zeros(6))   # ω = 1/2 start
+
+        # auxiliary inertia covariates widen the inner block
+        Xa = hcat(x_v, cos.(ct_v), sin.(ct_v))
+        aa = TC(:b, ct_v, Xa; trans=:expsm, nknots=6)
+        @test nparams(aa) == 3 + 6
+        @test aa.inner_design[:, 1] == ones(11)     # the intercept
+        @test aa.inner_design[:, 2] == cos.(ct_v)
+        @test aa.inner_design[:, 3] == sin.(ct_v)
+
+        # :lagindex anchors one weight, so it stores lags − 1 free ones
+        al = TC(:b, ct_v, x_v; trans=:lagindex, lags=4, nknots=6)
+        @test al.lags == 4
+        @test al.anchor == 1
+        @test nparams(al) == 3 + 6
+        @test initial_params(al) == vcat(ones(3), zeros(6))   # equal weights
+
+        # a shape-constrained outer smooth follows the SCOP parameter count,
+        # including the zero-endpoint reduction
+        @test nparams(TC(:b, ct_v, x_v; trans=:expsm, nknots=8,
+                         constraint=:increasing)) == 1 + 8
+        @test nparams(TC(:b, ct_v, x_v; trans=:expsm, nknots=8,
+                         constraint=:inc_zero_left)) == 1 + 7
+        # xi widens the outer knot span
+        @test TC(:b, ct_v, x_v; trans=:expsm, xi=5.0).domain == (-5.0, 5.0)
+        # an initial outer curve is sampled on the standardized knot grid
+        ai = TC(:b, ct_v, x_v; trans=:expsm, nknots=5, initial=z -> 3.0 + z)
+        @test initial_params(ai)[2:end] ≈ [1.0, 2.0, 3.0, 4.0, 5.0]
+        # string names accepted, and a vector covariate is a one-column matrix
+        @test TC("b", ct_v, x_v; trans=:expsm).name == :b
+        @test TC(:b, ct_v, x_v; trans=:expsm).X == reshape(x_v, :, 1)
+
+        # THE SIMPLIFICATION OVER SingleIndexApproximator. Its standardization
+        # is against the moving trajectory, so it is UNRESOLVED until
+        # PSMProblem construction fills in (μ̂, Σ̂) and `build_evaluator` on a
+        # bare approximator is an error. Here the covariate is fixed data, so
+        # this type is complete at construction: no index_stats keyword, no
+        # resolve hook, and a bare approximator evaluates immediately.
+        @test build_evaluator(TC(:b, ct_v, x_v; trans=:expsm, nknots=6),
+                              zeros(7))(3.0) == 0.0
+    end
+
+    @testset "TransformedCovariateApproximator — inner transforms and standardization" begin
+        PSM = PartiallySpecifiedModels
+        TC = TransformedCovariateApproximator
+        ct_v = collect(0.0:1.0:10.0)
+        x_v = Float64[1, 2, 3, 4, 5, 4, 3, 2, 1, 2, 3]
+
+        # (a) the :expsm recursion against a HAND-COMPUTED reference. At a = 0
+        # the inertia is ω = logistic(0) = 1/2 exactly, so each step halves the
+        # gap to the new observation: 1, 1.5, 2.25, 3.125, 4.0625.
+        a = TC(:b, ct_v, x_v; trans=:expsm, nknots=6)
+        @test smoothing_inertia(a, vcat(0.0, zeros(6))) == fill(0.5, 11)
+        @test PSM._tc_inner_series(a, [0.0])[1:5] ≈
+              [1.0, 1.5, 2.25, 3.125, 4.0625] atol=1e-12
+        # …and for general ω, against the recursion written out longhand
+        for ω in (0.2, 0.8)
+            aω = log(ω / (1 - ω))
+            @test smoothing_inertia(a, vcat(aω, zeros(6)))[1] ≈ ω atol=1e-12
+            ref = similar(x_v)
+            ref[1] = x_v[1]
+            for i in 2:11
+                ref[i] = ω * ref[i - 1] + (1 - ω) * x_v[i]
+            end
+            @test PSM._tc_inner_series(a, [aω]) ≈ ref atol=1e-12
+        end
+        # ω → 1 is the INFINITE-INERTIA limit: s̃ collapses to the constant x₁
+        # and z → 0. That is a legitimate model (a constant response), so the
+        # additive variance floor must return it finitely rather than 0/0.
+        z_inf = transformed_covariate(a, vcat(40.0, zeros(6)))
+        @test all(isfinite, z_inf)
+        @test maximum(abs, z_inf) < 1e-3
+        # auxiliary covariates really do make the inertia vary
+        Xa = hcat(x_v, cos.(ct_v))
+        aa = TC(:b, ct_v, Xa; trans=:expsm, nknots=6)
+        ωs = smoothing_inertia(aa, vcat([0.0, 1.5], zeros(6)))
+        @test length(unique(round.(ωs, digits=6))) > 5
+        @test all(0.0 .< ωs .< 1.0)
+
+        # (b) the :lagindex design is FIXED DATA: row i holds the covariate at
+        # tᵢ, tᵢ − Δ, … with Δ the sample spacing (1.0 here), held constant
+        # before the start of the record.
+        al = TC(:b, ct_v, x_v; trans=:lagindex, lags=4, nknots=6)
+        @test al.inner_design[5, :] == [x_v[5], x_v[4], x_v[3], x_v[2]]
+        @test al.inner_design[1, :] == fill(x_v[1], 4)
+        @test al.inner_design[:, 1] == x_v            # lag 0 is x itself
+        # …so the transform is EXACTLY linear in the weights
+        w = [1.0, 0.5, 0.25, 0.125]
+        @test PSM._tc_inner_series(al, w[2:end]) ≈ al.inner_design * w
+        @test lag_weights(al, vcat(w[2:end], zeros(6))) == w
+        # a[anchor] ≡ 1 wherever the anchor is placed
+        a3 = TC(:b, ct_v, x_v; trans=:lagindex, lags=4, anchor=3, nknots=6)
+        @test lag_weights(a3, vcat([0.2, 0.4, 0.6], zeros(6))) ==
+              [0.2, 0.4, 1.0, 0.6]
+
+        # (c) STANDARDIZATION. The paper's recipe — mean 0, variance 1 over the
+        # covariate sample — ports VERBATIM here, because the covariate is
+        # fixed data rather than a trajectory that moves under the optimizer.
+        # The scale is √(v + κ), so the standardized variance is v/(v + κ):
+        # it approaches 1 strictly FROM BELOW, by κ/v ≈ 2e-8 at worst over
+        # these parameter values. That bound is asserted rather than hidden
+        # inside an `≈`, because the direction is a property of the additive
+        # floor and an exceedance would mean the floor had stopped applying.
+        vsamp(v) = sum(abs2, v .- mean(v)) / (length(v) - 1)
+        for θ in (-2.0, -0.5, 0.0, 1.0, 2.5)
+            z = transformed_covariate(a, vcat(θ, zeros(6)))
+            @test abs(mean(z)) < 1e-10
+            @test 1.0 - 1e-6 < vsamp(z) <= 1.0
+        end
+        for wf in ([0.5, 0.25, 0.125], [1.0, 1.0, 1.0], [-0.3, 0.7, 0.1])
+            z = transformed_covariate(al, vcat(wf, zeros(6)))
+            @test abs(mean(z)) < 1e-10
+            @test 1.0 - 1e-6 < vsamp(z) <= 1.0
+        end
+        # Standardizing a LINEAR transform makes z invariant under a → c·a,
+        # which is precisely the flat direction the :lagindex anchor removes.
+        # SingleIndexApproximator makes its aᵀΣ̂a floor proportional to ‖a‖² so
+        # this invariance stays EXACT even when the floor binds; here the floor
+        # is a fixed additive constant chosen instead for smoothness in `a`, so
+        # the invariance holds only to ≈ κ/v ~ 1e-10 relative. That is
+        # harmless: the anchor, not the floor, is what removes the direction.
+        wv = [1.0, 0.5, 0.25, 0.125]
+        @test maximum(abs, PSM._tc_standardize(al, al.inner_design * wv) .-
+                           PSM._tc_standardize(al, al.inner_design * (4wv))) < 1e-8
+
+        # (d) the evaluator interpolates z LINEARLY in time and holds it
+        # constant outside the record, so f is continuous everywhere — which
+        # adaptive ODE stepping requires.
+        θ_out = collect(range(-1.0, 1.5, length=6))
+        f = build_evaluator(a, vcat(0.0, θ_out))
+        s_out = build_evaluator(a.outer, θ_out)
+        z = transformed_covariate(a, vcat(0.0, θ_out))
+        for i in 1:11
+            @test f(ct_v[i]) ≈ s_out(z[i]) atol=1e-12
+        end
+        @test f(4.5) ≈ s_out((z[5] + z[6]) / 2) atol=1e-12
+        @test f(-7.0) == f(0.0)
+        @test f(99.0) == f(10.0)
+        @test maximum(abs(f(t + 1e-7) - f(t - 1e-7)) for t in ct_v) < 1e-6
+        # a ONE-argument callable of TIME: passing a state is refused loudly
+        @test_throws ArgumentError f(1.0, 2.0)
+    end
+
+    @testset "TransformedCovariateApproximator — Dual safety in params and time" begin
+        using ForwardDiff
+        PSM = PartiallySpecifiedModels
+        TC = TransformedCovariateApproximator
+        ct_v = collect(0.0:1.0:10.0)
+        x_v = Float64[1, 2, 3, 4, 5, 4, 3, 2, 1, 2, 3]
+
+        for a in (TC(:b, ct_v, x_v; trans=:expsm, nknots=7),
+                  TC(:b, ct_v, x_v; trans=:lagindex, lags=4, nknots=7))
+            ni = PSM._tc_n_inner(a)
+            θ = vcat(a.trans === :expsm ? [0.7] : [0.6, 0.3, 0.1],
+                     collect(range(-1.0, 1.5, length=7)))
+            f = build_evaluator(a, θ)
+            # inside the record and in BOTH constant-extrapolation branches
+            for t in (0.0, 3.5, 7.25, -4.0, 40.0)
+                g1 = ForwardDiff.gradient(b -> build_evaluator(a, b)(t), θ)
+                @test all(isfinite, g1)
+                h = 1e-6
+                for k in (1, ni + 2, ni + 5)
+                    e_k = [i == k ? 1.0 : 0.0 for i in eachindex(θ)]
+                    fd = (build_evaluator(a, θ .+ h .* e_k)(t) -
+                          build_evaluator(a, θ .- h .* e_k)(t)) / (2h)
+                    @test g1[k] ≈ fd atol=1e-5
+                end
+            end
+            # …and THROUGH the time interpolation, including nested Duals
+            @test isfinite(ForwardDiff.derivative(t -> f(t), 3.5))
+            @test all(isfinite, ForwardDiff.gradient(
+                b -> ForwardDiff.derivative(t -> build_evaluator(a, b)(t), 3.5), θ))
+            # the inner parameter really moves the fit, so none of this is vacuous
+            @test abs(ForwardDiff.gradient(
+                b -> build_evaluator(a, b)(3.5), θ)[1]) > 1e-8
+        end
+
+        # The :expsm scan stays finite at extreme inertia parameters, where the
+        # naive 1/(1 + exp(−z)) logistic overflows to Inf and then to a NaN
+        # derivative. `_tc_logistic` is tanh-based and branch-free instead.
+        ax = TC(:b, ct_v, x_v; trans=:expsm, nknots=7)
+        θx = collect(range(-1.0, 1.5, length=7))
+        for big in (-800.0, 800.0)
+            @test all(isfinite, ForwardDiff.gradient(
+                b -> build_evaluator(ax, b)(3.5), vcat(big, θx)))
+        end
+        @test PSM._tc_logistic(-800.0) == 0.0
+        @test PSM._tc_logistic(800.0) == 1.0
+        @test PSM._tc_logistic(0.0) == 0.5
+        @test PSM._tc_logistic(1.3) ≈ 1 / (1 + exp(-1.3)) atol=1e-15
+
+        # the same holds for a shape-constrained outer smooth
+        ac = TC(:b, ct_v, x_v; trans=:expsm, nknots=7, constraint=:increasing)
+        θc = vcat([0.7], randn(StableRNG(51), 7))
+        @test all(isfinite, ForwardDiff.gradient(
+            b -> build_evaluator(ac, b)(3.5), θc))
+        @test isfinite(ForwardDiff.derivative(
+            t -> build_evaluator(ac, θc)(t), 3.5))
+    end
+
+    @testset "TransformedCovariateApproximator — penalty blocks and merged penalty" begin
+        PSM = PartiallySpecifiedModels
+        TC = TransformedCovariateApproximator
+        ct_v = collect(0.0:1.0:10.0)
+        x_v = Float64[1, 2, 3, 4, 5, 4, 3, 2, 1, 2, 3]
+
+        # (a) :expsm — a ridge on the inertia parameters
+        a = TC(:b, ct_v, x_v; trans=:expsm, nknots=8, inner_ridge=0.05)
+        bl = penalty_blocks(a)
+        @test length(bl) == 2
+        @test bl[1][2] == 1:1
+        @test bl[2][2] == 2:9
+        @test bl[1][1] == ones(1, 1)
+        # the outer block is EXACTLY the univariate spline penalty on the same
+        # knot count — reuse by composition, not duplication
+        @test bl[2][1] ≈ penalty_matrix(BSplineApproximator(:b, (-2.0, 2.0), 8))
+        S = penalty_matrix(a)
+        @test size(S) == (9, 9)
+        @test issymmetric(S)
+        @test S[1, 1] == 0.05                     # the FIXED merged weight
+        @test all(S[1, 2:end] .== 0.0)
+        @test S[2:end, 2:end] ≈ bl[2][1]
+
+        # (b) :lagindex — the paper's FIRST-DIFFERENCE smooth-lag prior, not a
+        # ridge. Its null space is "all free weights equal", which is why a
+        # large λ flattens the lag TAIL instead of erasing it.
+        al = TC(:b, ct_v, x_v; trans=:lagindex, lags=5, nknots=8)
+        bll = penalty_blocks(al)
+        @test length(bll) == 2
+        @test bll[1][2] == 1:4
+        @test bll[2][2] == 5:12
+        Si = bll[1][1]
+        @test Si ≈ [1.0 -1.0 0.0 0.0; -1.0 2.0 -1.0 0.0;
+                    0.0 -1.0 2.0 -1.0; 0.0 0.0 -1.0 1.0]
+        @test norm(Si * ones(4)) < 1e-12
+        @test rank(Si) == 3
+        # …and the merged penalty carries the same matrix, scaled
+        @test penalty_matrix(al)[1:4, 1:4] ≈ 1e-4 .* Si
+        for (Sb, _) in vcat(bl, bll)
+            @test maximum(abs.(Sb .- Sb')) < 1e-8 * max(maximum(abs.(Sb)), 1.0)
+            @test minimum(eigvals(Symmetric(Sb))) > -1e-8
+        end
+        # with fewer than two free weights there is no difference to take, so
+        # the inner block is omitted rather than declared as a zero matrix
+        # (which would hand LAML an unidentified λ)
+        a2 = TC(:b, ct_v, x_v; trans=:lagindex, lags=2, nknots=8)
+        @test length(penalty_blocks(a2)) == 1
+        @test penalty_blocks(a2)[1][2] == 2:9
+        a1 = TC(:b, ct_v, x_v; trans=:lagindex, lags=1, nknots=8)
+        @test nparams(a1) == 8
+        @test length(penalty_blocks(a1)) == 1
+        @test penalty_blocks(a1)[1][2] == 1:8
+
+        # (c) build_penalty_matrices validates and lays the blocks out globally
+        al_c = TC(:c, ct_v, x_v; trans=:lagindex, lags=5, nknots=8)
+        prob_pb = PSMProblem((du, u, p, t) -> (du[1] = p.b(t) + p.c(t);
+                                               du[2] = -0.1 * u[2]; nothing),
+            [1.0, 1.0], (0.0, 10.0), [a, al_c];
+            data_times=[0.0, 5.0, 10.0], data_values=ones(3, 2),
+            obs_to_state=[1, 2], likelihood=Gaussian(), solver=Tsit5())
+        S_list, offs, nks = PartiallySpecifiedModels.build_penalty_matrices(prob_pb)
+        @test length(S_list) == 4
+        @test offs == [0, 1, 9, 13]
+        @test nks == [1, 8, 4, 8]
+
+        # (d) the accessors read THIS approximator's block, not the whole
+        # coefficient vector — the failure mode N1 found with index_loadings
+        @test_throws ArgumentError lag_weights(al, zeros(3))
+        @test_throws ArgumentError smoothing_inertia(a, zeros(3))
+        @test_throws ArgumentError transformed_covariate(a, zeros(3))
+        err_lw = try
+            lag_weights(al, zeros(3))
+            nothing
+        catch e; e; end
+        @test occursin("coefficient block", err_lw.msg)
+        # …and refuse the transformation they do not describe
+        @test_throws ArgumentError lag_weights(a, zeros(nparams(a)))
+        @test_throws ArgumentError smoothing_inertia(al, zeros(nparams(al)))
+    end
+
+    # ── The :expsm recovery fixture ────────────────────────────────────
+    #
+    # SIR with transmission driven by TEMPERATURE through a learned thermal
+    # inertia: β(t) = s₀(z(t)) with z the standardized exponentially smoothed
+    # temperature at ω_true = 0.8. The covariate is a realistic seasonal
+    # series (a 45-day-amplitude annual arc plus daily weather noise), and the
+    # weather noise is what gives the inertia something to smooth — a
+    # noise-free driver would make every ω produce nearly the same z.
+    tc_ct = collect(0.0:1.0:120.0)
+    tc_temp = [18.0 + 7.0 * sin(2pi * t / 180 - pi / 3) for t in tc_ct] .+
+              1.2 .* randn(StableRNG(101), length(tc_ct))
+    tc_wtrue = 0.8
+    function tc_ewma(x, w)
+        s = similar(x)
+        s[1] = x[1]
+        for i in 2:length(x)
+            s[i] = w * s[i - 1] + (1 - w) * x[i]
+        end
+        s
+    end
+    function tc_lin(ts, vs, t)
+        t <= ts[1] && return vs[1]
+        t >= ts[end] && return vs[end]
+        i = searchsortedlast(ts, t)
+        w = (t - ts[i]) / (ts[i + 1] - ts[i])
+        vs[i] + w * (vs[i + 1] - vs[i])
+    end
+    tc_ztrue = let v = tc_ewma(tc_temp, tc_wtrue)
+        m = mean(v)
+        (v .- m) ./ sqrt(sum(abs2, v .- m) / (length(v) - 1))
+    end
+    tc_s0(z) = 0.30 + 0.12 * tanh(0.9z)
+    tc_btrue(t) = tc_s0(tc_lin(tc_ct, tc_ztrue, t))
+    function tc_sir_true!(du, u, p, t)
+        inf = tc_btrue(t) * u[1] * u[2] / 1000.0
+        du[1] = -inf
+        du[2] = inf - 0.2 * u[2]
+        du[3] = inf
+        nothing
+    end
+    tc_ref = OrdinaryDiffEq.solve(
+        ODEProblem(tc_sir_true!, [990.0, 10.0, 0.0], (0.0, 120.0)), Tsit5(),
+        saveat=2.0, abstol=1e-10, reltol=1e-10)
+    tc_traj = reduce(hcat, tc_ref.u)'
+    tc_ts = collect(tc_ref.t)
+    tc_data = tc_traj[:, [2, 3]] .+
+              3.0 .* randn(StableRNG(102), size(tc_traj, 1), 2)
+    function tc_sir!(du, u, p, t)
+        inf = p.beta(t) * u[1] * u[2] / p.N
+        du[1] = -inf
+        du[2] = inf - p.gam * u[2]
+        du[3] = inf
+        nothing
+    end
+    tc_prob(a) = PSMProblem(tc_sir!, [990.0, 10.0, 0.0], (0.0, 120.0), [a];
+        data_times=tc_ts, data_values=tc_data, obs_to_state=[2, 3],
+        known_params=(N=1000.0, gam=0.2), likelihood=Gaussian(), solver=Tsit5())
+    tc_beta_rmse(f) = sqrt(mean(abs2,
+        [f(t) - tc_btrue(t) for t in 0.0:1.0:120.0]))
+
+    @testset "TransformedCovariateApproximator — SIR recovery of thermal inertia" begin
+        TC = TransformedCovariateApproximator
+        a = TC(:beta, tc_ct, tc_temp; trans=:expsm, nknots=8, initial=z -> 0.3)
+        prob = tc_prob(a)
+
+        # THE KINK MATTERS. β(t) is piecewise linear in t between covariate
+        # times, so the default finite-difference prediction Jacobian picks up
+        # adaptive-step noise at the kinks and the λ search stalls — the N0
+        # failure mode, reproduced here as a DIRECT comparison rather than
+        # asserted from theory.
+        sol_fd = solve(prob, LAML(maxiters=60, warmup=10, initial_lambda=0.01))
+        sol = solve(tc_prob(TC(:beta, tc_ct, tc_temp; trans=:expsm, nknots=8,
+                               initial=z -> 0.3)),
+                    LAML(maxiters=60, warmup=10, initial_lambda=0.01,
+                         jac=:forwarddiff))
+        # β(t) is piecewise linear, so the fd prediction Jacobian is noisy at
+        # the kinks and its λ search lands far from the optimum. The
+        # forwarddiff side is stable and exact: objective 480.98, λ_inner
+        # 11.5632, converged.
+        #
+        # The fd side is NOT quotable as a number — it is chaotic in the
+        # exact arithmetic. Measured: 611.90 (:maxiters) at BLAS=4/8 under
+        # --check-bounds=yes, 746.19 (:maxiters) at BLAS=1, and 1993.61
+        # REPORTING :converged_tol without the flag. So the gap runs from
+        # ~131 to ~1513 nats and the reported status flips with the run
+        # configuration — fd may or may not admit it failed. The assertion
+        # below is deliberately a floor (20 nats) that every variant clears
+        # by at least 6x, not a pin on any of those values.
+        @test sol.objective < sol_fd.objective - 20.0
+        @test sol.convergence.converged
+
+        # two smoothing parameters, one per penalty block, jointly estimated
+        @test length(sol.smoothing_params) == 2
+        @test all(isfinite, sol.smoothing_params)
+        @test all(>(0), sol.smoothing_params)
+        @test sol.smoothing_params[1] != sol.smoothing_params[2]
+
+        # the response curve is recovered sharply
+        f = sol.unknown_functions[:beta]
+        @test tc_beta_rmse(f) < 0.02              # observed 0.00877
+        @test maximum(abs(f(t) - tc_btrue(t)) for t in 0.0:1.0:120.0) < 0.05
+
+        # THE INERTIA IS ONLY WEAKLY IDENTIFIED — reported, not tuned away.
+        # ω̂ = 0.6867 against a truth of 0.8, from a start of ω = 0.5. It is
+        # shrunk toward 1/2 by the inner ridge (λ̂_inner = 11.56), and the
+        # shrinkage is honest rather than a bug: re-running the identical
+        # fixture at lower observation noise gives ω̂ = 0.7631 (sd 1.0) and
+        # 0.7909 (sd 0.25) with λ̂_inner falling to 0.6393 and 0.0310 — so the
+        # estimator is consistent and LAML is shrinking a genuinely weak
+        # signal. Weak because standardization removes the amplitude damping
+        # that different ω apply, leaving only a phase lag:
+        # cor(z(ω=0.8), z(ω=0.7)) = 0.99763 over this covariate sample.
+        # A profile of the LAML objective over FIXED ω has its minimum at
+        # ω ≈ 0.70 (objective 476.8, against 504.4 at ω = 0.5 and 548.1 at
+        # ω = 0.9), so the joint fit sits essentially AT its own criterion's
+        # optimum; the residual gap to 0.8 belongs to the criterion, not the
+        # optimizer. Notably the β-RMSE profile is minimized at the TRUE
+        # ω = 0.8 (0.00305), so the criterion trades a little inertia for a
+        # little outer curvature.
+        ω̂ = smoothing_inertia(a, Float64.(collect(sol.parameters)))[1]
+        @test length(smoothing_inertia(a, Float64.(collect(sol.parameters)))) ==
+              length(tc_ct)
+        @test 0.60 < ω̂ < 0.78                     # observed 0.6867
+        @test ω̂ > 0.55                            # …and it did move off 0.5
+        # the profile claim above, spot-checked at its two ends: a fit that
+        # HOLDS ω at 1/2 does strictly worse than the joint fit
+        a_half = TC(:beta, tc_ct, tc_ewma(tc_temp, 0.5); trans=:lagindex,
+                    lags=1, nknots=8, initial=z -> 0.3)
+        sol_half = solve(tc_prob(a_half),
+                         LAML(maxiters=60, warmup=10, initial_lambda=0.01,
+                              jac=:forwarddiff))
+        @test sol_half.objective > sol.objective   # observed 504.43 vs 480.99
+        @test tc_beta_rmse(sol_half.unknown_functions[:beta]) > tc_beta_rmse(f)
+
+        # AdamSolver — ForwardDiff through the ODE solve, i.e. Dual parameters
+        # AND a Dual-safe scan/interpolation inside the right-hand side. It
+        # fits far less well than LAML here (observed data_loss 1243 against
+        # LAML's 934, ω̂ 0.170, β-RMSE 0.0372): the flat-objective path barely
+        # identifies the inertia at all. Asserted loosely because what this
+        # checks is that the autodiff path RUNS and improves, not accuracy.
+        a_ad = TC(:beta, tc_ct, tc_temp; trans=:expsm, nknots=8, initial=z -> 0.3)
+        sol_ad = solve(tc_prob(a_ad), AdamSolver(maxiters=400, lr=0.05))
+        @test isfinite(sol_ad.data_loss)
+        @test sol_ad.data_loss < 3000.0
+        @test tc_beta_rmse(sol_ad.unknown_functions[:beta]) < 0.06
+    end
+
+    @testset "TransformedCovariateApproximator — distributed-lag recovery and penalty" begin
+        PSM = PartiallySpecifiedModels
+        TC = TransformedCovariateApproximator
+
+        # A fast-relaxing linear filter driven by the unknown function,
+        # du/dt = g(t) − 0.8u, observed directly. The epidemic fixture above
+        # is deliberately NOT reused here: an SIR integrates β over weeks, so
+        # it responds only to the low-frequency content of the driver and the
+        # lag PROFILE washes out (measured: the LAML fit there collapsed into
+        # the penalty null space). A directly-observed fast response keeps the
+        # profile identifiable.
+        lg_ct = collect(0.0:1.0:40.0)
+        lg_x = [10.0 + 4.0 * sin(2pi * t / 25) for t in lg_ct] .+
+               2.5 .* randn(StableRNG(201), length(lg_ct))
+        lg_wtrue = [1.0, 0.6, 0.36, 0.216]          # geometric decay, ratio 0.6
+        lg_a0 = TC(:g, lg_ct, lg_x; trans=:lagindex, lags=4, nknots=8)
+        lg_z = PSM._tc_standardize(lg_a0,
+                                   PSM._tc_inner_series(lg_a0, lg_wtrue[2:end]))
+        lg_s0(z) = 1.0 + 0.6 * tanh(z)
+        lg_gtrue(t) = lg_s0(tc_lin(lg_ct, lg_z, t))
+        lg_true!(du, u, p, t) = (du[1] = lg_gtrue(t) - 0.8 * u[1]; nothing)
+        lg_ref = OrdinaryDiffEq.solve(
+            ODEProblem(lg_true!, [1.25], (0.0, 40.0)), Tsit5(),
+            saveat=0.5, abstol=1e-10, reltol=1e-10)
+        lg_ts = collect(lg_ref.t)
+        lg_data = reduce(hcat, lg_ref.u)' .+
+                  0.02 .* randn(StableRNG(202), length(lg_ts), 1)
+        lg_dyn!(du, u, p, t) = (du[1] = p.g(t) - p.k * u[1]; nothing)
+        lg_prob(a) = PSMProblem(lg_dyn!, [1.25], (0.0, 40.0), [a];
+            data_times=lg_ts, data_values=lg_data, obs_to_state=[1],
+            known_params=(k=0.8,), likelihood=Gaussian(), solver=Tsit5())
+        centroid(w) = sum((0:(length(w) - 1)) .* w) / sum(w)
+
+        # (a) RECOVERY of the decaying lag profile
+        a = TC(:g, lg_ct, lg_x; trans=:lagindex, lags=4, nknots=8,
+               initial=z -> 1.0)
+        sol = solve(lg_prob(a), LAML(maxiters=60, warmup=10,
+                                     initial_lambda=0.01, jac=:forwarddiff))
+        @test length(sol.smoothing_params) == 2
+        @test all(isfinite, sol.smoothing_params)
+        @test sol.smoothing_params[1] != sol.smoothing_params[2]
+        # Guard the fit BEFORE reading recovery tolerances off it. The SCOP
+        # testset below documents why: an unconverged LAML fit still returns
+        # finite, plausible-looking numbers (and plausible λ and edf), so
+        # `converged` is the only reliable signal that these tolerances mean
+        # anything. This fit does converge (:converged_tol, objective 0.0146).
+        @test sol.convergence.converged
+        w = lag_weights(a, Float64.(collect(sol.parameters)))
+        @test w[1] == 1.0                          # anchored exactly
+        # observed [1.0, 0.5438, 0.2816, 0.2405] against [1, 0.6, 0.36, 0.216]
+        @test maximum(abs.(w .- lg_wtrue)) < 0.15
+        @test w[2] > w[3]                           # the decay is recovered…
+        @test w[2] < w[1]
+        # …and the identified summary, the mean lag, lands within 3%
+        @test abs(centroid(w) - centroid(lg_wtrue)) < 0.06   # observed 0.0194
+        g = sol.unknown_functions[:g]
+        lg_rmse = sqrt(mean(abs2, [g(t) - lg_gtrue(t) for t in 0.0:0.25:40.0]))
+        @test lg_rmse < 0.03                        # observed 0.01343
+        # the fit is stable in the LAML start, not a lucky setting
+        sol_b = solve(lg_prob(TC(:g, lg_ct, lg_x; trans=:lagindex, lags=4,
+                                 nknots=8, initial=z -> 1.0)),
+                      LAML(maxiters=60, warmup=5, initial_lambda=1.0,
+                           jac=:forwarddiff))
+        @test sol_b.convergence.converged
+        @test maximum(abs.(lag_weights(a, Float64.(collect(sol.parameters))) .-
+                           lag_weights(a, Float64.(collect(sol_b.parameters))))) < 0.02
+
+        # (b) THE PENALTY DISCRIMINATOR. The inner block really is a
+        # first-difference penalty and it really bites: sweeping the fixed
+        # merged weight `inner_ridge` under a single-λ solver flattens the lag
+        # profile by EIGHT orders of magnitude in roughness — and flattens
+        # it toward a COMMON NON-ZERO value, which a ridge (whose null space
+        # is {0}) could not do. That distinction is the point of the test.
+        # Measured: roughness 0.1502 -> 1.11e-9, spread 0.3477 -> 4.70e-5,
+        # and the free weights land at [0.9718, 0.9717, 0.9717] — a flat,
+        # decidedly non-zero tail.
+        rough(v) = sum(abs2, diff(v[2:end]))
+        spread(v) = maximum(v[2:end]) - minimum(v[2:end])
+        res = map((1e-6, 1e4)) do ir
+            ai = TC(:g, lg_ct, lg_x; trans=:lagindex, lags=4, nknots=8,
+                    inner_ridge=ir, initial=z -> 1.0)
+            si = solve(lg_prob(ai), AdamSolver(maxiters=500, lr=0.05,
+                                               penalty_weight=1.0))
+            lag_weights(ai, Float64.(collect(si.parameters)))
+        end
+        w_free, w_pen = res
+        @test rough(w_pen) < 1e-3 * rough(w_free)
+        @test spread(w_pen) < 0.1 * spread(w_free)
+        @test spread(w_pen) < 0.05
+        # a ridge would have driven the free weights to zero; the smooth-lag
+        # prior parks them on a common non-zero level instead
+        @test mean(w_pen[2:end]) > 0.05
+    end
+
+    @testset "TransformedCovariateApproximator — shape constraints, bands, bootstrap" begin
+        PSM = PartiallySpecifiedModels
+        TC = TransformedCovariateApproximator
+
+        # (a) a shape-constrained outer smooth is monotone BY CONSTRUCTION for
+        # arbitrary parameter vectors — the SCOP guarantee, inherited unchanged
+        # from ShapeConstrainedBSplineApproximator by composition
+        rng_sc = StableRNG(53)
+        for constraint in (:increasing, :decreasing)
+            asc = TC(:beta, tc_ct, tc_temp; trans=:expsm, nknots=9,
+                     constraint=constraint)
+            for _ in 1:5
+                θsc = vcat([0.8], 1.5 .* randn(rng_sc, 9))
+                curve = [PSM._eval_approx_at(asc, θsc, z)
+                         for z in range(-2.5, 2.5, length=60)]
+                d = diff(curve)
+                @test (constraint == :increasing ? minimum(d) > -1e-10 :
+                                                   maximum(d) < 1e-10)
+            end
+        end
+        # …and it recovers the monotone temperature response end to end.
+        #
+        # NOTE THE `initial_lambda`. The SCOP outer smooth composed with the
+        # :expsm scan is strongly nonlinear, and starting LAML from the very
+        # light penalty this file uses elsewhere (0.01) does NOT work here:
+        # measured under the test suite's own `--check-bounds=yes`, that start
+        # fails to converge — exiting on :maxiters with β-RMSE 0.031 (vs
+        # 0.0085 here). Note what it does NOT do: λ = [0.54, 0.85] and edf
+        # 5.11 both look perfectly reasonable, so magnitude checks would miss
+        # it entirely and only `converged` catches it. This is the package's
+        # documented advice for strongly
+        # nonlinear problems (see the `initial_lambda` note in solver.jl), not
+        # a fixture tuned until it passed: `initial_lambda` 1.0 and 0.1 (with
+        # warmup 20) converge to the SAME optimum — objective 479.89, λ =
+        # [11.18, 6.07], edf 5.444, ω̂ 0.6903 — and that optimum agrees with
+        # the UNCONSTRAINED fit's ω̂ 0.6867 above.
+        #
+        # The convergence flag is asserted for exactly this reason: without
+        # it the diverged run above still produced finite numbers, and an
+        # earlier draft of this testset read its tolerances off one.
+        a_sc = TC(:beta, tc_ct, tc_temp; trans=:expsm, nknots=9,
+                  constraint=:increasing, initial=z -> 0.3)
+        sol_sc = solve(tc_prob(a_sc), LAML(maxiters=60, warmup=10,
+                                           initial_lambda=1.0,
+                                           jac=:forwarddiff))
+        @test sol_sc.convergence.converged
+        @test sol_sc.edf > 3.0                      # not collapsed to a constant
+        @test all(<(1e6), sol_sc.smoothing_params)  # …and λ not pinned at the cap
+        @test tc_beta_rmse(sol_sc.unknown_functions[:beta]) < 0.02  # obs 0.00852
+        θ_sc = Float64.(collect(sol_sc.parameters))
+        curve_sc = [PSM._eval_approx_at(a_sc, θ_sc, z)
+                    for z in range(-2.0, 2.0, length=40)]
+        @test minimum(diff(curve_sc)) > -1e-10      # really increasing
+        @test maximum(curve_sc) - minimum(curve_sc) > 0.05   # observed 0.3033
+        @test 0.55 < smoothing_inertia(a_sc, θ_sc)[1] < 0.80  # observed 0.6903
+
+        # (b) confidence_band serves the OUTER RESPONSE CURVE over the
+        # standardized covariate — NOT f(t). Gridding the domain and calling
+        # the fitted callable would evaluate β at "times" −xi…xi, which is the
+        # sibling-site bug this dispatch exists to prevent.
+        a_cb = TC(:beta, tc_ct, tc_temp; trans=:expsm, nknots=8,
+                  initial=z -> 0.3)
+        prob_cb = tc_prob(a_cb)
+        sol_cb = solve(prob_cb, LAML(maxiters=40, warmup=10,
+                                     initial_lambda=0.01, jac=:forwarddiff))
+        band = confidence_band(sol_cb, prob_cb)
+        @test haskey(band, :beta)
+        @test extrema(band[:beta].grid) == (-2.0, 2.0)
+        @test all(isfinite, band[:beta].fitted)
+        @test all(isfinite, band[:beta].se)
+        @test all(band[:beta].se .>= 0)
+        @test all(band[:beta].lower .<= band[:beta].fitted)
+        @test all(band[:beta].fitted .<= band[:beta].upper)
+        θ_cb = Float64.(collect(sol_cb.parameters))
+        @test band[:beta].fitted ≈ [PSM._eval_approx_at(a_cb, θ_cb, z)
+                                    for z in band[:beta].grid]
+        # …and that is NOT what calling the time-callable on the grid gives
+        @test maximum(abs.(band[:beta].fitted .-
+                           [sol_cb.unknown_functions[:beta](z)
+                            for z in band[:beta].grid])) > 1e-6
+
+        # (c) bootstrap produces a real (non-NaN) band for the response curve
+        res_b = bootstrap(sol_cb, prob_cb, AdamSolver(maxiters=60, lr=0.05);
+                          nboot=4, rng=StableRNG(54))
+        @test res_b.n_success >= 3
+        @test haskey(res_b.ci_uf, :beta)
+        @test all(isfinite, res_b.ci_uf[:beta].lower)
+        @test all(isfinite, res_b.ci_uf[:beta].upper)
+    end
+
+    @testset "TransformedCovariateApproximator — sibling registration" begin
+        TC = TransformedCovariateApproximator
+        # In the union, so the SIX per-type penalty whitelists must list it
+        # explicitly — the generic non-built-in fallback will NOT fire for it.
+        @test TC <: PartiallySpecifiedModels._BUILTIN_APPROX_TYPES
+
+        # Behavioral check where it is cheap: the gradient-matching solvers
+        # really do apply the merged penalty.
+        S_tc = penalty_matrix(TC(:beta, tc_ct, tc_temp; trans=:expsm, nknots=9))
+        rough(sol) = dot(sol.parameters, S_tc * sol.parameters)
+        for alg in (λ -> TwoStageSolver(maxiters=150, lambda_smooth=λ),
+                    λ -> IntegralMatchingSolver(maxiters=150, lambda_smooth=λ))
+            s0_ = solve(tc_prob(TC(:beta, tc_ct, tc_temp; trans=:expsm,
+                                   nknots=9, initial=z -> 0.3)), alg(0.0))
+            sP_ = solve(tc_prob(TC(:beta, tc_ct, tc_temp; trans=:expsm,
+                                   nknots=9, initial=z -> 0.3)), alg(50.0))
+            @test s0_.parameters != sP_.parameters
+            @test rough(sP_) < rough(s0_)
+        end
+
+        # The remaining four whitelists (AGM — whose smoothing_lambda is not a
+        # user-facing keyword — plus MAGI, rodeo and DALTON, which sit inside
+        # Kalman/HMC objectives far too slow to gate a unit test on) cannot be
+        # exercised end-to-end here. The campaign's recurring failure mode is
+        # precisely a type landing on some sibling sites and not others, so
+        # assert the registration at each site directly.
+        src_dir = dirname(pathof(PartiallySpecifiedModels))
+        for f in ("two_stage_solver.jl", "integral_matching_solver.jl",
+                  "magi_solver.jl", "adaptive_gradient_matching.jl",
+                  "rodeo_solver.jl", "dalton_solver.jl",
+                  "bootstrap.jl", "diagnostics.jl",
+                  "approximator_interface.jl")
+            @test occursin("TransformedCovariateApproximator",
+                           read(joinpath(src_dir, f), String))
+        end
+        # exported, alongside its three accessors
+        for s in (:TransformedCovariateApproximator, :lag_weights,
+                  :smoothing_inertia, :transformed_covariate)
+            @test s in names(PartiallySpecifiedModels)
+        end
     end
 
 end

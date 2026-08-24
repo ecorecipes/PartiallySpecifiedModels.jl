@@ -531,12 +531,14 @@ end
     _coordinate_gcv(scorer, S_list, offsets, nknots_list, n_p,
                     rho0, tol; sweeps=3)
 
-Per-approximator CV score: coordinate descent over the vector ρ, minimizing
-each component by golden section while the others are held fixed. Wood (2001)
-treats λ as a VECTOR with one smoothing parameter per unknown function
-(as does ddefit's gcv.c); a single shared λ mis-smooths whenever the
-functions differ in scale or wiggliness. Started from the shared-λ optimum,
-2–3 sweeps typically converge. `scorer` as in `_golden_section_gcv`
+Per-block CV score: coordinate descent over the vector ρ (one coordinate
+per penalty block — historically one per unknown function, still the case
+for single-block approximators), minimizing each component by golden
+section while the others are held fixed. Wood (2001) treats λ as a VECTOR
+with one smoothing parameter per unknown function (as does ddefit's
+gcv.c); a single shared λ mis-smooths whenever the functions — or the
+blocks within one function — differ in scale or wiggliness. Started from
+the shared-λ optimum, 2–3 sweeps typically converge. `scorer` as in `_golden_section_gcv`
 (either GCV or NCV — the multi-λ path is criterion-agnostic).
 
 With `family_factory !== nothing` (`(rho, k) -> _gcv_reuse_family(...)`
@@ -621,9 +623,9 @@ For each IRLS iteration:
 3. Compute IRLS weights from current predictions
 4. Select λ by minimizing the CV criterion — GCV(λ) by default, NCV(λ)
    when `alg.criterion == :ncv` — via grid search + golden-section
-   refinement (and per-approximator coordinate descent when there are
-   multiple smooth terms; both criteria drive the identical search
-   machinery). With `alg.search == :reuse` the λ-search evaluates every
+   refinement (and per-block coordinate descent when there are multiple
+   penalty blocks — one per penalized approximator by default; both
+   criteria drive the identical search machinery). With `alg.search == :reuse` the λ-search evaluates every
    candidate from one whitening + eigendecomposition per IRLS iteration
    (`_gcv_reuse_family`; ddefit's `EasySmooth`/`EScv` trick) instead of
    one O(p³) solve per λ — same scores to floating-point accuracy, with
@@ -639,6 +641,7 @@ Returns a `PSMSolution`. `sol.convergence` is a NamedTuple
 """
 function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     _validate_problem(prob, "GCVSolver")
+    _warn_unanchored_index(prob, "GCVSolver")
     maxiters = alg.maxiters
     verbose  = alg.verbose
     gamma    = alg.gamma
@@ -658,7 +661,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     # on n_p), reused by every compute_jacobian! call below.
     fd_cfg = alg.jac === :forwarddiff ? _fd_jacobian_config(n_p) : nothing
 
-    # Build penalty matrices per approximator
+    # Enumerate penalty blocks (default: one per penalized approximator; a
+    # multi-block type contributes one entry — and hence one λ — per block)
     S_list, uf_offsets, uf_nk = build_penalty_matrices(prob)
     m = length(S_list)
 
@@ -840,9 +844,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
             if m == 1
                 theta .= exp(best_rho)
             else
-                # Per-approximator λ (Wood 2001 treats λ as a vector):
-                # refine each component by coordinate descent from the
-                # shared-λ optimum.
+                # Per-block λ (Wood 2001 treats λ as a vector; one
+                # coordinate per penalty block): refine each component by
+                # coordinate descent from the shared-λ optimum.
                 rho_vec, beta_gcv, gcv_val, trA = _coordinate_gcv(
                     scorer, S_list, uf_offsets, uf_nk,
                     n_p, fill(best_rho, m), tol;

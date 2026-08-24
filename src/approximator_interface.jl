@@ -3,11 +3,13 @@
 # `build_evaluator` is the single dispatch point through which every solver
 # turns an approximator plus its coefficient block into a callable unknown
 # function. Together with `nparams`, `initial_params`, and `penalty_matrix`
-# it forms the complete interface a custom approximator type must implement;
-# see docs/src/extending.md ("Custom approximators") for the contracts and a
+# it forms the complete interface a custom approximator type must implement
+# (plus the OPTIONAL fifth function `penalty_blocks`, below, for types that
+# carry several independently-smoothed penalty blocks); see
+# docs/src/extending.md ("Custom approximators") for the contracts and a
 # worked example.
 
-# The nine built-in approximator types. Six solvers (TwoStage,
+# The eleven built-in approximator types. Six solvers (TwoStage,
 # IntegralMatching, MAGI, AGM, Rodeo, Dalton) assemble their smoothing
 # penalties through per-type whitelists whose built-in treatment is
 # historical and deliberately NOT unified (the lists differ — e.g.
@@ -22,7 +24,8 @@ const _BUILTIN_APPROX_TYPES = Union{
     SPDEApproximator, ShapeConstrainedSPDEApproximator,
     GPApproximator, ShapeConstrainedGPApproximator,
     NeuralApproximator, COMONetApproximator,
-    TensorBSplineApproximator}
+    TensorBSplineApproximator, SingleIndexApproximator,
+    TransformedCovariateApproximator}
 
 """
     build_evaluator(approx, params_k) -> callable
@@ -32,7 +35,10 @@ its parameter block `params_k`. Solvers call this to build the object that
 the dynamics function receives as `p.<name>`, so the returned value must be
 callable on a scalar, `f = build_evaluator(a, θ); f(x)::Number` (or on as
 many scalar arguments as the dynamics pass it — `TensorBSplineApproximator`
-returns a two-argument callable `f(x, y)`).
+returns a two-argument callable `f(x, y)`, `SingleIndexApproximator` a
+`p`-argument callable `f(u₁, …, u_p)`, and
+`TransformedCovariateApproximator` a one-argument callable of TIME,
+`f(t)`).
 
 This is the extension point for user-defined approximator types. To add a
 new approximator, define a struct subtyping `AbstractApproximator` (with at
@@ -52,12 +58,14 @@ vector of `ForwardDiff.Dual` numbers, so the evaluator must be eltype-generic
 (`AdamSolver`, `MultipleShootingSolver`, `TwoStageSolver`, `BNGSolver`,
 `IntegralMatchingSolver`, …).
 
-Methods are provided for the nine built-in types:
+Methods are provided for the eleven built-in types:
 
 | Approximator | Evaluator |
 |:---|:---|
 | `BSplineApproximator` | `build_bspline_evaluator` on a uniform knot grid over `domain` |
 | `TensorBSplineApproximator` | `build_tensor_bspline_evaluator` (bivariate tensor product of the univariate construction; the callable takes TWO arguments, `f(x, y)`) |
+| `SingleIndexApproximator` | `build_single_index_evaluator` (learned direction composed with a univariate outer smooth; the callable takes `p` arguments, `f(u₁, …, u_p)`) |
+| `TransformedCovariateApproximator` | `build_transformed_covariate_evaluator` (learned transform of an exogenous covariate composed with a univariate outer smooth; the callable takes TIME, `f(t)`) |
 | `NeuralApproximator` | `build_neural_evaluator` (Dual-safe MLP path + Lux fallback) |
 | `GPApproximator` | `build_gp_evaluator` (kernel interpolation) |
 | `ShapeConstrainedGPApproximator` | `build_constrained_gp_evaluator` (SCOP reparameterization + kernel interpolation) |
@@ -89,6 +97,16 @@ end
 build_evaluator(approx::TensorBSplineApproximator, params_k) =
     build_tensor_bspline_evaluator(approx, params_k)
 
+# p-argument callable f(u₁, …, u_p) = s((aᵀu − aᵀμ̂)/√(aᵀΣ̂a)) — Dual-safe
+# in params and in the states.
+build_evaluator(approx::SingleIndexApproximator, params_k) =
+    build_single_index_evaluator(approx, params_k)
+
+# One-argument callable of TIME, f(t) = s(z(t)) with z the standardized
+# learned transform of an exogenous covariate — Dual-safe in params and in t.
+build_evaluator(approx::TransformedCovariateApproximator, params_k) =
+    build_transformed_covariate_evaluator(approx, params_k)
+
 # Dual-safe, eltype-generic (see neural_evaluator.jl) — required for
 # autodiff Jacobians in stiff ODE solvers and for gradients of any
 # objective w.r.t. β.
@@ -112,3 +130,45 @@ build_evaluator(approx::SPDEApproximator, params_k) =
 
 build_evaluator(approx::ShapeConstrainedSPDEApproximator, params_k) =
     build_constrained_spde_evaluator(approx, params_k)
+
+"""
+    penalty_blocks(approx) -> Vector{Tuple{Matrix{Float64}, UnitRange{Int}}}
+
+Quadratic penalty blocks of an approximator as `(S, local_range)` pairs.
+Under the penalized-likelihood solvers (`LAML`, `GCVSolver`,
+`CollocationLAML`, `GradientMatching`, `ProfileLikelihoodSolver`) each
+block receives its OWN smoothing parameter — the total penalty is
+`Σ_k λ_k β[r_k]' S_k β[r_k]` with every `λ_k` estimated jointly by
+LAML/GCV. This is the optional fifth function of the approximator
+extension protocol; types with a single roughness penalty need only
+`penalty_matrix` and get the default below.
+
+Contract: ranges are LOCAL to the approximator's own coefficient block
+(within `1:nparams(approx)`) and MUST be pairwise disjoint — the
+per-block generalized determinant `log|S_λ|₊` in laml.jl is exact only
+for non-overlapping blocks; `build_penalty_matrices` validates this and
+throws an `ArgumentError` otherwise. Each `S` must be
+`length(range) × length(range)`, symmetric positive semi-definite
+(possibly a zero matrix).
+
+Default: the single block `(penalty_matrix(approx), 1:nparams(approx))`,
+or no blocks (`[]`) when `penalty_matrix` returns `nothing` OR
+`nparams(approx) < 3`. The `np ≥ 3` inclusion gate was historically
+applied inside `build_penalty_matrices`; it lives in this default method
+so the default path is unchanged while custom multi-block types remain
+free to declare small blocks (e.g. a 2-parameter ridge).
+
+Types overriding `penalty_blocks` should usually also provide a
+CONSISTENT `penalty_matrix` — the block-diagonal merge of the blocks
+with fixed weights — because the single-λ consumers (the
+gradient-matching/probabilistic-numerics per-type penalty sites and the
+MCMC/VI/ABC prior builder) read `penalty_matrix` only and apply ONE
+weight to the whole approximator.
+"""
+function penalty_blocks(approx)
+    np = nparams(approx)
+    S = penalty_matrix(approx)
+    (S === nothing || np < 3) &&
+        return Tuple{Matrix{Float64}, UnitRange{Int}}[]
+    Tuple{Matrix{Float64}, UnitRange{Int}}[(S, 1:np)]
+end

@@ -14,6 +14,34 @@ using ForwardDiff   # jac=:forwarddiff prediction-Jacobian path
 # ─── Input validation ─────────────────────────────────────────────
 
 """
+    _warn_unanchored_index(prob, solver_name)
+
+Warn once per solve when a `SingleIndexApproximator` with `anchor === nothing`
+is fitted by a smoothing-parameter-estimating solver.
+
+The data term is EXACTLY flat along `a -> c*a` (the index standardization
+divides it out), so the inner ridge that makes free mode well posed for
+flat-objective optimizers is minimized by `‖a‖ -> 0` under a criterion that
+also drives λ. The fit then collapses to a near-zero loading vector with a
+meaningless inner λ and an ill-conditioned penalized Hessian, while the data
+loss looks normal — a silent-wrong path this warning exists to break.
+"""
+function _warn_unanchored_index(prob::PSMProblem, solver_name::String)
+    for a in prob.approximators
+        if a isa SingleIndexApproximator && a.anchor === nothing
+            @warn "$solver_name: SingleIndexApproximator :$(a.name) has " *
+                  "anchor=nothing. The data term is scale-invariant in the " *
+                  "loadings, so the inner ridge is minimized by ‖a‖ → 0 and " *
+                  "this fit will degenerate (near-zero loadings, meaningless " *
+                  "inner λ) while the data loss still looks reasonable. Use " *
+                  "the default anchor=<index> with $solver_name; free mode is " *
+                  "for flat-objective solvers (AdamSolver, DerivativeFreeSolver, " *
+                  "MCMCSolver)." maxlog=1
+        end
+    end
+end
+
+"""
     _validate_problem(prob, solver_name; require_continuous=false)
 
 Common input validation for all solve methods. Checks data dimensions,
@@ -570,8 +598,29 @@ end
 """
     build_penalty_matrices(prob)
 
-Build per-approximator penalty matrices (unit smoothing parameter).
-Returns `(S_list, offsets, nknots_list)`.
+Enumerate the quadratic penalty blocks of every approximator (unit
+smoothing parameter), via [`penalty_blocks`](@ref) — by default one block
+per penalized approximator, its `penalty_matrix` over the full coefficient
+range; a type overriding `penalty_blocks` contributes one entry per block.
+Every downstream smoothing-parameter machinery (LAML's Fellner–Schall and
+Newton phases, GCV's coordinate descent, CollocationLAML's and
+GradientMatching's FS updates) is per-ENTRY of these lists, so each block
+receives its own λ.
+
+Returns `(S_list, offsets, nknots_list)` where entry `l` is a penalty
+matrix, its GLOBAL offset into the flat coefficient vector, and its block
+size. `nknots_list` is the historical name: each entry is the SIZE of a
+penalty block (`length(range)`), which coincided with the knot count when
+blocks were whole approximators — every consumer treats it as a block
+size.
+
+Validates the blocks of each approximator (this is the single funnel all
+block consumers go through): local ranges must be non-empty and lie
+within `1:nparams(approx)`, be pairwise disjoint (the per-block
+generalized determinant `log|S_λ|₊` in laml.jl is exact only for
+non-overlapping blocks), and each `S` must be
+`length(range) × length(range)` and numerically symmetric. Violations
+throw an `ArgumentError` naming the approximator.
 """
 function build_penalty_matrices(prob::PSMProblem)
     S_list = Matrix{Float64}[]
@@ -581,11 +630,39 @@ function build_penalty_matrices(prob::PSMProblem)
     offset = 0
     for approx in prob.approximators
         np = nparams(approx)
-        S = penalty_matrix(approx)
-        if S !== nothing && np >= 3
+        covered = falses(np)
+        for (S, r) in penalty_blocks(approx)
+            # Contiguous ranges only: the enumeration below records a block
+            # by (offset, length), so a strided or non-contiguous index set
+            # would be silently reinterpreted as the contiguous range of
+            # the same length.
+            r isa AbstractUnitRange{<:Integer} || throw(ArgumentError(
+                "penalty_blocks(:$(approx.name)): range must be a " *
+                "contiguous unit range (got $(typeof(r)): $r)"))
+            isempty(r) && throw(ArgumentError(
+                "penalty_blocks(:$(approx.name)): empty range $r"))
+            (1 <= first(r) && last(r) <= np) || throw(ArgumentError(
+                "penalty_blocks(:$(approx.name)): range $r lies outside " *
+                "the approximator's coefficient block 1:$np"))
+            size(S) == (length(r), length(r)) || throw(ArgumentError(
+                "penalty_blocks(:$(approx.name)): S is " *
+                "$(size(S, 1))×$(size(S, 2)) but range $r has length " *
+                "$(length(r))"))
+            asym = maximum(abs.(S .- S'))
+            asym <= 1e-8 * max(maximum(abs.(S)), 1.0) || throw(ArgumentError(
+                "penalty_blocks(:$(approx.name)): S for range $r is not " *
+                "symmetric (max |S - S'| = $asym)"))
+            for i in r
+                covered[i] && throw(ArgumentError(
+                    "penalty_blocks(:$(approx.name)): ranges overlap at " *
+                    "local index $i. Blocks must be pairwise disjoint — " *
+                    "the per-block generalized determinant log|S_λ|₊ in " *
+                    "laml.jl is exact only for non-overlapping blocks."))
+                covered[i] = true
+            end
             push!(S_list, S)
-            push!(offsets, offset)
-            push!(nknots_list, np)
+            push!(offsets, offset + first(r) - 1)
+            push!(nknots_list, length(r))
         end
         offset += np
     end
@@ -629,6 +706,7 @@ laml)` — see the `LAML` and `PSMSolution` docstrings for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     _validate_problem(prob, "LAML")
+    _warn_unanchored_index(prob, "LAML")
     # The full Laplace criterion needs the actual family's NORMALIZED
     # log-likelihood with a KNOWN, fixed dispersion (its value enters the
     # criterion directly, and the generalized Fellner-Schall update assumes
@@ -657,7 +735,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     # on n_p), reused by every compute_jacobian! call below.
     fd_cfg = alg.jac === :forwarddiff ? _fd_jacobian_config(n_p) : nothing
 
-    # Build penalty matrices per approximator
+    # Enumerate penalty blocks (default: one per penalized approximator; a
+    # multi-block type contributes one entry — and hence one λ — per block)
     S_list, uf_offsets, uf_nk = build_penalty_matrices(prob)
     m = length(S_list)
 
