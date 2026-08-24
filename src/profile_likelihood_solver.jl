@@ -145,10 +145,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
             return 1e10
         end
         # Penalty at the FITTED smoothing parameters λ̂, over exactly the
-        # penalized blocks LAML used (build_penalty_matrices skips
-        # unpenalized approximators, e.g. NeuralApproximator with
-        # penalty_weight=0, so lam_hat aligns with S_list_prof — indexing
-        # by raw approximator position mis-assigned λ̂ for mixed sets).
+        # penalty BLOCKS LAML used: `base_sol.smoothing_params` carries one
+        # λ̂ per entry of `build_penalty_matrices` (unpenalized
+        # approximators — e.g. NeuralApproximator with penalty_weight=0 —
+        # contribute none; a multi-block `penalty_blocks` type contributes
+        # one per block), so lam_hat aligns index-for-index with
+        # S_list_prof here. Indexing by raw approximator position instead
+        # mis-assigned λ̂ for mixed sets.
         if with_penalty
             for k in eachindex(S_list_prof)
                 off = offs_prof[k]

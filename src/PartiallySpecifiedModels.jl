@@ -166,7 +166,7 @@ export FGPGMSolver
 
 # Exports — functions
 export solve, simulate, predict
-export spline_penalty_matrix, penalty_matrix
+export spline_penalty_matrix, penalty_matrix, penalty_blocks
 export nparams, initial_params, build_evaluator
 export optimize_spde_range, with_range_param
 export residual_diagnostics, durbin_watson, residual_acf, semivariogram
