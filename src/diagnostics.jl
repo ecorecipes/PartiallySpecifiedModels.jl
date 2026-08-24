@@ -416,7 +416,16 @@ function confidence_band(sol::PSMSolution, prob::PSMProblem;
         V_k = σ² .* V_beta[idx, idx]
 
         grid = collect(range(approx.domain[1], approx.domain[2], length=uf_ngrid))
-        f_est = Float64[sol.unknown_functions[approx.name](x) for x in grid]
+        # A single-index approximator's fitted callable takes p arguments, so
+        # its band is the band of the OUTER curve s(z) over the STANDARDIZED
+        # index z ∈ [−xi, xi] — the univariate payoff a tensor surface cannot
+        # have. Everything else is evaluated through its own callable.
+        f_est = if approx isa SingleIndexApproximator
+            Float64[_eval_approx_at(approx, Float64.(sol.parameters[idx]), x)
+                    for x in grid]
+        else
+            Float64[sol.unknown_functions[approx.name](x) for x in grid]
+        end
         se = zeros(uf_ngrid)
 
         # Compute ∂f(x)/∂β via central finite differences for all approximator types.
@@ -469,6 +478,19 @@ end
 
 function _eval_approx_at(approx::ShapeConstrainedGPApproximator, p::Vector{Float64}, x::Real)
     build_constrained_gp_evaluator(approx, p)(x)
+end
+
+"""
+Single index: the band is over the OUTER smooth `s(z)` evaluated at the
+standardized index `z`. The inner loadings do not enter `s` at a FIXED `z`,
+so their finite-difference sensitivities are exactly zero and the band is
+the uncertainty of the curve itself — not of where a given state maps onto
+it.
+"""
+function _eval_approx_at(approx::SingleIndexApproximator, p::Vector{Float64},
+                         x::Real)
+    ni = _si_n_inner(approx)
+    build_evaluator(approx.outer, p[(ni + 1):end])(x)
 end
 
 function _eval_approx_at(approx, p::Vector{Float64}, x::Real)

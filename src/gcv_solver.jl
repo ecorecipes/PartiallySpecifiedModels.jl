@@ -641,6 +641,7 @@ Returns a `PSMSolution`. `sol.convergence` is a NamedTuple
 """
 function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     _validate_problem(prob, "GCVSolver")
+    _warn_unanchored_index(prob, "GCVSolver")
     maxiters = alg.maxiters
     verbose  = alg.verbose
     gamma    = alg.gamma

@@ -10,8 +10,9 @@ shooting, adaptive gradient matching, rodeo, MCMC/HMC, MAGI, BNG, DALTON,
 pseudo-marginal, GCV, two-stage, derivative-free, variational, ABC-SMC,
 integral matching, profile likelihood, ensemble Kalman, ODIN, FGPGM, and
 RKHS)
-and 7 approximator types (B-spline, shape-constrained B-spline, SPDE,
-shape-constrained SPDE, neural network, Gaussian process, and COMONet).
+and 10 approximator types (B-spline, shape-constrained B-spline, tensor-product
+B-spline, single index, SPDE, shape-constrained SPDE, neural network, Gaussian
+process, shape-constrained Gaussian process, and COMONet).
 
 Uses Laplace Approximate Marginal Likelihood (LAML) for automatic smoothing
 parameter estimation, following:
@@ -149,6 +150,7 @@ include("bootstrap.jl")
 # Exports — types
 export AbstractApproximator, BSplineApproximator, NeuralApproximator, GPApproximator, SPDEApproximator
 export TensorBSplineApproximator
+export SingleIndexApproximator, index_loadings
 export ShapeConstrainedBSplineApproximator, ShapeConstrainedSPDEApproximator, SHAPE_CONSTRAINTS
 export ShapeConstrainedGPApproximator
 export COMONetApproximator, COMONET_CONSTRAINTS

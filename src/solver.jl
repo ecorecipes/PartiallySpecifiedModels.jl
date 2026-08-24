@@ -14,6 +14,34 @@ using ForwardDiff   # jac=:forwarddiff prediction-Jacobian path
 # ─── Input validation ─────────────────────────────────────────────
 
 """
+    _warn_unanchored_index(prob, solver_name)
+
+Warn once per solve when a `SingleIndexApproximator` with `anchor === nothing`
+is fitted by a smoothing-parameter-estimating solver.
+
+The data term is EXACTLY flat along `a -> c*a` (the index standardization
+divides it out), so the inner ridge that makes free mode well posed for
+flat-objective optimizers is minimized by `‖a‖ -> 0` under a criterion that
+also drives λ. The fit then collapses to a near-zero loading vector with a
+meaningless inner λ and an ill-conditioned penalized Hessian, while the data
+loss looks normal — a silent-wrong path this warning exists to break.
+"""
+function _warn_unanchored_index(prob::PSMProblem, solver_name::String)
+    for a in prob.approximators
+        if a isa SingleIndexApproximator && a.anchor === nothing
+            @warn "$solver_name: SingleIndexApproximator :$(a.name) has " *
+                  "anchor=nothing. The data term is scale-invariant in the " *
+                  "loadings, so the inner ridge is minimized by ‖a‖ → 0 and " *
+                  "this fit will degenerate (near-zero loadings, meaningless " *
+                  "inner λ) while the data loss still looks reasonable. Use " *
+                  "the default anchor=<index> with $solver_name; free mode is " *
+                  "for flat-objective solvers (AdamSolver, DerivativeFreeSolver, " *
+                  "MCMCSolver)." maxlog=1
+        end
+    end
+end
+
+"""
     _validate_problem(prob, solver_name; require_continuous=false)
 
 Common input validation for all solve methods. Checks data dimensions,
@@ -678,6 +706,7 @@ laml)` — see the `LAML` and `PSMSolution` docstrings for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     _validate_problem(prob, "LAML")
+    _warn_unanchored_index(prob, "LAML")
     # The full Laplace criterion needs the actual family's NORMALIZED
     # log-likelihood with a KNOWN, fixed dispersion (its value enters the
     # criterion directly, and the generalized Fellner-Schall update assumes

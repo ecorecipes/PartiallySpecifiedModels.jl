@@ -1,6 +1,6 @@
 # Approximators
 
-PartiallySpecifiedModels.jl provides eight approximator types for representing unknown functions in dynamical systems. Each approximator is a callable object that maps scalar inputs to scalar outputs and is fitted as part of the model (the tensor-product approximator takes two scalar inputs).
+PartiallySpecifiedModels.jl provides ten approximator types for representing unknown functions in dynamical systems. Each approximator is a callable object that maps scalar inputs to scalar outputs and is fitted as part of the model (the tensor-product approximator takes two scalar inputs; the single-index approximator takes `p`).
 
 ## BSplineApproximator
 
@@ -57,6 +57,68 @@ Works with the through-the-solver and penalized-likelihood solvers (`AdamSolver`
 
 ```@docs
 TensorBSplineApproximator
+```
+
+## SingleIndexApproximator
+
+Unknown function of **several** states through **one learned direction**,
+``f(u_1, \dots, u_p) = s(z)`` with ``z = (a^\top u - a^\top \hat\mu)/\sqrt{a^\top \hat\Sigma a}``.
+The loadings ``a`` and the univariate outer smooth ``s`` are estimated jointly — the
+nested-effects construction of Fasiolo et al. (arXiv:2511.19234), where the inner
+transformation and the outer smooth carry separate smoothing parameters under LAML.
+
+```@example approx
+approx_si = SingleIndexApproximator(:f, 2, 10; xi = 2.5,
+                                    initial = z -> -0.05 - 0.1 * z)
+```
+
+With `index_stats = nothing` (the default) this approximator is **unresolved**:
+its standardization statistics are filled in at `PSMProblem` construction, which
+stores a *resolved copy*. Read fitted results back through the problem's own
+object — `prob.approximators[1]`, or `sol.unknown_functions[:f]` — since calling
+`build_evaluator` on the bare `approx_si` above raises an error telling you so.
+Pass `index_stats = (mu, Sigma)` if you would rather resolve it up front.
+
+- **`2`**: number of index arguments (`p`), called as `p.f(u[1], u[2])`
+- **`10`**: knots of the outer smooth, placed on ``[-\xi, \xi]`` in **standardized** units
+- **`anchor`** (keyword, default `1`): `a[anchor] ≡ 1` is not a parameter, which fixes both the scale and the sign of the index. The anchor variable must genuinely load
+- **`constraint`** (keyword, default `:none`): any of [`SHAPE_CONSTRAINTS`](@ref) makes the outer smooth the SCOP construction
+- **`index_stats`** (keyword): `(mu, Sigma)`; `nothing` (default) derives them once from the data at `PSMProblem` construction and then holds them **fixed** for the whole fit
+
+**When to prefer this to a tensor surface — and when not.** The advantage is
+**model match**, not orbit geometry. On the damped predator–prey fixture in the test suite,
+whose truth genuinely *is* an index, both types fit the data equally well but the single
+index extrapolates far better off the orbit: RMSE 0.00421 against the tensor's 0.02678 at
+off-orbit states whose index the data pin down, 0.0256 against 0.0815 over all off-orbit
+states, and 0.0112 against 0.0369 over the whole state box — with 11 coefficients where the
+tensor uses 25, recovering the true loadings to within 2%. Rebuild the same fixture with a
+truth that is *not* an index and the ranking reverses by a comparable or larger margin: an
+additive two-ridge truth gives 0.314 against the tensor's 0.054, a multiplicative
+interaction 0.207 against 0.070.
+
+So reach for a single index when you have reason to believe one direction drives the
+response (and when ``p > 2``, where no tensor type exists at all); reach for the tensor
+when you expect a genuine interaction. Usefully, **the misspecification is not silent**: on
+both non-index truths above the single index's `data_loss` was 27–66% worse than the
+tensor's, so a poor in-sample fit flags the wrong choice. One asymmetry to keep in mind when
+comparing: the single index carries **two** smoothing parameters (inner and outer) while the
+tensor's Kronecker-sum penalty carries **one**.
+
+Two honest caveats. First, the loadings need the state path to change direction. What
+defeats identification is **collinearity** — states moving along an (affinely) straight
+line in state space, where a rescaled ``a`` is absorbed into ``s``. Mere monotonicity is
+*not* enough to break it: on decay fixtures where every coordinate and the index itself
+decrease monotonically, the loadings were still recovered to 2%, because a curved path keeps
+changing its tangent direction. Second, ``\xi = 2`` covers ±2 standard deviations of the
+index; a strongly skewed orbit needs a larger `xi` (outside the knots the outer smooth
+extrapolates linearly, as everywhere else in the package).
+
+`confidence_band` works, and returns the band of the **outer curve** over the standardized
+index — the univariate payoff a tensor surface cannot offer.
+
+```@docs
+SingleIndexApproximator
+index_loadings
 ```
 
 ## ShapeConstrainedBSplineApproximator

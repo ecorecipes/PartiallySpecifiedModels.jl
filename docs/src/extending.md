@@ -1,6 +1,6 @@
 # Custom approximators
 
-PartiallySpecifiedModels.jl ships with nine approximator types, but the set is open: every solver constructs and consumes unknown functions through four generic functions, so adding your own approximator requires no changes to any solver file. Define a struct, implement the four methods, and pass it to `PSMProblem` like any built-in type.
+PartiallySpecifiedModels.jl ships with ten approximator types, but the set is open: every solver constructs and consumes unknown functions through four generic functions, so adding your own approximator requires no changes to any solver file. Define a struct, implement the four methods, and pass it to `PSMProblem` like any built-in type.
 
 ## The interface
 
@@ -125,6 +125,12 @@ block and must be pairwise disjoint; each `S` must be
 `length(range) × length(range)`, symmetric PSD. The default method
 returns the single block `(penalty_matrix(a), 1:nparams(a))` (or none,
 under the gate above), so single-penalty types need not care.
+
+The built-in worked example is [`SingleIndexApproximator`](@ref): its
+coefficient block splits into the inner loadings and the outer smooth's
+coefficients, and it declares one ridge block for the former and the outer
+roughness penalty for the latter, so LAML estimates the direction's
+shrinkage and the curve's wiggliness independently.
 
 Types overriding `penalty_blocks` should usually also provide a
 consistent `penalty_matrix` — the block-diagonal merge of the blocks with
