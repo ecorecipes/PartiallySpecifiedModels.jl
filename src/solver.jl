@@ -938,6 +938,27 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     end
 
     otheta = copy(theta)
+    # θ̂ REPORTED TO THE USER: the smoothing parameters β was actually fitted
+    # under. Three θ vectors coexist in this loop and they are NOT
+    # interchangeable:
+    #   theta     — the newest Fellner-Schall PROPOSAL. Computed at the very
+    #               end of each iteration and only tested at the start of the
+    #               next one, so at loop exit it is always untested and may
+    #               have been explicitly REJECTED by the accept block below.
+    #   otheta    — the θ the NEXT PCLS step will use. The `f01 < obj_prev`
+    #               branch advances it to `theta` AFTER fitting β at the old
+    #               value, so it too can disagree with β at exit.
+    #   theta_fit — the θ whose penalty B(θ) actually produced the current β.
+    #               This is the only one for which β is the penalized MLE, so
+    #               it is what `smoothing_params` and every θ-dependent
+    #               quantity in the final block (B_final, edf, objective,
+    #               V_beta, sigma2, the LAML criterion) are computed at.
+    # Reporting `theta` instead made λ̂ and β̂ mutually inconsistent: refitting
+    # β at the reported λ moved it by up to 78% of ‖β‖ on a CONVERGED
+    # two-λ Lotka-Volterra fixture (measured), and the reported objective was
+    # 7.3e7 against a data loss of 0.89 because the penalty was evaluated at a
+    # λ the coefficients had never seen.
+    theta_fit = copy(theta)
     prev_obj = Inf  # Track penalized objective for convergence
     prev_data_loss = Inf  # Track data loss for non-Gaussian convergence
 
@@ -1003,6 +1024,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                 compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
                                   jac=alg.jac, fd_cfg=fd_cfg)
                 otheta .= theta
+                theta_fit .= theta      # β was fitted under B(theta)
             elseif f01 < obj_prev
                 # Old theta step improved at old theta
                 f0_vec, _ = try; eval_model(a0); catch; (f_vec, nothing); end
@@ -1010,6 +1032,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                 f_vec .= f0_vec
                 compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
                                   jac=alg.jac, fd_cfg=fd_cfg)
+                # a0 came from PCLS at the OLD θ, so record it BEFORE the
+                # otheta update below moves otheta onto the new proposal.
+                theta_fit .= otheta
                 # Also accept new theta if it didn't make data loss worse
                 if dl_a1 < dl_curr
                     otheta .= theta
@@ -1022,20 +1047,25 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                 compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
                                   jac=alg.jac, fd_cfg=fd_cfg)
                 otheta .= theta
+                theta_fit .= theta      # β was fitted under B(theta)
             else
-                # No improvement from either
+                # No improvement from either: β is unchanged, so theta_fit
+                # stays on whatever θ produced it.
                 if iter >= 10
                     stop = true
                 end
                 theta .= otheta
             end
         else
-            # First iteration: accept a0 and update otheta
+            # First iteration (or no penalized blocks): accept a0. Note this
+            # branch does NOT update otheta — theta_fit therefore records
+            # otheta, the θ a0 was actually stepped under.
             f0_vec, _ = try; eval_model(a0); catch; (f_vec, nothing); end
             beta .= a0
             f_vec .= f0_vec
             compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
                               jac=alg.jac, fd_cfg=fd_cfg)
+            theta_fit .= otheta     # a0 came from PCLS at otheta
         end
 
         # Track penalized objective for convergence monitoring
@@ -1111,6 +1141,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             theta .= theta_new
         end
     end
+
+    # Collapse onto the θ that β was actually fitted at (see the theta_fit
+    # comment above). Everything from here down — B_final, edf, obj_val,
+    # V_beta, sigma2, the LAML criterion, the verbose "Final θ" line and
+    # `smoothing_params` itself — reads `theta`, so this single assignment is
+    # what makes the whole reported solution self-consistent: β̂ IS the
+    # penalized MLE at the λ̂ reported next to it.
+    #
+    # A truncated fit (`converged == false`) is still not stationary at ANY λ
+    # — no choice of reported λ can fix that, and `convergence.reason` already
+    # says so — but the λ/β PAIRING is now honest in every case.
+    theta .= theta_fit
 
     # Build solution
     p_opt = copy(beta)

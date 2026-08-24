@@ -3659,7 +3659,19 @@ Result of fitting a PSM.
   returns them). With only single-block approximators — the default —
   this is one entry per penalized approximator, as historically; an
   unpenalized approximator (no blocks) contributes no entry, and a
-  multi-block approximator contributes one entry per block
+  multi-block approximator contributes one entry per block.
+  For `LAML` and `GCVSolver`, λ̂ and `parameters` are a MATCHED PAIR: λ̂ is
+  the λ whose penalty `B(λ̂) = Σ λ̂ₗ Sₗ` produced β̂ — the last accepted
+  penalized step was taken under it — and `objective`, `edf`,
+  `convergence.V_beta`, `convergence.sigma2` and `convergence.laml` are all
+  evaluated at that same λ̂. (`LAML` explores further λ proposals after the
+  last coefficient update; those are not reported, because β̂ was never
+  fitted under them.) On a CONVERGED fit β̂ is therefore a fixed point of
+  the penalized step at λ̂, so refitting reproduces `parameters`; on a
+  truncated fit (`convergence.converged == false`) it is not — the step
+  contraction may have accepted a partial step — but the pairing is still
+  honest. `RodeoSolver` and `DaltonSolver` also populate this field; their
+  pairing has not been audited to the same standard.
 - `fitted_values`: predicted values at data times (n_times × n_obs)
 - `unknown_functions`: Dict of name => callable evaluator
 - `convergence`: convergence information. For the iterative optimisers
