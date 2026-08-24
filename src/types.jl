@@ -1435,6 +1435,381 @@ function _resolve_index_stats(a::SingleIndexApproximator, u0,
                             mu, Sig, a.loadings_init)
 end
 
+# ─── Transformed-covariate approximator ────────────────────────────
+
+"""
+    _tc_logistic(z)
+
+The logistic function written as `(1 + tanh(z/2))/2`. Algebraically
+identical to `1/(1 + exp(-z))` but with no overflow branch: `exp(-z)`
+overflows to `Inf` for `z ≲ -710` and then produces a `NaN` derivative,
+while `tanh` saturates cleanly. Eltype-generic and branch-free, so it is
+Dual-safe in the exponential-smoothing scan below.
+"""
+_tc_logistic(z) = (one(z) + tanh(z / 2)) / 2
+
+"""
+    _tc_linterp(ts, vals, t)
+
+Linear interpolation of `vals` over the strictly increasing grid `ts`,
+held CONSTANT at the end values outside `[ts[1], ts[end]]`. Eltype-generic
+in `vals` (so `ForwardDiff.Dual` node values propagate) and in `t`.
+
+The ODE solver asks for the unknown function at arbitrary `t`, so the
+transformed covariate has to be continuous everywhere — a step function
+read off the nearest grid cell would give the integrator a discontinuous
+right-hand side and wreck adaptive stepping. Piecewise-linear is
+continuous but only C⁰: it has kinks at the covariate times, which is why
+the docstring of [`TransformedCovariateApproximator`](@ref) recommends
+`jac=:forwarddiff`.
+"""
+function _tc_linterp(ts::AbstractVector{Float64}, vals::AbstractVector, t)
+    n = length(ts)
+    t <= ts[1] && return vals[1] * one(t)
+    t >= ts[n] && return vals[n] * one(t)
+    i = searchsortedlast(ts, t)
+    i >= n && return vals[n] * one(t)
+    w = (t - ts[i]) / (ts[i + 1] - ts[i])
+    vals[i] + w * (vals[i + 1] - vals[i])
+end
+
+"""
+    TransformedCovariateApproximator(name, times, X; trans, nknots=8, lags=0,
+                                     anchor=1, constraint=:none, xi=2.0,
+                                     inner_ridge=1e-4, initial=nothing)
+
+Unknown function of TIME driven by an EXOGENOUS covariate through a
+LEARNED inner transformation:
+
+    f(t) = s(z(t)),    z = (s̃ − mean s̃) / sd s̃,    s̃ = T_a(x)
+
+where `x` is a user-supplied covariate series sampled at `times`, `T_a` is
+one of two parametric transformations with free parameters `a`, and `s` is
+a univariate smooth. Both are estimated JOINTLY, with SEPARATE smoothing
+parameters (see [`penalty_blocks`](@ref)). This is the nested-effects
+construction of Fasiolo et al. (arXiv:2511.19234; R package *gamFactory*),
+and it is the sibling of [`SingleIndexApproximator`](@ref): same outer
+smooth on a standardized inner statistic, different inner transformation.
+
+In the dynamics the fitted object is a ONE-ARGUMENT callable of time, the
+same convention every other time-varying unknown function in the package
+uses (`examples/sir_spline.jl`, `examples/copepod.jl`):
+
+```julia
+sir!(du, u, p, t) = begin
+    du[1] = -p.beta(t) * u[1] * u[2] / p.N
+    du[2] =  p.beta(t) * u[1] * u[2] / p.N - p.gamma * u[2]
+end
+```
+
+# The two inner transformations
+
+`trans = :expsm` — **adaptive exponential smoothing**. A causal
+exponentially weighted mean of the covariate whose INERTIA is learned:
+
+    s̃₁ = x₁,    s̃ᵢ = ωᵢ s̃ᵢ₋₁ + (1 − ωᵢ) xᵢ,    ωᵢ = logistic(w̃ᵢᵀa)
+
+With a single covariate column (the default) `w̃ᵢ ≡ 1` and there is ONE
+parameter, a constant inertia `ω = logistic(a₁)`. Extra columns of `X` are
+AUXILIARY covariates that enter `w̃ᵢ = [1, X[i, 2], …]`, making the inertia
+adaptive. The scientific case: transmission responding to temperature with
+a learned thermal lag, where `ω` is the memory of the environment rather
+than of the pathogen.
+
+`trans = :lagindex` — **distributed lag**. A weighted sum over a lag
+window of length `lags`:
+
+    s̃ᵢ = Σ_{ℓ=0}^{lags−1} a_{ℓ+1} · x(tᵢ − ℓΔ),   Δ = (t_end − t₁)/(n − 1)
+
+`Δ` is the mean sample spacing and `x` is read off the covariate by the
+same linear interpolation used for `z(t)`, held constant before `t₁`. The
+lag matrix is FIXED data, so it is built once in the constructor and the
+transformation is then exactly LINEAR in `a`.
+
+# The standardization is EASY here — and that is the point
+
+The paper standardizes the transformed series to mean 0 and variance 1
+over the covariate sample, and here that recipe ports VERBATIM: the
+covariate is fixed data, so `mean s̃` and `sd s̃` are smooth, differentiable
+functions of `a` alone with no feedback from the fitted trajectory.
+
+Contrast [`SingleIndexApproximator`](@ref), whose "covariate" is the
+trajectory itself: it standardizes against reference statistics `(μ̂, Σ̂)`
+resolved ONCE from the data at `PSMProblem` construction and then frozen,
+precisely to keep the geometry of `z` from drifting under the optimizer.
+This type needs NONE of that machinery — no `index_stats` keyword, no
+unresolved state, no `_resolve_index_stats` hook, no `PSMProblem`
+involvement at all. It is fully self-contained from construction, so
+`build_evaluator` works on a bare approximator and `bootstrap`'s
+`deepcopy` is trivially faithful.
+
+`sd s̃` is computed as `√(v + κ)` with `v` the sample variance and
+`κ = 1e-10 · max(max|x|, 1)²` a fixed, data-derived floor. The floor is
+ADDITIVE rather than a `max(...)` clamp so that `z` stays smooth in `a`
+everywhere — including the `ω → 1` limit of `:expsm`, where `s̃` collapses
+to the constant `x₁` and `z → 0`, i.e. infinite thermal inertia means a
+constant response. That limit is a legitimate model, not a numerical
+failure, and it should not produce a kink or a `NaN`.
+
+Two exact consequences of the additive form, both benign and both asserted
+in the test suite. The standardized variance is `v/(v + κ)`, so it
+approaches 1 strictly from BELOW. The size of the deficit is governed by
+the transform parameters, NOT by the covariate's scaling: over the
+parameter range used here it is ≤ 2e-8, but it grows as the transformed
+series flattens — ~2.5e-2 at an inertia parameter of 10, and → 1 beyond
+about 20, which is the documented infinite-inertia limit where `z → 0`. And the `a → c·a` invariance of `:lagindex` holds only to
+`≈ κ/v ~ 1e-10` relative, where [`SingleIndexApproximator`](@ref) keeps its
+analogous invariance EXACT by making its floor proportional to `‖a‖²`. The
+difference does not matter here because the anchor, not the floor, is what
+removes that direction — whereas smoothness in `a` is needed everywhere.
+
+# Identification
+
+`z` is invariant under `a → c·a` (`c > 0`) for `:lagindex`, exactly the
+flat direction [`SingleIndexApproximator`](@ref) has, so `:lagindex` uses
+the SAME fix: `anchor = 1` pins `a[anchor] ≡ 1` (by default the lag-0
+weight), it is not a parameter, and the block stores the remaining
+`lags − 1` free weights. This fixes both the scale and the sign of the
+index. There is no `anchor = nothing` free mode: N1 measured that mode
+collapsing to `‖a‖ → 0` under any λ-estimating solver, and nothing here
+would make it behave better.
+
+`:expsm` has no such invariance — `ω` enters through a logistic, so every
+`a` gives a genuinely different weighting — and therefore takes no anchor.
+Its inner penalty is a plain ridge, which shrinks the inertia toward
+`ω = 1/2`.
+
+!!! note "ω is identified through PHASE, not amplitude"
+    Standardization removes the amplitude damping that different `ω` apply
+    to a periodic covariate, so what is left to identify `ω` is the PHASE
+    LAG of the smoothed series. On a seasonal driver that is real
+    information, but it is second-order compared with the response shape,
+    and the inner ridge pulls toward `ω = 1/2`. Expect the outer curve to
+    be recovered much more sharply than the inertia; see the
+    `TransformedCovariateApproximator` recovery testset for measured
+    numbers.
+
+# Arguments
+- `name`: symbol for the unknown function, called as `p.name(t)`
+- `times`: strictly increasing covariate sample times (≥ 3 of them). They
+  should span the problem's `tspan`; outside them `z` is held constant at
+  its end values
+- `X`: `length(times) × m` covariate matrix. Column 1 is the DRIVER `x`;
+  for `:expsm` columns `2:m` are auxiliary inertia covariates, and for
+  `:lagindex` `m` must be 1. An `AbstractVector` is accepted and treated
+  as a single column
+- `trans`: `:expsm` or `:lagindex` (required)
+- `nknots`: knots of the outer smooth (≥ 3; ≥ 4 when `constraint ≠ :none`)
+- `lags`: lag-window length for `:lagindex` (≥ 1, ≤ `length(times)`); must
+  be left at 0 for `:expsm`
+- `anchor`: `:lagindex` only — which lag is pinned to 1, in `1:lags`
+  (default 1, the contemporaneous term)
+- `constraint`: `:none` (default) or any of [`SHAPE_CONSTRAINTS`](@ref);
+  the outer smooth is then the SCOP-spline construction of Pya & Wood
+  (2015), reusing `ShapeConstrainedBSplineApproximator` verbatim
+- `xi`: the outer smooth's knots span `[−xi, xi]` in STANDARDIZED units
+  (default 2.0), with linear extrapolation outside. **`domain` is
+  therefore standardized-covariate units, NOT time** — which is what makes
+  [`confidence_band`](@ref) report the band of the RESPONSE CURVE `s(z)`
+  rather than of `f(t)`
+- `inner_ridge`: fixed weight of the inner penalty in the merged
+  [`penalty_matrix`](@ref) read by the single-λ consumers (default 1e-4).
+  Under `LAML`/`GCVSolver` the inner penalty is a block with its own
+  estimated λ, so this value is irrelevant there
+- `initial`: optional initial outer curve `z -> s(z)`, or a constant
+
+# Fitting notes: `jac`, and where to start λ
+
+`f(t)` is piecewise linear in `t` between covariate times, so its
+derivative is discontinuous there. That is a property of the ARGUMENT, not
+of the parameters — the evaluator is perfectly smooth in `a` — but the
+kinks still inject adaptive-step noise into the finite-difference
+prediction Jacobian. Prefer `LAML(jac=:forwarddiff)` (likewise
+`GCVSolver`, `CollocationLAML`), or sample the covariate finely enough
+that the kinks are small. On the SIR fixture in the test suite the default
+Jacobian settles at a badly worse optimum than `jac=:forwarddiff`'s
+(objective 480.98, `λ_inner` 11.56, converged) — by 130 to 1500 nats
+depending on the environment — and, in the default run configuration,
+does so while REPORTING CONVERGENCE. The size and the reported status
+are not stable enough to quote: the finite-difference optimum is chaotic
+in the exact arithmetic, moving ~130 nats and six orders of magnitude in
+`λ_inner` between BLAS thread counts, and it exits `:maxiters` under
+`--check-bounds=yes` where it claims `:converged_tol` without it. Treat
+it as "the fd path can land far away and may call it success", not as a
+reproducible number.
+
+Composing the `:expsm` scan with a SHAPE-CONSTRAINED outer smooth is
+strongly nonlinear, and `LAML`'s `initial_lambda` matters there. Starting
+from a very light penalty can fail to converge: on that same fixture
+`initial_lambda = 0.01` exits on `:maxiters` with a β-RMSE of 0.031,
+where `initial_lambda = 1.0` (or `0.1` with a longer `warmup`) converges
+to objective 479.89, `λ = [11.18, 6.07]`, `edf` 5.44. Always check
+`sol.convergence.converged`: the unconverged fit still returns finite,
+plausible-looking numbers, and its λ and `edf` can look entirely
+reasonable — the convergence flag is the reliable signal, not the
+magnitudes. The unconstrained outer smooth is not sensitive this way.
+
+# Example
+```julia
+temp  = 15.0 .+ 8.0 .* sin.(2π .* (0:120) ./ 365)
+uf_β  = TransformedCovariateApproximator(:beta, collect(0.0:120.0), temp;
+                                         trans=:expsm, nknots=8,
+                                         constraint=:increasing)
+```
+
+# Reference
+Fasiolo, M. et al. Nested effects for generalized additive models.
+arXiv:2511.19234.
+"""
+struct TransformedCovariateApproximator{O<:AbstractApproximator} <: AbstractApproximator
+    name::Symbol
+    trans::Symbol
+    times::Vector{Float64}
+    X::Matrix{Float64}
+    nknots::Int
+    lags::Int
+    anchor::Union{Int, Nothing}
+    constraint::Symbol
+    xi::Float64
+    inner_ridge::Float64
+    # Domain of the STANDARDIZED covariate (−xi, xi) — NOT time. Present so
+    # the generic `confidence_band` / bootstrap gridding machinery, which
+    # reads `approx.domain`, grids the OUTER response curve.
+    domain::Tuple{Float64, Float64}
+    outer::O
+    # Fixed data, precomputed once: for :expsm the n × n_inner design of the
+    # inertia linear predictor, `[1 aux…]`; for :lagindex the n × lags matrix
+    # of lagged covariate values, so `s̃ = inner_design * a` exactly.
+    inner_design::Matrix{Float64}
+    # Additive variance floor keeping `sd s̃` smooth at a degenerate s̃.
+    var_floor::Float64
+end
+
+const _TC_TRANSFORMS = (:expsm, :lagindex)
+
+function TransformedCovariateApproximator(name::Union{Symbol,String},
+                                          times::AbstractVector,
+                                          X::AbstractMatrix;
+                                          trans::Symbol,
+                                          nknots::Int=8,
+                                          lags::Int=0,
+                                          anchor::Int=1,
+                                          constraint::Symbol=:none,
+                                          xi::Real=2.0,
+                                          inner_ridge::Real=1e-4,
+                                          initial=nothing)
+    name_s = Symbol(name)
+    pre = "TransformedCovariateApproximator(:$name_s)"
+    trans in _TC_TRANSFORMS || throw(ArgumentError(
+        "$pre: unknown trans :$trans. Must be one of $_TC_TRANSFORMS"))
+    constraint == :none || constraint in SHAPE_CONSTRAINTS || throw(ArgumentError(
+        "$pre: unknown constraint :$constraint. Must be :none or one of " *
+        "$SHAPE_CONSTRAINTS"))
+    nknots >= 3 || throw(ArgumentError(
+        "$pre needs nknots ≥ 3 for the outer cubic smooth (got $nknots)"))
+    constraint == :none || nknots >= 4 || throw(ArgumentError(
+        "$pre needs nknots ≥ 4 for a shape-constrained outer smooth " *
+        "(got $nknots)"))
+    ξ = Float64(xi)
+    (isfinite(ξ) && ξ > 0) || throw(ArgumentError(
+        "$pre: xi must be positive and finite, got $xi"))
+    ridge = Float64(inner_ridge)
+    (isfinite(ridge) && ridge >= 0) || throw(ArgumentError(
+        "$pre: inner_ridge must be finite and non-negative, got $inner_ridge"))
+
+    ts = Float64.(collect(times))
+    Xm = Matrix{Float64}(X)
+    n = length(ts)
+    n >= 3 || throw(ArgumentError(
+        "$pre needs at least 3 covariate sample times (got $n)"))
+    size(Xm, 1) == n || throw(ArgumentError(
+        "$pre: X has $(size(Xm, 1)) rows but times has $n entries; the " *
+        "covariate must be aligned to the sample times"))
+    size(Xm, 2) >= 1 || throw(ArgumentError(
+        "$pre: X needs at least one column (the driver covariate)"))
+    all(isfinite, ts) || throw(ArgumentError("$pre: times must be finite"))
+    all(isfinite, Xm) || throw(ArgumentError("$pre: X must be finite"))
+    all(>(0), diff(ts)) || throw(ArgumentError(
+        "$pre: times must be strictly increasing"))
+
+    # Per-transformation structure. `inner_design` is fixed data in both
+    # cases — the simplification the exogenous covariate buys us.
+    inner_design, lags_out, anchor_out = if trans === :lagindex
+        lags >= 1 || throw(ArgumentError(
+            "$pre: trans=:lagindex needs lags ≥ 1 (got $lags)"))
+        lags <= n || throw(ArgumentError(
+            "$pre: lags = $lags exceeds the $n covariate samples; the lag " *
+            "window cannot be longer than the record"))
+        size(Xm, 2) == 1 || throw(ArgumentError(
+            "$pre: trans=:lagindex takes a single covariate column (got " *
+            "$(size(Xm, 2))); auxiliary columns are only meaningful for " *
+            "trans=:expsm, where they modulate the inertia"))
+        (1 <= anchor <= lags) || throw(ArgumentError(
+            "$pre: anchor must lie in 1:$lags (lag 0 is index 1), got $anchor"))
+        Δ = (ts[n] - ts[1]) / (n - 1)
+        L = Matrix{Float64}(undef, n, lags)
+        x1 = @view Xm[:, 1]
+        for ℓ in 0:(lags - 1), i in 1:n
+            L[i, ℓ + 1] = _tc_linterp(ts, x1, ts[i] - ℓ * Δ)
+        end
+        L, lags, anchor
+    else
+        lags == 0 || throw(ArgumentError(
+            "$pre: lags is a :lagindex setting; leave it at 0 for " *
+            "trans=:expsm, whose window length is set by the learned " *
+            "inertia ω (got lags = $lags)"))
+        # Same reasoning for `anchor`: :expsm has no scale-invariant
+        # direction to pin (its inertia enters through a logistic link), so
+        # silently dropping a user-supplied anchor would hide a modelling
+        # misunderstanding.
+        anchor == 1 || throw(ArgumentError(
+            "$pre: anchor is a :lagindex setting; leave it at its default " *
+            "for trans=:expsm, which has no scale-invariant loading " *
+            "direction to anchor (got anchor = $anchor)"))
+        hcat(ones(n), Xm[:, 2:end]), 0, nothing
+    end
+
+    dom = (-ξ, ξ)
+    outer = if constraint == :none
+        BSplineApproximator(name_s, dom, nknots; initial=initial)
+    else
+        ShapeConstrainedBSplineApproximator(name_s, dom, nknots, constraint;
+                                            initial=initial)
+    end
+
+    var_floor = 1e-10 * max(maximum(abs, @view Xm[:, 1]), 1.0)^2
+
+    TransformedCovariateApproximator(name_s, trans, ts, Xm, nknots, lags_out,
+                                     anchor_out, constraint, ξ, ridge, dom,
+                                     outer, inner_design, var_floor)
+end
+
+TransformedCovariateApproximator(name::Union{Symbol,String},
+                                 times::AbstractVector,
+                                 x::AbstractVector; kwargs...) =
+    TransformedCovariateApproximator(name, times,
+                                     reshape(Float64.(collect(x)), :, 1);
+                                     kwargs...)
+
+"""
+Number of FREE inner parameters: the inertia linear predictor's width for
+`:expsm`, and `lags − 1` (one anchored) for `:lagindex`.
+"""
+_tc_n_inner(a::TransformedCovariateApproximator) =
+    a.trans === :lagindex ? a.lags - 1 : size(a.inner_design, 2)
+
+nparams(a::TransformedCovariateApproximator) =
+    _tc_n_inner(a) + nparams(a.outer)
+
+function initial_params(a::TransformedCovariateApproximator)
+    ni = _tc_n_inner(a)
+    # :expsm starts at a = 0, i.e. the neutral inertia ω = 1/2; :lagindex at
+    # equal weights (a = 1 everywhere including the anchor), matching the
+    # equal-weight start SingleIndexApproximator uses for its loadings.
+    inner = a.trans === :lagindex ? ones(ni) : zeros(ni)
+    vcat(inner, initial_params(a.outer))
+end
+
 # ─── Likelihood types ──────────────────────────────────────────────
 
 """

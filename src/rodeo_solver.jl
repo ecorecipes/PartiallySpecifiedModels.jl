@@ -135,6 +135,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
         elseif approx isa SingleIndexApproximator
             push!(smooth_mats, penalty_matrix(approx))
             push!(smooth_offsets, offset_acc)
+        elseif approx isa TransformedCovariateApproximator
+            push!(smooth_mats, penalty_matrix(approx))
+            push!(smooth_offsets, offset_acc)
         elseif approx isa SPDEApproximator
             S = penalty_matrix(approx)
             if S !== nothing

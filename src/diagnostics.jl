@@ -419,8 +419,13 @@ function confidence_band(sol::PSMSolution, prob::PSMProblem;
         # A single-index approximator's fitted callable takes p arguments, so
         # its band is the band of the OUTER curve s(z) over the STANDARDIZED
         # index z ∈ [−xi, xi] — the univariate payoff a tensor surface cannot
-        # have. Everything else is evaluated through its own callable.
-        f_est = if approx isa SingleIndexApproximator
+        # have. A transformed-covariate approximator is the same story with a
+        # different inner statistic: its callable takes TIME while its domain
+        # is the standardized covariate range, so calling it on the grid would
+        # evaluate f at times −xi…xi. Everything else is evaluated through its
+        # own callable.
+        f_est = if approx isa SingleIndexApproximator ||
+                   approx isa TransformedCovariateApproximator
             Float64[_eval_approx_at(approx, Float64.(sol.parameters[idx]), x)
                     for x in grid]
         else
@@ -490,6 +495,21 @@ it.
 function _eval_approx_at(approx::SingleIndexApproximator, p::Vector{Float64},
                          x::Real)
     ni = _si_n_inner(approx)
+    build_evaluator(approx.outer, p[(ni + 1):end])(x)
+end
+
+"""
+Transformed covariate: the band is over the OUTER response curve `s(z)`
+evaluated at the standardized covariate `z`, for the same reason as the
+single index — the fitted callable is a function of TIME, but `domain` is
+the range of `z`. The inner transformation parameters do not enter `s` at a
+FIXED `z`, so their finite-difference sensitivities are exactly zero and
+the band is the uncertainty of the response curve itself, not of where a
+given date maps onto it.
+"""
+function _eval_approx_at(approx::TransformedCovariateApproximator,
+                         p::Vector{Float64}, x::Real)
+    ni = _tc_n_inner(approx)
     build_evaluator(approx.outer, p[(ni + 1):end])(x)
 end
 

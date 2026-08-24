@@ -299,6 +299,9 @@ function agm_loss(prob::PSMProblem, beta::AbstractVector,
             elseif approx isa SingleIndexApproximator
                 S = penalty_matrix(approx)
                 total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
+            elseif approx isa TransformedCovariateApproximator
+                S = penalty_matrix(approx)
+                total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
             elseif approx isa ShapeConstrainedBSplineApproximator
                 S = penalty_matrix(approx)
                 total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)

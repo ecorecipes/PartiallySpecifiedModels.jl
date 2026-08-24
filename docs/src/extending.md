@@ -1,6 +1,6 @@
 # Custom approximators
 
-PartiallySpecifiedModels.jl ships with ten approximator types, but the set is open: every solver constructs and consumes unknown functions through four generic functions, so adding your own approximator requires no changes to any solver file. Define a struct, implement the four methods, and pass it to `PSMProblem` like any built-in type.
+PartiallySpecifiedModels.jl ships with eleven approximator types, but the set is open: every solver constructs and consumes unknown functions through four generic functions, so adding your own approximator requires no changes to any solver file. Define a struct, implement the four methods, and pass it to `PSMProblem` like any built-in type.
 
 ## The interface
 
@@ -131,6 +131,11 @@ coefficient block splits into the inner loadings and the outer smooth's
 coefficients, and it declares one ridge block for the former and the outer
 roughness penalty for the latter, so LAML estimates the direction's
 shrinkage and the curve's wiggliness independently.
+[`TransformedCovariateApproximator`](@ref) is the same pattern with a
+different inner statistic, and it shows that the inner block need not be a
+ridge: under `trans = :lagindex` it is a **first-difference** penalty on
+the distributed-lag weights, whose null space is "all free weights equal",
+so a large inner λ flattens the lag tail rather than erasing it.
 
 Types overriding `penalty_blocks` should usually also provide a
 consistent `penalty_matrix` — the block-diagonal merge of the blocks with
@@ -151,7 +156,13 @@ default finite-difference prediction Jacobian picks up adaptive-step
 noise at the kink, and the smoothing search can then stall well short of
 the optimum while still reporting convergence. This is a property of
 evaluator smoothness, independent of how many penalty blocks you
-declare.
+declare. [`TransformedCovariateApproximator`](@ref) is the built-in case:
+its `f(t)` is piecewise linear between covariate samples, and on the SIR
+fixture in the test suite the default Jacobian lands 130–1500 nats worse
+than `jac=:forwarddiff`'s converged 481.0 — reporting success while doing
+so in the default run configuration. The exact gap is chaotic in the
+arithmetic (it moves with BLAS thread count), so treat it as a qualitative
+warning rather than a reproducible figure.
 
 If you pass an approximator type that does not implement the interface, `build_evaluator` fails with an error listing the four required functions.
 
