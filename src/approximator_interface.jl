@@ -9,7 +9,7 @@
 # docs/src/extending.md ("Custom approximators") for the contracts and a
 # worked example.
 
-# The ten built-in approximator types. Six solvers (TwoStage,
+# The eleven built-in approximator types. Six solvers (TwoStage,
 # IntegralMatching, MAGI, AGM, Rodeo, Dalton) assemble their smoothing
 # penalties through per-type whitelists whose built-in treatment is
 # historical and deliberately NOT unified (the lists differ — e.g.
@@ -24,7 +24,8 @@ const _BUILTIN_APPROX_TYPES = Union{
     SPDEApproximator, ShapeConstrainedSPDEApproximator,
     GPApproximator, ShapeConstrainedGPApproximator,
     NeuralApproximator, COMONetApproximator,
-    TensorBSplineApproximator, SingleIndexApproximator}
+    TensorBSplineApproximator, SingleIndexApproximator,
+    TransformedCovariateApproximator}
 
 """
     build_evaluator(approx, params_k) -> callable
@@ -34,8 +35,10 @@ its parameter block `params_k`. Solvers call this to build the object that
 the dynamics function receives as `p.<name>`, so the returned value must be
 callable on a scalar, `f = build_evaluator(a, θ); f(x)::Number` (or on as
 many scalar arguments as the dynamics pass it — `TensorBSplineApproximator`
-returns a two-argument callable `f(x, y)`, and `SingleIndexApproximator` a
-`p`-argument callable `f(u₁, …, u_p)`).
+returns a two-argument callable `f(x, y)`, `SingleIndexApproximator` a
+`p`-argument callable `f(u₁, …, u_p)`, and
+`TransformedCovariateApproximator` a one-argument callable of TIME,
+`f(t)`).
 
 This is the extension point for user-defined approximator types. To add a
 new approximator, define a struct subtyping `AbstractApproximator` (with at
@@ -55,13 +58,14 @@ vector of `ForwardDiff.Dual` numbers, so the evaluator must be eltype-generic
 (`AdamSolver`, `MultipleShootingSolver`, `TwoStageSolver`, `BNGSolver`,
 `IntegralMatchingSolver`, …).
 
-Methods are provided for the ten built-in types:
+Methods are provided for the eleven built-in types:
 
 | Approximator | Evaluator |
 |:---|:---|
 | `BSplineApproximator` | `build_bspline_evaluator` on a uniform knot grid over `domain` |
 | `TensorBSplineApproximator` | `build_tensor_bspline_evaluator` (bivariate tensor product of the univariate construction; the callable takes TWO arguments, `f(x, y)`) |
 | `SingleIndexApproximator` | `build_single_index_evaluator` (learned direction composed with a univariate outer smooth; the callable takes `p` arguments, `f(u₁, …, u_p)`) |
+| `TransformedCovariateApproximator` | `build_transformed_covariate_evaluator` (learned transform of an exogenous covariate composed with a univariate outer smooth; the callable takes TIME, `f(t)`) |
 | `NeuralApproximator` | `build_neural_evaluator` (Dual-safe MLP path + Lux fallback) |
 | `GPApproximator` | `build_gp_evaluator` (kernel interpolation) |
 | `ShapeConstrainedGPApproximator` | `build_constrained_gp_evaluator` (SCOP reparameterization + kernel interpolation) |
@@ -97,6 +101,11 @@ build_evaluator(approx::TensorBSplineApproximator, params_k) =
 # in params and in the states.
 build_evaluator(approx::SingleIndexApproximator, params_k) =
     build_single_index_evaluator(approx, params_k)
+
+# One-argument callable of TIME, f(t) = s(z(t)) with z the standardized
+# learned transform of an exogenous covariate — Dual-safe in params and in t.
+build_evaluator(approx::TransformedCovariateApproximator, params_k) =
+    build_transformed_covariate_evaluator(approx, params_k)
 
 # Dual-safe, eltype-generic (see neural_evaluator.jl) — required for
 # autodiff Jacobians in stiff ODE solvers and for gradients of any

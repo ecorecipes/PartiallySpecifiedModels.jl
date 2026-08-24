@@ -1309,3 +1309,272 @@ function penalty_blocks(a::SingleIndexApproximator)
     So === nothing || push!(blocks, (Matrix{Float64}(So), (ni + 1):(ni + no)))
     blocks
 end
+
+# ═══════════════════════════════════════════════════════════════════════
+# Transformed covariate: learned inner transform of an EXOGENOUS series
+# composed with a univariate outer smooth
+# ═══════════════════════════════════════════════════════════════════════
+#
+# f(t) = s(z(t)), z the standardized transformed covariate. The coefficient
+# block is [free inner parameters; outer smooth coefficients], and — exactly
+# as for SingleIndexApproximator — the outer smooth is a REAL
+# BSplineApproximator (or ShapeConstrainedBSplineApproximator) over
+# [−xi, xi] held in the `outer` field, so the whole univariate machinery
+# including the SCOP-spline construction is reused by composition.
+#
+# What differs from the single index is the standardization. There the
+# "covariate" is the fitted trajectory, which MOVES, so N1 had to freeze
+# reference statistics at problem construction. Here the covariate is fixed
+# data: mean and sd of the transformed series are ordinary smooth functions
+# of the inner parameters, recomputed exactly once per evaluator build, and
+# none of N1's resolve-at-construction machinery is needed.
+
+"""
+    lag_weights(a::TransformedCovariateApproximator, params) -> Vector{Float64}
+
+The fitted distributed-lag profile `[a₀, a₁, …]` from a `:lagindex`
+approximator's own coefficient block, on the anchor's scale
+(`a[anchor] = 1`), which is what makes profiles comparable across fits.
+Entry `ℓ + 1` is the weight on `x(t − ℓΔ)`.
+"""
+function lag_weights(a::TransformedCovariateApproximator,
+                     params::AbstractVector)
+    a.trans === :lagindex || throw(ArgumentError(
+        "lag_weights(:$(a.name)): defined only for trans=:lagindex, but " *
+        "this approximator uses trans=:$(a.trans). For :expsm see " *
+        "`smoothing_inertia`."))
+    _tc_check_block(a, params, "lag_weights")
+    Float64.(_tc_weights(a, params[1:_tc_n_inner(a)]))
+end
+
+"""
+    smoothing_inertia(a::TransformedCovariateApproximator, params) -> Vector{Float64}
+
+The fitted exponential-smoothing inertia `ωᵢ = logistic(w̃ᵢᵀa)` at each
+covariate time, from an `:expsm` approximator's own coefficient block.
+With the default single covariate column the inertia is constant and every
+entry is the same number; auxiliary columns make it vary.
+"""
+function smoothing_inertia(a::TransformedCovariateApproximator,
+                           params::AbstractVector)
+    a.trans === :expsm || throw(ArgumentError(
+        "smoothing_inertia(:$(a.name)): defined only for trans=:expsm, but " *
+        "this approximator uses trans=:$(a.trans). For :lagindex see " *
+        "`lag_weights`."))
+    _tc_check_block(a, params, "smoothing_inertia")
+    inner = params[1:_tc_n_inner(a)]
+    Float64[_tc_logistic(dot(view(a.inner_design, i, :), inner))
+            for i in 1:size(a.inner_design, 1)]
+end
+
+"""
+    transformed_covariate(a::TransformedCovariateApproximator, params) -> Vector{Float64}
+
+The standardized transformed covariate `z` at each of `a.times` — the
+inner statistic the outer smooth actually sees. Mean ≈ 0 and variance ≈ 1
+by construction (up to the additive variance floor).
+"""
+function transformed_covariate(a::TransformedCovariateApproximator,
+                               params::AbstractVector)
+    _tc_check_block(a, params, "transformed_covariate")
+    Float64.(_tc_standardize(a, _tc_inner_series(a, params[1:_tc_n_inner(a)])))
+end
+
+# `params` must be THIS approximator's block. Without the check, a
+# multi-approximator fit silently reports a transform decoded from whichever
+# approximator happens to come first — the failure N1 hit with
+# `index_loadings`.
+function _tc_check_block(a::TransformedCovariateApproximator,
+                         params::AbstractVector, fname::AbstractString)
+    length(params) == nparams(a) || throw(ArgumentError(
+        "$fname(:$(a.name)): expected this approximator's own coefficient " *
+        "block of length $(nparams(a)), got $(length(params)). For a " *
+        "multi-approximator problem, slice the fitted vector to this " *
+        "approximator's range first."))
+    nothing
+end
+
+"""
+    _tc_weights(a, inner) -> Vector
+
+The full length-`lags` weight vector implied by the free `:lagindex`
+parameters: `a[anchor]` is a hard 1 and the stored parameters fill the
+rest, in order. Eltype-generic, so `ForwardDiff.Dual` parameters propagate.
+"""
+function _tc_weights(a::TransformedCovariateApproximator,
+                     inner::AbstractVector)
+    L, k = a.lags, a.anchor
+    T = eltype(inner)
+    [i == k ? one(T) : inner[i < k ? i : i - 1] for i in 1:L]
+end
+
+"""
+    _tc_inner_series(a, inner) -> Vector
+
+The UNSTANDARDIZED transformed covariate `s̃` at every covariate time.
+
+`:lagindex` is exactly the linear map `inner_design * weights` — the lag
+matrix is fixed data built in the constructor, so nothing is recomputed
+here beyond one matrix–vector product.
+
+`:expsm` is the sequential scan `s̃ᵢ = ωᵢ s̃ᵢ₋₁ + (1 − ωᵢ) xᵢ`, run ONCE per
+`build_evaluator` call in O(n) — not once per evaluation, which would make
+every right-hand-side call O(n). It is branch-free in the parameters
+(`_tc_logistic` is `tanh`-based), so it is Dual-safe.
+"""
+function _tc_inner_series(a::TransformedCovariateApproximator,
+                          inner::AbstractVector)
+    W = a.inner_design
+    if a.trans === :lagindex
+        return W * _tc_weights(a, inner)
+    end
+    n = size(W, 1)
+    T = promote_type(eltype(inner), Float64)
+    s = Vector{T}(undef, n)
+    s[1] = a.X[1, 1]
+    @inbounds for i in 2:n
+        η = zero(T)
+        for j in axes(W, 2)
+            η += W[i, j] * inner[j]
+        end
+        ω = _tc_logistic(η)
+        s[i] = ω * s[i - 1] + (one(T) - ω) * a.X[i, 1]
+    end
+    s
+end
+
+"""
+    _tc_standardize(a, stil) -> Vector
+
+Centre and scale the transformed series over the covariate SAMPLE — the
+paper's recipe, applicable verbatim because the covariate is fixed data.
+The scale is `√(v + κ)` with the constructor's additive floor `κ`, which
+keeps `z` smooth (no `max` kink) even where `s̃` degenerates to a constant.
+"""
+function _tc_standardize(a::TransformedCovariateApproximator,
+                         stil::AbstractVector)
+    n = length(stil)
+    m = sum(stil) / n
+    c = stil .- m
+    v = sum(abs2, c) / (n - 1)
+    c ./ sqrt(v + a.var_floor)
+end
+
+"""
+    build_transformed_covariate_evaluator(a, params_k)
+
+Build the ONE-ARGUMENT callable `f(t) = s(z(t))`, the same convention every
+other time-varying unknown function in the package uses (`p.beta(t)`).
+
+The transformed, standardized series is computed once here — including the
+`:expsm` scan — and the returned closure only interpolates it linearly in
+time and evaluates the outer smooth, so a right-hand-side call is O(log n).
+Linear interpolation keeps `f` CONTINUOUS in `t`, which adaptive ODE
+stepping requires; it is only C⁰, hence the `jac=:forwarddiff` advice in
+the type's docstring.
+
+Dual-safe in the parameters (the scan, the standardization and the outer
+evaluator are all eltype-generic) and in `t`.
+"""
+function build_transformed_covariate_evaluator(a::TransformedCovariateApproximator,
+                                               params_k::AbstractVector)
+    ni = _tc_n_inner(a)
+    z = _tc_standardize(a, _tc_inner_series(a, params_k[1:ni]))
+    outer_eval = build_evaluator(a.outer, params_k[(ni + 1):end])
+    ts = a.times
+    nm = a.name
+
+    function transformed_covariate_eval(u...)
+        length(u) == 1 || throw(ArgumentError(
+            "TransformedCovariateApproximator(:$nm) is a function of TIME " *
+            "alone but was called with $(length(u)) arguments; the dynamics " *
+            "must pass the time, e.g. p.$nm(t)"))
+        outer_eval(_tc_linterp(ts, z, u[1]))
+    end
+    transformed_covariate_eval
+end
+
+"""
+    _tc_inner_penalty(a) -> Union{Nothing, Matrix{Float64}}
+
+The inner penalty on the free transformation parameters, or `nothing` when
+there is nothing to penalize.
+
+`:expsm` — a ridge `I` on the inertia parameters, shrinking `ω` toward
+1/2 and keeping the penalized Hessian non-singular when the inertia is
+weakly identified (which, per the type's docstring, it often is).
+
+`:lagindex` — the FIRST-DIFFERENCE penalty `DᵀD` of the paper's smooth-lag
+prior, so neighbouring lags are pulled together and a large λ flattens the
+lag profile. It acts on the FREE weights only: the anchored weight is not
+a parameter, so the step from it to the first free weight would contribute
+an affine (not quadratic) term that the `λ βᵀSβ` penalty interface cannot
+represent. The null space is therefore "all free weights equal", and the
+`λ → ∞` limit of the profile is `[1, c, c, …]` rather than a flat line.
+With fewer than two free weights there are no differences to take and this
+returns `nothing`.
+"""
+function _tc_inner_penalty(a::TransformedCovariateApproximator)
+    ni = _tc_n_inner(a)
+    ni >= 1 || return nothing
+    a.trans === :expsm && return Matrix{Float64}(I, ni, ni)
+    ni >= 2 || return nothing
+    D = zeros(ni - 1, ni)
+    for i in 1:(ni - 1)
+        D[i, i] = -1.0
+        D[i, i + 1] = 1.0
+    end
+    S = D' * D
+    (S .+ S') ./ 2
+end
+
+"""
+    penalty_matrix(a::TransformedCovariateApproximator)
+
+Block-diagonal merge of the two penalties with FIXED relative weights:
+`inner_ridge ·` the inner penalty (a ridge for `:expsm`, the lag
+first-difference penalty for `:lagindex`), and the outer smooth's own
+roughness penalty on the outer coefficients.
+
+This is the single-λ view read by the gradient-matching and
+probabilistic-numerics penalty sites and by the MCMC/VI/ABC prior builder,
+which apply ONE weight per approximator. The penalized-likelihood solvers
+instead read [`penalty_blocks`](@ref) and give the inner and outer
+penalties SEPARATE smoothing parameters, in which case `inner_ridge` is
+irrelevant.
+"""
+function penalty_matrix(a::TransformedCovariateApproximator)
+    ni = _tc_n_inner(a)
+    no = nparams(a.outer)
+    S = zeros(ni + no, ni + no)
+    Si = _tc_inner_penalty(a)
+    Si === nothing || (S[1:ni, 1:ni] .= a.inner_ridge .* Si)
+    So = penalty_matrix(a.outer)
+    So === nothing || (S[(ni + 1):end, (ni + 1):end] .= So)
+    (S .+ S') ./ 2
+end
+
+"""
+    penalty_blocks(a::TransformedCovariateApproximator)
+
+Two disjoint blocks — the nested-effects structure of Fasiolo et al.
+(arXiv:2511.19234), where the inner transformation and the outer smooth
+carry independent smoothing parameters estimated jointly under LAML:
+
+1. `(S_inner, 1:n_inner)` — the ridge on the `:expsm` inertia parameters,
+   or the first-difference smooth-lag penalty on the free `:lagindex`
+   weights (see `_tc_inner_penalty`). Omitted when there is nothing to
+   penalize (a `:lagindex` window with fewer than two free weights).
+2. `(S_outer, n_inner+1:end)` — the outer smooth's roughness penalty,
+   exactly as the corresponding univariate approximator supplies it.
+"""
+function penalty_blocks(a::TransformedCovariateApproximator)
+    ni = _tc_n_inner(a)
+    no = nparams(a.outer)
+    blocks = Tuple{Matrix{Float64}, UnitRange{Int}}[]
+    Si = _tc_inner_penalty(a)
+    Si === nothing || push!(blocks, (Si, 1:ni))
+    So = penalty_matrix(a.outer)
+    So === nothing || push!(blocks, (Matrix{Float64}(So), (ni + 1):(ni + no)))
+    blocks
+end

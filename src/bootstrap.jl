@@ -155,17 +155,19 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
     # NeuralApproximator constructed without one — cannot be gridded)
     uf_grids = Dict{Symbol, Vector{Float64}}()
     # Approximators whose FITTED callable is not the univariate function the
-    # band grids. A SingleIndexApproximator's callable takes p arguments, so
-    # its band is taken from the OUTER curve over the standardized index —
-    # recorded here as (approximator, coefficient range) so each replicate
-    # can rebuild that curve from its own parameters.
+    # band grids. A SingleIndexApproximator's callable takes p arguments and
+    # a TransformedCovariateApproximator's takes TIME while its `domain` is
+    # the STANDARDIZED covariate range, so for both the band is taken from
+    # the OUTER curve — recorded here as (approximator, coefficient range) so
+    # each replicate can rebuild that curve from its own parameters.
     uf_special = Dict{Symbol, Tuple{Any, UnitRange{Int}}}()
     _uf_offset = 0
     for approx in prob.approximators
         _uf_range = (_uf_offset + 1):(_uf_offset + nparams(approx))
         _uf_offset = last(_uf_range)
-        approx isa SingleIndexApproximator && (uf_special[approx.name] =
-            (approx, _uf_range))
+        (approx isa SingleIndexApproximator ||
+         approx isa TransformedCovariateApproximator) &&
+            (uf_special[approx.name] = (approx, _uf_range))
         if approx isa TensorBSplineApproximator
             # Bivariate surface: the UF band machinery grids one variable
             # and calls the evaluator with one argument. Skip its band
