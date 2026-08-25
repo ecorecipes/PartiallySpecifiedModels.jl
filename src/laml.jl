@@ -518,12 +518,12 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
             #   EVERY λ_k, so the fitted β cannot improve, while the walk
             #   takes λ into a regime where our own linear algebra loses the
             #   fit. The mechanism is `_pcls_augmented_solve`'s RELATIVE
-            #   singular-value truncation (`src/pcls.jl`, σ > 1e-7·σmax):
-            #   σmax grows like √λ·‖C‖ while the data block stays O(1), so
-            #   past λ ≈ 1e14 it starts zeroing DATA-INFORMED directions in
-            #   the penalty null space — exactly where a fit with β'S_kβ = 0
-            #   lives (measured: 0 directions truncated at 1.9e13, 1 at 1e14,
-            #   2 at 1e16).
+            #   singular-value truncation (`src/pcls.jl`, σ > 1e-7·σmax_aug):
+            #   σmax_aug grows like √λ·‖C‖ while the data block stays O(1),
+            #   so past λ ≈ 1e14 it starts zeroing DATA-INFORMED directions
+            #   in the penalty null space — exactly where a fit with
+            #   β'S_kβ = 0 lives (measured: 0 directions truncated at
+            #   1.9e13, 1 at 1e14, 2 at 1e16).
             #   NOT the `_safe_inv` ridge, which an earlier draft of this
             #   comment blamed: β never passes through `_safe_inv` (it comes
             #   from the augmented SVD solve, already the mgcv-style
@@ -532,16 +532,42 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
             #   because λ then climbs to 2.0e14 instead of stopping. The
             #   ridge is still worth fixing, but for the `stationarity` /
             #   gradient / Hessian diagnostics, not for fit quality.
-            #   Consequence worth knowing: relaxing that truncation to
-            #   1e-13·σmax makes the escalating policy reproduce the hold
-            #   policy to 8 significant figures, so this branch is blocked by
-            #   ONE CONSTANT, not by anything fundamental. It is held anyway
-            #   because even with exact linear algebra mgcv's branch parks
-            #   λ_k on the RHO_MAX rail with edf → 5.6e-6: the right REML
-            #   answer when the truth lies in null(S), but a boundary
-            #   solution carrying no usable uncertainty. That is a modelling
-            #   judgement, and it should be made deliberately rather than
-            #   inherited. See the pcls truncation follow-up.
+            #   An earlier draft of this comment concluded that relaxing the
+            #   truncation to 1e-13·σmax makes the escalating policy
+            #   reproduce the hold policy to 8 significant figures, "so this
+            #   branch is blocked by ONE CONSTANT, not by anything
+            #   fundamental". F5 measured that and BOTH halves are wrong;
+            #   see the "F5 — PCLS truncation" testset for the pinned
+            #   numbers and the `@test_broken`s that track the open defect.
+            #   (i) 1e-13 is NOT inert. It is the constant that defeats the
+            #   guard the truncation exists for: at the `x -> 0` default
+            #   initialization with u0 placed off a knot (so the dead
+            #   Jacobian columns are ~1e-10 rather than exactly 0, which is
+            #   why an on-knot fixture hides this), it restores ‖β̂‖ = 2.3e9
+            #   against 0.28 at 1e-7 — the unrescuable step, in full.
+            #   (ii) The λ-coupling is not ONLY a bug. It is silently doing
+            #   three jobs, and fixing the reference to the λ-free
+            #   σmax(W^½J) removes all three at once: the rank guard (job 1,
+            #   which survives the change), a subspace trust region at high
+            #   λ (job 2), and an implicit brake on λ escalation (job 3).
+            #   Measured: the λ-free reference alone fails 3 suite
+            #   assertions ("LAML mixed spline+NN", data_loss 18534 against
+            #   a < 500 gate) and sends 3 of 12 seeds of a Lotka-Volterra
+            #   GCV ensemble from data_loss 0.72–1.29 to 27–29 (job 2).
+            #   Emitting both steps as candidates and letting the penalized
+            #   objective choose repairs those, but then job 3 fires: on the
+            #   SCOP-spline SIR fixture in "known_params mixed with an
+            #   approximator", λ̂ runs 5.2e-6 → 2.4e17 and β̂(0.05) goes
+            #   0.387 → -3086.9 against a truth of 0.389. So this branch is
+            #   NOT blocked by one constant; jobs 2 and 3 need their own
+            #   mechanisms (a trust region and a λ bound) before the
+            #   reference can be corrected. The branch is held for the
+            #   modelling reason below as well: even with exact linear
+            #   algebra mgcv's branch parks λ_k on the RHO_MAX rail with
+            #   edf → 5.6e-6 — the right REML answer when the truth lies in
+            #   null(S), but a boundary solution carrying no usable
+            #   uncertainty. That is a modelling judgement, and it should be
+            #   made deliberately rather than inherited.
             #   Measured cost of escalating anyway (one decade per step, the
             #   tamest version), on fixtures whose truth lies in the penalty
             #   null space so this branch fires AT the optimum:
