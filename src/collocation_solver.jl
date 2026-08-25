@@ -996,15 +996,44 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                     # null space (rank + nullity − θtr(H⁻¹S)) and bias θ up.
                     r_k = _rank_penalty(S_list[l])
                     trHS = tr(H_inv[idx, idx] * S_list[l])
-                    # Keep θ_k unchanged when the effective numerator is ≤ 0
-                    # (matching estimate_smoothing_params in laml.jl): a
-                    # non-positive numerator means the FS update prescribes
-                    # keeping/decreasing λ, and flooring it at 0.01 would
-                    # manufacture a spurious increase. Preserve the upper cap.
                     fs_num = min(r_k - theta[l] * trHS, Float64(uf_nk[l]))
-                    if bSb > 1e-30 && fs_num > 0
-                        theta[l] = clamp(sigma2_est * fs_num / bSb, 1e-20, 1e20)
-                    end
+                    # Degenerate-update policy — the SAME policy as
+                    # `estimate_smoothing_params`; the full rationale lives
+                    # beside the sibling update in laml.jl. Summary: adopt
+                    # mgcv's direction where the fixed point it names is
+                    # FINITE (`fs_num ≤ 0` with β'S_lβ > 0 ⇒ θ* ≤ 0 ⇒ release
+                    # by one bounded decade, which the old freeze blocked),
+                    # and hold where it is not (β'S_lβ ≈ 0 ⇒ θ* = +∞: the
+                    # penalty θ_l·β'S_lβ is zero for every θ_l, so escalating
+                    # cannot improve the fit but does wreck the conditioning
+                    # of H). Measured on the deterministic linear-map fixture
+                    # in the F4 testset, escalating this branch made the
+                    # collocation fit WORSE — data loss 1.04e-16 → 2.93e-13
+                    # and g(1) error 1.4e-9 → 7.8e-8.
+                    #
+                    # Two structural facts make the conservative choice even
+                    # safer here than in laml.jl: this update runs once per
+                    # continuation level (`n_continuation`, default 8) with NO
+                    # acceptance test of any kind — the next level's
+                    # Gauss–Newton fit simply adopts whatever θ comes out,
+                    # whereas the laml.jl proposal is still vetted by the
+                    # accept block in solver.jl — and the criterion here
+                    # carries an ODE-compliance term the laml.jl one does not,
+                    # so a large jump is less well calibrated to begin with.
+                    #
+                    # Preserve the existing (1e-20, 1e20) cap as the outer
+                    # bound, and leave the hold cases bit-identical (θ
+                    # untouched, never re-clamped).
+                    if bSb > 1e-30
+                        if fs_num > 0
+                            cand = sigma2_est * fs_num / bSb
+                            # mgcv's `r[!is.finite(r)] <- 1e6` hole; we hold.
+                            isfinite(cand) &&
+                                (theta[l] = clamp(cand, 1e-20, 1e20))
+                        else
+                            theta[l] = max(theta[l] / 10.0, 1e-20)  # θ* ≤ 0
+                        end
+                    end                     # no finite θ*, or 0/0 ⇒ hold
                 end
                 if verbose
                     println("  FS update: σ²=$(round(sigma2_est, sigdigits=4)) " *
