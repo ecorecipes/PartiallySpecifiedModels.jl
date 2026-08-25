@@ -3660,17 +3660,26 @@ Result of fitting a PSM.
   this is one entry per penalized approximator, as historically; an
   unpenalized approximator (no blocks) contributes no entry, and a
   multi-block approximator contributes one entry per block.
-  For `LAML` and `GCVSolver`, λ̂ and `parameters` are a MATCHED PAIR: λ̂ is
-  the λ whose penalty `B(λ̂) = Σ λ̂ₗ Sₗ` produced β̂ — the last accepted
-  penalized step was taken under it — and `objective`, `edf`,
-  `convergence.V_beta`, `convergence.sigma2` and `convergence.laml` are all
-  evaluated at that same λ̂. (`LAML` explores further λ proposals after the
-  last coefficient update; those are not reported, because β̂ was never
-  fitted under them.) On a CONVERGED fit β̂ is therefore a fixed point of
-  the penalized step at λ̂, so refitting reproduces `parameters`; on a
-  truncated fit (`convergence.converged == false`) it is not — the step
-  contraction may have accepted a partial step — but the pairing is still
-  honest. `RodeoSolver` and `DaltonSolver` also populate this field; their
+  For `LAML`, `GCVSolver` and `CollocationLAML`, λ̂ and `parameters` are a
+  MATCHED PAIR: λ̂ is the λ whose penalty `B(λ̂) = Σ λ̂ₗ Sₗ` produced β̂ — the
+  last accepted penalized step was taken under it — and every other
+  θ-dependent quantity the solution carries is evaluated at that same λ̂
+  (`objective` and `edf` for all three; `convergence.V_beta`,
+  `convergence.sigma2` and `convergence.laml` for `LAML`, which alone
+  reports them). Both `LAML` and `CollocationLAML` compute one further λ
+  proposal after their last coefficient update — `LAML` from the next
+  Fellner-Schall step of the IRLS loop, `CollocationLAML` at the end of its
+  final continuation level, where the proposal exists only to seed a next
+  level that never runs. Those proposals are not reported, because β̂ was
+  never fitted under them. For `LAML` on a CONVERGED fit, β̂ is therefore a
+  fixed point of the penalized step at λ̂ and refitting reproduces
+  `parameters`; on a truncated fit (`convergence.converged == false`) it is
+  not — the step contraction may have accepted a partial step — but the
+  pairing is still honest. `CollocationLAML` gives the weaker guarantee:
+  its inner loop stops on an objective tolerance inside a continuation
+  schedule rather than at a stationary point, so β̂ is near but not exactly
+  a fixed point at λ̂ (measured: refitting moves β̂ by up to 5e-5 on
+  converged fits). The λ̂ it reports is still the one β̂ was fitted under. `RodeoSolver` and `DaltonSolver` also populate this field; their
   pairing has not been audited to the same standard.
 - `fitted_values`: predicted values at data times (n_times × n_obs)
 - `unknown_functions`: Dict of name => callable evaluator

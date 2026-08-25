@@ -7362,6 +7362,15 @@ end
                            sol_ca_w11.fitted_values) < 1e-5
         @test abs(sol_ca_w11.data_loss - sol_cf_w11.data_loss) <
               1e-4 * max(sol_cf_w11.data_loss, 1e-8)
+        # λ was NOT compared here, unlike the GCVSolver neighbour above —
+        # a coverage gap this suite carried. Measured at this config:
+        # 0.1655051398 (:fd) vs 0.1655046247 (:forwarddiff), |log ratio|
+        # 3.1e-6, so 1e-4 keeps 32x margin. PIN THE CONFIG: at package
+        # defaults λ is unidentified on this fixture (edf ≈ 2.13, the
+        # penalty null-space dimension) and the two backends land 17x
+        # apart — not a defect, but a λ assertion there would be noise.
+        @test abs(log(sol_cf_w11.smoothing_params[1] /
+                      sol_ca_w11.smoothing_params[1])) < 1e-4
 
         # ── THE critical test: collocation failure-mask preservation ──
         # sqrt(u) throws DomainError at collocation points whose state is
@@ -9343,6 +9352,159 @@ end
             @test sol_eg.objective ≈
                   0.5 * (sol_eg.data_loss +
                          reported_penalty(prob_eg, sol_eg)) rtol=1e-8
+        end
+    end
+
+    @testset "CollocationLAML — reported λ̂ and β̂ are mutually consistent" begin
+        PSM = PartiallySpecifiedModels
+
+        # The collocation sibling of the LAML testset above, and the same
+        # defect: `smoothing_params` reported a smoothing parameter that no
+        # coefficient step was ever taken under. CollocationLAML computes its
+        # Fellner-Schall update at the END of each continuation level, to be
+        # consumed by the NEXT level's inner loop — so after the LAST level
+        # the proposal is untested, and reporting it made λ̂ and β̂ describe
+        # different fits. See the `theta_fit` comment block in
+        # `collocation_solver.jl`.
+        #
+        # β̂ is the penalized optimum at λ̂ only if the gradient of the
+        # COLLOCATION penalized objective
+        #     ‖r(α, β; λ_ode)‖² + βᵀ B(λ̂) β,     ∇ = 2(Jᵀr + B p),
+        # vanishes in its β block at the reported (α̂, β̂, λ̂). This recovers
+        # α̂ from `fitted_values` (exact: the solution stores α at the
+        # observed states verbatim), rebuilds r and J with the solver's own
+        # `collocation_residual_jacobian` at the final λ_ode, and returns
+        # ‖∇_β‖ / ‖β̂‖.
+        #
+        # Note this is a STATIONARITY test, not a refit-distance test as in
+        # the LAML testset, and the distinction is load-bearing: on the
+        # exponential-growth fixture below a refit at the wrong λ̂ moves β by
+        # EXACTLY 0.0, so a displacement test would pass while the solver was
+        # wrong. The gradient test flags the same fit at 0.0227 against a
+        # 1e-3 gate.
+        #
+        # Why displacement is blind here: the Gauss–Newton Hessian is
+        # dominated by the λ_ode-scaled ODE-fidelity block (λ_ode reaches
+        # 1e2–1e4), so H⁻¹∇ stays tiny even when ∇ is enormous. It is NOT
+        # that the jointly-optimised α block absorbs the wrong penalty —
+        # that was measured and is false: holding α fixed makes β move LESS,
+        # not more, on 4 of 5 fixtures (inverted by up to 300×). Refit
+        # distance also is not bounded the way it first appeared: on a
+        # logistic fixture it reaches 16% of ‖β‖ and shifts data_loss 35%.
+        # Measured on the Poisson fixture below (converged == true): 303.6
+        # before the fix, 0.00232 after — a 1.3e5× gap.
+        function colloc_grad_norm(prob, sol)
+            beta = Vector{Float64}(collect(sol.parameters))
+            times = Float64.(prob.data_times)
+            T_pts = length(times)
+            n_obs = size(prob.data_values, 2)
+            K = length(prob.u0)
+            # α is only recoverable from `fitted_values` when every state is
+            # observed, which is true of both fixtures here.
+            @assert sort(collect(prob.obs_to_state)) == collect(1:K)
+            alpha = zeros(T_pts, K)
+            for j in 1:n_obs
+                alpha[:, prob.obs_to_state[j]] .= sol.fitted_values[:, j]
+            end
+
+            n_alpha = T_pts * K
+            w_vec = zeros(T_pts * n_obs)
+            for j in 1:n_obs, i in 1:T_pts
+                w_vec[(j - 1) * T_pts + i] = PSM.usable_cell(prob, i, j) ?
+                                             prob.data_weights[i, j] : 0.0
+            end
+
+            S_list, uf_offsets, uf_nk = PSM.build_penalty_matrices(prob)
+            B_beta = zeros(length(beta), length(beta))
+            for l in eachindex(S_list)
+                off, nk = uf_offsets[l], uf_nk[l]
+                B_beta[off+1:off+nk, off+1:off+nk] .+=
+                    sol.smoothing_params[l] .* S_list[l]
+            end
+
+            resid, J_full = PSM.collocation_residual_jacobian(
+                prob, times, alpha, beta, PSM.build_diff_matrix(times),
+                sol.convergence.lambda_ode_final, w_vec;
+                jac=:fd, fd_cfg=nothing)
+            g_beta = 2 .* (J_full' * resid)[n_alpha+1:end] .+
+                     2 .* (B_beta * beta)
+            norm(g_beta) / max(norm(beta), 1e-12)
+        end
+
+        # The reported tuple must be ONE coherent set: CollocationLAML's
+        # `objective` is data_loss + β̂ᵀS^λ̂β̂ (no ½ factor, unlike LAML) using
+        # the SAME λ̂ and β̂ the solution reports. Guards against "fixing" the
+        # reported λ̂ alone while leaving the θ-dependent scalars at the other
+        # θ.
+        function colloc_reported_penalty(prob, sol)
+            beta = Vector{Float64}(collect(sol.parameters))
+            S_list, uf_offsets, uf_nk = PSM.build_penalty_matrices(prob)
+            p = 0.0
+            for l in eachindex(S_list)
+                off, nk = uf_offsets[l], uf_nk[l]
+                bl = beta[off+1:off+nk]
+                p += sol.smoothing_params[l] * dot(bl, S_list[l] * bl)
+            end
+            p
+        end
+
+        growth_f1b!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+
+        # ── Discriminating fixture: Poisson counts. The counts are hardcoded
+        #    so the fit is identical across Julia/RNG versions. Converged, so
+        #    β̂ really is at the inner loop's optimum and the stationarity
+        #    test is not confounded by truncation.
+        dt_f1b = collect(range(0.0, 6.0, length=25))
+        counts_f1b = [5.0, 5.0, 6.0, 6.0, 6.0, 7.0, 8.0, 8.0, 8.0, 8.0, 9.0,
+                      9.0, 10.0, 12.0, 12.0, 12.0, 14.0, 13.0, 14.0, 17.0,
+                      18.0, 19.0, 21.0, 20.0, 24.0]
+        prob_f1b_pois = PSMProblem(growth_f1b!, [5.0], (0.0, 6.0),
+            [BSplineApproximator(:r, (0.0, 30.0), 6; initial=x -> 0.2)];
+            data_times=dt_f1b, data_values=reshape(counts_f1b, :, 1),
+            obs_to_state=[1], likelihood=Poisson(), solver=Tsit5())
+        alg_f1b = CollocationLAML(maxiters=20, verbose=false,
+                                  lambda_ode_start=0.01, lambda_ode_end=100.0,
+                                  n_continuation=4)
+        sol_f1b_pois = solve(prob_f1b_pois, alg_f1b)
+
+        @test sol_f1b_pois.convergence.converged
+        # Measured: 0.00232 with the fix, 303.6 without it — so 1.0 sits 430×
+        # above the fixed value and 304× below the broken one.
+        @test colloc_grad_norm(prob_f1b_pois, sol_f1b_pois) < 1.0
+        @test sol_f1b_pois.objective ≈
+              sol_f1b_pois.data_loss +
+              colloc_reported_penalty(prob_f1b_pois, sol_f1b_pois) rtol=1e-8
+        # …and the reported penalty is commensurate with the fit rather than
+        # dwarfing it: 0.0121 against a data loss of 11.73 (measured; the
+        # untested proposal reported 0.653, a 54× inflation).
+        @test colloc_reported_penalty(prob_f1b_pois, sol_f1b_pois) <
+              sol_f1b_pois.data_loss
+
+        # ── The same invariant on the suite's own exponential-growth fixture
+        #    (see the "CollocationLAML solver" testset), on both Jacobian
+        #    backends and both at 4 continuation levels and at the package
+        #    defaults. Measured ‖∇_β‖/‖β̂‖ with the fix: 2.33e-6, 2.33e-6 and
+        #    1.71e-5; without it 0.0227, 0.0615 and 0.156.
+        dt_f1b_g = collect(range(0.0, 5.0, length=30))
+        prob_f1b_g = PSMProblem(growth_f1b!, [1.0], (0.0, 5.0),
+            [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+            data_times=dt_f1b_g,
+            data_values=reshape(exp.(0.3 .* dt_f1b_g), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=Gaussian(), solver=Tsit5(),
+            abstol=1e-8, reltol=1e-8, maxiters=10000)
+        for alg_g in (alg_f1b,
+                      CollocationLAML(maxiters=20, verbose=false,
+                                      lambda_ode_start=0.01,
+                                      lambda_ode_end=100.0, n_continuation=4,
+                                      jac=:forwarddiff),
+                      CollocationLAML(verbose=false))
+            sol_g = solve(prob_f1b_g, alg_g)
+            @test sol_g.convergence.converged
+            @test colloc_grad_norm(prob_f1b_g, sol_g) < 1e-3
+            @test sol_g.objective ≈
+                  sol_g.data_loss +
+                  colloc_reported_penalty(prob_f1b_g, sol_g) rtol=1e-8
         end
     end
 
