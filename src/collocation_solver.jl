@@ -737,6 +737,43 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     end
 
     # ─── Continuation loop ────────────────────────────────────────
+    # θ̂ REPORTED TO THE USER: the smoothing parameters β was actually fitted
+    # under. Two θ vectors coexist in this loop and they are NOT
+    # interchangeable (the same distinction `solver.jl` draws for LAML, which
+    # carries three):
+    #   theta     — the newest Fellner–Schall PROPOSAL. It is produced at the
+    #               END of a continuation level and consumed only by the NEXT
+    #               level's inner loop, so after the LAST level it is
+    #               untested: no coefficient step was ever taken under it.
+    #   theta_fit — the θ whose penalty B(θ) actually produced the current
+    #               (α, β). This is the only one at which β is the penalized
+    #               optimum, so it is what `smoothing_params` and `obj_val`
+    #               are reported at. `edf`/σ̂² are ALREADY computed from the H
+    #               built with this θ (the Fellner–Schall block below forms
+    #               S_full before it overwrites `theta`), so collapsing onto
+    #               theta_fit is also what makes edf and λ̂ describe one fit.
+    # Measured, all on fits reporting converged == true: on the suite's
+    # exponential-growth fixture the reported λ̂ was 5536.4 where β had been
+    # fitted at 384.6 (14.4×); on a Poisson fixture 8.402 vs 0.1559 (53.9×),
+    # inflating the reported penalty term to 0.653 from 0.0121 and leaving β̂
+    # 1.3e5× further from stationarity of the penalized collocation objective
+    # at the reported λ̂ than at the fitted one. The reported EDF was already
+    # computed at theta_fit, so pre-fix a fit could print an EDF of 3.03
+    # (its value at λ=0.156) beside a λ̂ of 8.402, whose own EDF is 2.08 —
+    # 45% apart.
+    #
+    # Report rather than refit at the proposal. Unlike LAML — where the
+    # accept logic had explicitly REJECTED the final θ's step — this
+    # proposal was never rejected, so that argument is unavailable here.
+    # What closes the door instead is that the Fellner–Schall sequence is
+    # nowhere near a fixed point at exit: taking one further FS step after
+    # refitting moves λ again by factors of 0.07× to 148×. Refitting would
+    # therefore relocate the same inconsistency one step down a
+    # non-convergent sequence, while changing the delivered fit by up to
+    # 16% of ‖β‖ and 35% of data_loss IN BOTH DIRECTIONS — and collocation
+    # computes no marginal likelihood that could say the new point is
+    # better.
+    theta_fit = copy(theta)
     edf_final = Float64(sum(uf_nk))   # updated by the Fellner–Schall step
     fs_skip_warned = false            # warn once if the FS step never runs
     # Honest convergence reporting: converged/reason describe the FINAL
@@ -852,6 +889,14 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
             params_new = params_vec .+ best_step .* delta
             alpha .= reshape(params_new[1:n_alpha], T_pts, K)
             beta .= params_new[n_alpha+1:end]
+            # (α, β) were just stepped under the penalty B(theta). Record it
+            # HERE — the only place β is accepted — and before the
+            # Fellner–Schall block at the end of this level moves `theta` onto
+            # its next proposal. If a level's inner loop accepts no step at
+            # all (singular system, or the line search rejects every
+            # contraction on its first iteration) theta_fit correctly stays on
+            # the earlier θ that did produce the current β.
+            theta_fit .= theta
         end
 
         # ── Fellner–Schall smoothing-parameter update ────────────────
@@ -968,6 +1013,22 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
             end
         end
     end
+
+    # Collapse onto the θ that β was actually fitted at (see the theta_fit
+    # comment above). Both θ-dependent quantities below — `obj_val`'s penalty
+    # term and `smoothing_params` itself — read `theta`, so this single
+    # assignment is what makes the reported solution self-consistent: β̂ is the
+    # penalized optimum at the λ̂ reported beside it, and that λ̂ is the one
+    # `edf` was computed at.
+    #
+    # Reporting rather than refitting mirrors the same fix in `solver.jl`: the
+    # final Fellner–Schall proposal exists only to seed the NEXT continuation
+    # level and there is no next level, so no coefficient step was ever taken
+    # under it. Refitting β to it would change the fit itself, which is a
+    # behavior change rather than a reporting fix. A truncated fit
+    # (`converged == false`) is still not stationary at ANY λ — no choice of
+    # reported λ can fix that — but the λ/β PAIRING is now honest in all cases.
+    theta .= theta_fit
 
     # ─── Build solution ───────────────────────────────────────────
     # Compute final predictions (alpha at observed states)

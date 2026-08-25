@@ -619,8 +619,10 @@ block consumers go through): local ranges must be non-empty and lie
 within `1:nparams(approx)`, be pairwise disjoint (the per-block
 generalized determinant `log|S_λ|₊` in laml.jl is exact only for
 non-overlapping blocks), and each `S` must be
-`length(range) × length(range)` and numerically symmetric. Violations
-throw an `ArgumentError` naming the approximator.
+`length(range) × length(range)`, numerically symmetric, and positive
+semi-definite (a non-PSD block would otherwise pass silently and be
+treated as unpenalized by the rank and log-determinant routines).
+Violations throw an `ArgumentError` naming the approximator.
 """
 function build_penalty_matrices(prob::PSMProblem)
     S_list = Matrix{Float64}[]
@@ -652,6 +654,30 @@ function build_penalty_matrices(prob::PSMProblem)
             asym <= 1e-8 * max(maximum(abs.(S)), 1.0) || throw(ArgumentError(
                 "penalty_blocks(:$(approx.name)): S for range $r is not " *
                 "symmetric (max |S - S'| = $asym)"))
+            # PSD, which the contract requires and nothing used to check.
+            # Neither failure mode is caught downstream, and both are silent
+            # (measured): a NEGATIVE-DEFINITE block gives _rank_penalty 0 and
+            # _log_det_plus 0, i.e. a fully inert penalty — the user asked
+            # for smoothing and got none. An INDEFINITE block is worse
+            # because it looks alive: diag(-1,+1) gives rank 1 and logdet 0,
+            # so the negative direction is silently dropped and the block
+            # penalizes a subspace the user never specified. One
+            # eigendecomposition per block per solve (every call site is
+            # once-per-solve, and blocks are small), so the cost is noise.
+            #
+            # The tolerance is relative and generous: across 73 penalty
+            # blocks from 69 configurations of all eleven built-in types,
+            # the worst relative eigmin is -9.7e-17 (pure roundoff), so
+            # -1e-8 leaves seven orders of margin over anything the package
+            # itself produces.
+            evmin, evmax = extrema(eigvals(Symmetric(Matrix(Float64.(S)))))
+            evmin >= -1e-8 * max(evmax, 1.0) || throw(ArgumentError(
+                "penalty_blocks(:$(approx.name)): S for range $r is not " *
+                "positive semi-definite (smallest eigenvalue $evmin against " *
+                "largest $evmax). A penalty must be PSD: a negative " *
+                "direction would REWARD roughness, and downstream rank and " *
+                "log-determinant routines would silently treat the block as " *
+                "unpenalized rather than report the error."))
             for i in r
                 covered[i] && throw(ArgumentError(
                     "penalty_blocks(:$(approx.name)): ranges overlap at " *
@@ -702,7 +728,11 @@ For each IRLS iteration:
 
 Returns a `PSMSolution`. `sol.convergence` is a NamedTuple
 `(V_beta, sigma2, converged, iterations, reason, laml_failures, criterion,
-laml)` — see the `LAML` and `PSMSolution` docstrings for the key taxonomy.
+laml, stationarity, smoothing_advanced)` — see the `LAML` and `PSMSolution`
+docstrings for the key taxonomy. Note in particular that `converged` is a
+stability test, and that `stationarity`/`smoothing_advanced` are the additive
+diagnostics that say whether the fit stopped at a smoothing optimum or merely
+stopped moving.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     _validate_problem(prob, "LAML")
@@ -772,6 +802,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     else
         theta = Float64[1.0 / max(tr(S_list[l]), 1e-10) for l in 1:m]
     end
+    # Snapshot of the INITIALIZATION, kept untouched for the whole solve so
+    # `convergence.smoothing_advanced` can answer "did smoothing selection
+    # ever move λ off this?". Compared against the FINAL reported θ (=
+    # theta_fit), so both the Gaussian warm-start and the main-loop
+    # Fellner-Schall count as advancement.
+    theta_init = copy(theta)
 
     # Build total penalty B = Σ θ_k S_k (embedded in n_p × n_p)
     function build_B(th)
@@ -938,6 +974,27 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     end
 
     otheta = copy(theta)
+    # θ̂ REPORTED TO THE USER: the smoothing parameters β was actually fitted
+    # under. Three θ vectors coexist in this loop and they are NOT
+    # interchangeable:
+    #   theta     — the newest Fellner-Schall PROPOSAL. Computed at the very
+    #               end of each iteration and only tested at the start of the
+    #               next one, so at loop exit it is always untested and may
+    #               have been explicitly REJECTED by the accept block below.
+    #   otheta    — the θ the NEXT PCLS step will use. The `f01 < obj_prev`
+    #               branch advances it to `theta` AFTER fitting β at the old
+    #               value, so it too can disagree with β at exit.
+    #   theta_fit — the θ whose penalty B(θ) actually produced the current β.
+    #               This is the only one for which β is the penalized MLE, so
+    #               it is what `smoothing_params` and every θ-dependent
+    #               quantity in the final block (B_final, edf, objective,
+    #               V_beta, sigma2, the LAML criterion) are computed at.
+    # Reporting `theta` instead made λ̂ and β̂ mutually inconsistent: refitting
+    # β at the reported λ moved it by up to 78% of ‖β‖ on a CONVERGED
+    # two-λ Lotka-Volterra fixture (measured), and the reported objective was
+    # 7.3e7 against a data loss of 0.89 because the penalty was evaluated at a
+    # λ the coefficients had never seen.
+    theta_fit = copy(theta)
     prev_obj = Inf  # Track penalized objective for convergence
     prev_data_loss = Inf  # Track data loss for non-Gaussian convergence
 
@@ -1003,6 +1060,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                 compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
                                   jac=alg.jac, fd_cfg=fd_cfg)
                 otheta .= theta
+                theta_fit .= theta      # β was fitted under B(theta)
             elseif f01 < obj_prev
                 # Old theta step improved at old theta
                 f0_vec, _ = try; eval_model(a0); catch; (f_vec, nothing); end
@@ -1010,6 +1068,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                 f_vec .= f0_vec
                 compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
                                   jac=alg.jac, fd_cfg=fd_cfg)
+                # a0 came from PCLS at the OLD θ, so record it BEFORE the
+                # otheta update below moves otheta onto the new proposal.
+                theta_fit .= otheta
                 # Also accept new theta if it didn't make data loss worse
                 if dl_a1 < dl_curr
                     otheta .= theta
@@ -1022,23 +1083,55 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                 compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
                                   jac=alg.jac, fd_cfg=fd_cfg)
                 otheta .= theta
+                theta_fit .= theta      # β was fitted under B(theta)
             else
-                # No improvement from either
+                # No improvement from either: β is unchanged, so theta_fit
+                # stays on whatever θ produced it.
                 if iter >= 10
                     stop = true
                 end
                 theta .= otheta
             end
         else
-            # First iteration: accept a0 and update otheta
+            # First iteration (or no penalized blocks): accept a0. Note this
+            # branch does NOT update otheta — theta_fit therefore records
+            # otheta, the θ a0 was actually stepped under.
             f0_vec, _ = try; eval_model(a0); catch; (f_vec, nothing); end
             beta .= a0
             f_vec .= f0_vec
             compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
                               jac=alg.jac, fd_cfg=fd_cfg)
+            theta_fit .= otheta     # a0 came from PCLS at otheta
         end
 
-        # Track penalized objective for convergence monitoring
+        # Track penalized objective for convergence monitoring.
+        #
+        # `theta`, NOT `theta_fit`, ON PURPOSE — and this is the one place in
+        # the loop where that is true. F1 moved every REPORTED θ-dependent
+        # quantity onto `theta_fit` (the θ β was actually fitted under) and
+        # deliberately left this monitor alone. Tested here, in isolation,
+        # on the 18-fixture characterization sweep: scoring at `theta_fit`
+        # is a REGRESSION, not the completion of F1.
+        #
+        # The reason is that `curr_obj` is not a report, it is a STOPPING
+        # SIGNAL, and it is the only term in the convergence test that can
+        # see the smoothing parameters still moving. `theta` carries the
+        # newest Fellner-Schall proposal, so B(theta) keeps changing while
+        # smoothing selection is still working even when β has settled;
+        # `theta_fit` lags a step behind and goes flat first. Freezing the
+        # monitor on `theta_fit` therefore fires `:converged_tol` BEFORE FS
+        # has advanced λ off its initialization.
+        #
+        # Measured (jac defaults, same fixtures, only this line changed):
+        # the loop stopped earlier on 6 of 18 fixtures — exponential-growth
+        # B-spline 9→7 iters, ODEProblem-converted growth 9→7, NegBin
+        # logistic 11→7, two-λ Lotka-Volterra 18→7, floor-kink map 32→13,
+        # clamp-kink map 22→20 — and three fits that are stationary today
+        # became non-stationary stalls whose λ̂ never left the default
+        # 1/tr(S). Worst case, two-λ Lotka-Volterra: EDF 4.00 → 11.99 and
+        # λ̂ [1.9e7, 3.1e7] → [1.569e-4, 1.569e-4] (i.e. exactly the
+        # initialization), with `converged == true` in both cases. Its
+        # stationarity residual went 5.3e-6 → 0.9997.
         curr_obj = penalized_objective(beta, build_B(theta))
 
         if verbose && (iter <= 4 || iter % 10 == 0)
@@ -1111,6 +1204,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             theta .= theta_new
         end
     end
+
+    # Collapse onto the θ that β was actually fitted at (see the theta_fit
+    # comment above). Everything from here down — B_final, edf, obj_val,
+    # V_beta, sigma2, the LAML criterion, the verbose "Final θ" line and
+    # `smoothing_params` itself — reads `theta`, so this single assignment is
+    # what makes the whole reported solution self-consistent: β̂ IS the
+    # penalized MLE at the λ̂ reported next to it.
+    #
+    # A truncated fit (`converged == false`) is still not stationary at ANY λ
+    # — no choice of reported λ can fix that, and `convergence.reason` already
+    # says so — but the λ/β PAIRING is now honest in every case.
+    theta .= theta_fit
 
     # Build solution
     p_opt = copy(beta)
@@ -1209,22 +1314,99 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     # Reported under BOTH criteria (under :working for non-Gaussian it is a
     # diagnostic, not the quantity the FS update was calibrated to). NaN
     # when no penalized term exists (m == 0) or the evaluation fails.
-    laml_value = if m > 0
+    # `laml_objective` returns (V, H_laml, S_lambda, sigma2). H_laml and
+    # sigma2 are exactly the quantities `laml_gradient` needs, so taking all
+    # four here makes the reported criterion value and the stationarity
+    # residual below two readings of the SAME evaluation — no second, subtly
+    # different assembly of H or σ̂².
+    laml_value, laml_H, laml_sigma2 = if m > 0
         try
-            first(laml_objective(prob.likelihood, p_opt, J, W_irls, w_vec,
-                                 y_vec, f_vec, S_list, uf_offsets, uf_nk,
-                                 log.(max.(theta, 1e-300)), n_p))
+            V, Hl, _, s2l = laml_objective(prob.likelihood, p_opt, J, W_irls,
+                                           w_vec, y_vec, f_vec, S_list,
+                                           uf_offsets, uf_nk,
+                                           log.(max.(theta, 1e-300)), n_p)
+            (V, Hl, s2l)
+        catch
+            (NaN, nothing, NaN)
+        end
+    else
+        (NaN, nothing, NaN)
+    end
+
+    # ─── Stationarity of the smoothing parameters ────────────────────
+    # `converged` above is a STABILITY test (the penalized objective and the
+    # data loss stopped moving). Stability is not stationarity: an IRLS
+    # search can stop moving because it reached the optimum, OR because the
+    # steps it can construct from a noisy finite-difference Jacobian all fail
+    # the accept test, OR because Fellner-Schall never engaged at all. Only
+    # the first is convergence. `stationarity` distinguishes them by asking
+    # the criterion directly.
+    #
+    #   ∂V/∂ρ_k = -½λ_k β̂'S_kβ̂/σ̂² + ½ r_k - ½ tr(H⁻¹λ_kS_k)
+    #
+    # is the exact gradient of the LAML criterion w.r.t. ρ = log λ at the
+    # returned (β̂, λ̂). Dividing by ½ r_k = ½ rank(S_k) makes the residual
+    # dimensionless and comparable across blocks, bases, resolutions and
+    # data scales: the ½r_k and ½tr(H⁻¹λ_kS_k) terms are both bounded by
+    # ½ r_k, so the ratio measures the gradient against the natural scale of
+    # the block. It is NOT bounded by 1 — the β̂'S_kβ̂/σ̂² term has no upper
+    # bound, and the largest value observed across this package's suite is
+    # 14.1. `stationarity` is the max over blocks of that ratio.
+    #
+    # DELIBERATELY REPORTED AS A NUMBER, NOT A PASS/FAIL FLAG. An earlier
+    # draft of this block carried a companion `stationary::Bool` at a
+    # threshold of 0.1. It was dropped after measuring the residual on all
+    # 151 LAML solves the test suite performs: the distribution is an
+    # unbroken continuum, not two clusters. Quantiles are p25 = 1.7e-7,
+    # p50 = 9.5e-6, p75 = 1.5e-2, p90 = 0.46, max = 14.1, and across the
+    # whole decision-relevant region (1e-3 to 3) the largest ratio between
+    # consecutive sorted values is 1.65 below 1 and 2.98 across the whole
+    # region — nothing resembling the orders-of-magnitude separation a
+    # threshold would need, i.e. there is no gap anywhere a
+    # threshold could sit. A cutoff at 0.1 would have flagged 25 of 151
+    # solves (16.6%), splitting a continuum of otherwise ordinary
+    # `:converged_tol` fits spanning the same families and Jacobian
+    # backends. A flag that fires on one fit in six teaches users to ignore
+    # it, which would destroy the value of the honest signal this block
+    # exists to add.
+    #
+    # (An earlier partial sample of 94 solves appeared to show a 3.2x gap
+    # around 0.1; the remaining 57 solves filled it in completely. Recorded
+    # because it is the reason not to calibrate a gate on a subsample.)
+    #
+    # Users who need a gate should threshold the float for their own problem
+    # class — and should read the σ̂²→0 caveat in the LAML docstring first.
+    stationarity = if m == 0
+        # No penalized block ⇒ no smoothing parameter to be stationary in.
+        # The empty gradient's max-norm is 0 by convention, not by luck.
+        0.0
+    elseif laml_H === nothing
+        NaN
+    else
+        try
+            g = laml_gradient(prob.likelihood, p_opt, S_list, uf_offsets,
+                              uf_nk, log.(max.(theta, 1e-300)), n_p,
+                              laml_H, laml_sigma2)
+            maximum(abs(g[l]) / max(0.5 * _rank_penalty(S_list[l]), 1e-8)
+                    for l in 1:m)
         catch
             NaN
         end
-    else
-        NaN
     end
+    # Did smoothing selection ever move λ off its initialization? `false`
+    # means the reported λ̂ IS the initial value: either every FS proposal
+    # was rejected by the accept block, or FS never ran (m == 0, or
+    # maxiters ≤ warmup). See the LAML docstring.
+    smoothing_advanced = m > 0 && any(
+        abs(theta[l] - theta_init[l]) >
+            1e-10 * max(abs(theta_init[l]), 1e-300) for l in 1:m)
 
     convergence_info = (V_beta=V_beta, sigma2=sigma2_hat,
                         converged=conv_converged, iterations=conv_iters,
                         reason=conv_reason, laml_failures=laml_failures,
-                        criterion=alg.criterion, laml=laml_value)
+                        criterion=alg.criterion, laml=laml_value,
+                        stationarity=stationarity,
+                        smoothing_advanced=smoothing_advanced)
 
     PSMSolution(params, obj_val, data_loss, edf, copy(theta),
                 Float64.(pred), Float64.(prob.data_values),

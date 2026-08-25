@@ -101,6 +101,12 @@ function PartiallySpecifiedModels.penalty_blocks(a::BadBlocksApproximator)
     a.kind === :out_of_range  ? [(Matrix{Float64}(I, 4, 4), 4:7)] :
     a.kind === :size_mismatch ? [(Matrix{Float64}(I, 2, 2), 1:3)] :
     a.kind === :strided        ? [(I3, 1:2:5)] :
+    # symmetric but INDEFINITE: eigenvalues -1 and +1. Passes every other
+    # check; downstream it would become an inert (rank-0) penalty rather
+    # than an error, so the user asks for smoothing and silently gets none.
+    a.kind === :indefinite     ? [([0.0 1.0; 1.0 0.0], 1:2)] :
+    # symmetric NEGATIVE definite: a penalty that rewards roughness.
+    a.kind === :negdef         ? [(-1.0 * Matrix{Float64}(I, 3, 3), 1:3)] :
                                 [([1.0 2.0; 0.0 1.0], 1:2)]
 end
 
@@ -4245,6 +4251,185 @@ end
         end
     end
 
+    @testset "LAML stationarity diagnostics (F2)" begin
+        # `convergence.converged` is a STABILITY test: it fires when the
+        # penalized objective and the data loss stop changing. Several
+        # different things stop a fit moving and `converged` reports them
+        # all as success. These tests pin the two ADDITIVE keys that tell
+        # them apart -- `stationarity` (|dV/drho| normalized by
+        # 1/2 rank(S_k)) and `smoothing_advanced` -- and pin that they stay
+        # quiet on a healthy fit.
+        #
+        # Both keys are additive: `converged`, `reason`, `iterations` and
+        # every fitted quantity are unchanged by this testset's subject.
+        #
+        # NOTE ON THRESHOLDS. There is deliberately no `stationary::Bool` in
+        # the API, because measured across all 151 LAML solves this suite
+        # performs the residual is an UNBROKEN continuum, not two clusters:
+        # quantiles p25=1.7e-7, p50=9.5e-6, p75=1.5e-2, p90=0.46, max=14.1,
+        # and over the whole decision-relevant region (1e-3..3) the largest
+        # ratio between consecutive sorted values is 1.65 below 1 and 2.98
+        # across the whole region -- nothing like the orders-of-magnitude
+        # separation a threshold would need, so no cutoff could sit there. (A partial 94-solve sample appeared to show a
+        # 3.2x gap near 0.1; the remaining 57 solves filled it in. That is
+        # why none of the assertions below rely on a universal cutoff.)
+        # Each either compares a fixture against a STRUCTURALLY MATCHED
+        # control, or pins a fixture-specific measured magnitude with wide
+        # margin.
+
+        # ── (a) HEALTHY: the diagnostics must stay quiet ──
+        gh_f2!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        t_f2 = collect(0.0:0.5:10.0)
+        # Deterministic (RNG-free) wobble so the fit has REAL residual
+        # variance. A noiseless fixture drives the profiled sigma^2 to
+        # ~1e-17 and the REML gradient's -1/2 lambda b'Sb / sigma^2 term
+        # with it, which is a ratio of two near-zero quantities and is not
+        # informative (see the caveat in the LAML docstring).
+        noi_f2 = [0.01 * (sin(3.1i) + 0.5cos(7.7i)) for i in 1:length(t_f2)]
+        mk_f2() = PSMProblem(gh_f2!, [1.0], (0.0, 10.0),
+            [BSplineApproximator(:r, (0.0, 5.0), 5; initial=x -> 0.05)];
+            data_times=t_f2,
+            data_values=reshape(exp.(0.1 .* t_f2) .+ noi_f2, :, 1),
+            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+
+        s_ok = solve(mk_f2(), LAML(maxiters=30))
+        @test s_ok.convergence.converged
+        @test s_ok.convergence.smoothing_advanced
+        # measured 2.90e-7; 85 of the suite's 151 solves sit below 1e-4
+        @test s_ok.convergence.stationarity < 1e-4
+        @test isfinite(s_ok.convergence.stationarity)
+
+        # ── (b) MODE: Fellner-Schall never advanced ──
+        # Same problem, jac=:forwarddiff. The exact Jacobian makes the very
+        # first step good enough that the accept block takes the `f01 <
+        # obj_prev` branch every iteration with `dl_a1 >= dl_curr`, so
+        # `otheta` never moves onto an FS proposal. `converged` is true and
+        # the reported lambda-hat is EXACTLY the data-driven default
+        # 1/tr(S) -- smoothing selection never took effect. This was hidden
+        # before F1, which reported a plausible-looking proposal instead.
+        # `smoothing_advanced` is exact and threshold-free, which is why it
+        # is the assertion carrying the weight here.
+        s_m3 = solve(mk_f2(), LAML(maxiters=30, jac=:forwarddiff))
+        @test s_m3.convergence.converged          # unchanged: still "converged"
+        @test !s_m3.convergence.smoothing_advanced
+        # lambda-hat is bit-identical to the initialization, not merely close
+        lam0_f2 = 1.0 / tr(penalty_matrix(
+            BSplineApproximator(:r, (0.0, 5.0), 5)))
+        @test s_m3.smoothing_params[1] == lam0_f2
+        # ...and the fd path on the SAME data does advance, so this is a
+        # property of the search, not of the fixture being unfittable
+        @test s_ok.smoothing_params[1] != lam0_f2
+
+        # ── (c) MODE: stalled on a non-smooth evaluator ──
+        # Structurally MATCHED PAIR: the same discrete-map model, the same
+        # basis, the same solver settings and the same deterministic noise,
+        # differing only in whether the step applies floor() to a
+        # coefficient-dependent quantity. The kink makes the prediction
+        # discontinuous in beta, so the default finite-difference Jacobian
+        # is noise and the search plateaus at a non-optimum -- while still
+        # reporting converged=true. Comparing the pair avoids asserting any
+        # absolute stationarity cutoff.
+        smooth_step(g) = g
+        kink_step(g) = g - 0.5 * (floor(g * 20.0) / 20.0)
+        function mk_map(stepf)
+            Nt = zeros(31); Nt[1] = 20.0
+            for t in 1:30
+                Nt[t+1] = max(Nt[t] *
+                    exp(stepf(0.8 * (1 - Nt[t] / 100.0))), 0.01)
+            end
+            dat = Nt .+ [0.5 * (sin(3.1i) + 0.7cos(7.7i)) for i in 1:31]
+            dyn! = (un, u, p, t) -> (un[1] = max(u[1] * exp(stepf(p.f(u[1]))),
+                                                 0.01))
+            PSMProblem(dyn!, [20.0], (0.0, 30.0),
+                [BSplineApproximator(:f, (0.0, 150.0), 8;
+                    initial=x -> 0.5 * (1.0 - x / 100.0))];
+                data_times=Float64.(0:30), data_values=reshape(dat, :, 1),
+                discrete=true, solver=nothing)
+        end
+        s_smooth = solve(mk_map(smooth_step), LAML(maxiters=50))
+        s_kink   = solve(mk_map(kink_step),   LAML(maxiters=50))
+
+        # Both report success -- `converged` cannot tell them apart
+        @test s_smooth.convergence.converged
+        @test s_kink.convergence.converged
+        # ...but the stationarity residuals differ by orders of magnitude.
+        # Measured: 1.52e-6 (smooth) vs 1.32 (kinked), a factor of ~8.7e5.
+        # Asserted at 1e3 -- ~870x of margin -- so this is a qualitative
+        # separation check, not a pinned constant.
+        @test s_kink.convergence.stationarity >
+              1e3 * s_smooth.convergence.stationarity
+        @test s_smooth.convergence.stationarity < 1e-4    # measured 1.5e-6
+        @test s_kink.convergence.stationarity > 0.5       # measured 1.32
+        # here FS DID move lambda -- it just never reached an optimum, which
+        # is exactly why `smoothing_advanced` alone cannot detect this mode
+        # and the residual is needed
+        @test s_kink.convergence.smoothing_advanced
+        # more budget does not help: it is stalled, not truncated
+        s_kink2 = solve(mk_map(kink_step), LAML(maxiters=80))
+        @test s_kink2.convergence.iterations == s_kink.convergence.iterations
+        @test s_kink2.convergence.stationarity ≈ s_kink.convergence.stationarity
+
+        # ── (d) the keys exist on NON-converged exits too ──
+        # (`haskey` patterns and `keys()` comparisons must not depend on the
+        # exit path)
+        s_tr = solve(mk_f2(), LAML(maxiters=1))
+        @test !s_tr.convergence.converged
+        for s in (s_tr, s_ok, s_kink)
+            @test haskey(s.convergence, :stationarity)
+            @test haskey(s.convergence, :smoothing_advanced)
+            @test s.convergence.stationarity isa Float64
+            @test s.convergence.smoothing_advanced isa Bool
+        end
+        # a 1-iteration fit cannot have advanced smoothing (warmup=3 > 1)
+        @test !s_tr.convergence.smoothing_advanced
+        # no `stationary::Bool` is exposed -- see the threshold note above
+        @test !haskey(s_ok.convergence, :stationary)
+
+        # ── (e) every pre-existing key keeps its meaning ──
+        for k in (:V_beta, :sigma2, :converged, :iterations, :reason,
+                  :laml_failures, :criterion, :laml)
+            @test haskey(s_ok.convergence, k)
+        end
+
+        # ── (f) the convergence monitor is scored at `theta`, not
+        # `theta_fit` ──
+        # `curr_obj = penalized_objective(beta, build_B(theta))` in
+        # solver.jl is the ONLY theta-dependent quantity F1 left on the FS
+        # proposal rather than on theta_fit, and that is deliberate: it is
+        # the sole term in the convergence test that can see lambda still
+        # moving. Rescoring it at theta_fit makes this two-lambda fit stop
+        # 11 iterations earlier with lambda-hat frozen at its
+        # initialization (measured: EDF 4.00 -> 11.99, lambda-hat
+        # [1.9e7, 3.1e7] -> [1.569e-4, 1.569e-4], stationarity 5.3e-6 ->
+        # 0.9997). These assertions fail under that change.
+        function lv_f2!(du, u, p, t)
+            N, Pr = u
+            du[1] = p.r(N) * N - 0.02 * N * Pr
+            du[2] = 0.01 * N * Pr - p.m(Pr) * Pr
+        end
+        pt_f2 = ODEProblem((du, u, p, t) -> begin
+                N, Pr = u
+                du[1] = 0.5N - 0.02N * Pr
+                du[2] = 0.01N * Pr - 0.3Pr
+            end, [20.0, 5.0], (0.0, 20.0))
+        st_f2 = OrdinaryDiffEq.solve(pt_f2, Tsit5(); saveat=0.5)
+        Y_f2 = hcat([u[1] for u in st_f2.u], [u[2] for u in st_f2.u])
+        Y_f2 .+= 0.2 .* hcat([sin(3.1i) + 0.5cos(7.7i) for i in 1:size(Y_f2,1)],
+                             [0.6sin(3.1i) + cos(7.7i) for i in 1:size(Y_f2,1)])
+        prob_lv2 = PSMProblem(lv_f2!, [20.0, 5.0], (0.0, 20.0),
+            [BSplineApproximator(:r, (0.0, 80.0), 6; initial=x -> 0.5),
+             BSplineApproximator(:m, (0.0, 30.0), 6; initial=x -> 0.3)];
+            data_times=st_f2.t, data_values=Y_f2, obs_to_state=[1, 2],
+            likelihood=Gaussian(), solver=Tsit5())
+        s_lv2 = solve(prob_lv2, LAML(maxiters=60))
+        @test s_lv2.convergence.converged
+        @test s_lv2.convergence.iterations > 12      # measured 18; 7 if rescored
+        @test s_lv2.convergence.smoothing_advanced
+        @test s_lv2.convergence.stationarity < 1e-4  # measured 5.3e-6; 0.9997 if rescored
+        @test s_lv2.edf < 6.0                        # measured 4.00; 11.99 if rescored
+        @test all(s_lv2.smoothing_params .> 1.0)     # measured ~2e7; 1.6e-4 if rescored
+    end
+
     @testset "Minor-batch fixes (T10)" begin
         @testset "_normlogcdf: tail accuracy and branch continuity" begin
             using PartiallySpecifiedModels: _normlogcdf, _normcdf
@@ -5231,8 +5416,41 @@ end
             # PRE-FIX (measured): λ 0.0867 (masked) vs 0.5658 (pruned) —
             # 85% relative error — and EDF 2.691 vs 2.199 (22%).
             # POST-FIX: 2.7e-4 and 1.7e-5.
+            #
+            # λ tolerance WIDENED 0.02 -> 0.05 when `smoothing_params` was
+            # changed to report the θ β was actually fitted at (rather than
+            # the last, untested Fellner-Schall proposal — see the
+            # `theta_fit` comment in solver.jl). This is a REAL change, not
+            # a papered-over one, and it is one-sided: the MASKED fit's λ is
+            # bit-identical before and after (0.5658567355454274); only the
+            # PRUNED fit moved, 0.5658007 -> 0.5455690, so masked-vs-pruned
+            # agreement went from 9.9e-5 to 3.6e-2. The pre-fix closeness
+            # was coincidence — both sides happened to report proposals that
+            # nearly matched. Three things say the new value is the better
+            # one: on the pruned problem it attains a HIGHER LAML criterion
+            # than the number it replaced (74.172972 vs 74.172875); λ is
+            # barely identified here, that same 3.6% λ move buying only
+            # 9.6e-5 of criterion; and the quantities the denominator bug
+            # actually corrupted still agree tightly — EDF to 0.28% and σ̂²
+            # to 0.031% (both still asserted at rtol=0.02 below), with
+            # `data_loss` agreeing to 0.06% (3 significant figures). 0.05
+            # still separates fixed from broken by 17x (the bug gave 85%).
+            #
+            # The 3.6% gap is an artifact of the DEFAULT FD Jacobian, not of
+            # masking: under jac=:forwarddiff the same masked-vs-pruned
+            # comparison agrees to 5.9e-9 both before and after this fix.
+            # That is asserted below at rtol=1e-6, keeping a genuinely tight
+            # guard on λ equivalence — the 0.05 line above has only 1.4x
+            # headroom and would not catch a small regression on its own.
             @test isapprox(s_nm.smoothing_params[1], s_np.smoothing_params[1];
-                           rtol=0.02)
+                           rtol=0.05)
+            s_nm_fd = solve(mk_n(ts_n, vals_n, w_n),
+                            LAML(maxiters=40, verbose=false, jac=:forwarddiff))
+            s_np_fd = solve(mk_n(ts_n[keep_n], reshape(clean_n[keep_n], :, 1),
+                                 ones(length(keep_n), 1)),
+                            LAML(maxiters=40, verbose=false, jac=:forwarddiff))
+            @test isapprox(s_nm_fd.smoothing_params[1],
+                           s_np_fd.smoothing_params[1]; rtol=1e-6)
             @test isapprox(s_nm.edf, s_np.edf; rtol=0.02)
             @test isapprox(s_nm.convergence.sigma2, s_np.convergence.sigma2;
                            rtol=0.02)
@@ -7329,6 +7547,15 @@ end
                            sol_ca_w11.fitted_values) < 1e-5
         @test abs(sol_ca_w11.data_loss - sol_cf_w11.data_loss) <
               1e-4 * max(sol_cf_w11.data_loss, 1e-8)
+        # λ was NOT compared here, unlike the GCVSolver neighbour above —
+        # a coverage gap this suite carried. Measured at this config:
+        # 0.1655051398 (:fd) vs 0.1655046247 (:forwarddiff), |log ratio|
+        # 3.1e-6, so 1e-4 keeps 32x margin. PIN THE CONFIG: at package
+        # defaults λ is unidentified on this fixture (edf ≈ 2.13, the
+        # penalty null-space dimension) and the two backends land 17x
+        # apart — not a defect, but a λ assertion there would be noise.
+        @test abs(log(sol_cf_w11.smoothing_params[1] /
+                      sol_ca_w11.smoothing_params[1])) < 1e-4
 
         # ── THE critical test: collocation failure-mask preservation ──
         # sqrt(u) throws DomainError at collocation points whose state is
@@ -7563,6 +7790,41 @@ end
             # coefficients.
             @test_throws ArgumentError PSM.build_penalty_matrices(
                 mkprob_pb(BadBlocksApproximator(:bad, :strided)))
+            # Non-PSD blocks: the contract required PSD but nothing checked
+            # it, and neither failure mode is caught downstream. Measured:
+            # negative-definite gives _rank_penalty 0 / _log_det_plus 0 (a
+            # fully inert penalty — smoothing requested, none applied),
+            # while indefinite diag(-1,+1) gives rank 1 / logdet 0, which is
+            # worse for looking alive: the negative direction is silently
+            # dropped and the block penalizes a subspace nobody asked for.
+            @test_throws ArgumentError PSM.build_penalty_matrices(
+                mkprob_pb(BadBlocksApproximator(:bad, :indefinite)))
+            @test_throws ArgumentError PSM.build_penalty_matrices(
+                mkprob_pb(BadBlocksApproximator(:bad, :negdef)))
+            err_psd = try
+                PSM.build_penalty_matrices(
+                    mkprob_pb(BadBlocksApproximator(:bad, :negdef)))
+                nothing
+            catch e; e; end
+            @test err_psd isa ArgumentError
+            @test occursin(":bad", err_psd.msg)                  # names it
+            @test occursin("positive semi-definite", err_psd.msg)
+            # …and every built-in penalty passes with room to spare: the
+            # worst relative eigmin across 73 blocks from 69 configurations
+            # of all eleven built-in types is -9.7e-17, against a -1e-8
+            # relative gate.
+            for a_psd in (BSplineApproximator(:z, (0.0, 1.0), 10),
+                          SPDEApproximator(:z, (0.0, 1.0), 8),
+                          GPApproximator(:z, (0.0, 1.0), 6),
+                          ShapeConstrainedBSplineApproximator(:z, (0.0, 1.0), 8,
+                                                              :increasing),
+                          TensorBSplineApproximator(:z, (0.0, 1.0), (0.0, 1.0),
+                                                    5, 5))
+                for (S_psd, _) in PSM.penalty_blocks(a_psd)
+                    ev_psd = eigvals(Symmetric(Matrix(Float64.(S_psd))))
+                    @test minimum(ev_psd) >= -1e-8 * max(maximum(ev_psd), 1.0)
+                end
+            end
         end
 
         # ── Shared two-block fixture: linear forcing problem du = f(t),
@@ -9171,6 +9433,298 @@ end
         for s in (:TransformedCovariateApproximator, :lag_weights,
                   :smoothing_inertia, :transformed_covariate)
             @test s in names(PartiallySpecifiedModels)
+        end
+    end
+
+    @testset "LAML — reported λ̂ and β̂ are mutually consistent" begin
+        PSM = PartiallySpecifiedModels
+
+        # β̂ is the penalized MLE at λ̂ if and only if it is a FIXED POINT of
+        # the PCLS step at λ̂: one penalized-least-squares solve of the
+        # working linear model formed AT β̂, using B(λ̂), returns β̂ again.
+        # This refits β at `sol.smoothing_params` with the solver's own
+        # machinery (`_pcls_augmented_solve` — the same call `pcls_step`
+        # makes inside the IRLS loop) and reports how far it moves, relative
+        # to ‖β̂‖.
+        #
+        # This is not decoration. The IRLS loop carries THREE θ vectors (see
+        # the `theta_fit` comment in solver.jl) and used to report the
+        # newest Fellner-Schall PROPOSAL, which at loop exit is untested and
+        # is sometimes one the accept block explicitly rejected. On the
+        # two-λ fixture below that made `smoothing_params` disagree with
+        # `parameters` badly enough that this refit moved β by 77% of ‖β̂‖
+        # (measured), and the reported `objective` was 7.3e7 against a
+        # `data_loss` of 0.89 — the penalty evaluated at a λ the
+        # coefficients had never seen.
+        function pcls_refit_move(prob, sol)
+            beta = Float64.(vec(sol.parameters))
+            n_times = length(prob.data_times)
+            n_obs = length(prob.obs_to_state)
+            n_data = n_times * n_obs
+            n_p = length(beta)
+
+            S_list, uf_offsets, uf_nk = PSM.build_penalty_matrices(prob)
+            B = zeros(n_p, n_p)
+            for l in eachindex(S_list)
+                off, nk = uf_offsets[l], uf_nk[l]
+                for i in 1:nk, j in 1:nk
+                    B[off+i, off+j] += sol.smoothing_params[l] * S_list[l][i, j]
+                end
+            end
+
+            pred = PSM.simulate(prob, beta)
+            y = zeros(n_data); w = zeros(n_data); f = zeros(n_data)
+            k = 1
+            for oi in 1:n_obs, ti in 1:n_times
+                yv, wv = prob.data_values[ti, oi], prob.data_weights[ti, oi]
+                if PSM._usable(yv, wv)
+                    y[k] = yv; w[k] = wv
+                end
+                f[k] = pred[ti, oi]
+                k += 1
+            end
+
+            J = zeros(n_data, n_p)
+            PSM.compute_jacobian!(J, prob, beta, f, n_times, n_obs;
+                                  dam=fill(1e-8, n_p), jac=:fd)
+            w_irls = PSM.irls_weights(prob.likelihood, y, f, w)
+            z = y .- f .+ J * beta
+            beta_star = PSM._pcls_augmented_solve(J, z, B, w_irls)
+            norm(beta_star .- beta) / max(norm(beta), 1e-12)
+        end
+
+        # The reported tuple must be ONE coherent set: `objective` is
+        # ½(data_loss + β̂'S^λ̂β̂) using the SAME λ̂ and β̂ the solution
+        # reports. Guards against "fixing" the reported λ̂ alone while
+        # leaving the θ-dependent scalars computed at the other θ.
+        function reported_penalty(prob, sol)
+            beta = Float64.(vec(sol.parameters))
+            S_list, uf_offsets, uf_nk = PSM.build_penalty_matrices(prob)
+            p = 0.0
+            for l in eachindex(S_list)
+                off, nk = uf_offsets[l], uf_nk[l]
+                bl = beta[off+1:off+nk]
+                p += sol.smoothing_params[l] * dot(bl, S_list[l] * bl)
+            end
+            p
+        end
+
+        # ── Discriminating fixture: two penalized splines (hence two λ) on a
+        #    Lotka-Volterra system. The noise draws are hardcoded so the fit
+        #    is identical across Julia/RNG versions. Converged, so β̂ really
+        #    is stationary and the fixed-point test is not confounded by
+        #    truncation.
+        noise_H = [-0.60448, 0.36713, -0.25198, 2.28400, -1.68664,
+                   -0.22035, -1.89084]
+        noise_L = [-1.13449, 1.36343, 0.20909, 0.48198, 0.80718,
+                   -0.14331, -0.08570]
+        r_true_lv(H) = 0.7 * exp(-H / 60)
+        function lv_true_f1!(du, u, p, t)
+            H, L = u
+            du[1] = r_true_lv(H) * H - 0.01 * H * L
+            du[2] = 0.01 * H * L - 0.25 * L
+        end
+        function lv_2s!(du, u, p, t)
+            H, L = u
+            du[1] = p.r(H) * H - p.α * H * L
+            du[2] = p.α * H * L - p.δ(L) * L
+        end
+        dtimes_lv = collect(range(0.5, 13.5, length=7))
+        st_lv = OrdinaryDiffEq.solve(
+            ODEProblem(lv_true_f1!, [30.0, 40.0], (0.0, 14.0)), Tsit5();
+            saveat=dtimes_lv, abstol=1e-8, reltol=1e-8)
+        dvals_lv = hcat([st_lv(t)[1] for t in dtimes_lv] .+ 0.3 .* noise_H,
+                        [st_lv(t)[2] for t in dtimes_lv] .+ 0.3 .* noise_L)
+        prob_lv2 = PSMProblem(lv_2s!, [30.0, 40.0], (0.0, 14.0),
+            [BSplineApproximator(:r, (0.0, 80.0), 6; initial=x -> 0.4),
+             BSplineApproximator(:δ, (0.0, 100.0), 5; initial=x -> 0.25)];
+            data_times=dtimes_lv, data_values=dvals_lv, obs_to_state=[1, 2],
+            known_params=(α=0.01,), likelihood=Gaussian(), solver=Tsit5())
+        sol_lv2 = solve(prob_lv2, LAML(maxiters=60, verbose=false, warmup=3))
+
+        @test sol_lv2.convergence.converged
+        # Measured: 1.0e-3 with the fix, 0.77 without it — a 760x gap, so
+        # 1e-2 discriminates with a wide margin on both sides.
+        @test pcls_refit_move(prob_lv2, sol_lv2) < 1e-2
+        @test sol_lv2.objective ≈
+              0.5 * (sol_lv2.data_loss +
+                     reported_penalty(prob_lv2, sol_lv2)) rtol=1e-8
+        # …and the reported penalty is commensurate with the fit rather than
+        # dwarfing it: 0.0153 against a data loss of 0.888 (measured).
+        @test reported_penalty(prob_lv2, sol_lv2) < sol_lv2.data_loss
+
+        # ── The same invariant on two ordinary single-λ fixtures, so a
+        #    future regression is caught broadly and on both Jacobian
+        #    backends. Measured moves: 1.2e-8 (:fd) and 4.0e-9
+        #    (:forwarddiff).
+        Random.seed!(1234)
+        dt_eg = collect(0.0:0.5:10.0)
+        dv_eg = reshape(exp.(0.2 .* dt_eg) .+ 0.01 .* randn(length(dt_eg)), :, 1)
+        growth_f1!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        prob_eg = PSMProblem(growth_f1!, [1.0], (0.0, 10.0),
+            [BSplineApproximator(:r, (0.0, 5.0), 5; initial=x -> 0.05)];
+            data_times=dt_eg, data_values=dv_eg, obs_to_state=[1],
+            likelihood=Gaussian(), solver=Tsit5())
+        for alg_f1 in (LAML(maxiters=30, verbose=false),
+                       LAML(maxiters=30, verbose=false, jac=:forwarddiff))
+            sol_eg = solve(prob_eg, alg_f1)
+            @test pcls_refit_move(prob_eg, sol_eg) < 1e-4
+            @test sol_eg.objective ≈
+                  0.5 * (sol_eg.data_loss +
+                         reported_penalty(prob_eg, sol_eg)) rtol=1e-8
+        end
+    end
+
+    @testset "CollocationLAML — reported λ̂ and β̂ are mutually consistent" begin
+        PSM = PartiallySpecifiedModels
+
+        # The collocation sibling of the LAML testset above, and the same
+        # defect: `smoothing_params` reported a smoothing parameter that no
+        # coefficient step was ever taken under. CollocationLAML computes its
+        # Fellner-Schall update at the END of each continuation level, to be
+        # consumed by the NEXT level's inner loop — so after the LAST level
+        # the proposal is untested, and reporting it made λ̂ and β̂ describe
+        # different fits. See the `theta_fit` comment block in
+        # `collocation_solver.jl`.
+        #
+        # β̂ is the penalized optimum at λ̂ only if the gradient of the
+        # COLLOCATION penalized objective
+        #     ‖r(α, β; λ_ode)‖² + βᵀ B(λ̂) β,     ∇ = 2(Jᵀr + B p),
+        # vanishes in its β block at the reported (α̂, β̂, λ̂). This recovers
+        # α̂ from `fitted_values` (exact: the solution stores α at the
+        # observed states verbatim), rebuilds r and J with the solver's own
+        # `collocation_residual_jacobian` at the final λ_ode, and returns
+        # ‖∇_β‖ / ‖β̂‖.
+        #
+        # Note this is a STATIONARITY test, not a refit-distance test as in
+        # the LAML testset, and the distinction is load-bearing: on the
+        # exponential-growth fixture below a refit at the wrong λ̂ moves β by
+        # EXACTLY 0.0, so a displacement test would pass while the solver was
+        # wrong. The gradient test flags the same fit at 0.0227 against a
+        # 1e-3 gate.
+        #
+        # Why displacement is blind here: the Gauss–Newton Hessian is
+        # dominated by the λ_ode-scaled ODE-fidelity block (λ_ode reaches
+        # 1e2–1e4), so H⁻¹∇ stays tiny even when ∇ is enormous. It is NOT
+        # that the jointly-optimised α block absorbs the wrong penalty —
+        # that was measured and is false: holding α fixed makes β move LESS,
+        # not more, on 4 of 5 fixtures (inverted by up to 300×). Refit
+        # distance also is not bounded the way it first appeared: on a
+        # logistic fixture it reaches 16% of ‖β‖ and shifts data_loss 35%.
+        # Measured on the Poisson fixture below (converged == true): 303.6
+        # before the fix, 0.00232 after — a 1.3e5× gap.
+        function colloc_grad_norm(prob, sol)
+            beta = Vector{Float64}(collect(sol.parameters))
+            times = Float64.(prob.data_times)
+            T_pts = length(times)
+            n_obs = size(prob.data_values, 2)
+            K = length(prob.u0)
+            # α is only recoverable from `fitted_values` when every state is
+            # observed, which is true of both fixtures here.
+            @assert sort(collect(prob.obs_to_state)) == collect(1:K)
+            alpha = zeros(T_pts, K)
+            for j in 1:n_obs
+                alpha[:, prob.obs_to_state[j]] .= sol.fitted_values[:, j]
+            end
+
+            n_alpha = T_pts * K
+            w_vec = zeros(T_pts * n_obs)
+            for j in 1:n_obs, i in 1:T_pts
+                w_vec[(j - 1) * T_pts + i] = PSM.usable_cell(prob, i, j) ?
+                                             prob.data_weights[i, j] : 0.0
+            end
+
+            S_list, uf_offsets, uf_nk = PSM.build_penalty_matrices(prob)
+            B_beta = zeros(length(beta), length(beta))
+            for l in eachindex(S_list)
+                off, nk = uf_offsets[l], uf_nk[l]
+                B_beta[off+1:off+nk, off+1:off+nk] .+=
+                    sol.smoothing_params[l] .* S_list[l]
+            end
+
+            resid, J_full = PSM.collocation_residual_jacobian(
+                prob, times, alpha, beta, PSM.build_diff_matrix(times),
+                sol.convergence.lambda_ode_final, w_vec;
+                jac=:fd, fd_cfg=nothing)
+            g_beta = 2 .* (J_full' * resid)[n_alpha+1:end] .+
+                     2 .* (B_beta * beta)
+            norm(g_beta) / max(norm(beta), 1e-12)
+        end
+
+        # The reported tuple must be ONE coherent set: CollocationLAML's
+        # `objective` is data_loss + β̂ᵀS^λ̂β̂ (no ½ factor, unlike LAML) using
+        # the SAME λ̂ and β̂ the solution reports. Guards against "fixing" the
+        # reported λ̂ alone while leaving the θ-dependent scalars at the other
+        # θ.
+        function colloc_reported_penalty(prob, sol)
+            beta = Vector{Float64}(collect(sol.parameters))
+            S_list, uf_offsets, uf_nk = PSM.build_penalty_matrices(prob)
+            p = 0.0
+            for l in eachindex(S_list)
+                off, nk = uf_offsets[l], uf_nk[l]
+                bl = beta[off+1:off+nk]
+                p += sol.smoothing_params[l] * dot(bl, S_list[l] * bl)
+            end
+            p
+        end
+
+        growth_f1b!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+
+        # ── Discriminating fixture: Poisson counts. The counts are hardcoded
+        #    so the fit is identical across Julia/RNG versions. Converged, so
+        #    β̂ really is at the inner loop's optimum and the stationarity
+        #    test is not confounded by truncation.
+        dt_f1b = collect(range(0.0, 6.0, length=25))
+        counts_f1b = [5.0, 5.0, 6.0, 6.0, 6.0, 7.0, 8.0, 8.0, 8.0, 8.0, 9.0,
+                      9.0, 10.0, 12.0, 12.0, 12.0, 14.0, 13.0, 14.0, 17.0,
+                      18.0, 19.0, 21.0, 20.0, 24.0]
+        prob_f1b_pois = PSMProblem(growth_f1b!, [5.0], (0.0, 6.0),
+            [BSplineApproximator(:r, (0.0, 30.0), 6; initial=x -> 0.2)];
+            data_times=dt_f1b, data_values=reshape(counts_f1b, :, 1),
+            obs_to_state=[1], likelihood=Poisson(), solver=Tsit5())
+        alg_f1b = CollocationLAML(maxiters=20, verbose=false,
+                                  lambda_ode_start=0.01, lambda_ode_end=100.0,
+                                  n_continuation=4)
+        sol_f1b_pois = solve(prob_f1b_pois, alg_f1b)
+
+        @test sol_f1b_pois.convergence.converged
+        # Measured: 0.00232 with the fix, 303.6 without it — so 1.0 sits 430×
+        # above the fixed value and 304× below the broken one.
+        @test colloc_grad_norm(prob_f1b_pois, sol_f1b_pois) < 1.0
+        @test sol_f1b_pois.objective ≈
+              sol_f1b_pois.data_loss +
+              colloc_reported_penalty(prob_f1b_pois, sol_f1b_pois) rtol=1e-8
+        # …and the reported penalty is commensurate with the fit rather than
+        # dwarfing it: 0.0121 against a data loss of 11.73 (measured; the
+        # untested proposal reported 0.653, a 54× inflation).
+        @test colloc_reported_penalty(prob_f1b_pois, sol_f1b_pois) <
+              sol_f1b_pois.data_loss
+
+        # ── The same invariant on the suite's own exponential-growth fixture
+        #    (see the "CollocationLAML solver" testset), on both Jacobian
+        #    backends and both at 4 continuation levels and at the package
+        #    defaults. Measured ‖∇_β‖/‖β̂‖ with the fix: 2.33e-6, 2.33e-6 and
+        #    1.71e-5; without it 0.0227, 0.0615 and 0.156.
+        dt_f1b_g = collect(range(0.0, 5.0, length=30))
+        prob_f1b_g = PSMProblem(growth_f1b!, [1.0], (0.0, 5.0),
+            [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
+            data_times=dt_f1b_g,
+            data_values=reshape(exp.(0.3 .* dt_f1b_g), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=Gaussian(), solver=Tsit5(),
+            abstol=1e-8, reltol=1e-8, maxiters=10000)
+        for alg_g in (alg_f1b,
+                      CollocationLAML(maxiters=20, verbose=false,
+                                      lambda_ode_start=0.01,
+                                      lambda_ode_end=100.0, n_continuation=4,
+                                      jac=:forwarddiff),
+                      CollocationLAML(verbose=false))
+            sol_g = solve(prob_f1b_g, alg_g)
+            @test sol_g.convergence.converged
+            @test colloc_grad_norm(prob_f1b_g, sol_g) < 1e-3
+            @test sol_g.objective ≈
+                  sol_g.data_loss +
+                  colloc_reported_penalty(prob_f1b_g, sol_g) rtol=1e-8
         end
     end
 
