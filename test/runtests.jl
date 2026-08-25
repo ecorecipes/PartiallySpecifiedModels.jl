@@ -4245,6 +4245,185 @@ end
         end
     end
 
+    @testset "LAML stationarity diagnostics (F2)" begin
+        # `convergence.converged` is a STABILITY test: it fires when the
+        # penalized objective and the data loss stop changing. Several
+        # different things stop a fit moving and `converged` reports them
+        # all as success. These tests pin the two ADDITIVE keys that tell
+        # them apart -- `stationarity` (|dV/drho| normalized by
+        # 1/2 rank(S_k)) and `smoothing_advanced` -- and pin that they stay
+        # quiet on a healthy fit.
+        #
+        # Both keys are additive: `converged`, `reason`, `iterations` and
+        # every fitted quantity are unchanged by this testset's subject.
+        #
+        # NOTE ON THRESHOLDS. There is deliberately no `stationary::Bool` in
+        # the API, because measured across all 151 LAML solves this suite
+        # performs the residual is an UNBROKEN continuum, not two clusters:
+        # quantiles p25=1.7e-7, p50=9.5e-6, p75=1.5e-2, p90=0.46, max=14.1,
+        # and over the whole decision-relevant region (1e-3..3) the largest
+        # ratio between consecutive sorted values is 1.65 below 1 and 2.98
+        # across the whole region -- nothing like the orders-of-magnitude
+        # separation a threshold would need, so no cutoff could sit there. (A partial 94-solve sample appeared to show a
+        # 3.2x gap near 0.1; the remaining 57 solves filled it in. That is
+        # why none of the assertions below rely on a universal cutoff.)
+        # Each either compares a fixture against a STRUCTURALLY MATCHED
+        # control, or pins a fixture-specific measured magnitude with wide
+        # margin.
+
+        # ── (a) HEALTHY: the diagnostics must stay quiet ──
+        gh_f2!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        t_f2 = collect(0.0:0.5:10.0)
+        # Deterministic (RNG-free) wobble so the fit has REAL residual
+        # variance. A noiseless fixture drives the profiled sigma^2 to
+        # ~1e-17 and the REML gradient's -1/2 lambda b'Sb / sigma^2 term
+        # with it, which is a ratio of two near-zero quantities and is not
+        # informative (see the caveat in the LAML docstring).
+        noi_f2 = [0.01 * (sin(3.1i) + 0.5cos(7.7i)) for i in 1:length(t_f2)]
+        mk_f2() = PSMProblem(gh_f2!, [1.0], (0.0, 10.0),
+            [BSplineApproximator(:r, (0.0, 5.0), 5; initial=x -> 0.05)];
+            data_times=t_f2,
+            data_values=reshape(exp.(0.1 .* t_f2) .+ noi_f2, :, 1),
+            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+
+        s_ok = solve(mk_f2(), LAML(maxiters=30))
+        @test s_ok.convergence.converged
+        @test s_ok.convergence.smoothing_advanced
+        # measured 2.90e-7; 85 of the suite's 151 solves sit below 1e-4
+        @test s_ok.convergence.stationarity < 1e-4
+        @test isfinite(s_ok.convergence.stationarity)
+
+        # ── (b) MODE: Fellner-Schall never advanced ──
+        # Same problem, jac=:forwarddiff. The exact Jacobian makes the very
+        # first step good enough that the accept block takes the `f01 <
+        # obj_prev` branch every iteration with `dl_a1 >= dl_curr`, so
+        # `otheta` never moves onto an FS proposal. `converged` is true and
+        # the reported lambda-hat is EXACTLY the data-driven default
+        # 1/tr(S) -- smoothing selection never took effect. This was hidden
+        # before F1, which reported a plausible-looking proposal instead.
+        # `smoothing_advanced` is exact and threshold-free, which is why it
+        # is the assertion carrying the weight here.
+        s_m3 = solve(mk_f2(), LAML(maxiters=30, jac=:forwarddiff))
+        @test s_m3.convergence.converged          # unchanged: still "converged"
+        @test !s_m3.convergence.smoothing_advanced
+        # lambda-hat is bit-identical to the initialization, not merely close
+        lam0_f2 = 1.0 / tr(penalty_matrix(
+            BSplineApproximator(:r, (0.0, 5.0), 5)))
+        @test s_m3.smoothing_params[1] == lam0_f2
+        # ...and the fd path on the SAME data does advance, so this is a
+        # property of the search, not of the fixture being unfittable
+        @test s_ok.smoothing_params[1] != lam0_f2
+
+        # ── (c) MODE: stalled on a non-smooth evaluator ──
+        # Structurally MATCHED PAIR: the same discrete-map model, the same
+        # basis, the same solver settings and the same deterministic noise,
+        # differing only in whether the step applies floor() to a
+        # coefficient-dependent quantity. The kink makes the prediction
+        # discontinuous in beta, so the default finite-difference Jacobian
+        # is noise and the search plateaus at a non-optimum -- while still
+        # reporting converged=true. Comparing the pair avoids asserting any
+        # absolute stationarity cutoff.
+        smooth_step(g) = g
+        kink_step(g) = g - 0.5 * (floor(g * 20.0) / 20.0)
+        function mk_map(stepf)
+            Nt = zeros(31); Nt[1] = 20.0
+            for t in 1:30
+                Nt[t+1] = max(Nt[t] *
+                    exp(stepf(0.8 * (1 - Nt[t] / 100.0))), 0.01)
+            end
+            dat = Nt .+ [0.5 * (sin(3.1i) + 0.7cos(7.7i)) for i in 1:31]
+            dyn! = (un, u, p, t) -> (un[1] = max(u[1] * exp(stepf(p.f(u[1]))),
+                                                 0.01))
+            PSMProblem(dyn!, [20.0], (0.0, 30.0),
+                [BSplineApproximator(:f, (0.0, 150.0), 8;
+                    initial=x -> 0.5 * (1.0 - x / 100.0))];
+                data_times=Float64.(0:30), data_values=reshape(dat, :, 1),
+                discrete=true, solver=nothing)
+        end
+        s_smooth = solve(mk_map(smooth_step), LAML(maxiters=50))
+        s_kink   = solve(mk_map(kink_step),   LAML(maxiters=50))
+
+        # Both report success -- `converged` cannot tell them apart
+        @test s_smooth.convergence.converged
+        @test s_kink.convergence.converged
+        # ...but the stationarity residuals differ by orders of magnitude.
+        # Measured: 1.52e-6 (smooth) vs 1.32 (kinked), a factor of ~8.7e5.
+        # Asserted at 1e3 -- ~870x of margin -- so this is a qualitative
+        # separation check, not a pinned constant.
+        @test s_kink.convergence.stationarity >
+              1e3 * s_smooth.convergence.stationarity
+        @test s_smooth.convergence.stationarity < 1e-4    # measured 1.5e-6
+        @test s_kink.convergence.stationarity > 0.5       # measured 1.32
+        # here FS DID move lambda -- it just never reached an optimum, which
+        # is exactly why `smoothing_advanced` alone cannot detect this mode
+        # and the residual is needed
+        @test s_kink.convergence.smoothing_advanced
+        # more budget does not help: it is stalled, not truncated
+        s_kink2 = solve(mk_map(kink_step), LAML(maxiters=80))
+        @test s_kink2.convergence.iterations == s_kink.convergence.iterations
+        @test s_kink2.convergence.stationarity ≈ s_kink.convergence.stationarity
+
+        # ── (d) the keys exist on NON-converged exits too ──
+        # (`haskey` patterns and `keys()` comparisons must not depend on the
+        # exit path)
+        s_tr = solve(mk_f2(), LAML(maxiters=1))
+        @test !s_tr.convergence.converged
+        for s in (s_tr, s_ok, s_kink)
+            @test haskey(s.convergence, :stationarity)
+            @test haskey(s.convergence, :smoothing_advanced)
+            @test s.convergence.stationarity isa Float64
+            @test s.convergence.smoothing_advanced isa Bool
+        end
+        # a 1-iteration fit cannot have advanced smoothing (warmup=3 > 1)
+        @test !s_tr.convergence.smoothing_advanced
+        # no `stationary::Bool` is exposed -- see the threshold note above
+        @test !haskey(s_ok.convergence, :stationary)
+
+        # ── (e) every pre-existing key keeps its meaning ──
+        for k in (:V_beta, :sigma2, :converged, :iterations, :reason,
+                  :laml_failures, :criterion, :laml)
+            @test haskey(s_ok.convergence, k)
+        end
+
+        # ── (f) the convergence monitor is scored at `theta`, not
+        # `theta_fit` ──
+        # `curr_obj = penalized_objective(beta, build_B(theta))` in
+        # solver.jl is the ONLY theta-dependent quantity F1 left on the FS
+        # proposal rather than on theta_fit, and that is deliberate: it is
+        # the sole term in the convergence test that can see lambda still
+        # moving. Rescoring it at theta_fit makes this two-lambda fit stop
+        # 11 iterations earlier with lambda-hat frozen at its
+        # initialization (measured: EDF 4.00 -> 11.99, lambda-hat
+        # [1.9e7, 3.1e7] -> [1.569e-4, 1.569e-4], stationarity 5.3e-6 ->
+        # 0.9997). These assertions fail under that change.
+        function lv_f2!(du, u, p, t)
+            N, Pr = u
+            du[1] = p.r(N) * N - 0.02 * N * Pr
+            du[2] = 0.01 * N * Pr - p.m(Pr) * Pr
+        end
+        pt_f2 = ODEProblem((du, u, p, t) -> begin
+                N, Pr = u
+                du[1] = 0.5N - 0.02N * Pr
+                du[2] = 0.01N * Pr - 0.3Pr
+            end, [20.0, 5.0], (0.0, 20.0))
+        st_f2 = OrdinaryDiffEq.solve(pt_f2, Tsit5(); saveat=0.5)
+        Y_f2 = hcat([u[1] for u in st_f2.u], [u[2] for u in st_f2.u])
+        Y_f2 .+= 0.2 .* hcat([sin(3.1i) + 0.5cos(7.7i) for i in 1:size(Y_f2,1)],
+                             [0.6sin(3.1i) + cos(7.7i) for i in 1:size(Y_f2,1)])
+        prob_lv2 = PSMProblem(lv_f2!, [20.0, 5.0], (0.0, 20.0),
+            [BSplineApproximator(:r, (0.0, 80.0), 6; initial=x -> 0.5),
+             BSplineApproximator(:m, (0.0, 30.0), 6; initial=x -> 0.3)];
+            data_times=st_f2.t, data_values=Y_f2, obs_to_state=[1, 2],
+            likelihood=Gaussian(), solver=Tsit5())
+        s_lv2 = solve(prob_lv2, LAML(maxiters=60))
+        @test s_lv2.convergence.converged
+        @test s_lv2.convergence.iterations > 12      # measured 18; 7 if rescored
+        @test s_lv2.convergence.smoothing_advanced
+        @test s_lv2.convergence.stationarity < 1e-4  # measured 5.3e-6; 0.9997 if rescored
+        @test s_lv2.edf < 6.0                        # measured 4.00; 11.99 if rescored
+        @test all(s_lv2.smoothing_params .> 1.0)     # measured ~2e7; 1.6e-4 if rescored
+    end
+
     @testset "Minor-batch fixes (T10)" begin
         @testset "_normlogcdf: tail accuracy and branch continuity" begin
             using PartiallySpecifiedModels: _normlogcdf, _normcdf
