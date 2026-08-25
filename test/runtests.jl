@@ -2124,6 +2124,214 @@ end
         @test 0 < norm(a_res) < 1e-4             # via a phase-2 contracted step
     end
 
+    @testset "F5 — PCLS truncation: λ-coupling (OPEN) and the rank guard" begin
+        PSM = PartiallySpecifiedModels
+
+        # `_pcls_augmented_solve` drops components with σ ≤ 1e-7·σ_max(F_aug).
+        # That reference is λ-DEPENDENT: σ_max(F_aug) grows like √λ·‖C‖ while
+        # the data block W^½J stays O(1), so the EFFECTIVE tolerance on
+        # data-informed directions inflates with λ and past a
+        # fixture-dependent λ the solve zeroes directions the data actually
+        # determines. Those live in null(S) — exactly where a fit with
+        # β'S_kβ = 0 sits. The `@test_broken`s below pin that defect.
+        #
+        # It is NOT fixed by referencing σ_max(W^½J) instead, and this
+        # testset exists partly to stop that being retried blind. The
+        # λ-coupling is silently doing THREE jobs, and only the first is
+        # documented:
+        #   1. rank guard on the data block — sections (3) below;
+        #   2. subspace trust region at high λ. The λ-free reference takes a
+        #      step 15× longer in a direction where the linearization has
+        #      stopped holding (measured on a Lotka-Volterra GCV working
+        #      model at λ₂ = 4.8e9: penalized objective 1248.6 at α = 1 and
+        #      13.84 at best, against 2.58 at α = 1 for the λ-coupled step);
+        #   3. an implicit brake on Fellner-Schall λ escalation. Removing it
+        #      lets λ run away — measured on the SCOP-spline SIR fixture in
+        #      "known_params mixed with an approximator", λ̂ goes 5.2e-6 →
+        #      2.4e17 and β̂(0.05) goes 0.387 → -3086.9 (truth 0.389).
+        # Measured suite cost of the λ-free reference alone: 3 failures
+        # ("LAML mixed spline+NN", data_loss 18534 against a < 500 gate).
+        # Emitting BOTH steps as candidates and letting the penalized
+        # objective choose fixes those 3 but still trips job 3 above (1
+        # failure). A real fix needs jobs 2 and 3 given their own
+        # mechanisms — a trust region and a λ bound — not a different
+        # constant. Retuning the constant is squeezed from both sides: on
+        # the data scale σ/σ_max(W^½J), the informative null(S) direction
+        # below sits at 0.0995 and must be KEPT, the Lotka-Volterra
+        # direction that wrecks the step sits at 4.5e-4 and must be
+        # DROPPED, and staying inert on the poor-init fixture of section
+        # (3) additionally caps the tolerance at its smallest genuine
+        # direction, 1.6e-3. That leaves 4.5e-4 … 1.6e-3 — half a decade,
+        # calibrated on two fixtures, with no reason to generalize.
+
+        # ── Shared helpers: the solver's own working linear model ────────
+        function f5_working(prob, beta)
+            n_t = length(prob.data_times); n_o = length(prob.obs_to_state)
+            n_d = n_t * n_o; n_pp = length(beta)
+            pred = PSM.simulate(prob, beta)
+            yv = zeros(n_d); wv = zeros(n_d); fv = zeros(n_d)
+            local kk = 1
+            for oi in 1:n_o, ti in 1:n_t
+                y0, w0 = prob.data_values[ti, oi], prob.data_weights[ti, oi]
+                if PSM._usable(y0, w0); yv[kk] = y0; wv[kk] = w0; end
+                fv[kk] = pred[ti, oi]; kk += 1
+            end
+            Jm = zeros(n_d, n_pp)
+            PSM.compute_jacobian!(Jm, prob, beta, fv, n_t, n_o;
+                                  dam=fill(1e-8, n_pp), jac=:fd)
+            Jm, yv .- fv .+ Jm * beta,
+                PSM.irls_weights(prob.likelihood, yv, fv, wv)
+        end
+        function f5_B(prob, lams, n_pp)
+            S_l, off_l, nk_l = PSM.build_penalty_matrices(prob)
+            Bm = zeros(n_pp, n_pp)
+            for l in eachindex(S_l), i in 1:nk_l[l], j in 1:nk_l[l]
+                Bm[off_l[l]+i, off_l[l]+j] += lams[l] * S_l[l][i, j]
+            end
+            Bm
+        end
+
+        # ── Fixture: exponential growth, TRUE r ≡ 0.10. The B-spline
+        #    penalty is ∫(f'')², whose null space is {constant, linear}, so
+        #    the truth lies EXACTLY in null(S) (a 2-dimensional subspace).
+        #    Noise is hardcoded so the fixture is identical across Julia
+        #    and RNG versions.
+        f5_growth!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        dt_f5 = collect(range(1.0, 12.0, length=12))
+        st_f5 = OrdinaryDiffEq.solve(
+            ODEProblem((du, u, p, t) -> (du[1] = 0.10 * u[1]), [1.0],
+                       (0.0, 12.0)), Tsit5();
+            saveat=dt_f5, abstol=1e-10, reltol=1e-10)
+        noise_f5 = [0.00674, -0.01152, 0.00325, 0.01890, -0.00466, -0.00220,
+                    -0.01891, 0.00913, 0.01363, 0.00209, 0.00482, -0.00807]
+        dv_f5 = reshape([st_f5(t)[1] for t in dt_f5] .+ noise_f5, :, 1)
+        prob_f5 = PSMProblem(f5_growth!, [1.0], (0.0, 12.0),
+            [BSplineApproximator(:r, (0.5, 4.0), 8; initial=0.10)];
+            data_times=dt_f5, data_values=dv_f5, obs_to_state=[1],
+            likelihood=Gaussian())
+        np_f5 = 8
+        btrue_f5 = fill(0.10, np_f5)
+        J_f5, z_f5, w_f5 = f5_working(prob_f5, btrue_f5)
+        lams_f5 = [1e8, 1e10, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17]
+
+        # (1) BROKEN: the NUMBER OF RETAINED DIRECTIONS should be
+        # λ-invariant. Measured WITHOUT reproducing the truncation rule —
+        # the solve is linear in `z_pseudo`, so applying it to a basis of
+        # RHS vectors recovers the operator z ↦ β̂, whose rank is exactly
+        # the number of directions the data is allowed to inform. At large
+        # λ only null(S) survives, so that rank SHOULD be dim null(S) = 2
+        # at every λ. Measured today: 2, 2, 1, 6, 6, 6, 6, 6 — and the 6s
+        # are degenerate, every retained singular value ~1e-14, i.e. the
+        # fit is annihilated. With a λ-free reference it is 2 at all eight
+        # λ with a clean gap (operator singular values 0.288, 0.038, then
+        # ≤ 3.6e-10) — that part of the fix is right, it is jobs 2 and 3
+        # above that block it.
+        ranks_f5 = map(lams_f5) do lam
+            Bm = f5_B(prob_f5, [lam], np_f5)
+            M = reduce(hcat, (PSM._pcls_augmented_solve(J_f5, ei, Bm, w_f5)
+                              for ei in eachcol(Matrix(1.0I, 12, 12))))
+            rank(M; rtol=1e-8)
+        end
+        @test_broken all(==(2), ranks_f5)
+        # …but the small-λ end is NOT broken and must stay that way: the
+        # defect only switches on once √λ‖C‖ overtakes σ_max(W^½J).
+        @test all(==(2), ranks_f5[1:2])          # λ = 1e8, 1e10
+
+        # (2) BROKEN: and so the FIT should stop moving with λ. Measured
+        # today: 0.00164, 0.00164, 0.1133, then 0.28284 for every λ ≥ 1e13
+        # — a 172× error inflation. With a λ-free reference: 0.0016441 flat
+        # to 5 significant figures across nine decades.
+        errs_f5 = [norm(PSM._pcls_augmented_solve(
+                            J_f5, z_f5, f5_B(prob_f5, [lam], np_f5), w_f5)
+                        .- btrue_f5) for lam in lams_f5]
+        @test_broken maximum(errs_f5) < 2e-3
+        @test_broken maximum(errs_f5) - minimum(errs_f5) < 1e-6
+        @test maximum(errs_f5[1:2]) < 2e-3       # small-λ end is correct
+
+        # ── (3) MODE (b) REGRESSION GUARD: the reason the truncation exists
+        #    at all. At the `x -> 0` default initialization the trajectory
+        #    sits at u0, so most basis columns of the FD Jacobian are
+        #    numerically null; a plain QR solve returns O(1e9) coefficients
+        #    — a step no contraction can rescue. u0 = 1.1 is deliberately
+        #    placed OFF a knot, so the dead columns are ~1e-10 rather than
+        #    exactly 0 (an on-knot u0 makes them exactly 0, which `\` then
+        #    handles by itself and the failure mode does not reproduce).
+        #    This must keep holding: it is what a naive relaxation of the
+        #    1e-7 constant to 1e-13 destroys (measured: ‖β̂‖ back to 2.3e9).
+        prob_f5b = PSMProblem(f5_growth!, [1.1], (0.0, 12.0),
+            [BSplineApproximator(:r, (0.5, 4.0), 8)];   # default x -> 0
+            data_times=dt_f5, data_values=dv_f5, obs_to_state=[1],
+            likelihood=Gaussian())
+        beta0_f5b = PSM.build_initial_params(prob_f5b)
+        @test all(iszero, beta0_f5b)
+        J_f5b, z_f5b, w_f5b = f5_working(prob_f5b, beta0_f5b)
+        S_f5b, _, _ = PSM.build_penalty_matrices(prob_f5b)
+        for lam_b in (0.0, 1.0 / tr(S_f5b[1]))     # 0 and the solver default
+            B_f5b = f5_B(prob_f5b, [lam_b], 8)
+            C_f5b = PSM.penalty_sqrt_matrix(B_f5b)
+            Ws_f5b = sqrt.(max.(w_f5b, 1e-15))
+            b_qr = vcat(Diagonal(Ws_f5b) * J_f5b, C_f5b) \
+                   vcat(Ws_f5b .* z_f5b, zeros(size(C_f5b, 1)))
+            b_tr = PSM._pcls_augmented_solve(J_f5b, z_f5b, B_f5b, w_f5b)
+            @test norm(b_qr) > 1e8      # measured 2.27e9 / 2.39e9
+            @test norm(b_tr) < 1.0      # measured 0.153 / 0.282
+        end
+
+        # ── (4) The squeeze that blocks a one-constant fix. On the SAME
+        #    null(S) fixture the informative direction a λ-free tolerance
+        #    must KEEP sits at σ/σ_max(W^½J) ≈ 0.0995; on the
+        #    Lotka-Volterra working model below, the direction whose
+        #    retention wrecks the nonlinear step sits at ≈ 4.5e-4. Any
+        #    λ-independent tolerance has to fall between them — 2.3 decades
+        #    here, and only half a decade once section (3)'s poor-init
+        #    fixture is added (its smallest genuine direction, 1.6e-3, caps
+        #    the tolerance from above). Both bounds are fixture-dependent,
+        #    which is why the fix is not a different constant. Pinned so
+        #    the gap is re-measured rather than re-argued.
+        C_f5a = PSM.penalty_sqrt_matrix(f5_B(prob_f5, [1e14], np_f5))
+        Ws_f5a = sqrt.(max.(w_f5, 1e-15))
+        A_f5a = Diagonal(Ws_f5a) * J_f5
+        rel_a = svdvals(vcat(A_f5a, C_f5a)) ./ maximum(svdvals(A_f5a))
+        # the two null(S) directions, as a fraction of the data scale
+        @test count(<(1.0), rel_a) == 2
+        @test 0.09 < minimum(rel_a) < 0.11        # measured 0.0995
+
+        r_f5(H) = 0.7 * exp(-H / 60)
+        function lv_f5!(du, u, p, t)
+            H, L = u
+            du[1] = p.r(H) * H - p.α * H * L
+            du[2] = p.α * H * L - p.δ(L) * L
+        end
+        function lv_f5_true!(du, u, p, t)
+            H, L = u
+            du[1] = r_f5(H) * H - 0.01 * H * L
+            du[2] = 0.01 * H * L - 0.25 * L
+        end
+        dt_lv5 = collect(range(0.5, 13.5, length=7))
+        st_lv5 = OrdinaryDiffEq.solve(
+            ODEProblem(lv_f5_true!, [30.0, 40.0], (0.0, 14.0)), Tsit5();
+            saveat=dt_lv5, abstol=1e-8, reltol=1e-8)
+        nH_f5 = [-0.60448, 0.36713, -0.25198, 2.28400, -1.68664, -0.22035, -1.89084]
+        nL_f5 = [-1.13449, 1.36343, 0.20909, 0.48198, 0.80718, -0.14331, -0.08570]
+        dv_lv5 = hcat([st_lv5(t)[1] for t in dt_lv5] .+ 0.3 .* nH_f5,
+                      [st_lv5(t)[2] for t in dt_lv5] .+ 0.3 .* nL_f5)
+        prob_lv5 = PSMProblem(lv_f5!, [30.0, 40.0], (0.0, 14.0),
+            [BSplineApproximator(:r, (5.0, 60.0), 6; initial=0.5),
+             BSplineApproximator(:δ, (5.0, 60.0), 6; initial=0.25)];
+            data_times=dt_lv5, data_values=dv_lv5, obs_to_state=[1, 2],
+            known_params=(α=0.01,), likelihood=Gaussian())
+        b0_lv5 = PSM.build_initial_params(prob_lv5)
+        J_lv5, z_lv5, w_lv5 = f5_working(prob_lv5, b0_lv5)
+        C_lv5 = PSM.penalty_sqrt_matrix(f5_B(prob_lv5, [2.56, 4.832e9], 12))
+        Ws_lv5 = sqrt.(max.(w_lv5, 1e-15))
+        A_lv5 = Diagonal(Ws_lv5) * J_lv5
+        rel_lv = svdvals(vcat(A_lv5, C_lv5)) ./ maximum(svdvals(A_lv5))
+        @test 3e-4 < minimum(rel_lv) < 6e-4       # measured 4.51e-4
+        # The squeeze: the direction to keep and the direction to drop are
+        # within ~2.3 decades of each other on the data scale.
+        @test minimum(rel_a) / minimum(rel_lv) < 1e3
+    end
+
     @testset "TwoStageSolver — logistic growth" begin
         r_ts(N) = 0.5 * (1.0 - N / 10.0)
         function logistic_ts!(du, u, p, t)
