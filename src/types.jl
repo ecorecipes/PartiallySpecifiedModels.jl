@@ -1943,7 +1943,8 @@ Uses Fellner-Schall + Newton for smoothing parameter estimation.
 
 # Convergence info
 `sol.convergence` is a NamedTuple `(V_beta, sigma2, converged, iterations,
-reason, laml_failures, criterion, laml)`: the posterior covariance and σ̂² used
+reason, laml_failures, criterion, laml, stationarity,
+smoothing_advanced)`: the posterior covariance and σ̂² used
 by [`confidence_band`](@ref), plus the standard honest-convergence keys (see
 [`PSMSolution`](@ref)), `laml_failures::Int` (the number of iterations in
 which the LAML smoothing-parameter update failed and θ was kept),
@@ -1951,6 +1952,111 @@ which the LAML smoothing-parameter update failed and θ was kept),
 LAML criterion value V at the returned fit — profiled REML for Gaussian, the
 full Laplace criterion above for other families; a MAXIMIZED quantity, `NaN`
 when no penalized term exists or the evaluation fails).
+
+## Stationarity diagnostics: what `converged` does NOT tell you
+
+`converged` is a STABILITY test — the penalized objective and the data loss
+stopped changing. A fit stops changing for several distinct reasons and
+`converged` cannot tell them apart: it is `true` for a genuine optimum, for a
+search that stalled because a non-smooth model made the finite-difference
+Jacobian too noisy to build an accepted step from, and for a fit whose
+smoothing parameters never moved at all. The two keys below separate those
+cases. **They are additive diagnostics; they do not change `converged`,
+`reason`, or any fitted quantity, and they are present on every LAML solution,
+converged or not.**
+
+- `smoothing_advanced::Bool`: whether λ̂ ever moved off its initialization
+  (`initial_lambda`, or the data-driven `1/tr(S)` default). `false` means the
+  reported λ̂ **is** the initial value — smoothing selection never took
+  effect, because every Fellner-Schall proposal was rejected by the step
+  accept test or because it never ran (no penalized term, or
+  `maxiters ≤ warmup`). It is `false` for a model with no penalized term.
+  This is a plain fact about the search, not a statistical judgement — the
+  comparison against the initialization uses a 1e-10 RELATIVE tolerance,
+  which guards against pure round-off rather than being a calibrated
+  cutoff, so there is no magnitude to tune. A `false` here with
+  `converged == true` is the strongest available signal that the reported λ̂
+  carries no information from the data. It does NOT mean the fit is wrong —
+  the initialization can happen to be reasonable — only that nothing chose
+  it. Across the package's own test suite this is `false` for 20 of 151 LAML
+  solves, 13 of which nonetheless report `converged == true`. It is genuinely
+  complementary to `stationarity` rather than a proxy for it: those 20 fits
+  span residuals from 0.016 to 8.7, so a fit can sit at a perfectly ordinary
+  residual and still never have moved its λ̂.
+
+- `stationarity::Float64`: how far the returned λ̂ is from a stationary point
+  of the LAML criterion, as
+  `maxₖ |∂V/∂ρₖ| / (½·rank(Sₖ))` with `ρ = log λ`, evaluated at the returned
+  `(β̂, λ̂)`. The normalization makes it dimensionless and comparable across
+  bases and resolutions — and, for Gaussian data, across data scales; under
+  a non-Gaussian family the `λₖβ̂'Sₖβ̂` term carries no `σ̂²` divisor and so
+  does scale with the data. The `½·rank(Sₖ)` and
+  `½·tr(H⁻¹λₖSₖ)` terms of `∂V/∂ρₖ` are both bounded by `½·rank(Sₖ)`, so the
+  ratio measures the gradient against the natural scale of the block, and `0`
+  is exactly stationary. It is **not** bounded above by 1 — the
+  `λₖβ̂'Sₖβ̂/σ̂²` term has no upper bound, and the largest value observed
+  across this package's test suite is 14.1. `0.0` when the model has no
+  penalized term (nothing to be stationary in); `NaN` when the criterion or
+  its gradient could not be evaluated.
+
+  It does NOT measure whether the fit is *good*, or whether λ̂ is at a global
+  rather than a local optimum — it is a first-order condition on the
+  smoothing parameters, evaluated at the returned β̂, not a gradient through
+  the ODE solve. It is nonzero when λ̂ is off its conditional optimum AND
+  when β̂ is off the penalized least-squares solution at λ̂ (at a true fixed
+  point of the IRLS loop those coincide, so it tests both).
+
+  One further caveat for NON-GAUSSIAN families under the default
+  `criterion = :working`: the residual is the gradient of the FULL LAPLACE
+  criterion (that is what `laml_gradient` returns for those families), while
+  the Fellner-Schall update was calibrated on the Gaussian working model. A
+  nonzero value can therefore reflect that mismatch rather than a stalled
+  search — the same caveat the `laml` key already carries. Under
+  `criterion = :laplace` the two agree and the residual is unambiguous.
+
+### How to read `stationarity`
+
+**There is deliberately no `stationary::Bool`, because the observed
+distribution does not support one.** Measured on all 151 LAML solves the test
+suite performs, the residual is an unbroken continuum rather than two
+clusters. Its quantiles are p25 = 1.7e-7, p50 = 9.5e-6, p75 = 1.4e-2,
+p90 = 0.46, max = 14.1, and across the whole decision-relevant region (1e-3
+to 3) the largest ratio between consecutive sorted values is 1.65 below 1
+and 2.98 across the whole region — nothing resembling the
+orders-of-magnitude separation a threshold would need, so there is
+no gap anywhere a threshold could sit. A cutoff at 0.1 would have flagged 25
+of those 151 solves (16.6%), splitting a continuum of otherwise ordinary
+`:converged_tol` fits.
+
+So treat it as a magnitude, calibrated against your own problem class rather
+than an absolute scale. For orientation, on this suite 85 of 151 solves sit
+below 1e-4; a deliberately non-smooth fixture (a discrete map applying `floor`
+to a coefficient-dependent quantity, which makes the default `jac=:fd`
+Jacobian noise) reads 1.32, against 1.5e-6 for the identical map, basis and
+data with the `floor` removed — a factor of 8.7e5 between two fits that
+`converged` describes identically. A residual orders of magnitude larger than
+comparable fits of yours is the signal; a particular number is not. The usual
+causes of a large value are a non-smooth dynamics function
+(`floor`/`clamp`/`round` on a coefficient-dependent quantity) — for which
+`jac=:forwarddiff` is the fix — or too few `maxiters`.
+
+**One regime where it is ill-conditioned, and must not be read at all:** for
+`Gaussian` data the gradient contains `−½λₖβ̂'Sₖβ̂/σ̂²` with `σ̂²` the profiled
+REML scale. On a fit that interpolates its data — noiseless synthetic
+fixtures, most obviously — `σ̂²` underflows toward zero and that term becomes
+a ratio of two near-zero quantities, so the residual is numerically unstable
+and can read anywhere from 1e-2 to ~1 on fits that are otherwise
+indistinguishable. Measured: the same noiseless growth fixture reads 0.042
+under `jac=:fd` and 0.413 under `jac=:forwarddiff`, with λ̂ agreeing to 5e-5
+relative and identical EDF and data loss. This is less a defect in the
+residual than a true statement about the fit — with no residual variance,
+REML does not identify λ and λ̂ is set by round-off — but it does mean
+`stationarity` is uninformative there. Judge it only on fits with meaningful
+residual variance.
+
+`converged && smoothing_advanced`, plus a `stationarity` in line with
+comparable fits, is the combination that means what users generally read
+`converged` alone to mean.
 """
 struct LAML
     maxiters::Int

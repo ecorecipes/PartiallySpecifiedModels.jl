@@ -164,6 +164,22 @@ so in the default run configuration. The exact gap is chaotic in the
 arithmetic (it moves with BLAS thread count), so treat it as a qualitative
 warning rather than a reproducible figure.
 
+`LAML` now gives you a number for this rather than leaving you to suspect it:
+`sol.convergence.stationarity` measures how far the returned λ̂ is from a
+stationary point of the LAML criterion, and it rises sharply when the fit
+stops at a point that is not a smoothing optimum even though
+`sol.convergence.converged` is `true`. On a deliberately non-smooth fixture
+in the test suite — a discrete map whose step applies `floor` to a
+coefficient-dependent quantity — the default `jac=:fd` run plateaus with
+`converged = true` and a residual of 1.32, against 1.5e-6 for the identical
+map, basis and data with the `floor` removed: a factor of 8.7e5 on two fits
+that `converged` describes identically. Compare the residual against
+structurally similar
+fits of your own rather than against a fixed cutoff (the LAML docstring
+explains why there is no `stationary::Bool`), and check
+`smoothing_advanced` too — it is exact, and `false` means λ̂ never moved off
+its initialization.
+
 If you pass an approximator type that does not implement the interface, `build_evaluator` fails with an error listing the four required functions.
 
 ```@docs
