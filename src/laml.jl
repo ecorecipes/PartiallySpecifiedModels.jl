@@ -464,10 +464,124 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
 
             edf_k = ranks[k] - tau_k
 
-            lambda_new = if bSb > 1e-30 && edf_k > 0
-                sigma2 * edf_k / bSb
+            # ── Degenerate-update policy (mgcv's directions, bounded) ──
+            # The Fellner–Schall fixed point is λ*_k = φ·edf_k / β'S_kβ, so
+            # each degenerate case NAMES A LIMIT rather than an absence of
+            # information:
+            #   edf_k ≤ 0, β'S_kβ > 0  ⇒ λ* ≤ 0     — release the penalty
+            #   edf_k > 0, β'S_kβ ≈ 0  ⇒ λ* = +∞    — tighten it
+            #   both degenerate        ⇒ 0/0        — genuinely no information
+            # mgcv's `efsudr` (R/gam.fit4.r) resolves them as r = 0 (λ → 0),
+            # r = Inf caught by `r[!is.finite(r)] <- 1e6` (λ ×= 1e6), and
+            # `r[a==0&bSb==0] <- 1` (λ unchanged). This code used to FREEZE λ
+            # in the first two cases, which stops the search dead at whatever
+            # point the numerics happened to degenerate.
+            #
+            # We adopt mgcv's DIRECTION where the fixed point it points at is
+            # finite, and keep the hold where it is not. Concretely:
+            #
+            # `edf_k ≤ 0, β'S_kβ > 0` — ADOPTED, bounded to one decade.
+            #   λ* is finite and BELOW the current λ_k, so stepping down both
+            #   moves toward a real optimum and terminates there. mgcv jumps
+            #   straight to λ = 0; we step a decade, because every `efsudr`
+            #   step is followed by a refit and an `if (fit$REML<=old.reml)`
+            #   test that halves the multiplier on failure, whereas this loop
+            #   iterates λ internally against a FROZEN working model (J, W̃,
+            #   z_work fixed for the whole call) and re-scores nothing — and
+            #   `edf_k ≤ 0` is reachable from roundoff in tr(H⁻¹S_k) alone.
+            #   Adding mgcv's re-score is unavailable only on the NON-GAUSSIAN
+            #   `criterion = :working` path, where the FS update deliberately
+            #   uses the Pearson dispersion while `laml_objective` uses unit
+            #   scale (for Gaussian both use the same profiled σ̂² and the
+            #   same n_eff, so a re-score IS available there and was simply
+            #   not attempted — worth revisiting if this branch is ever
+            #   widened), and scoring a step against a criterion the update is not
+            #   ascending is the exact failure the Newton phase is skipped to
+            #   avoid (see the note above Phase 2). One decade costs no
+            #   reach: n_fs ≤ 30 steps × ln 10 = 69.1 exceeds
+            #   RHO_MAX − RHO_MIN = 60. And the update is a fixed-point MAP
+            #   on λ, not an increment, so the next ordinary step recomputes
+            #   λ from scratch and a single bounded misstep is erased rather
+            #   than compounded — measured on the unit fixture in the F4
+            #   testset, one decade is enough to unstick the block and the
+            #   ordinary update then walks λ back down on its own (1e6 → 1e5
+            #   → … → 3.78e4). Note it has NOT converged there: λ is still
+            #   falling ~1.5%/step at the n_fs = 30 cap, so the value the
+            #   test pins is the iterate at the cap, not a fixed point.
+            #
+            # `edf_k > 0, β'S_kβ ≈ 0` — NOT ADOPTED; λ_k is held.
+            #   mgcv sends this to r = Inf → λ ×= 1e6. The criterion does
+            #   prefer a larger λ_k here (the gradient is ½·edf_k > 0 through
+            #   the ½log|S_λ|₊ − ½log|H| terms), but there is NO finite fixed
+            #   point to walk to, and the walk buys nothing while costing
+            #   accuracy: with β'S_kβ = 0 the penalty λ_k·β'S_kβ is zero for
+            #   EVERY λ_k, so the fitted β cannot improve, while the walk
+            #   takes λ into a regime where our own linear algebra loses the
+            #   fit. The mechanism is `_pcls_augmented_solve`'s RELATIVE
+            #   singular-value truncation (`src/pcls.jl`, σ > 1e-7·σmax):
+            #   σmax grows like √λ·‖C‖ while the data block stays O(1), so
+            #   past λ ≈ 1e14 it starts zeroing DATA-INFORMED directions in
+            #   the penalty null space — exactly where a fit with β'S_kβ = 0
+            #   lives (measured: 0 directions truncated at 1.9e13, 1 at 1e14,
+            #   2 at 1e16).
+            #   NOT the `_safe_inv` ridge, which an earlier draft of this
+            #   comment blamed: β never passes through `_safe_inv` (it comes
+            #   from the augmented SVD solve, already the mgcv-style
+            #   augmented least-squares form), and replacing that ridge with
+            #   an absolute one while escalating makes F2 (a) 21,700× WORSE,
+            #   because λ then climbs to 2.0e14 instead of stopping. The
+            #   ridge is still worth fixing, but for the `stationarity` /
+            #   gradient / Hessian diagnostics, not for fit quality.
+            #   Consequence worth knowing: relaxing that truncation to
+            #   1e-13·σmax makes the escalating policy reproduce the hold
+            #   policy to 8 significant figures, so this branch is blocked by
+            #   ONE CONSTANT, not by anything fundamental. It is held anyway
+            #   because even with exact linear algebra mgcv's branch parks
+            #   λ_k on the RHO_MAX rail with edf → 5.6e-6: the right REML
+            #   answer when the truth lies in null(S), but a boundary
+            #   solution carrying no usable uncertainty. That is a modelling
+            #   judgement, and it should be made deliberately rather than
+            #   inherited. See the pcls truncation follow-up.
+            #   Measured cost of escalating anyway (one decade per step, the
+            #   tamest version), on fixtures whose truth lies in the penalty
+            #   null space so this branch fires AT the optimum:
+            #     - F2 (a), truth r ≡ 0.1: λ̂ 1.87e4 → 1.87e13, edf 2.00 →
+            #       0.037, data loss 7.68e-4 → 3.60e-2 (47×), r(1) error
+            #       0.05% → 13%, stationarity 2.9e-7 → 3.6;
+            #     - F2 (c) smooth map, truth linear: stationarity
+            #       1.5e-6 → 2.5e32;
+            #     - the collocation linear map: data loss 1.04e-16 →
+            #       2.93e-13, g(1) error 1.4e-9 → 7.8e-8.
+            #   Holding parks λ_k at the last FINITE Fellner–Schall fixed
+            #   point, which is where the criterion's gradient in this
+            #   coordinate is already ~0: on F2 (a) the reported
+            #   `stationarity` there is 2.9e-7, i.e. |∂V/∂ρ_k| ≈ 4e-7 against
+            #   its ½·rank(S_k) = 1.5 normalizer.
+            #
+            # `both degenerate` — mgcv's `r[a==0&bSb==0] <- 1`: hold. Same
+            # in both implementations.
+            #
+            # mgcv is itself inconsistent about the aggressive branches,
+            # which is why they are treated as a direction rather than a
+            # specification: the sibling `efsud` (gam.fit5 path, same file)
+            # floors BOTH quantities at `tiny = eps^0.5` — `a <- pmax(tiny,
+            # ...)`, `r <- a/pmax(tiny, bSb)` — and so also declines the 0/∞
+            # step, and Wood left `## NOTE: double check scaling here` on
+            # `efsudr`'s φ line.
+            lambda_new = if bSb > 1e-30
+                if edf_k > 0
+                    lam_fs = sigma2 * edf_k / bSb
+                    # mgcv's `r[!is.finite(r)] <- 1e6` guards the same hole
+                    # (we hold rather than multiply, per the note above).
+                    # Letting a non-finite value through would SILENTLY leave
+                    # λ_k = NaN: every comparison against NaN is false, so
+                    # the convergence test below would declare success on it.
+                    isfinite(lam_fs) ? lam_fs : lambda[k]
+                else
+                    lambda[k] / 10.0          # λ* ≤ 0 — release, bounded
+                end
             else
-                lambda[k]
+                lambda[k]                     # no finite λ*, or 0/0 — hold
             end
             lambda_new = clamp(lambda_new, exp(RHO_MIN), exp(RHO_MAX))
 

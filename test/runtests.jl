@@ -4430,6 +4430,173 @@ end
         @test all(s_lv2.smoothing_params .> 1.0)     # measured ~2e7; 1.6e-4 if rescored
     end
 
+    @testset "Fellner-Schall degenerate-update policy (F4)" begin
+        # The Fellner-Schall update is
+        #   lambda_k <- phi * (r_k - lambda_k*tr(H^-1 S_k)) / (beta' S_k beta)
+        # whose fixed point lambda* = phi*edf_k/bSb NAMES A LIMIT in each
+        # degenerate case rather than an absence of information:
+        #   edf_k <= 0 with bSb > 0  =>  lambda* <= 0    (FINITE, below lambda)
+        #   edf_k >  0 with bSb ~ 0  =>  lambda* = +Inf  (NOT finite)
+        #   both degenerate          =>  0/0             (no information)
+        # mgcv's `efsudr` (R/gam.fit4.r) resolves these as r = 0 (lambda->0),
+        # r = Inf caught by `r[!is.finite(r)] <- 1e6` (lambda *= 1e6), and
+        # `r[a==0&bSb==0] <- 1` (unchanged). We used to FREEZE lambda in the
+        # first two cases. We now adopt mgcv's direction for the FIRST -- a
+        # bounded one-decade release toward a finite optimum -- and
+        # deliberately keep the hold for the second, because escalating
+        # toward lambda* = +Inf measurably DEGRADES fits whose truth lies in
+        # the penalty null space (the branch then fires AT the optimum). The
+        # full argument and the measurements are in src/laml.jl; (b) and (e)
+        # below are the regression guards that pin the rejection.
+        #
+        # Each unit fixture calls `estimate_smoothing_params` with
+        # `maxiter = 30`, which makes n_fs = 30 and n_newton = 0 so the
+        # Newton phase cannot mask the Fellner-Schall behaviour under test.
+        # `rho` round-trips through log/exp inside the function, so "frozen"
+        # means `exp(log(lambda0))`, not `lambda0` -- the pre-change
+        # assertions below are equalities against that round-trip.
+        using PartiallySpecifiedModels: estimate_smoothing_params,
+                                        _rank_penalty
+
+        J3 = Matrix{Float64}(I, 3, 3)
+        w3 = ones(3)
+
+        # -- (a) edf_k <= 0 with beta'S beta > 0: lambda must FALL --
+        # S's third eigenvalue (1e-11) sits below `_rank_penalty`'s
+        # 1e-10*max(eig) tolerance, so the rank counts 2 while
+        # lambda*tr(H^-1 S) still collects a partial third direction.
+        # Measured at lambda = 1e6: rank 2, tau_k = 2.0000080,
+        # edf_k = -8.0e-6, bSb = 1.2e-11 > 1e-30 -- exactly mgcv's
+        # `a <= 0, bSb > 0` case.
+        S_a = [Matrix(Diagonal([1.0, 1.0, 1e-11]))]
+        @test _rank_penalty(S_a[1]) == 2
+        lam_a0 = 1e6
+        lam_a, _ = estimate_smoothing_params(J3, w3, w3, ones(3), zeros(3),
+                                             zeros(3), S_a, [0], [3], 3;
+                                             family=Gaussian(),
+                                             rho_init=[log(lam_a0)],
+                                             maxiter=30)
+        # PRE-CHANGE: exactly exp(log(1e6)). The freeze guard returned
+        # `lambda[k]`, the step was zero, and the loop declared convergence
+        # at Fellner-Schall iteration 1.
+        @test lam_a[1] != exp(log(lam_a0))
+        @test lam_a[1] < lam_a0 / 10          # mgcv's direction (r = 0)
+        @test lam_a[1] > 0                    # ...but not to the floor
+        @test isfinite(lam_a[1])
+        # Measured 3.7795e4. Note this is NOT 1e6/10: the single bounded
+        # decade unsticks the block, `edf_k` turns positive again and the
+        # ORDINARY update walks lambda back down (1e6 -> 1e5 -> ... -> 3.78e4)
+        # -- the concrete demonstration that a bounded degenerate step is a
+        # nudge, not a commitment. Caveat on this pin: lambda has NOT
+        # converged at 3.78e4, it is still falling ~1.5%/step at the n_fs=30
+        # cap, so this value is the iterate AT THE CAP. It is deterministic
+        # (no RNG anywhere in the fixture) but brittle to any change in n_fs.
+        @test lam_a[1] ≈ 37794.912212703035 rtol=1e-6
+
+        # -- (b) beta'S beta ~ 0 with edf_k > 0: lambda is HELD --
+        # y == 0 => beta_hat == 0 exactly => bSb == 0.0, while lambda is
+        # small enough that tau_k = 3*lambda/(1+lambda) << 3 = rank(S):
+        # measured edf_k = 2.997 > 0. This is mgcv's `a > 0, bSb <= 0` case,
+        # the one it sends to r = Inf -> lambda *= 1e6.
+        #
+        # We do NOT adopt that, and this is the guard. beta is identically
+        # zero at every lambda here, so the branch never stops firing: an
+        # escalating variant walks the whole admissible range and pins
+        # lambda at exp(RHO_MAX) = 2.354e17 (measured, in 21 of its 30
+        # allowed steps). Holding is correct because with beta'S beta == 0
+        # the penalty contributes nothing at ANY lambda, so no lambda can
+        # improve the fit, while H = J'WJ + lambda*S is inverted with a ridge
+        # proportional to lambda (see src/laml.jl `_safe_inv`). This
+        # assertion FAILS under the escalating variant.
+        S_b = [Matrix{Float64}(I, 3, 3)]
+        lam_b0 = 1e-3
+        lam_b, _ = estimate_smoothing_params(J3, w3, w3, zeros(3), zeros(3),
+                                             zeros(3), S_b, [0], [3], 3;
+                                             family=Gaussian(),
+                                             rho_init=[log(lam_b0)],
+                                             maxiter=30)
+        @test lam_b[1] == exp(log(lam_b0))    # 2.354e17 if escalated
+        @test isfinite(lam_b[1])
+
+        # -- (c) BOTH degenerate: lambda unchanged (mgcv's r = 1) --
+        # Same S as (a) but with y == 0, so beta == 0 (bSb == 0.0) AND
+        # edf_k = -8.0e-6 <= 0. This is the one degenerate case where mgcv
+        # also holds lambda, so it is a PIN, not a discriminator: it reads
+        # the same before and after this change.
+        lam_c0 = 1e6
+        lam_c, _ = estimate_smoothing_params(J3, w3, w3, zeros(3), zeros(3),
+                                             zeros(3), S_a, [0], [3], 3;
+                                             family=Gaussian(),
+                                             rho_init=[log(lam_c0)],
+                                             maxiter=30)
+        @test lam_c[1] == exp(log(lam_c0))
+
+        # -- (d) STABILITY: a healthy fit is bit-identical --
+        # A well-posed penalized regression that never enters a degenerate
+        # branch (measured: 12 Fellner-Schall updates, all `normal`). Both
+        # numbers below are the pre-change values, unchanged.
+        Dm_f4 = zeros(6, 8)
+        for i in 1:6
+            Dm_f4[i, i] = 1.0; Dm_f4[i, i + 1] = -2.0; Dm_f4[i, i + 2] = 1.0
+        end
+        S_d = [Dm_f4' * Dm_f4]
+        xs_d = collect(range(0, 1, length=40))
+        J_d = hcat([xs_d .^ (j - 1) for j in 1:8]...)
+        y_d = 2.0 .+ 3.0 .* xs_d .- 1.5 .* xs_d .^ 2 .+ 0.01 .* sin.(37 .* xs_d)
+        w_d = ones(40)
+        lam_d, edf_d = estimate_smoothing_params(J_d, w_d, w_d, y_d,
+                                                 zeros(40), zeros(8), S_d,
+                                                 [0], [8], 8;
+                                                 family=Gaussian(),
+                                                 rho_init=[log(1.0 / tr(S_d[1]))],
+                                                 maxiter=30)
+        @test lam_d[1] ≈ 5.529284778348337e-6 rtol=1e-9
+        @test edf_d ≈ 5.7270446624079305 rtol=1e-9
+
+        # -- (e) the CollocationLAML sibling carries the same policy --
+        # src/collocation_solver.jl duplicates the Fellner-Schall formula
+        # rather than calling `estimate_smoothing_params`, and this
+        # campaign's recurring failure mode is fixing one branch and not its
+        # sibling. Deterministic trigger, no RNG: a discrete linear map
+        # u_{t+1} = g(1)*u_t whose truth g == 1 is CONSTANT, started from a
+        # constant initial function. A constant coefficient vector lies in
+        # the null space of the second-difference penalty, so
+        # beta'S beta == 0 at every continuation level and the collocation
+        # Fellner-Schall takes the `bSb ~ 0` branch at 7 of its 8 levels
+        # (measured: 2 of the 8 continuation levels take `normal`, the other
+        # 6 take `bSb0`).
+        #
+        # This is the fixture that decided the policy. The criterion says
+        # theta* = +Inf here, so an mgcv-faithful escalation looks right on
+        # paper -- and it makes the fit WORSE. Measured, escalating one
+        # bounded decade per level (the tamest form of mgcv's `r = Inf`
+        # branch) drove theta 2.9288e-11 -> 2921.99 and with it
+        # data_loss 1.0376e-16 -> 2.9271e-13 (2800x) and the g(1) error
+        # 1.42e-9 -> 7.77e-8 (55x). So this sub-test is a REGRESSION GUARD on
+        # the deliberate non-adoption, and it fails under the escalating
+        # variant on both of the pinned numbers below.
+        linmap_f4!(un, u, p, t) = (un[1] = p.g(1.0) * u[1])
+        prob_f4 = PSMProblem(linmap_f4!, [1.0], (0.0, 8.0),
+            [BSplineApproximator(:g, (0.0, 2.0), 6; initial=x -> 0.9)];
+            data_times=collect(0.0:1.0:8.0),
+            data_values=reshape(fill(1.0, 9), :, 1), discrete=true)
+        s_f4 = solve(prob_f4, CollocationLAML(maxiters=30))
+        @test s_f4.smoothing_params[1] < 1e-6       # 2921.99 if escalated
+        @test s_f4.data_loss < 1e-14                # 2.93e-13 if escalated
+        @test abs(s_f4.unknown_functions[:g](1.0) - 1.0) < 1e-8
+        @test all(isfinite, s_f4.smoothing_params)
+        # NOTE on coverage: the collocation sibling's OTHER branch
+        # (`fs_num <= 0` with bSb > 0, the one whose direction we did adopt)
+        # is never reached by any fixture in this suite -- 0 of the 60
+        # collocation Fellner-Schall updates the suite performs take it,
+        # versus 98 of 34,875 in laml.jl. That is a statement about THIS
+        # SUITE, not about reachability: swapping the approximator for a
+        # ShapeConstrainedBSplineApproximator hits the branch 3 times in a
+        # single solve. So the collocation edit guards a branch an ordinary
+        # combination of shipped features reaches, and which no test here
+        # covers; (a) above exercises the adopted direction in laml.jl.
+    end
+
     @testset "Minor-batch fixes (T10)" begin
         @testset "_normlogcdf: tail accuracy and branch continuity" begin
             using PartiallySpecifiedModels: _normlogcdf, _normcdf
