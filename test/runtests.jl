@@ -4508,25 +4508,45 @@ end
         @test isfinite(s_ok.convergence.stationarity)
 
         # ── (b) MODE: Fellner-Schall never advanced ──
-        # Same problem, jac=:forwarddiff. The exact Jacobian makes the very
-        # first step good enough that the accept block takes the `f01 <
-        # obj_prev` branch every iteration with `dl_a1 >= dl_curr`, so
-        # `otheta` never moves onto an FS proposal. `converged` is true and
-        # the reported lambda-hat is EXACTLY the data-driven default
-        # 1/tr(S) -- smoothing selection never took effect. This was hidden
-        # before F1, which reported a plausible-looking proposal instead.
-        # `smoothing_advanced` is exact and threshold-free, which is why it
-        # is the assertion carrying the weight here.
-        s_m3 = solve(mk_f2(), LAML(maxiters=30, jac=:forwarddiff))
-        @test s_m3.convergence.converged          # unchanged: still "converged"
-        @test !s_m3.convergence.smoothing_advanced
-        # lambda-hat is bit-identical to the initialization, not merely close
+        # This slot used to be the SAME problem under jac=:forwarddiff, which
+        # reported `converged = true` with lambda-hat bit-identical to the
+        # 1/tr(S) default: the accept block took the `f01 < obj_prev` branch
+        # every iteration with `dl_a1 >= dl_curr`, so `otheta` never moved
+        # onto an FS proposal. F6 removed that mode from this fixture by
+        # warm-starting Fellner-Schall from `otheta` (the ACCEPTED theta)
+        # instead of from its own last, rejected proposal -- see the
+        # "Fellner-Schall warm start (F6)" testset, which owns the before/after
+        # numbers. Here we only pin that the fixture no longer exhibits it.
         lam0_f2 = 1.0 / tr(penalty_matrix(
             BSplineApproximator(:r, (0.0, 5.0), 5)))
-        @test s_m3.smoothing_params[1] == lam0_f2
-        # ...and the fd path on the SAME data does advance, so this is a
-        # property of the search, not of the fixture being unfittable
+        s_m3 = solve(mk_f2(), LAML(maxiters=30, jac=:forwarddiff))
+        @test s_m3.convergence.converged          # unchanged: still "converged"
+        @test s_m3.convergence.smoothing_advanced # was false before F6
+        @test s_m3.smoothing_params[1] != lam0_f2 # was == before F6
+        # ...and the fd path on the SAME data also advances, so neither is a
+        # property of the fixture being unfittable
         @test s_ok.smoothing_params[1] != lam0_f2
+
+        # The mode itself is NOT gone -- `smoothing_advanced` still has to be
+        # able to report `converged = true` with a lambda-hat nothing chose.
+        # Its remaining structural cause is a model with no penalized block at
+        # all: an unpenalized `NeuralApproximator` (penalty_weight = 0)
+        # contributes no S_k, so there is no smoothing parameter to select and
+        # the key is `false` by construction while the fit converges normally.
+        # `stationarity` is 0.0 there by convention (nothing to be stationary
+        # in), which is exactly why the two keys are not redundant.
+        import Lux
+        nn_f2 = Lux.Chain(Lux.Dense(1, 4, tanh), Lux.Dense(4, 1))
+        prob_nn_f2 = PSMProblem(gh_f2!, [1.0], (0.0, 10.0),
+            [NeuralApproximator(:r, nn_f2; domain=(0.0, 5.0), rng_seed=42)];
+            data_times=t_f2,
+            data_values=reshape(exp.(0.1 .* t_f2) .+ noi_f2, :, 1),
+            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+        s_nopen = solve(prob_nn_f2, LAML(maxiters=30))
+        @test isempty(s_nopen.smoothing_params)
+        @test s_nopen.convergence.converged            # measured :converged_tol
+        @test !s_nopen.convergence.smoothing_advanced
+        @test s_nopen.convergence.stationarity == 0.0
 
         # ── (c) MODE: stalled on a non-smooth evaluator ──
         # Structurally MATCHED PAIR: the same discrete-map model, the same
@@ -4554,26 +4574,37 @@ end
                 data_times=Float64.(0:30), data_values=reshape(dat, :, 1),
                 discrete=true, solver=nothing)
         end
-        s_smooth = solve(mk_map(smooth_step), LAML(maxiters=50))
-        s_kink   = solve(mk_map(kink_step),   LAML(maxiters=50))
+        # maxiters=80: the budget the kinked fixture needs to reach its
+        # plateau. It was 50 before F6; with the Fellner-Schall proposal no
+        # longer frozen (see the F6 testset) `curr_obj` keeps moving for
+        # longer and the plateau now lands at iteration 65 instead of 32.
+        # 50 would TRUNCATE it (measured: converged = false, reason
+        # :maxiters), which would make this a truncation comparison rather
+        # than the stall comparison it is meant to be.
+        s_smooth = solve(mk_map(smooth_step), LAML(maxiters=80))
+        s_kink   = solve(mk_map(kink_step),   LAML(maxiters=80))
 
         # Both report success -- `converged` cannot tell them apart
         @test s_smooth.convergence.converged
         @test s_kink.convergence.converged
         # ...but the stationarity residuals differ by orders of magnitude.
-        # Measured: 1.52e-6 (smooth) vs 1.32 (kinked), a factor of ~8.7e5.
-        # Asserted at 1e3 -- ~870x of margin -- so this is a qualitative
+        # Measured: 9.28e-7 (smooth) vs 0.293 (kinked), a factor of ~3.2e5.
+        # Asserted at 1e3 -- ~320x of margin -- so this is a qualitative
         # separation check, not a pinned constant.
         @test s_kink.convergence.stationarity >
               1e3 * s_smooth.convergence.stationarity
-        @test s_smooth.convergence.stationarity < 1e-4    # measured 1.5e-6
-        @test s_kink.convergence.stationarity > 0.5       # measured 1.32
+        @test s_smooth.convergence.stationarity < 1e-4    # measured 9.3e-7
+        # measured 0.293. Was 1.32 pre-F6, at a WORSE fit: EDF 6.65 -> 6.23
+        # and data loss 5.678 -> 5.420, i.e. the kinked fixture is somewhat
+        # less stalled now, not more. The threshold moves 0.5 -> 0.1 to track
+        # that; it still sits 3.2e5x above the smooth control.
+        @test s_kink.convergence.stationarity > 0.1
         # here FS DID move lambda -- it just never reached an optimum, which
         # is exactly why `smoothing_advanced` alone cannot detect this mode
         # and the residual is needed
         @test s_kink.convergence.smoothing_advanced
         # more budget does not help: it is stalled, not truncated
-        s_kink2 = solve(mk_map(kink_step), LAML(maxiters=80))
+        s_kink2 = solve(mk_map(kink_step), LAML(maxiters=120))
         @test s_kink2.convergence.iterations == s_kink.convergence.iterations
         @test s_kink2.convergence.stationarity ≈ s_kink.convergence.stationarity
 
@@ -4631,11 +4662,150 @@ end
             likelihood=Gaussian(), solver=Tsit5())
         s_lv2 = solve(prob_lv2, LAML(maxiters=60))
         @test s_lv2.convergence.converged
-        @test s_lv2.convergence.iterations > 12      # measured 18; 7 if rescored
+        @test s_lv2.convergence.iterations > 12      # measured 16; 7 if rescored
         @test s_lv2.convergence.smoothing_advanced
-        @test s_lv2.convergence.stationarity < 1e-4  # measured 5.3e-6; 0.9997 if rescored
+        @test s_lv2.convergence.stationarity < 1e-4  # measured 8.9e-6; 0.9997 if rescored
         @test s_lv2.edf < 6.0                        # measured 4.00; 11.99 if rescored
-        @test all(s_lv2.smoothing_params .> 1.0)     # measured ~2e7; 1.6e-4 if rescored
+        @test all(s_lv2.smoothing_params .> 1.0)     # measured [1.5e7, 3.2e7]; 1.6e-4 if rescored
+    end
+
+    @testset "Fellner-Schall warm start (F6)" begin
+        # `estimate_smoothing_params` leaves its Fellner-Schall phase as soon
+        # as ONE internal step moves log(lambda) by less than its tol = 1e-6.
+        # Warm-starting it from `theta` -- the previous, possibly REJECTED
+        # proposal -- therefore made it a near-identity map: it took one step,
+        # saw no movement, and handed back its own input. Measured on fixture
+        # (a) below, it returned 31429.207404658788 BIT-IDENTICALLY on every
+        # call from iteration 4 on, while beta went on being fitted at
+        # theta = 4.2641e-4 (the 1/tr(S) initialization) -- a 7.4e7x
+        # divergence that repeated unchanged until the loop exited.
+        #
+        # That freeze is not cosmetic. `curr_obj` is scored at `theta` on
+        # purpose, because it is the only term in the convergence test that
+        # can see smoothing selection still moving (see the F2 (f) block
+        # above); a frozen proposal blinds it, so `:converged_tol` fires while
+        # lambda-hat still sits on its initialization and the loop never
+        # reaches the `f11 < f10` branch that accepts a new theta once beta is
+        # exhausted at the old one. F6 warm-starts from `otheta` -- the
+        # ACCEPTED smoothing parameters -- instead, which keeps the proposal
+        # live. When a proposal IS accepted, otheta == theta and the warm
+        # start is bit-identical to the old behaviour; the two differ only on
+        # the rejection path.
+        #
+        # NOTE ON WHAT IS *NOT* CHANGED. The `dl_a1 <= dl_a0` / `dl_a1 <
+        # dl_curr` vetoes in the accept block are a ONE-WAY RATCHET: data loss
+        # is monotone decreasing in model flexibility, so any lambda INCREASE
+        # necessarily raises it (measured dl_a1/dl_curr at the first rejected
+        # iteration of the three fixtures below: 1.0086, 1.0163, 1.00078) and
+        # those vetoes can only ever accept lambda DECREASES. They are left
+        # alone because the `f11 < f10` branch already accepts a new theta on
+        # its own penalized objective; restoring a live proposal is what lets
+        # that branch be reached.
+        #
+        # Every assertion below FAILS on the pre-F6 source (verified by
+        # stashing the one-line change and re-running); the measured pre-F6
+        # value is given inline next to each.
+
+        gh_f6!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        t_f6 = collect(0.0:0.5:10.0)
+        noi_f6 = [0.01 * (sin(3.1i) + 0.5cos(7.7i)) for i in 1:length(t_f6)]
+        mk_f6(k) = PSMProblem(gh_f6!, [1.0], (0.0, 10.0),
+            [BSplineApproximator(:r, (0.0, 5.0), k; initial=x -> 0.05)];
+            data_times=t_f6,
+            data_values=reshape(exp.(0.1 .* t_f6) .+ noi_f6, :, 1),
+            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+        lam0_f6(k) = 1.0 / tr(penalty_matrix(
+            BSplineApproximator(:r, (0.0, 5.0), k)))
+
+        # ── (a) jac=:forwarddiff, 5 knots -- the frozen-proposal fixture ──
+        # Pre-F6: converged = true, smoothing_advanced = false, lambda-hat
+        # BIT-IDENTICAL to 1/tr(S) = 4.2641e-4, EDF 3.222, stationarity 0.391.
+        s6a = solve(mk_f6(5), LAML(maxiters=30, jac=:forwarddiff))
+        @test s6a.convergence.converged
+        @test s6a.convergence.smoothing_advanced           # was false
+        @test s6a.smoothing_params[1] != lam0_f6(5)        # was ==
+        @test s6a.smoothing_params[1] > 1e3                # measured 3.502e4
+        @test s6a.convergence.stationarity < 1e-4          # measured 4.95e-7 (was 0.391)
+        @test s6a.edf < 2.5                                # measured 2.000 (was 3.222)
+        # The truth r == 0.1 is constant, hence in null(S), so EDF 2 is the
+        # RIGHT answer: the frozen fit was UNDERSMOOTHED, not merely
+        # mislabelled. This is the assertion that makes F6 a fix rather than a
+        # reporting change.
+        r6a = s6a.unknown_functions[:r]
+        @test maximum(abs(r6a(x) - 0.1) for x in range(1.0, 2.8, length=41)) <
+              5e-4                                         # measured 1.311e-4 (was 1.447e-3)
+
+        # ── (b) jac=:fd, 8 knots -- the same mode on the DEFAULT Jacobian ──
+        # Pre-F6: lambda-hat == 1/tr(S) = 3.6584e-5, EDF 4.070,
+        # stationarity 0.328, sup error 3.368e-3.
+        s6b = solve(mk_f6(8), LAML(maxiters=30))
+        @test s6b.convergence.converged
+        @test s6b.convergence.smoothing_advanced           # was false
+        @test s6b.smoothing_params[1] != lam0_f6(8)        # was ==
+        @test s6b.convergence.stationarity < 1e-4          # measured 6.25e-7 (was 0.328)
+        @test s6b.edf < 2.5                                # measured 2.000 (was 4.070)
+        r6b = s6b.unknown_functions[:r]
+        @test maximum(abs(r6b(x) - 0.1) for x in range(1.0, 2.8, length=41)) <
+              5e-4                                         # measured 1.312e-4 (was 3.368e-3)
+
+        # ── (c) non-Gaussian: not a Gaussian-only artefact ──
+        # Poisson logistic growth, truth g(N) = 0.3(1 - N/50), also in null(S).
+        # Pre-F6: lambda-hat == 1/tr(S) = 1.5691e-4, EDF 5.320,
+        # stationarity 0.829, sup error 7.068e-2. Note this fixture's
+        # Fellner-Schall proposals were NOT frozen -- they wandered over an
+        # order of magnitude (4.7e7 ... 1.0e8) -- and were rejected anyway, so
+        # (c) exercises the one-way-ratchet half of the mechanism rather than
+        # the near-identity-map half.
+        lg_f6!(du, u, p, t) = (du[1] = p.g(u[1]) * u[1])
+        t6c = collect(0.0:1.0:20.0)
+        y6c = round.([50.0 / (1 + 49exp(-0.3t)) for t in t6c])
+        prob6c = PSMProblem(lg_f6!, [1.0], (0.0, 20.0),
+            [BSplineApproximator(:g, (0.0, 60.0), 6; initial=x -> 0.3)];
+            data_times=t6c, data_values=reshape(y6c, :, 1),
+            obs_to_state=[1], likelihood=Poisson(), solver=Tsit5())
+        s6c = solve(prob6c, LAML(maxiters=40))
+        @test s6c.convergence.converged
+        @test s6c.convergence.smoothing_advanced           # was false
+        @test s6c.smoothing_params[1] > 1e3                # measured 1.831e7 (was 1.5691e-4)
+        @test s6c.convergence.stationarity < 1e-4          # measured 1.07e-8 (was 0.829)
+        @test s6c.edf < 2.5                                # measured 2.000 (was 5.320)
+        g6c = s6c.unknown_functions[:g]
+        @test maximum(abs(g6c(x) - 0.3 * (1 - x / 50)) for
+                      x in range(1.0, 50.0, length=41)) < 1e-2
+                                                           # measured 2.129e-3 (was 7.068e-2)
+
+        # ── (d) the fit is not pinned to its lambda initialization ──
+        # Warm-starting Fellner-Schall from `otheta` means the FS call is
+        # seeded with the CURRENT accepted lambda every iteration, so the
+        # obvious worry is that lambda now just sits wherever it started.
+        # Starting a decade-and-a-half ABOVE where (a) lands (1e6 against
+        # 3.5e4) reaches the same fit: EDF 2.000 and a data loss equal to
+        # (a)'s to 8 significant figures (measured relative difference
+        # 9.0e-8 -- an earlier draft of this comment claimed 12 s.f. and set
+        # the tolerance below from that unmeasured claim, which failed), with
+        # lambda-hat measured at
+        # 1.00252e6 -- moved off 1e6, and in the flat region above the
+        # Fellner-Schall optimum where EDF is already 2 and further smoothing
+        # buys nothing, which is why it does not travel further.
+        s6d = solve(mk_f6(5), LAML(maxiters=30, initial_lambda=1e6))
+        @test s6d.convergence.converged
+        @test s6d.convergence.smoothing_advanced
+        @test s6d.smoothing_params[1] != 1e6              # measured 1.00252e6
+        @test s6d.edf < 2.5                               # measured 1.9997
+        # rtol 1e-6 against a measured 7.6e-8 (13x margin); 1e-10 was a
+        # guess, not a measurement, and failed.
+        #
+        # Read this line as a SANITY check, not the discriminating one. It
+        # is weak by construction: a fit with lambda genuinely pinned at 1e6
+        # (measured via warmup >= maxiters, so Fellner-Schall never runs)
+        # differs from (a) by only 1.3e-6 relative -- because 1e6 and (a)'s
+        # optimum both sit in the flat over-smoothed region where EDF is
+        # already 2 and data loss barely moves. So data loss cannot separate
+        # "found the optimum" from "never moved". The DISCRIMINATION in this
+        # block comes from `smoothing_advanced` (false for the pinned fit)
+        # and `smoothing_params[1] != 1e6`; this assertion only rules out
+        # the fit having gone somewhere wildly different.
+        @test s6d.data_loss ≈ s6a.data_loss rtol=1e-6     # both 7.68271e-4
     end
 
     @testset "Fellner-Schall degenerate-update policy (F4)" begin
@@ -9921,11 +10091,34 @@ end
         # Measured: 1.0e-3 with the fix, 0.77 without it — a 760x gap, so
         # 1e-2 discriminates with a wide margin on both sides.
         @test pcls_refit_move(prob_lv2, sol_lv2) < 1e-2
+        # TOLERANCE, 1e-8 -> 1e-5, and why that is not hiding anything.
+        # `objective` is literally `0.5 * (data_loss + dot(p_opt, B_final *
+        # p_opt))` in solver.jl, so the only difference from the line below is
+        # the ORDER of the floating-point sum: the solver contracts the
+        # assembled n_p x n_p B, this recomputes it block by block. Before F6
+        # that made no difference at all (the two agreed BIT-EXACTLY, measured
+        # reldiff 0) -- because this fixture was itself one of the
+        # never-advancing solves and its lambda-hat stayed on the 1/tr(S)
+        # initialization, [1.569e-4, 4.264e-4], where the penalty is a
+        # well-conditioned 0.0153. With F6 the search now selects
+        # [0.2409, 5.967e6], and the second block's quadratic form is driven
+        # into null(S_2): b'S_2 b = -7.04e-15 against sum|b_i S_ij b_j| =
+        # 436.8, a cancellation ratio of 6.2e16 -- i.e. that block's b'Sb is
+        # AT the double-precision noise floor, which is the correct answer for
+        # lambda_2 = 6e6. Against a BigFloat(512) reference the two Float64
+        # orderings carry relative errors of 4.5e-7 (block-by-block) and
+        # 1.4e-5 (assembled), which is the entire 9.3e-8 relative gap in the
+        # objective. The defect this test exists to catch -- theta-dependent
+        # scalars evaluated at a different theta from beta-hat -- was measured
+        # in F1 as an objective of 7.3e7 against a data loss of 0.89, so 1e-5
+        # still discriminates it by twelve orders of magnitude.
         @test sol_lv2.objective ≈
               0.5 * (sol_lv2.data_loss +
-                     reported_penalty(prob_lv2, sol_lv2)) rtol=1e-8
+                     reported_penalty(prob_lv2, sol_lv2)) rtol=1e-5
         # …and the reported penalty is commensurate with the fit rather than
-        # dwarfing it: 0.0153 against a data loss of 0.888 (measured).
+        # dwarfing it: 0.00754 against a data loss of 1.168 (measured; 0.0153
+        # against 0.888 before F6, when this fixture's λ̂ never left its
+        # initialization — see the rtol note above).
         @test reported_penalty(prob_lv2, sol_lv2) < sol_lv2.data_loss
 
         # ── The same invariant on two ordinary single-λ fixtures, so a
