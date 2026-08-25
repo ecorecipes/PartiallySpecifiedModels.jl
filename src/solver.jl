@@ -1173,8 +1173,78 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         end
 
         # Re-estimate smoothing parameters via LAML.
-        # Use theta (latest), NOT otheta, for warm-start so Fellner-Schall
-        # doesn't restart from scratch.
+        #
+        # WARM START FROM `otheta` — the smoothing parameters the search has
+        # ACCEPTED — not from `theta`, the last (possibly REJECTED) proposal.
+        #
+        # Warm-starting from the proposal is self-referential, and on the
+        # rejection path it is degenerate. `estimate_smoothing_params` leaves
+        # its Fellner–Schall phase as soon as one internal step moves log λ by
+        # less than its 1e-6 tolerance, so handing it back its own previous
+        # output makes it a NEAR-IDENTITY MAP: it takes one step, sees no
+        # movement, and returns what it was given. Measured on the F2 fixture
+        # under `jac=:forwarddiff` (exponential growth, one 5-knot B-spline):
+        # from iteration 4 onward it returned 31429.207404658788
+        # bit-identically on every call, while β went on being fitted at
+        # θ = 4.2641e-4 — the 1/tr(S) initialization — a 7.4e7× divergence
+        # that repeated unchanged until the loop exited.
+        #
+        # That freeze is not cosmetic. `curr_obj` above is scored at `theta`
+        # on purpose, because it is the only term in the convergence test that
+        # can see smoothing selection still moving (see the comment there). A
+        # frozen proposal makes that monitor blind, so `:converged_tol` fires
+        # while λ̂ still sits on its initialization — and the loop never
+        # reaches the `f11 < f10` branch, which is what accepts a new θ once β
+        # stops improving at the old one. This is the mechanism behind LAML
+        # solves that report `converged == true` with
+        # `smoothing_advanced == false`.
+        #
+        # `otheta` is the θ the next PCLS step will use, so Fellner–Schall is
+        # asked the question it exists to answer: given the current working
+        # model, what should the CURRENT λ become? This is NOT "restarting
+        # from scratch" (that would be `theta_init` — `initial_lambda`, or the
+        # 1/tr(S) default); whenever a proposal IS accepted, `otheta == theta`
+        # and the warm start is bit-identical to the old behaviour. The two
+        # differ only on the rejection path, which is exactly where the old
+        # behaviour was degenerate. The Gaussian pre-loop above already warm-
+        # starts from its accepted `gw_otheta`; this line was the outlier.
+        #
+        # `theta_fit` was the other candidate and is subtly wrong here: on the
+        # `f01 < obj_prev` branch that ALSO accepts the new θ, `theta_fit`
+        # holds the PREVIOUS `otheta`, so warm-starting from it would discard
+        # a λ the loop had just accepted. `theta_fit` is a REPORTING concept
+        # (the θ at which β̂ is the penalized MLE); `otheta` is the search
+        # STATE.
+        #
+        # NOT changed, deliberately: the `dl_a1 <= dl_a0` / `dl_a1 < dl_curr`
+        # vetoes above. Data loss is monotone decreasing in model flexibility,
+        # so ANY λ increase raises it and those vetoes are a one-way ratchet
+        # that can only ever accept λ DECREASES — measured `dl_a1/dl_curr` at
+        # the first rejected iteration of the three fixtures below: 1.0086,
+        # 1.0163, 1.00078. (The comment above them says data loss is unbiased
+        # because it is θ-independent; the FUNCTION is, but its argmin over β
+        # moves toward λ → 0, so it is biased against λ increases exactly as
+        # the penalized objective is biased for them.) The correct arbiter of
+        # λ is the LAML criterion Fellner–Schall already ascends — but the
+        # loop does not need one here, because the `f11 < f10` branch accepts
+        # a new θ on its own penalized objective once β is exhausted at the
+        # old θ. Restoring a live proposal is what lets that branch be
+        # reached; widening the veto is a larger change with no measured need.
+        #
+        # Measured effect (λ̂ / EDF / `stationarity` / sup|f̂ − truth|, before →
+        # after). All three reported `converged = true` with λ̂ frozen bit-
+        # identically on its initialization before this change:
+        #   exp growth, BSpline(:r,(0,5),5), jac=:forwarddiff, truth r ≡ 0.1
+        #     4.2641e-4 → 3.502e4 | 3.222 → 2.000 | 0.391 → 4.95e-7 |
+        #     1.447e-3 → 1.311e-4
+        #   exp growth, BSpline(:r,(0,5),8), jac=:fd, truth r ≡ 0.1
+        #     3.6584e-5 → 1.474e4 | 4.070 → 2.000 | 0.328 → 6.25e-7 |
+        #     3.368e-3 → 1.312e-4
+        #   logistic, BSpline(:g,(0,60),6), Poisson, truth g(N)=0.3(1−N/50)
+        #     1.5691e-4 → 1.831e7 | 5.320 → 2.000 | 0.829 → 1.07e-8 |
+        #     7.068e-2 → 2.129e-3
+        # In all three the truth lies in null(S), so EDF 2 is the correct
+        # answer: the frozen fits were UNDERSMOOTHED, not merely mislabelled.
         w_irls_for_laml = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
         if m > 0 && iter >= alg.warmup
             # sigma2_init caps the FS dispersion during early iterations to
@@ -1187,7 +1257,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                 alg.sigma2_init * 10.0^clamp(iter - alg.warmup, 0, 300)
             end
             theta_new, _ = try
-                rho_init = log.(max.(theta, 1e-20))
+                rho_init = log.(max.(otheta, 1e-20))
                 estimate_smoothing_params(J, w_irls_for_laml, w_vec,
                                          y_vec, f_vec, beta,
                                          S_list, uf_offsets, uf_nk, n_p;
