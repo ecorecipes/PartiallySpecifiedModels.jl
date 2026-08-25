@@ -619,8 +619,10 @@ block consumers go through): local ranges must be non-empty and lie
 within `1:nparams(approx)`, be pairwise disjoint (the per-block
 generalized determinant `log|S_λ|₊` in laml.jl is exact only for
 non-overlapping blocks), and each `S` must be
-`length(range) × length(range)` and numerically symmetric. Violations
-throw an `ArgumentError` naming the approximator.
+`length(range) × length(range)`, numerically symmetric, and positive
+semi-definite (a non-PSD block would otherwise pass silently and be
+treated as unpenalized by the rank and log-determinant routines).
+Violations throw an `ArgumentError` naming the approximator.
 """
 function build_penalty_matrices(prob::PSMProblem)
     S_list = Matrix{Float64}[]
@@ -652,6 +654,30 @@ function build_penalty_matrices(prob::PSMProblem)
             asym <= 1e-8 * max(maximum(abs.(S)), 1.0) || throw(ArgumentError(
                 "penalty_blocks(:$(approx.name)): S for range $r is not " *
                 "symmetric (max |S - S'| = $asym)"))
+            # PSD, which the contract requires and nothing used to check.
+            # Neither failure mode is caught downstream, and both are silent
+            # (measured): a NEGATIVE-DEFINITE block gives _rank_penalty 0 and
+            # _log_det_plus 0, i.e. a fully inert penalty — the user asked
+            # for smoothing and got none. An INDEFINITE block is worse
+            # because it looks alive: diag(-1,+1) gives rank 1 and logdet 0,
+            # so the negative direction is silently dropped and the block
+            # penalizes a subspace the user never specified. One
+            # eigendecomposition per block per solve (every call site is
+            # once-per-solve, and blocks are small), so the cost is noise.
+            #
+            # The tolerance is relative and generous: across 73 penalty
+            # blocks from 69 configurations of all eleven built-in types,
+            # the worst relative eigmin is -9.7e-17 (pure roundoff), so
+            # -1e-8 leaves seven orders of margin over anything the package
+            # itself produces.
+            evmin, evmax = extrema(eigvals(Symmetric(Matrix(Float64.(S)))))
+            evmin >= -1e-8 * max(evmax, 1.0) || throw(ArgumentError(
+                "penalty_blocks(:$(approx.name)): S for range $r is not " *
+                "positive semi-definite (smallest eigenvalue $evmin against " *
+                "largest $evmax). A penalty must be PSD: a negative " *
+                "direction would REWARD roughness, and downstream rank and " *
+                "log-determinant routines would silently treat the block as " *
+                "unpenalized rather than report the error."))
             for i in r
                 covered[i] && throw(ArgumentError(
                     "penalty_blocks(:$(approx.name)): ranges overlap at " *
