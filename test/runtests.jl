@@ -101,6 +101,12 @@ function PartiallySpecifiedModels.penalty_blocks(a::BadBlocksApproximator)
     a.kind === :out_of_range  ? [(Matrix{Float64}(I, 4, 4), 4:7)] :
     a.kind === :size_mismatch ? [(Matrix{Float64}(I, 2, 2), 1:3)] :
     a.kind === :strided        ? [(I3, 1:2:5)] :
+    # symmetric but INDEFINITE: eigenvalues -1 and +1. Passes every other
+    # check; downstream it would become an inert (rank-0) penalty rather
+    # than an error, so the user asks for smoothing and silently gets none.
+    a.kind === :indefinite     ? [([0.0 1.0; 1.0 0.0], 1:2)] :
+    # symmetric NEGATIVE definite: a penalty that rewards roughness.
+    a.kind === :negdef         ? [(-1.0 * Matrix{Float64}(I, 3, 3), 1:3)] :
                                 [([1.0 2.0; 0.0 1.0], 1:2)]
 end
 
@@ -7784,6 +7790,41 @@ end
             # coefficients.
             @test_throws ArgumentError PSM.build_penalty_matrices(
                 mkprob_pb(BadBlocksApproximator(:bad, :strided)))
+            # Non-PSD blocks: the contract required PSD but nothing checked
+            # it, and neither failure mode is caught downstream. Measured:
+            # negative-definite gives _rank_penalty 0 / _log_det_plus 0 (a
+            # fully inert penalty — smoothing requested, none applied),
+            # while indefinite diag(-1,+1) gives rank 1 / logdet 0, which is
+            # worse for looking alive: the negative direction is silently
+            # dropped and the block penalizes a subspace nobody asked for.
+            @test_throws ArgumentError PSM.build_penalty_matrices(
+                mkprob_pb(BadBlocksApproximator(:bad, :indefinite)))
+            @test_throws ArgumentError PSM.build_penalty_matrices(
+                mkprob_pb(BadBlocksApproximator(:bad, :negdef)))
+            err_psd = try
+                PSM.build_penalty_matrices(
+                    mkprob_pb(BadBlocksApproximator(:bad, :negdef)))
+                nothing
+            catch e; e; end
+            @test err_psd isa ArgumentError
+            @test occursin(":bad", err_psd.msg)                  # names it
+            @test occursin("positive semi-definite", err_psd.msg)
+            # …and every built-in penalty passes with room to spare: the
+            # worst relative eigmin across 73 blocks from 69 configurations
+            # of all eleven built-in types is -9.7e-17, against a -1e-8
+            # relative gate.
+            for a_psd in (BSplineApproximator(:z, (0.0, 1.0), 10),
+                          SPDEApproximator(:z, (0.0, 1.0), 8),
+                          GPApproximator(:z, (0.0, 1.0), 6),
+                          ShapeConstrainedBSplineApproximator(:z, (0.0, 1.0), 8,
+                                                              :increasing),
+                          TensorBSplineApproximator(:z, (0.0, 1.0), (0.0, 1.0),
+                                                    5, 5))
+                for (S_psd, _) in PSM.penalty_blocks(a_psd)
+                    ev_psd = eigvals(Symmetric(Matrix(Float64.(S_psd))))
+                    @test minimum(ev_psd) >= -1e-8 * max(maximum(ev_psd), 1.0)
+                end
+            end
         end
 
         # ── Shared two-block fixture: linear forcing problem du = f(t),
