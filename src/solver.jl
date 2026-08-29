@@ -1424,28 +1424,29 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     # ½ r_k, so the ratio measures the gradient against the natural scale of
     # the block. It is NOT bounded by 1 — the β̂'S_kβ̂/σ̂² term has no upper
     # bound, and the largest value observed across this package's suite is
-    # 14.1. `stationarity` is the max over blocks of that ratio.
+    # 8.72. `stationarity` is the max over blocks of that ratio.
     #
     # DELIBERATELY REPORTED AS A NUMBER, NOT A PASS/FAIL FLAG. An earlier
     # draft of this block carried a companion `stationary::Bool` at a
     # threshold of 0.1. It was dropped after measuring the residual on all
-    # 151 LAML solves the test suite performs: the distribution is an
-    # unbroken continuum, not two clusters. Quantiles are p25 = 1.7e-7,
-    # p50 = 9.5e-6, p75 = 1.5e-2, p90 = 0.46, max = 14.1, and across the
-    # whole decision-relevant region (1e-3 to 3) the largest ratio between
-    # consecutive sorted values is 1.65 below 1 and 2.98 across the whole
-    # region — nothing resembling the orders-of-magnitude separation a
-    # threshold would need, i.e. there is no gap anywhere a
-    # threshold could sit. A cutoff at 0.1 would have flagged 25 of 151
-    # solves (16.6%), splitting a continuum of otherwise ordinary
-    # `:converged_tol` fits spanning the same families and Jacobian
-    # backends. A flag that fires on one fit in six teaches users to ignore
-    # it, which would destroy the value of the honest signal this block
-    # exists to add.
+    # LAML solves the test suite performs (most recently the 163 solves of
+    # the post-F6/F8 suite): the distribution is an unbroken continuum, not
+    # two clusters. Quantiles are p25 = 1.6e-7, p50 = 8.5e-6, p75 = 1.6e-2,
+    # p90 = 0.29, max = 8.72, and across the whole decision-relevant region
+    # (1e-3 to 3) the largest ratio between consecutive sorted values is
+    # 1.52 below 1 and 2.98 across the whole region — nothing resembling
+    # the orders-of-magnitude separation a threshold would need, i.e. there
+    # is no gap anywhere a threshold could sit. A cutoff at 0.1 would have
+    # flagged 23 of 163 solves (14.1%), splitting a continuum of otherwise
+    # ordinary `:converged_tol` fits spanning the same families and
+    # Jacobian backends. A flag that fires on one fit in seven teaches
+    # users to ignore it, which would destroy the value of the honest
+    # signal this block exists to add.
     #
-    # (An earlier partial sample of 94 solves appeared to show a 3.2x gap
-    # around 0.1; the remaining 57 solves filled it in completely. Recorded
-    # because it is the reason not to calibrate a gate on a subsample.)
+    # (During the original 151-solve calibration a partial sample of 94
+    # solves appeared to show a 3.2x gap around 0.1; the remaining 57
+    # filled it in completely. Recorded because it is the reason not to
+    # calibrate a gate on a subsample.)
     #
     # Users who need a gate should threshold the float for their own problem
     # class — and should read the σ̂²→0 caveat in the LAML docstring first.
