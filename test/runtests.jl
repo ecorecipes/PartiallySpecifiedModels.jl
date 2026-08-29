@@ -4570,14 +4570,17 @@ end
         # every fitted quantity are unchanged by this testset's subject.
         #
         # NOTE ON THRESHOLDS. There is deliberately no `stationary::Bool` in
-        # the API, because measured across all 151 LAML solves this suite
-        # performs the residual is an UNBROKEN continuum, not two clusters:
-        # quantiles p25=1.7e-7, p50=9.5e-6, p75=1.5e-2, p90=0.46, max=14.1,
+        # the API, because measured across all 163 LAML solves this suite
+        # performs (post-F6/F8) the residual is an UNBROKEN continuum, not
+        # two clusters:
+        # quantiles p25=1.6e-7, p50=8.5e-6, p75=1.6e-2, p90=0.29, max=8.7,
         # and over the whole decision-relevant region (1e-3..3) the largest
-        # ratio between consecutive sorted values is 1.65 below 1 and 2.98
+        # ratio between consecutive sorted values is 1.52 below 1 and 2.98
         # across the whole region -- nothing like the orders-of-magnitude
-        # separation a threshold would need, so no cutoff could sit there. (A partial 94-solve sample appeared to show a
-        # 3.2x gap near 0.1; the remaining 57 solves filled it in. That is
+        # separation a threshold would need, so no cutoff could sit there.
+        # (During the original 151-solve calibration, a partial 94-solve
+        # sample appeared to show a 3.2x gap near 0.1; the remaining 57
+        # solves filled it in. That is
         # why none of the assertions below rely on a universal cutoff.)
         # Each either compares a fixture against a STRUCTURALLY MATCHED
         # control, or pins a fixture-specific measured magnitude with wide
@@ -4601,7 +4604,7 @@ end
         s_ok = solve(mk_f2(), LAML(maxiters=30))
         @test s_ok.convergence.converged
         @test s_ok.convergence.smoothing_advanced
-        # measured 2.90e-7; 85 of the suite's 151 solves sit below 1e-4
+        # measured 3.28e-7; 95 of the suite's 163 solves sit below 1e-4
         @test s_ok.convergence.stationarity < 1e-4
         @test isfinite(s_ok.convergence.stationarity)
 

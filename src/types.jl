@@ -1978,11 +1978,12 @@ converged or not.**
   `converged == true` is the strongest available signal that the reported λ̂
   carries no information from the data. It does NOT mean the fit is wrong —
   the initialization can happen to be reasonable — only that nothing chose
-  it. Across the package's own test suite this is `false` for 20 of 151 LAML
-  solves, 13 of which nonetheless report `converged == true`. It is genuinely
-  complementary to `stationarity` rather than a proxy for it: those 20 fits
-  span residuals from 0.016 to 8.7, so a fit can sit at a perfectly ordinary
-  residual and still never have moved its λ̂.
+  it. Across the package's own test suite this is `false` for 17 of 163 LAML
+  solves, 8 of which nonetheless report `converged == true`. It is genuinely
+  complementary to `stationarity` rather than a proxy for it: one of those 17
+  is an unpenalized model whose residual is `0.0` by convention, and the
+  other 16 span residuals from 0.016 to 8.7, so a fit can sit at a perfectly
+  ordinary residual and still never have moved its λ̂.
 
 - `stationarity::Float64`: how far the returned λ̂ is from a stationary point
   of the LAML criterion, as
@@ -1995,7 +1996,7 @@ converged or not.**
   ratio measures the gradient against the natural scale of the block, and `0`
   is exactly stationary. It is **not** bounded above by 1 — the
   `λₖβ̂'Sₖβ̂/σ̂²` term has no upper bound, and the largest value observed
-  across this package's test suite is 14.1. `0.0` when the model has no
+  across this package's test suite is 8.7. `0.0` when the model has no
   penalized term (nothing to be stationary in); `NaN` when the criterion or
   its gradient could not be evaluated.
 
@@ -2017,23 +2018,23 @@ converged or not.**
 ### How to read `stationarity`
 
 **There is deliberately no `stationary::Bool`, because the observed
-distribution does not support one.** Measured on all 151 LAML solves the test
+distribution does not support one.** Measured on all 163 LAML solves the test
 suite performs, the residual is an unbroken continuum rather than two
-clusters. Its quantiles are p25 = 1.7e-7, p50 = 9.5e-6, p75 = 1.4e-2,
-p90 = 0.46, max = 14.1, and across the whole decision-relevant region (1e-3
-to 3) the largest ratio between consecutive sorted values is 1.65 below 1
+clusters. Its quantiles are p25 = 1.6e-7, p50 = 8.5e-6, p75 = 1.6e-2,
+p90 = 0.29, max = 8.7, and across the whole decision-relevant region (1e-3
+to 3) the largest ratio between consecutive sorted values is 1.52 below 1
 and 2.98 across the whole region — nothing resembling the
 orders-of-magnitude separation a threshold would need, so there is
-no gap anywhere a threshold could sit. A cutoff at 0.1 would have flagged 25
-of those 151 solves (16.6%), splitting a continuum of otherwise ordinary
+no gap anywhere a threshold could sit. A cutoff at 0.1 would have flagged 23
+of those 163 solves (14.1%), splitting a continuum of otherwise ordinary
 `:converged_tol` fits.
 
 So treat it as a magnitude, calibrated against your own problem class rather
-than an absolute scale. For orientation, on this suite 85 of 151 solves sit
+than an absolute scale. For orientation, on this suite 95 of 163 solves sit
 below 1e-4; a deliberately non-smooth fixture (a discrete map applying `floor`
 to a coefficient-dependent quantity, which makes the default `jac=:fd`
-Jacobian noise) reads 1.32, against 1.5e-6 for the identical map, basis and
-data with the `floor` removed — a factor of 8.7e5 between two fits that
+Jacobian noise) reads 0.29, against 9.3e-7 for the identical map, basis and
+data with the `floor` removed — a factor of 3.2e5 between two fits that
 `converged` describes identically. A residual orders of magnitude larger than
 comparable fits of yours is the signal; a particular number is not. The usual
 causes of a large value are a non-smooth dynamics function
@@ -2044,11 +2045,12 @@ causes of a large value are a non-smooth dynamics function
 `Gaussian` data the gradient contains `−½λₖβ̂'Sₖβ̂/σ̂²` with `σ̂²` the profiled
 REML scale. On a fit that interpolates its data — noiseless synthetic
 fixtures, most obviously — `σ̂²` underflows toward zero and that term becomes
-a ratio of two near-zero quantities, so the residual is numerically unstable
-and can read anywhere from 1e-2 to ~1 on fits that are otherwise
-indistinguishable. Measured: the same noiseless growth fixture reads 0.042
-under `jac=:fd` and 0.413 under `jac=:forwarddiff`, with λ̂ agreeing to 5e-5
-relative and identical EDF and data loss. This is less a defect in the
+a ratio of two near-zero quantities, so the residual carries no information
+about the search and can read large on a fit that is exact to round-off.
+Measured: the same noiseless growth fixture reads 0.91 under both `jac=:fd`
+and `jac=:forwarddiff` — with λ̂ agreeing to machine precision, EDF to ~1e-4
+relative, `σ̂² ≈ 2e-19` and a data loss of ~3e-18 — an alarming-looking
+residual on an essentially exact fit. This is less a defect in the
 residual than a true statement about the fit — with no residual variance,
 REML does not identify λ and λ̂ is set by round-off — but it does mean
 `stationarity` is uninformative there. Judge it only on fits with meaningful
