@@ -2124,46 +2124,38 @@ end
         @test 0 < norm(a_res) < 1e-4             # via a phase-2 contracted step
     end
 
-    @testset "F5 — PCLS truncation: λ-coupling (OPEN) and the rank guard" begin
+    @testset "F8 — PCLS truncation reference and the step trust region" begin
         PSM = PartiallySpecifiedModels
 
-        # `_pcls_augmented_solve` drops components with σ ≤ 1e-7·σ_max(F_aug).
-        # That reference is λ-DEPENDENT: σ_max(F_aug) grows like √λ·‖C‖ while
-        # the data block W^½J stays O(1), so the EFFECTIVE tolerance on
-        # data-informed directions inflates with λ and past a
-        # fixture-dependent λ the solve zeroes directions the data actually
-        # determines. Those live in null(S) — exactly where a fit with
-        # β'S_kβ = 0 sits. The `@test_broken`s below pin that defect.
+        # `_pcls_truncated_step` drops components with σ ≤ 1e-7·σ_ref.  The
+        # reference is σ_max(W^½J) — the DATA block — NOT σ_max of the
+        # augmented [W^½J; C].  The augmented reference is λ-DEPENDENT:
+        # σ_max(F_aug) grows like √λ·‖C‖ while W^½J stays O(1), so the
+        # EFFECTIVE tolerance on data-informed directions inflates with λ and
+        # past a fixture-dependent λ the solve zeroes directions the data
+        # actually determines.  Those live in null(S) — exactly where a fit
+        # with β'S_kβ = 0 sits.  Sections (1) and (2) pin the λ-invariance
+        # the data reference buys (they were `@test_broken` under F5).
         #
-        # It is NOT fixed by referencing σ_max(W^½J) instead, and this
-        # testset exists partly to stop that being retried blind. The
-        # λ-coupling is silently doing THREE jobs, and only the first is
+        # Correcting the reference was blocked until F8 because the
+        # λ-coupling was silently doing THREE jobs and only the first was
         # documented:
-        #   1. rank guard on the data block — sections (3) below;
-        #   2. subspace trust region at high λ. The λ-free reference takes a
-        #      step 15× longer in a direction where the linearization has
-        #      stopped holding (measured on a Lotka-Volterra GCV working
-        #      model at λ₂ = 4.8e9: penalized objective 1248.6 at α = 1 and
-        #      13.84 at best, against 2.58 at α = 1 for the λ-coupled step);
-        #   3. an implicit brake on Fellner-Schall λ escalation. Removing it
-        #      lets λ run away — measured on the SCOP-spline SIR fixture in
-        #      "known_params mixed with an approximator", λ̂ goes 5.2e-6 →
-        #      2.4e17 and β̂(0.05) goes 0.387 → -3086.9 (truth 0.389).
-        # Measured suite cost of the λ-free reference alone: 3 failures
-        # ("LAML mixed spline+NN", data_loss 18534 against a < 500 gate).
-        # Emitting BOTH steps as candidates and letting the penalized
-        # objective choose fixes those 3 but still trips job 3 above (1
-        # failure). A real fix needs jobs 2 and 3 given their own
-        # mechanisms — a trust region and a λ bound — not a different
-        # constant. Retuning the constant is squeezed from both sides: on
-        # the data scale σ/σ_max(W^½J), the informative null(S) direction
-        # below sits at 0.0995 and must be KEPT, the Lotka-Volterra
-        # direction that wrecks the step sits at 4.5e-4 and must be
-        # DROPPED, and staying inert on the poor-init fixture of section
-        # (3) additionally caps the tolerance at its smallest genuine
-        # direction, 1.6e-3. That leaves 4.5e-4 … 1.6e-3 — half a decade,
-        # calibrated on two fixtures, with no reason to generalize.
-
+        #   1. rank guard on the data block — section (3) below.  This
+        #      SURVIVES the change: the guard is a statement about the data
+        #      block, so referencing the data block keeps it exactly.
+        #   2. subspace trust region at high λ — section (5) below.  This is
+        #      the job that now has its own explicit mechanism, the
+        #      Levenberg-Marquardt damping ladder in `_pcls_step_contract`.
+        #   3. an implicit brake on Fellner-Schall λ escalation.  Measured
+        #      not to be a separate mechanism: on the SCOP-spline SIR fixture
+        #      in "known_params mixed with an approximator" the data
+        #      reference ALONE leaves λ̂ at 9.65e-6 and β̂(0.05) at 0.38431,
+        #      bit-identical to the augmented reference; with the trust
+        #      region they are 6.049e-7 and 0.39595.  No escalation appears,
+        #      so job 3 was an artifact of F5's rejected two-candidate rule,
+        #      not of the reference.
+        # Retuning the CONSTANT was never the answer, and section (4) keeps
+        # that measurement so the gap is re-measured rather than re-argued.
         # ── Shared helpers: the solver's own working linear model ────────
         function f5_working(prob, beta)
             n_t = length(prob.data_times); n_o = length(prob.obs_to_state)
@@ -2214,38 +2206,35 @@ end
         J_f5, z_f5, w_f5 = f5_working(prob_f5, btrue_f5)
         lams_f5 = [1e8, 1e10, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17]
 
-        # (1) BROKEN: the NUMBER OF RETAINED DIRECTIONS should be
-        # λ-invariant. Measured WITHOUT reproducing the truncation rule —
-        # the solve is linear in `z_pseudo`, so applying it to a basis of
-        # RHS vectors recovers the operator z ↦ β̂, whose rank is exactly
-        # the number of directions the data is allowed to inform. At large
-        # λ only null(S) survives, so that rank SHOULD be dim null(S) = 2
-        # at every λ. Measured today: 2, 2, 1, 6, 6, 6, 6, 6 — and the 6s
-        # are degenerate, every retained singular value ~1e-14, i.e. the
-        # fit is annihilated. With a λ-free reference it is 2 at all eight
-        # λ with a clean gap (operator singular values 0.288, 0.038, then
-        # ≤ 3.6e-10) — that part of the fix is right, it is jobs 2 and 3
-        # above that block it.
+        # (1) The NUMBER OF RETAINED DIRECTIONS is λ-invariant. Measured
+        # WITHOUT reproducing the truncation rule — the solve is linear in
+        # `z_pseudo`, so applying it to a basis of RHS vectors recovers the
+        # operator z ↦ β̂, whose rank is exactly the number of directions
+        # the data is allowed to inform. At large λ only null(S) survives,
+        # so that rank must be dim null(S) = 2 at every λ. Under the
+        # augmented reference it was 2, 2, 1, 6, 6, 6, 6, 6 — and the 6s
+        # were degenerate, every retained singular value ~1e-14, i.e. the
+        # fit annihilated. Measured now: 2 at all eight λ.
         ranks_f5 = map(lams_f5) do lam
             Bm = f5_B(prob_f5, [lam], np_f5)
             M = reduce(hcat, (PSM._pcls_augmented_solve(J_f5, ei, Bm, w_f5)
                               for ei in eachcol(Matrix(1.0I, 12, 12))))
             rank(M; rtol=1e-8)
         end
-        @test_broken all(==(2), ranks_f5)
-        # …but the small-λ end is NOT broken and must stay that way: the
-        # defect only switches on once √λ‖C‖ overtakes σ_max(W^½J).
+        @test all(==(2), ranks_f5)
+        # The small-λ end was never broken and must stay that way: the old
+        # defect only switched on once √λ‖C‖ overtook σ_max(W^½J).
         @test all(==(2), ranks_f5[1:2])          # λ = 1e8, 1e10
 
-        # (2) BROKEN: and so the FIT should stop moving with λ. Measured
-        # today: 0.00164, 0.00164, 0.1133, then 0.28284 for every λ ≥ 1e13
-        # — a 172× error inflation. With a λ-free reference: 0.0016441 flat
-        # to 5 significant figures across nine decades.
+        # (2) …and so the FIT stops moving with λ. Under the augmented
+        # reference: 0.00164, 0.00164, 0.1133, then 0.28284 for every
+        # λ ≥ 1e13 — a 172× error inflation. Measured now: 0.001644052 …
+        # 0.001644099 across nine decades, a spread of 4.6e-8.
         errs_f5 = [norm(PSM._pcls_augmented_solve(
                             J_f5, z_f5, f5_B(prob_f5, [lam], np_f5), w_f5)
                         .- btrue_f5) for lam in lams_f5]
-        @test_broken maximum(errs_f5) < 2e-3
-        @test_broken maximum(errs_f5) - minimum(errs_f5) < 1e-6
+        @test maximum(errs_f5) < 2e-3
+        @test maximum(errs_f5) - minimum(errs_f5) < 1e-6
         @test maximum(errs_f5[1:2]) < 2e-3       # small-λ end is correct
 
         # ── (3) MODE (b) REGRESSION GUARD: the reason the truncation exists
@@ -2258,6 +2247,11 @@ end
         #    handles by itself and the failure mode does not reproduce).
         #    This must keep holding: it is what a naive relaxation of the
         #    1e-7 constant to 1e-13 destroys (measured: ‖β̂‖ back to 2.3e9).
+        #    Retargeting the reference from the augmented matrix to the data
+        #    block leaves it untouched — the guard was always a statement
+        #    about the data block, and here √λ‖C‖ never overtakes
+        #    σ_max(W^½J) anyway. The LM ladder is checked to be bounded too,
+        #    since it is the other thing that can now propose a step.
         prob_f5b = PSMProblem(f5_growth!, [1.1], (0.0, 12.0),
             [BSplineApproximator(:r, (0.5, 4.0), 8)];   # default x -> 0
             data_times=dt_f5, data_values=dv_f5, obs_to_state=[1],
@@ -2275,6 +2269,13 @@ end
             b_tr = PSM._pcls_augmented_solve(J_f5b, z_f5b, B_f5b, w_f5b)
             @test norm(b_qr) > 1e8      # measured 2.27e9 / 2.39e9
             @test norm(b_tr) < 1.0      # measured 0.153 / 0.282
+            # the damping ladder is bounded here too (measured, λ = 0:
+            # 0.152 / 0.153 / 0.153; λ = 1/tr(S): 0.152 / 0.169 / 0.272)
+            fac_f5b = PSM._pcls_factorize(J_f5b, z_f5b, B_f5b, w_f5b)
+            for τ in (1e-1, 1e-2, 1e-3)
+                @test norm(PSM._pcls_damped_step(
+                    fac_f5b, beta0_f5b, τ * fac_f5b.sigma_data)) < 1.0
+            end
         end
 
         # ── (4) The squeeze that blocks a one-constant fix. On the SAME
@@ -2330,6 +2331,103 @@ end
         # The squeeze: the direction to keep and the direction to drop are
         # within ~2.3 decades of each other on the data scale.
         @test minimum(rel_a) / minimum(rel_lv) < 1e3
+
+        # ── (5) JOB 2: the explicit step trust region, on the SAME
+        #    Lotka-Volterra working model. `δ`'s truth is constant, hence in
+        #    null(S), so GCV drives λ₂ to ~2e9 and the λ-free solve keeps a
+        #    direction the linearization cannot support. Reached
+        #    deterministically: one contracted PCLS step from the initial
+        #    coefficients puts us at the iterate where the undamped step
+        #    goes wrong.
+        #
+        #    The load-bearing point is that BACKTRACKING CANNOT FIX IT.
+        #    Backtracking only shortens the Gauss-Newton direction, and here
+        #    the direction itself is wrong: rescaling it down to the length
+        #    the trust region actually takes still scores worse than not
+        #    stepping. Damping has to live in the SOLVE.
+        B_lv5 = f5_B(prob_lv5, [2.56, 4.832e9], 12)
+        yv_lv5 = [prob_lv5.data_values[ti, oi] for oi in 1:2 for ti in 1:7]
+        wv_lv5 = [prob_lv5.data_weights[ti, oi] for oi in 1:2 for ti in 1:7]
+        function lv5_obj(b, Bm)
+            ft = try
+                pred = PSM.simulate(prob_lv5, b)
+                [pred[ti, oi] for oi in 1:2 for ti in 1:7]
+            catch; return Inf; end
+            any(!isfinite, ft) && return Inf
+            -PSM.log_likelihood(prob_lv5.likelihood, yv_lv5, ft, wv_lv5) +
+                0.5 * dot(b, Bm * b)
+        end
+        fac0_lv5 = PSM._pcls_factorize(J_lv5, z_lv5, B_lv5, w_lv5)
+        b1_lv5, _ = PSM._pcls_step_contract(
+            lv5_obj, b0_lv5, PSM._pcls_truncated_step(fac0_lv5), B_lv5, fac0_lv5)
+        J1_lv5, z1_lv5, w1_lv5 = f5_working(prob_lv5, b1_lv5)
+        fac1_lv5 = PSM._pcls_factorize(J1_lv5, z1_lv5, B_lv5, w1_lv5)
+        und_lv5 = PSM._pcls_truncated_step(fac1_lv5)
+        fold_lv5 = lv5_obj(b1_lv5, B_lv5)                 # measured 14.904
+
+        # The undamped step is long and catastrophic: measured ‖s‖ = 3.88 and
+        # objective 350.6 at α = 1 against 14.90 before the step, i.e. 23.5×
+        # worse — comfortably past the PSM._PCLS_STEP_REJECT trigger of 10.
+        @test norm(und_lv5 .- b1_lv5) > 3.0
+        @test lv5_obj(und_lv5, B_lv5) > PSM._PCLS_STEP_REJECT * fold_lv5
+
+        # Contraction alone barely moves (measured 14.573); the trust region
+        # gets 2.012 — 7.2× better.
+        a4_lv5, f4_lv5 = PSM._pcls_step_contract(lv5_obj, b1_lv5, und_lv5, B_lv5)
+        a5_lv5, f5_lv5 = PSM._pcls_step_contract(lv5_obj, b1_lv5, und_lv5,
+                                                 B_lv5, fac1_lv5)
+        @test f4_lv5 > 0.9 * fold_lv5
+        @test f5_lv5 < 0.3 * f4_lv5
+        @test norm(a5_lv5 .- b1_lv5) < norm(a4_lv5 .- b1_lv5)
+
+        # …and a pure step-length cap on the undamped DIRECTION does not:
+        # rescaled to the trust region's own step length it scores 14.745,
+        # still worse than the 14.573 that plain backtracking finds.
+        d_lv5 = und_lv5 .- b1_lv5
+        capped_lv5 = b1_lv5 .+ (norm(a5_lv5 .- b1_lv5) / norm(d_lv5)) .* d_lv5
+        @test lv5_obj(capped_lv5, B_lv5) > 0.9 * fold_lv5
+
+        # ── (6) The trust region is INERT when the full step is merely
+        #    imperfect, so ordinary fits are untouched — including the ones
+        #    that pin exact agreement between two code paths (the GCVSolver
+        #    :reuse equivalence). On the exponential-growth fixture at its own
+        #    initialization and a light penalty the full step IMPROVES the
+        #    objective (measured 6.4596e-4 → 5.2574e-4), so the trigger is
+        #    nowhere near, and the 4- and 5-argument contractions agree
+        #    exactly.
+        function f5_obj(b, Bm)
+            ft = try
+                pred = PSM.simulate(prob_f5, b); [pred[ti, 1] for ti in 1:12]
+            catch; return Inf; end
+            any(!isfinite, ft) && return Inf
+            -PSM.log_likelihood(prob_f5.likelihood,
+                                [prob_f5.data_values[ti, 1] for ti in 1:12], ft,
+                                [prob_f5.data_weights[ti, 1] for ti in 1:12]) +
+                0.5 * dot(b, Bm * b)
+        end
+        b0_f5h = PSM.build_initial_params(prob_f5)
+        Jh, zh, wh = f5_working(prob_f5, b0_f5h)
+        Bh = f5_B(prob_f5, [1e-3], np_f5)
+        fach = PSM._pcls_factorize(Jh, zh, Bh, wh)
+        undh = PSM._pcls_truncated_step(fach)
+        @test f5_obj(undh, Bh) < f5_obj(b0_f5h, Bh)
+        @test f5_obj(undh, Bh) < PSM._PCLS_STEP_REJECT * f5_obj(b0_f5h, Bh)
+        r4h = PSM._pcls_step_contract(f5_obj, b0_f5h, undh, Bh)
+        r5h = PSM._pcls_step_contract(f5_obj, b0_f5h, undh, Bh, fach)
+        @test r5h[1] == r4h[1]
+        @test r5h[2] == r4h[2]
+
+        # …and the damped solve is the LM step it claims to be: μ = 0
+        # reproduces the plain augmented least-squares solution, and the
+        # step length is non-increasing in μ (measured 0.01288 → 8.4e-7).
+        Csh = PSM.penalty_sqrt_matrix(Bh)
+        Wsh = sqrt.(max.(wh, 1e-15))
+        ls_h = vcat(Diagonal(Wsh) * Jh, Csh) \ vcat(Wsh .* zh, zeros(size(Csh, 1)))
+        @test norm(PSM._pcls_damped_step(fach, b0_f5h, 0.0) .- ls_h) /
+              norm(ls_h) < 1e-10
+        lens_h = [norm(PSM._pcls_damped_step(fach, b0_f5h, μ) .- b0_f5h)
+                  for μ in (0.0, 1e-3, 1e-2, 1e-1, 1.0, 10.0) .* fach.sigma_data]
+        @test issorted(lens_h; rev=true)
     end
 
     @testset "TwoStageSolver — logistic growth" begin
@@ -4472,14 +4570,17 @@ end
         # every fitted quantity are unchanged by this testset's subject.
         #
         # NOTE ON THRESHOLDS. There is deliberately no `stationary::Bool` in
-        # the API, because measured across all 151 LAML solves this suite
-        # performs the residual is an UNBROKEN continuum, not two clusters:
-        # quantiles p25=1.7e-7, p50=9.5e-6, p75=1.5e-2, p90=0.46, max=14.1,
+        # the API, because measured across all 163 LAML solves this suite
+        # performs (post-F6/F8) the residual is an UNBROKEN continuum, not
+        # two clusters:
+        # quantiles p25=1.6e-7, p50=8.5e-6, p75=1.6e-2, p90=0.29, max=8.7,
         # and over the whole decision-relevant region (1e-3..3) the largest
-        # ratio between consecutive sorted values is 1.65 below 1 and 2.98
+        # ratio between consecutive sorted values is 1.52 below 1 and 2.98
         # across the whole region -- nothing like the orders-of-magnitude
-        # separation a threshold would need, so no cutoff could sit there. (A partial 94-solve sample appeared to show a
-        # 3.2x gap near 0.1; the remaining 57 solves filled it in. That is
+        # separation a threshold would need, so no cutoff could sit there.
+        # (During the original 151-solve calibration, a partial 94-solve
+        # sample appeared to show a 3.2x gap near 0.1; the remaining 57
+        # solves filled it in. That is
         # why none of the assertions below rely on a universal cutoff.)
         # Each either compares a fixture against a STRUCTURALLY MATCHED
         # control, or pins a fixture-specific measured magnitude with wide
@@ -4503,7 +4604,7 @@ end
         s_ok = solve(mk_f2(), LAML(maxiters=30))
         @test s_ok.convergence.converged
         @test s_ok.convergence.smoothing_advanced
-        # measured 2.90e-7; 85 of the suite's 151 solves sit below 1e-4
+        # measured 3.28e-7; 95 of the suite's 163 solves sit below 1e-4
         @test s_ok.convergence.stationarity < 1e-4
         @test isfinite(s_ok.convergence.stationarity)
 

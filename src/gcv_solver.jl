@@ -735,20 +735,22 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     end
 
     # PCLS step: truncated-SVD solve of the augmented system
-    # [W^½J; C] β = [W^½z; 0] — see _pcls_augmented_solve in pcls.jl.
-    # (Shared with the LAML solver; the SVD truncation guards against
-    # exploding coefficients along numerically-null Jacobian directions
-    # at poor initializations, and equals the plain QR solve when the
-    # system is well-conditioned.)
+    # [W^½J; C] β = [W^½z; 0] — see _pcls_factorize / _pcls_truncated_step
+    # in pcls.jl.  (Shared with the LAML solver; the SVD truncation guards
+    # against exploding coefficients along numerically-null Jacobian
+    # directions at poor initializations, and equals the plain QR solve when
+    # the system is well-conditioned.)  The factorization is returned as well
+    # so `step_contract` can reuse it for the trust region.
     function pcls_step(J_mat, z_pseudo, th, w_irls)
         B = build_B(th)
-        _pcls_augmented_solve(J_mat, z_pseudo, B, w_irls), B
+        fac = _pcls_factorize(J_mat, z_pseudo, B, w_irls)
+        _pcls_truncated_step(fac), B, fac
     end
 
-    # Step contraction: backtracking with explosive-step rescue — see
-    # _pcls_step_contract in pcls.jl.
-    step_contract(a_old, a_new, B) =
-        _pcls_step_contract(penalized_objective, a_old, a_new, B)
+    # Step contraction: backtracking with explosive-step rescue, plus the
+    # Levenberg-Marquardt trust region — see _pcls_step_contract in pcls.jl.
+    step_contract(a_old, a_new, B, fac) =
+        _pcls_step_contract(penalized_objective, a_old, a_new, B, fac)
 
     # Initialize
     beta  = build_initial_params(prob)
@@ -864,8 +866,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
         # PCLS step at current θ; step_contract already returns the
         # penalized objective at the accepted point (a full ODE solve),
         # so reuse it for convergence tracking instead of recomputing.
-        beta_new_pcls, B_new = pcls_step(J, z_pseudo, theta, w_irls)
-        beta_new, curr_obj = step_contract(beta, beta_new_pcls, B_new)
+        beta_new_pcls, B_new, fac_new = pcls_step(J, z_pseudo, theta, w_irls)
+        beta_new, curr_obj = step_contract(beta, beta_new_pcls, B_new, fac_new)
 
         if verbose && (iter <= 4 || iter % 10 == 0)
             data_ss = sum(w_vec[i] * (y_vec[i] - f_vec[i])^2 for i in 1:n_data)
