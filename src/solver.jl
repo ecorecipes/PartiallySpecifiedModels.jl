@@ -864,17 +864,20 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     end
 
     # PCLS step: truncated-SVD solve of the augmented system
-    # [W^½J; C] β = [W^½z; 0] — see _pcls_augmented_solve in pcls.jl.
-    # Uses IRLS weights that depend on the current predictions.
+    # [W^½J; C] β = [W^½z; 0] — see _pcls_factorize / _pcls_truncated_step in
+    # pcls.jl.  Uses IRLS weights that depend on the current predictions.
+    # The factorization is returned as well so `step_contract` can reuse it
+    # for the trust region instead of decomposing again.
     function pcls_step(J_mat, z_pseudo, th, w_irls)
         B = build_B(th)
-        _pcls_augmented_solve(J_mat, z_pseudo, B, w_irls), B
+        fac = _pcls_factorize(J_mat, z_pseudo, B, w_irls)
+        _pcls_truncated_step(fac), B, fac
     end
 
-    # Step contraction: backtracking with explosive-step rescue — see
-    # _pcls_step_contract in pcls.jl.
-    step_contract(a_old, a_new, B) =
-        _pcls_step_contract(penalized_objective, a_old, a_new, B)
+    # Step contraction: backtracking with explosive-step rescue, plus the
+    # Levenberg-Marquardt trust region — see _pcls_step_contract in pcls.jl.
+    step_contract(a_old, a_new, B, fac) =
+        _pcls_step_contract(penalized_objective, a_old, a_new, B, fac)
 
     # Initialize
     beta = build_initial_params(prob)
@@ -911,8 +914,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             z_pseudo = y_vec .- f_vec .+ J * beta
 
             # Try step with current θ
-            a0_pcls, _ = pcls_step(J, z_pseudo, gw_otheta, w_gauss)
-            a0, f01 = step_contract(beta, a0_pcls, build_B(gw_otheta))
+            a0_pcls, B0, fac0 = pcls_step(J, z_pseudo, gw_otheta, w_gauss)
+            a0, f01 = step_contract(beta, a0_pcls, B0, fac0)
 
             # After warmup iters, also estimate θ via Gaussian LAML
             if gw_iter > 3
@@ -924,8 +927,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                 catch; (copy(gw_otheta), NaN); end
 
                 # Try step with new θ
-                a1_pcls, B1 = pcls_step(J, z_pseudo, theta_new, w_gauss)
-                a1, f11 = step_contract(beta, a1_pcls, B1)
+                a1_pcls, B1, fac1 = pcls_step(J, z_pseudo, theta_new, w_gauss)
+                a1, f11 = step_contract(beta, a1_pcls, B1, fac1)
 
                 # Accept new θ only if it improves the Gaussian data fit.
                 # Evaluate each candidate's model ONCE (a full ODE solve) —
@@ -1029,16 +1032,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         z_pseudo = y_vec .- f_vec .+ J * beta
 
         # PCLS with current (accepted) θ
-        a0_pcls, _ = pcls_step(J, z_pseudo, otheta, w_irls)
-        a0, f01 = step_contract(beta, a0_pcls, build_B(otheta))
+        a0_pcls, B_old, fac0 = pcls_step(J, z_pseudo, otheta, w_irls)
+        a0, f01 = step_contract(beta, a0_pcls, B_old, fac0)
 
         stop = false
         obj_prev = penalized_objective(beta, build_B(otheta))
 
         if iter > 0 && m > 0
             # PCLS with new θ (from LAML)
-            a1_pcls, B_new = pcls_step(J, z_pseudo, theta, w_irls)
-            a1, f11 = step_contract(beta, a1_pcls, B_new)
+            a1_pcls, B_new, fac1 = pcls_step(J, z_pseudo, theta, w_irls)
+            a1, f11 = step_contract(beta, a1_pcls, B_new, fac1)
 
             f10 = penalized_objective(beta, B_new)
 
