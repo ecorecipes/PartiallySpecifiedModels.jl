@@ -4689,17 +4689,22 @@ end
         @test s_smooth.convergence.converged
         @test s_kink.convergence.converged
         # ...but the stationarity residuals differ by orders of magnitude.
-        # Measured: 9.28e-7 (smooth) vs 0.293 (kinked), a factor of ~3.2e5.
-        # Asserted at 1e3 -- ~320x of margin -- so this is a qualitative
+        # Measured: 9.28e-7 (smooth) vs 0.0539 (kinked), a factor of ~5.8e4.
+        # Asserted at 1e3 -- ~58x of margin -- so this is a qualitative
         # separation check, not a pinned constant.
         @test s_kink.convergence.stationarity >
               1e3 * s_smooth.convergence.stationarity
         @test s_smooth.convergence.stationarity < 1e-4    # measured 9.3e-7
-        # measured 0.293. Was 1.32 pre-F6, at a WORSE fit: EDF 6.65 -> 6.23
-        # and data loss 5.678 -> 5.420, i.e. the kinked fixture is somewhat
-        # less stalled now, not more. The threshold moves 0.5 -> 0.1 to track
-        # that; it still sits 3.2e5x above the smooth control.
-        @test s_kink.convergence.stationarity > 0.1
+        # measured 0.0539 (kink edf 7.51, data loss 5.678, --check-bounds
+        # run config). The kink residual has tracked every improvement to
+        # the machinery it exercises: 1.32 pre-F6, 0.293 post-F6 (threshold
+        # 0.5 -> 0.1), and now 0.0539 after B1's noise-aware FD step growth
+        # (compute_jacobian! grows kink-noise-dominated columns to a
+        # provably-resolved step, so the lambda search stalls less badly on
+        # this fixture -- less stalled, still stalled). The threshold moves
+        # 0.1 -> 0.02 to track it, with 2.7x margin, and the kink residual
+        # still sits 5.8e4x above the smooth control.
+        @test s_kink.convergence.stationarity > 0.02
         # here FS DID move lambda -- it just never reached an optimum, which
         # is exactly why `smoothing_advanced` alone cannot detect this mode
         # and the residual is needed
@@ -8330,6 +8335,101 @@ end
         # 0.65s (its Jacobian is dominated by the pointwise state blocks).
     end
 
+    @testset "B1: exact-reference Jacobian — jac=:fd absolute noise floor" begin
+        PSM = PartiallySpecifiedModels
+
+        # Time-as-state quadrature fixture: du₁ = r(u₂), du₂ = 1, so the
+        # trajectory is LINEAR in the spline coefficients and the Jacobian
+        # has the closed form J[i,j] = ∫₀^{tᵢ} B_j(t) dt — an exact
+        # reference independent of AD and FD, built by extracting the
+        # per-interval cubics of the package's own basis (4-point
+        # Vandermonde solve per interval; extraction error asserted below,
+        # measured 4.8e-15). Sensitivities are O(1) (‖J‖_max = 1.196), the
+        # regime where the FD path's ABSOLUTE error floor is visible: the
+        # adaptive re-solve jitter (measured 1.5e-6 at the default
+        # reltol=abstol=1e-8) divided by a too-small step swamped the
+        # entries — before the noise-aware step growth in
+        # compute_jacobian!, jac=:fd measured absmax error 6.45e-1 against
+        # this reference (54% of scale) while the step-adaptation loop
+        # SHRANK dam 1e-8 → 1e-9 on every column (it misread the noise in
+        # the second difference as truncation error). The W11 fixtures
+        # above never see this: they are noise-free at their evaluation
+        # points, so their FD errors sit at 1e-10.
+        b1_nk = 6
+        b1_a = BSplineApproximator(:r, (0.0, 5.0), b1_nk)
+        b1_beta = [0.10, 0.14, 0.05, 0.12, 0.08, 0.15]
+        b1_dyn!(du, u, p, t) = (du[1] = p.r(u[2]); du[2] = 1.0; nothing)
+        b1_times = collect(0.0:0.5:5.0)
+        b1_nT = length(b1_times)
+        b1_prob = PSMProblem(b1_dyn!, [1.0, 0.0], (0.0, 5.0), [b1_a];
+                             data_times=b1_times,
+                             data_values=reshape(ones(b1_nT), :, 1),
+                             obs_to_state=[1], likelihood=Gaussian(),
+                             solver=Tsit5())
+
+        # Per-interval cubic extraction from the package's own evaluator
+        b1_polyval(c, x) = c[1] + c[2]*x + c[3]*x^2 + c[4]*x^3
+        b1_anti(c, x) = c[1]*x + c[2]*x^2/2 + c[3]*x^3/3 + c[4]*x^4/4
+        function b1_poly_coeffs(lo, hi)
+            xs4 = collect(range(lo + 0.1*(hi - lo), hi - 0.1*(hi - lo),
+                                length=4))
+            V = [x^k for x in xs4, k in 0:3]
+            C = zeros(4, b1_nk)
+            for j in 1:b1_nk
+                e = zeros(b1_nk); e[j] = 1.0
+                ev = PSM.build_evaluator(b1_a, e)
+                C[:, j] = V \ [ev(x) for x in xs4]
+            end
+            C
+        end
+        b1_C = [b1_poly_coeffs(Float64(k), Float64(k + 1)) for k in 0:4]
+        b1_ev = PSM.build_evaluator(b1_a, b1_beta)
+        b1_extract_err = maximum(
+            abs(b1_ev(x) - sum(b1_beta[j] *
+                b1_polyval(b1_C[clamp(floor(Int, x) + 1, 1, 5)][:, j], x)
+                for j in 1:b1_nk))
+            for x in range(0.02, 4.98, length=249))
+        @test b1_extract_err < 1e-13   # measured 4.8e-15
+
+        function b1_integral_basis(j, T)
+            s = 0.0
+            for k in 0:4
+                lo = Float64(k); hi = min(Float64(k + 1), T)
+                hi <= lo && break
+                c = b1_C[k + 1][:, j]
+                s += b1_anti(c, hi) - b1_anti(c, lo)
+            end
+            s
+        end
+        b1_Jref = [b1_integral_basis(j, b1_times[i])
+                   for i in 1:b1_nT, j in 1:b1_nk]
+
+        b1_f0 = vec(PSM.simulate(b1_prob, b1_beta))
+        # Closed-form trajectory parity: pred(tᵢ) = 1 + Σⱼ βⱼ∫₀^{tᵢ}Bⱼ —
+        # measured 8.3e-7 (the ODE solver's own error at default tolerance)
+        @test maximum(abs(b1_f0[i] - (1.0 + sum(b1_beta[j] *
+                  b1_Jref[i, j] for j in 1:b1_nk))) for i in 1:b1_nT) < 1e-5
+
+        b1_Jfd = zeros(b1_nT, b1_nk)
+        b1_dam = fill(1e-8, b1_nk)
+        PSM.compute_jacobian!(b1_Jfd, b1_prob, copy(b1_beta), b1_f0,
+                              b1_nT, 1; dam=b1_dam, jac=:fd)
+        b1_Jfw = zeros(b1_nT, b1_nk)
+        PSM.compute_jacobian!(b1_Jfw, b1_prob, copy(b1_beta), b1_f0,
+                              b1_nT, 1; dam=fill(1e-8, b1_nk),
+                              jac=:forwarddiff,
+                              fd_cfg=PSM._fd_jacobian_config(b1_nk))
+        # BOTH backends against the exact reference, ABSOLUTE error on this
+        # ‖J‖=1.196 matrix. :forwarddiff measured 2.6e-6 (solver precision;
+        # 4x headroom). :fd measured 6.8e-5 post-fix (3x headroom) — the
+        # unfixed code measured 6.45e-1 here, 3000x over this gate.
+        @test maximum(abs, b1_Jfw - b1_Jref) < 1e-5
+        @test maximum(abs, b1_Jfd - b1_Jref) < 2e-4
+        # The wrong-way step adaptation itself: noise domination must never
+        # SHRINK the step below its start (unfixed code: every entry 1e-9).
+        @test all(b1_dam .>= 1e-8)
+    end
+
     # ─── N0: penalty_blocks — multiple penalty blocks per approximator ──
 
     @testset "N0: penalty_blocks" begin
@@ -9775,29 +9875,34 @@ end
         prob = tc_prob(a)
 
         # THE KINK MATTERS. β(t) is piecewise linear in t between covariate
-        # times, so the default finite-difference prediction Jacobian picks up
-        # adaptive-step noise at the kinks and the λ search stalls — the N0
-        # failure mode, reproduced here as a DIRECT comparison rather than
-        # asserted from theory.
+        # times, so the finite-difference prediction Jacobian picks up
+        # adaptive-step noise at the kinks — the N0 failure mode, reproduced
+        # here as a DIRECT comparison rather than asserted from theory.
         sol_fd = solve(prob, LAML(maxiters=60, warmup=10, initial_lambda=0.01))
         sol = solve(tc_prob(TC(:beta, tc_ct, tc_temp; trans=:expsm, nknots=8,
                                initial=z -> 0.3)),
                     LAML(maxiters=60, warmup=10, initial_lambda=0.01,
                          jac=:forwarddiff))
-        # β(t) is piecewise linear, so the fd prediction Jacobian is noisy at
-        # the kinks and its λ search lands far from the optimum. The
-        # forwarddiff side is stable and exact: objective 480.98, λ_inner
-        # 11.5632, converged.
+        # The forwarddiff side is stable and exact: objective 480.98,
+        # converged.
         #
-        # The fd side is NOT quotable as a number — it is chaotic in the
-        # exact arithmetic. Measured: 611.90 (:maxiters) at BLAS=4/8 under
-        # --check-bounds=yes, 746.19 (:maxiters) at BLAS=1, and 1993.61
-        # REPORTING :converged_tol without the flag. So the gap runs from
-        # ~131 to ~1513 nats and the reported status flips with the run
-        # configuration — fd may or may not admit it failed. The assertion
-        # below is deliberately a floor (20 nats) that every variant clears
-        # by at least 6x, not a pin on any of those values.
-        @test sol.objective < sol_fd.objective - 20.0
+        # HISTORY OF THIS ASSERTION. Before compute_jacobian!'s noise-aware
+        # step selection (the B1 fix: the FD path measures the re-solve
+        # jitter per call and grows a catastrophically noise-dominated
+        # column's step until its signal clears 1e4x the noise) the fd side
+        # was NOT quotable as a number — chaotic in the exact arithmetic,
+        # measured 611.90 (:maxiters) at BLAS=4/8 under --check-bounds=yes,
+        # 746.19 (:maxiters) at BLAS=1, and 1993.61 without the flag: 131
+        # to 1513 nats worse than forwarddiff, and this test asserted that
+        # gap as a 20-nat floor. The step-growth fix targets exactly this
+        # mechanism (kink noise in the perturbed re-solves), and the
+        # measured post-fix gap collapses: fd objective 480.83, converged,
+        # 0.15 nats BETTER than forwarddiff's 480.98 (--check-bounds run
+        # config, BLAS default). One config measured post-fix, so the
+        # assertion is a generous parity band — 20 nats, the same floor the
+        # broken fd cleared by 6x from the OTHER side — not a pin on either
+        # value.
+        @test abs(sol.objective - sol_fd.objective) < 20.0
         @test sol.convergence.converged
 
         # two smoothing parameters, one per penalty block, jointly estimated

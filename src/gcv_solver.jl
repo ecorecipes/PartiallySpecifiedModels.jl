@@ -765,8 +765,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     end
 
     f_vec, _ = eval_model(beta)
+    # grow=false: the :direct vs :reuse equivalence contract (tested to
+    # 1e-6 agreement) requires a beta-continuous Jacobian policy, so
+    # GCVSolver pins the historical fixed-step FD path — see the
+    # compute_jacobian! docstring.
     compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
-                      jac=alg.jac, fd_cfg=fd_cfg)
+                      jac=alg.jac, fd_cfg=fd_cfg, grow=false)
 
     prev_obj = Inf
     gcv_val  = NaN
@@ -788,7 +792,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
         end
         f_vec .= f_vec_new
         compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
-                          jac=alg.jac, fd_cfg=fd_cfg)
+                          jac=alg.jac, fd_cfg=fd_cfg, grow=false)
 
         # Compute IRLS weights from current predictions
         w_irls = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
@@ -902,7 +906,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
         k += 1
     end
     compute_jacobian!(J, prob, p_opt, f_vec, n_times, n_obs; dam=dam,
-                      jac=alg.jac, fd_cfg=fd_cfg)
+                      jac=alg.jac, fd_cfg=fd_cfg, grow=false)
 
     B_final  = build_B(theta)
     W_irls   = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
