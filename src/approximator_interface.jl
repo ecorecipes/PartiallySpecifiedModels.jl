@@ -172,3 +172,37 @@ function penalty_blocks(approx)
         return Tuple{Matrix{Float64}, UnitRange{Int}}[]
     Tuple{Matrix{Float64}, UnitRange{Int}}[(S, 1:np)]
 end
+
+"""
+    band_domain(approx) -> Tuple or nothing
+
+Interval over which a univariate confidence band for `approx`'s unknown
+function should be gridded, or `nothing` when the type has no such interval
+(a bivariate surface, or an approximator deliberately constructed without a
+domain — e.g. a `NeuralApproximator`).
+
+This is an OPTIONAL protocol function, like [`penalty_blocks`](@ref), and is
+exported alongside it: the four REQUIRED functions of the approximator
+extension protocol are `nparams`, `initial_params`, `penalty_matrix` and
+`build_evaluator`, and a `domain` FIELD is deliberately not among them.
+`bootstrap` nevertheless has
+to grid something to produce an unknown-function band, and it used to read
+`approx.domain` directly — which threw a hard `FieldError` on any custom
+type that satisfies the documented protocol without carrying that field,
+killing the whole bootstrap (the grid loop runs before the first replicate
+is fitted, so not even the coefficient intervals survived).
+
+The default reads an `a.domain` field when the type has one, so every
+built-in and every custom type that happens to carry a `domain` behaves
+exactly as before. A custom type that stores its range under another name —
+or computes it — opts into a band by defining this method:
+
+```julia
+PartiallySpecifiedModels.band_domain(a::MyApproximator) = (a.lo, a.hi)
+```
+
+Types that return `nothing` are skipped with a warning; the rest of the
+bootstrap (coefficient and fitted-value intervals) still runs.
+"""
+band_domain(approx::AbstractApproximator) =
+    hasproperty(approx, :domain) ? approx.domain : nothing

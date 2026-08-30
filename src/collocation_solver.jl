@@ -623,7 +623,11 @@ effective scale, mirroring `LAML`'s default `:working` criterion.
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
 `sol.convergence` is a NamedTuple `(ode_compliance, lambda_ode_final,
 converged, iterations, reason, iterations_total)` — see the
-`CollocationLAML` docstring for the key taxonomy.
+`CollocationLAML` docstring for the key taxonomy. `lambda_ode_final` is the
+ENDPOINT THE CONTINUATION SCHEDULE WAS BUILT TO, which for `prob.discrete`
+is `min(alg.lambda_ode_end, 100.0)` — not necessarily the algorithm setting.
+(The last level itself multiplies in the round-tripped
+`exp(log(lambda_ode_final))`, which differs in the last bits.)
 """
 function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     _validate_problem(prob, "CollocationLAML")
@@ -1079,7 +1083,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                     pearson = 0.0
                     for c in eachindex(y_vec2)
                         w_vec2[c] > 0 || continue
-                        pearson += w_vec2[c] * (y_vec2[c] - mu_base[c])^2 /
+                        # Centre on E[Y|μ] via `_family_mean` — the identical
+                        # correction as the LAML sibling in laml.jl, and for
+                        # the identical reason: the denominator is the
+                        # family's variance function, so the numerator must
+                        # subtract the family's MEAN. Identity for every
+                        # family except `TruncatedNormal`, whose μ is the
+                        # latent normal location.
+                        pearson += w_vec2[c] *
+                                   (y_vec2[c] - _family_mean(lik, mu_base[c]))^2 /
                                    max(_variance_function(lik,
                                                           abs(mu_base[c])),
                                        1e-10)
@@ -1227,7 +1239,22 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     PSMSolution(params, obj_val, data_loss, edf, copy(theta),
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (ode_compliance=ode_loss, lambda_ode_final=alg.lambda_ode_end,
+                # `lode_end`, NOT `alg.lambda_ode_end`: discrete problems cap
+                # the compliance penalty at 100 (see the schedule above), so
+                # the setting the caller passed can be an order of magnitude
+                # away from what the run used. The report must be the
+                # ENDPOINT THE SCHEDULE WAS BUILT TO — downstream code (e.g.
+                # the F1b stationarity check in the suite) feeds this straight
+                # back into `collocation_residual_jacobian`, so a misreport
+                # there silently rebuilds a different objective.
+                # Not `last(lambda_ode_schedule)`, which is the round-tripped
+                # `exp(log(lode_end))`: that differs from `lode_end` in the
+                # last bits (measured 100.00000000000004 for `lode_end = 100`,
+                # 10000.00000000001 for 1e4), so `lode_end` is both the
+                # cleaner report and the one an `==` assertion can pin. The
+                # ~4e-14 gap is the only sense in which this is not literally
+                # the number the final level multiplied by.
+                (ode_compliance=ode_loss, lambda_ode_final=lode_end,
                  converged=conv_converged, iterations=conv_iters,
                  reason=conv_reason, iterations_total=conv_iters_total))
 end

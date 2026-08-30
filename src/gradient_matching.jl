@@ -452,11 +452,59 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
                 n_eff = count(!iszero, w)
                 sigma2 = resid_ss / max(n_eff, 1)
                 if alg.sigma2_init !== nothing; sigma2 = min(sigma2, alg.sigma2_init); end
+                # Fellner–Schall smoothing update (Wood & Fasiolo 2017), in
+                # PARITY with `estimate_smoothing_params` (laml.jl) and the
+                # collocation sibling (collocation_solver.jl). The numerator
+                # is
+                #     rank(S_l) − θ_l·tr(H⁻¹S_l)
+                # with H = J'J + B the Gauss–Newton Hessian already formed
+                # above.
+                #
+                # This replaces `max(nk - 2, 1)`, a hard-coded GUESS at "the
+                # rank of a second-difference penalty on nk coefficients".
+                # That guess is exactly right for a nullity-2 penalty
+                # (B-spline, GP) and wrong for every other nullity: an SPDE
+                # penalty is full rank, so on a 9-coefficient block the guess
+                # said 7 where the rank is 9 and the reported θ̂ was off by
+                # precisely 9/7 = 1.2857×; a convex-constrained B-spline block
+                # of 8 has rank 5, not 6; a ridge block is full rank. Since
+                # the update is a single multiplicative fixed point, the error
+                # passes straight into the user-visible
+                # `sol.smoothing_params`. `_rank_penalty` reads the rank off
+                # the matrix instead of assuming it, which is what the other
+                # four Fellner–Schall sites in this package already do —
+                # GradientMatching was the only fabricated rank left in src/.
+                #
+                # The `−θ·tr(H⁻¹S)` term was absent entirely, making this the
+                # τ = 0 limit of Fellner–Schall rather than the method itself.
+                # `_safe_inv` (laml.jl) rather than an inline ridge, so the
+                # parity with the LAML sibling is LITERAL and not merely
+                # equivalent-looking: it is the same Cholesky-with-fallback
+                # every other Fellner–Schall site inverts its Hessian with.
+                H_inv = _safe_inv(JtJ)
                 for l in 1:m
                     off = uf_offsets[l]; nk = uf_nk[l]
-                    bSb = dot(beta[off+1:off+nk], S_list[l] * beta[off+1:off+nk])
-                    rank_k = max(nk - 2, 1)
-                    if bSb > 1e-30; theta[l] = clamp(sigma2 * rank_k / bSb, 1e-20, 1e20); end
+                    idx = (off + 1):(off + nk)
+                    bSb = dot(beta[idx], S_list[l] * beta[idx])
+                    fs_num = _rank_penalty(S_list[l]) -
+                             theta[l] * tr(H_inv[idx, idx] * S_list[l])
+                    # Degenerate-update policy, verbatim from the LAML and
+                    # collocation siblings: adopt mgcv's direction where the
+                    # fixed point it names is FINITE (fs_num ≤ 0 with
+                    # β'S_lβ > 0 ⇒ θ* ≤ 0 ⇒ release by one bounded decade),
+                    # and HOLD where it is not (β'S_lβ ≈ 0 ⇒ θ* = +∞).
+                    if bSb > 1e-30
+                        if fs_num > 0
+                            cand = sigma2 * fs_num / bSb
+                            # mgcv's `r[!is.finite(r)] <- 1e6` hole; we hold,
+                            # as laml.jl and collocation_solver.jl do. A NaN
+                            # θ would pass every subsequent comparison.
+                            isfinite(cand) &&
+                                (theta[l] = clamp(cand, 1e-20, 1e20))
+                        else
+                            theta[l] = max(theta[l] / 10.0, 1e-20)  # θ* ≤ 0
+                        end
+                    end                     # no finite θ*, or 0/0 ⇒ hold
                 end
             end
         end

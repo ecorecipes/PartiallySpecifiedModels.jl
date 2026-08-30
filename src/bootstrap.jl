@@ -61,6 +61,34 @@ Compute bootstrap confidence intervals for a PSM solution.
     (Gaussian likelihoods only: additive residuals are invalid pseudo-data
     for count or truncated families)
 
+`prob.data_weights` are honoured by BOTH methods. They are precision weights
+(`Var(yᵢ) = σ²/wᵢ`, the convention used throughout the package), so each
+sampler narrows the cell it draws by `wᵢ`: the Gaussian and fallback samplers
+draw at `σ̂/√w`, `TruncatedNormal` at `σ/√w`, and the count families read `w`
+as a replicate count (`Poisson(wμ)/w`, `NegBin(wμ, wθ)/w`, both with variance
+`V(μ)/w`), which can make pseudo-data non-integer when `w ≠ 1`.
+`:nonparametric` resamples STANDARDIZED residuals `√wᵢ·rᵢ` — the raw
+residuals are not exchangeable under unequal weights — and rescales each draw
+by `1/√wᵢ`. With uniform weights all of this reduces to the unweighted
+sampler exactly.
+
+For every family EXCEPT `TruncatedNormal` this gives a `w = 4` cell exactly
+half the spread of a `w = 1` cell, i.e. `Var = V(μ)/w`. `TruncatedNormal` does
+NOT satisfy that, deliberately: scaling `σ` also moves
+`ξ = (μ − a)/σ_eff`, so the truncation bites LESS at high `w`, and the draw's
+sd is `σ_eff·√(1 − ξλ(ξ) − λ(ξ)²)`, not `σ_eff`. At `μ = 0.30, σ = 0.20,
+a = 0` (measured): `w = 1` gives `ξ = 1.5`, `λ = 0.13878975`, shape
+`0.87894981`, sd `0.17578996`; `w = 4` gives `ξ = 3.0`, `λ = 0.00443784`,
+shape `0.99331102`, sd `0.09933110` — a ratio of `0.56505560`, and 13.0%
+WIDER than `Var = V(μ)/w` would require. The response mean moves too, from
+`μ + σ_eff·λ(ξ)` = `0.32775795` toward the latent `μ = 0.30`
+(`0.30044378` at `w = 4`). Reweighting a truncated normal cannot preserve
+both its mean and `V(μ)/w`; this sampler holds the LATENT location fixed and
+scales the latent σ, which is the only reading under which the family's own
+`σ` still means what `TruncatedNormal(lower, σ)` says it means. The count
+families take the other branch (replicate count) because there `V(μ)/w`
+is reachable inside the family.
+
 Each replicate is refit from scratch with `alg`, so smoothing parameters are
 re-estimated per replicate; the intervals therefore include smoothing-
 selection variability (unlike a fixed-λ conditional bootstrap).
@@ -177,12 +205,23 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                   "(only univariate functions can be gridded)"
             continue
         end
-        if approx.domain === nothing
+        # `band_domain`, NOT `approx.domain`: a `domain` field is NOT part of
+        # the documented approximator protocol (which is `nparams`,
+        # `initial_params`, `penalty_matrix`, `build_evaluator`, plus the
+        # optional `penalty_blocks`). Reading the field directly threw a hard
+        # `FieldError` on a protocol-conforming custom type, and it threw HERE
+        # — in the grid loop, before a single replicate was fitted — so the
+        # entire bootstrap was unavailable, not merely the band. The default
+        # `band_domain` method still reads `a.domain` where it exists, so
+        # every built-in path is unchanged; a custom type opts into a band by
+        # defining the method.
+        dom = band_domain(approx)
+        if dom === nothing
             @warn "bootstrap: approximator :$(approx.name) has no domain; " *
                   "skipping its unknown-function confidence band"
             continue
         end
-        lo, hi = approx.domain
+        lo, hi = dom
         uf_grids[approx.name] = collect(range(lo, hi, length=uf_ngrid))
     end
     uf_names = collect(keys(uf_grids))
@@ -204,7 +243,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
         rngs = [Random.Xoshiro(rand(rng, UInt64)) for _ in 1:nboot]
         boot_data = [_resample_data(method, prob.likelihood, fitted, resid,
                                     σ_hat, valid, prob.data_values,
-                                    n_times, n_obs, rngs[b])
+                                    prob.data_weights, n_times, n_obs, rngs[b])
                      for b in 1:nboot]
 
         # Per-replicate result storage (avoid races)
@@ -297,7 +336,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
 
             y_boot = _resample_data(method, prob.likelihood, fitted, resid,
                                     σ_hat, valid, prob.data_values,
-                                    n_times, n_obs, rng)
+                                    prob.data_weights, n_times, n_obs, rng)
 
             prob_boot = PSMProblem(prob.dynamics!, prob.u0, prob.tspan,
                 deepcopy(prob.approximators);   # isolate adaptive (mutable) state per replicate
@@ -398,17 +437,39 @@ end
 # ─── Resampling methods ──────────────────────────────────────────
 
 """
-    _resample_data(method, family, fitted, resid, σ_hat, valid, orig,
+    _resample_data(method, family, fitted, resid, σ_hat, valid, orig, w,
                    n_times, n_obs, rng)
 
 Generate bootstrap pseudo-data.
 
-For `:parametric`, the sampling distribution depends on the likelihood family:
-- `Gaussian()`:  y* ~ N(μ̂, σ̂)
-- `Poisson()`:   y* ~ Poisson(μ̂)
-- `NegativeBinomial(θ)`: y* ~ NegBin(μ̂, θ)  (Gamma-Poisson mixture)
-- `TruncatedNormal(lower, σ)`: y* ~ TruncNorm(μ̂, σ, lower)
-- Other: falls back to Gaussian residuals
+`w` is the problem's `data_weights` matrix. The package convention throughout
+is that these are PRECISION weights, `Var(yᵢ) = σ²/wᵢ` (stated where `σ̂` is
+estimated above and enforced by `irls_weights`, `W̃ᵢ = wᵢ/V(μᵢ)`), so every
+sampler below scales the cell it draws by `wᵢ`. `σ̂` itself is the UNIT-weight
+scale — it is estimated with the weights applied — so applying it unscaled to
+a `w = 4` cell would simulate that cell `√w = 2×` too wide.
+
+For `:parametric`, the sampling distribution depends on the likelihood family
+(μ̂ = `fitted`, w = the cell's precision weight):
+- `Gaussian()`:  y* ~ N(μ̂, σ̂²/w)
+- `Poisson()`:   w·y* ~ Poisson(w·μ̂), i.e. y* = Poisson(w·μ̂)/w
+- `NegativeBinomial(θ)`: y* = NegBin(mean = w·μ̂, shape = w·θ)/w
+  (Gamma-Poisson mixture with `G ~ Gamma(wθ, μ̂/θ)`)
+- `TruncatedNormal(lower, σ)`: y* ~ TruncNorm(μ̂, σ/√w, lower)
+- Other: falls back to Gaussian residuals, N(μ̂, σ̂²/w)
+
+The count families read `w` as a REPLICATE COUNT, which is the only reading
+that both reproduces the working variance `V(μ)/w` that `irls_weights`
+already commits to AND stays inside the family: `Poisson(wμ)/w` has mean `μ`
+and variance `μ/w`; `NegBin(wμ, wθ)/w` has mean `μ` and variance
+`(μ + μ²/θ)/w = V(μ)/w`. Its one cost is non-integer pseudo-data when
+`w ≠ 1`, which is harmless here — the package's Poisson/NegBin
+`log_likelihood` and `loglik_pointwise` use `_loggamma(y+1)` and accept
+real `y`.
+
+With uniform weights (`w ≡ 1`) every expression below reduces to the
+unweighted one EXACTLY — `x/sqrt(1.0) === x` and `1.0*μ === μ` — so the
+unweighted bootstrap is bitwise unchanged.
 
 For `:nonparametric`, residuals are resampled with replacement per state
 (valid for Gaussian likelihoods; rejected earlier for other families),
@@ -419,17 +480,20 @@ Cells NOT in `valid` keep their original value from `orig`: replicates
 must present the same missingness pattern as the real data (they are
 refit with the same `data_weights`, so masked cells never enter the
 replicate objective), and perturbing a NaN cell would either fabricate
-data or propagate NaN into the replicate fit.
+data or propagate NaN into the replicate fit. Such cells typically have
+`w = 0`, and `1/√0 = Inf` would poison the draw BEFORE that overwrite, so
+every sampler floors the weight it uses at 1.0 (`wi = w > 0 ? w : 1.0`).
 """
 function _resample_data(method::Symbol, family::AbstractLikelihood,
                         fitted::Matrix{Float64},
                         resid::Matrix{Float64}, σ_hat::Vector{Float64},
                         valid::BitMatrix, orig::Matrix{Float64},
-                        n_times::Int, n_obs::Int, rng)
+                        w::AbstractMatrix, n_times::Int, n_obs::Int, rng)
     y_boot = similar(fitted)
 
     if method == :parametric
-        _parametric_resample!(y_boot, family, fitted, σ_hat, n_times, n_obs, rng)
+        _parametric_resample!(y_boot, family, fitted, σ_hat, w,
+                              n_times, n_obs, rng)
     elseif method == :nonparametric
         for j in 1:n_obs
             # Pool of usable residuals for this column, CENTERED before
@@ -439,11 +503,31 @@ function _resample_data(method::Symbol, family::AbstractLikelihood,
             # and resampling an off-center pool would shift every
             # pseudo-dataset by that same offset instead of representing
             # pure noise around the fit.
-            pool = Float64[resid[i, j] for i in 1:n_times if valid[i, j]]
+            #
+            # The pool holds STANDARDIZED residuals √wᵢ·rᵢ, not raw ones.
+            # Under Var(yᵢ) = σ²/wᵢ the raw residuals are NOT exchangeable —
+            # their scale is 1/√wᵢ — so a pool of them is a mixture and
+            # assigns every cell the same mixed spread regardless of its own
+            # weight. The standardized residuals share the common scale σ;
+            # draw from those, then push the draw back onto the target cell's
+            # scale with 1/√wᵢ. (Measured on the suite's own D1 fixture —
+            # `d1_sd_ratio(:nonparametric, Gaussian(), fill(1.0,17,1),
+            # [0.034254])`, w = 1 on rows 1:9 and w = 4 on rows 10:17,
+            # 20 000 draws: the raw pool gave replicate sd 0.67208× the
+            # model-implied σ/√w at w = 1 and 1.34383× at w = 4 — the SAME
+            # absolute spread everywhere, group ratio 0.99976 where 0.5 is
+            # correct. The standardized pool gives 0.78065× at BOTH weights,
+            # group ratio 0.49999. The common 0.78 shortfall is the finite
+            # 17-residual pool and the n-vs-n−edf deficiency of residual
+            # resampling, not the weighting; the group RATIO is the
+            # discriminating statistic, which is why the test gates on it.)
+            pool = Float64[sqrt(w[i, j]) * resid[i, j]
+                           for i in 1:n_times if valid[i, j]]
             pool .-= mean(pool)
             np = length(pool)
             for i in 1:n_times
-                y_boot[i, j] = fitted[i, j] + pool[rand(rng, 1:np)]
+                wi = w[i, j] > 0 ? w[i, j] : 1.0
+                y_boot[i, j] = fitted[i, j] + pool[rand(rng, 1:np)] / sqrt(wi)
             end
         end
     end
@@ -458,41 +542,62 @@ end
 
 # ─── Parametric samplers per likelihood family ────────────────────
 
+# Every sampler floors the precision weight it uses at 1.0. A masked cell
+# normally carries w = 0 and is overwritten from `orig` by the caller, but
+# that overwrite happens AFTER the draw, and `1/√0 = Inf` (or `Poisson(0)`)
+# would already have poisoned it. `w ≡ 1` makes each expression bitwise the
+# unweighted one.
+_boot_wi(w, i, j) = w[i, j] > 0 ? Float64(w[i, j]) : 1.0
+
 function _parametric_resample!(y::Matrix, ::Gaussian, fitted::Matrix,
-                               σ_hat::Vector, n_t::Int, n_obs::Int, rng)
+                               σ_hat::Vector, w::AbstractMatrix,
+                               n_t::Int, n_obs::Int, rng)
+    # σ̂ is the unit-weight scale; this cell's sd is σ̂/√w.
     for j in 1:n_obs, i in 1:n_t
-        y[i, j] = fitted[i, j] + σ_hat[j] * randn(rng)
+        y[i, j] = fitted[i, j] + σ_hat[j] / sqrt(_boot_wi(w, i, j)) * randn(rng)
     end
 end
 
 function _parametric_resample!(y::Matrix, ::Poisson, fitted::Matrix,
-                               σ_hat::Vector, n_t::Int, n_obs::Int, rng)
+                               σ_hat::Vector, w::AbstractMatrix,
+                               n_t::Int, n_obs::Int, rng)
+    # Replicate-count reading of the precision weight: y* = Poisson(wμ)/w has
+    # mean μ and variance μ/w = V(μ)/w, the working variance `irls_weights`
+    # already assumes.
     for j in 1:n_obs, i in 1:n_t
+        wi = _boot_wi(w, i, j)
         μ = max(fitted[i, j], 1e-10)
-        y[i, j] = Float64(_sample_poisson(μ, rng))
+        y[i, j] = Float64(_sample_poisson(wi * μ, rng)) / wi
     end
 end
 
 function _parametric_resample!(y::Matrix, fam::NegativeBinomial, fitted::Matrix,
-                               σ_hat::Vector, n_t::Int, n_obs::Int, rng)
+                               σ_hat::Vector, w::AbstractMatrix,
+                               n_t::Int, n_obs::Int, rng)
     θ = fam.theta
     for j in 1:n_obs, i in 1:n_t
+        wi = _boot_wi(w, i, j)
         μ = max(fitted[i, j], 1e-10)
-        # Gamma-Poisson mixture: G ~ Gamma(θ, μ/θ), then Y ~ Poisson(G)
-        g = _sample_gamma(θ, μ / θ, rng)
-        y[i, j] = Float64(_sample_poisson(g, rng))
+        # Gamma-Poisson mixture: G ~ Gamma(wθ, μ/θ), then Y ~ Poisson(G),
+        # divided by w. That is NegBin(mean = wμ, shape = wθ)/w, which has
+        # mean μ and variance (wμ + (wμ)²/(wθ))/w² = (μ + μ²/θ)/w = V(μ)/w.
+        g = _sample_gamma(wi * θ, μ / θ, rng)
+        y[i, j] = Float64(_sample_poisson(g, rng)) / wi
     end
 end
 
 function _parametric_resample!(y::Matrix, fam::TruncatedNormal, fitted::Matrix,
-                               σ_hat::Vector, n_t::Int, n_obs::Int, rng)
+                               σ_hat::Vector, w::AbstractMatrix,
+                               n_t::Int, n_obs::Int, rng)
     σ = fam.sigma
     lo = fam.lower
     for j in 1:n_obs, i in 1:n_t
-        # Rejection sampling from N(μ, σ²) truncated to [lower, ∞)
+        # Rejection sampling from N(μ, σ²/w) truncated to [lower, ∞). The
+        # family's σ is fixed, so the precision weight enters as σ_eff = σ/√w.
+        σ_eff = σ / sqrt(_boot_wi(w, i, j))
         μ = fitted[i, j]
         for _ in 1:1000
-            z = μ + σ * randn(rng)
+            z = μ + σ_eff * randn(rng)
             if z >= lo
                 y[i, j] = z
                 @goto next_tn
@@ -505,11 +610,12 @@ end
 
 # Fallback: use Gaussian residuals for unknown likelihood families
 function _parametric_resample!(y::Matrix, fam::AbstractLikelihood, fitted::Matrix,
-                               σ_hat::Vector, n_t::Int, n_obs::Int, rng)
+                               σ_hat::Vector, w::AbstractMatrix,
+                               n_t::Int, n_obs::Int, rng)
     @warn "bootstrap: no parametric sampler for $(typeof(fam)); " *
           "falling back to Gaussian residual sampling" maxlog=1
     for j in 1:n_obs, i in 1:n_t
-        y[i, j] = fitted[i, j] + σ_hat[j] * randn(rng)
+        y[i, j] = fitted[i, j] + σ_hat[j] / sqrt(_boot_wi(w, i, j)) * randn(rng)
     end
 end
 

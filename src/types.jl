@@ -2154,7 +2154,12 @@ least squares.)
 - `tol::Float64=1e-6`: convergence tolerance
 - `verbose::Bool=false`: print diagnostics
 - `lambda_ode_start::Float64=0.01`: initial ODE compliance penalty
-- `lambda_ode_end::Float64=1e4`: final ODE compliance penalty
+- `lambda_ode_end::Float64=1e4`: final ODE compliance penalty. **Capped at
+  100 for discrete-time problems** (`prob.discrete`), where the "ODE"
+  residual is a one-step map residual coupling only consecutive pairs, so a
+  1e4 weight overwhelms the data block without improving the dynamics fit.
+  `sol.convergence.lambda_ode_final` reports the capped endpoint, not this
+  setting.
 - `n_continuation::Int=8`: number of log-spaced continuation levels
 - `sigma2_init::Union{Nothing,Float64}=nothing`: σ² cap for Fellner-Schall
 - `jac::Symbol=:fd`: backend for the differentiated parts of the
@@ -2190,6 +2195,12 @@ converged, iterations, reason, iterations_total)`. `converged`/`reason`
 describe the final continuation level's inner loop, `iterations` counts its
 inner iterations, and `iterations_total` accumulates inner iterations across
 all continuation levels (see [`PSMSolution`](@ref) for the key taxonomy).
+`lambda_ode_final` is the ENDPOINT THE CONTINUATION SCHEDULE WAS BUILT TO —
+the discrete cap above means it is `min(lambda_ode_end, 100.0)` for
+`prob.discrete`, not necessarily the setting you passed. (The schedule's last
+level is the round-tripped `exp(log(lambda_ode_final))`, which can differ in
+the last bits — `100.00000000000004` for `100.0` — so this is the exact
+endpoint rather than the exact multiplier of the final level.)
 """
 struct CollocationLAML
     maxiters::Int
