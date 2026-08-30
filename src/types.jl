@@ -971,8 +971,17 @@ functions while still guaranteeing shape constraints.
 - `constraint`: one of `COMONET_CONSTRAINTS`
 - `penalty_weight`: L2 regularization on unconstrained weights (for LAML)
 - `activation`: `:relu` (default, piecewise linear C⁰) or `:softplus` (smooth C∞).
-  Both preserve monotonicity/convexity guarantees. Use `:softplus` when smooth
+  Both preserve the convexity/concavity guarantees. Use `:softplus` when smooth
   derivatives are needed.
+
+  **This argument applies only to the curvature-constrained classes** —
+  `:convex`, `:concave`, `:inc_convex`, `:inc_concave`, `:dec_convex`,
+  `:dec_concave` — which are built from `_comonet_branch`. The purely monotone
+  classes `:increasing` and `:decreasing` use a **tanh** network
+  (`_comonet_monotone`) and **ignore `activation` entirely**; `:positive` uses a
+  tanh MLP inside `exp(·)`. Note that the monotone network's output layer is
+  `exp(W̃)·h + b` with an unconstrained bias `b` and `h ∈ (−1,1)`, so its range is
+  sign-unrestricted — monotonicity is guaranteed, but there is no zero floor.
 
 # Example
 ```julia
@@ -3852,7 +3861,10 @@ Result of fitting a PSM.
     improving step existed), `:maxiters` (budget exhausted without a
     criterion firing), or `:early_break` (internal failure such as a
     simulation error or singular linear system),
-  plus solver-specific extras documented on each solver type.
+  plus solver-specific additional keys documented on each solver type.
+  A few solvers put a whole object here instead of a NamedTuple (for
+  example `MCMCSolver` stores its `MCMCChains.Chains`). Note there is no
+  `extras` field: solver-specific output lives in `convergence`.
 """
 struct PSMSolution
     parameters::ComponentArray

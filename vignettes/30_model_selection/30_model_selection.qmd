@@ -29,7 +29,9 @@ $$
 \mathcal{V}(\lambda) = \ell(\hat{\boldsymbol\beta}) - \tfrac{1}{2}\hat{\boldsymbol\beta}'\mathbf{S}_\lambda\hat{\boldsymbol\beta} + \tfrac{1}{2}\log|\mathbf{S}_\lambda|_+ - \tfrac{1}{2}\log|\mathbf{H}| + \tfrac{M_p}{2}\log(2\pi)
 $$
 
-where $\mathbf{S}_\lambda$ is the penalty matrix scaled by the smoothing parameter $\lambda$, $|\cdot|_+$ denotes the pseudo-determinant (the product of the positive eigenvalues, since $\mathbf{S}_\lambda$ is rank deficient), $\mathbf{H}$ is the Hessian of the penalized log-likelihood, and $M_p$ is the penalty null-space dimension. For Gaussian data with unknown $\sigma^2$ this reduces to profiled REML. The criterion is maximized internally when selecting $\lambda$. Note that the `sol.objective` field recorded below is not this marginal likelihood but the final penalized objective $\tfrac{1}{2}(\|\mathbf{y}-\hat{\mathbf{y}}\|^2 + \hat{\boldsymbol\beta}'\mathbf{S}_\lambda\hat{\boldsymbol\beta})$, for which lower values indicate a better penalized fit.
+where $\mathbf{S}_\lambda$ is the penalty matrix scaled by the smoothing parameter $\lambda$, $|\cdot|_+$ denotes the pseudo-determinant (the product of the positive eigenvalues, since $\mathbf{S}_\lambda$ is rank deficient), $\mathbf{H}$ is the Hessian of the penalized log-likelihood, and $M_p$ is the penalty null-space dimension. For Gaussian data with unknown $\sigma^2$ this reduces to profiled REML.
+
+**Which field to select on.** The criterion value $\mathcal{V}$ at the returned fit is exposed as `sol.convergence.laml`, and it is **maximized** — larger is better. This is the quantity every table below reports and every selection below uses. It is *not* `sol.objective`, which for `LAML` is the final penalized objective $\tfrac{1}{2}(\|\mathbf{y}-\hat{\mathbf{y}}\|^2 + \hat{\boldsymbol\beta}'\mathbf{S}_\lambda\hat{\boldsymbol\beta})$ — a measure of penalized fit that carries **no complexity term**, so ranking models by it simply rewards whichever model fits hardest. Two further caveats: `convergence.laml` is `NaN` when a fit has no penalized term or the criterion evaluation failed (the helper below treats `NaN` as the worst score), and it exists only on `LAML` solutions — `GCVSolver` reports `convergence.gcv`/`convergence.ncv` (both *minimized*), and `CollocationLAML` exposes no comparable criterion at all.
 
 This vignette demonstrates LAML-based model selection on two example systems: logistic growth and Lotka–Volterra predator–prey.
 
@@ -44,6 +46,21 @@ using Random
 using DataFrames
 using Printf
 Random.seed!(42)
+
+# LAML is a MAXIMIZED criterion, and `sol.convergence.laml` is NaN when a
+# fit has no penalized term or the criterion evaluation failed. Selecting
+# with a bare `argmax` would be unreliable in that case, so treat NaN as
+# the worst possible score.
+best_by_laml(v) = argmax([isnan(x) ? -Inf : x for x in Float64.(v)])
+
+# A LAML score is only meaningful if the fit it came from is itself sound. A
+# runaway λ can collapse a spline onto nothing (EDF → 0), which removes the
+# unknown function from the model entirely — and such a degenerate fit can post
+# a very large LAML score. Note `converged` does NOT catch this; the
+# `stationarity` diagnostic does. Section 3 has a live example.
+is_comparable(sol) = isfinite(sol.convergence.laml) && sol.edf > 0.5 &&
+                     isfinite(sol.convergence.stationarity) &&
+                     sol.convergence.stationarity < 1e3
 ```
 
 ## Logistic Growth with Unknown Per-Capita Rate
@@ -110,17 +127,21 @@ for nk in knot_counts
         obs_to_state=[1], known_params=(;),
         solver=Tsit5())
     sol = solve(prob, LAML(maxiters=80, verbose=false))
-    push!(knot_results, (nk=nk, laml=sol.objective, edf=sol.edf, ss=sol.data_loss))
+    push!(knot_results, (nk=nk, laml=sol.convergence.laml, edf=sol.edf, ss=sol.data_loss))
 end
 ```
 
 ### LAML vs number of knots
 
-In principle the criterion balances underfitting (too few knots) against overfitting (too many knots). In practice the curve below is not a clean U shape: most knot counts reach similar objective values, while the 6- and 10-knot fits converged to poor local optima with much larger data SS, which dominates their criterion values. This is a useful reminder to inspect the individual fits — not just the selection criterion — before comparing models.
+In principle the criterion balances underfitting (too few knots) against overfitting (too many knots), and one expects a peak at some intermediate knot count. What the table below actually shows is more interesting, and is the standard result for a well-penalized spline: **every knot count from 4 to 20 produces the same fit** — identical effective degrees of freedom (2.0) and identical data SS (1.753).
+
+The reason is that $\lambda$ is estimated, not fixed. The true $r(N)$ is linear, so LAML drives $\lambda$ up until the fit collapses onto the penalty null space — the straight lines — and that null space is two-dimensional no matter how many knots the basis started with. Extra knots add flexibility that the penalty then removes.
+
+So the knot count is not really a model-selection question here: **once the smoothing parameter is estimated, the basis size stops mattering, provided it is generous enough to contain the truth.** The LAML values do drift slightly upward with more knots, so `argmax` formally selects the largest basis, but the differences are small and the fitted function is unchanged — the choice is immaterial rather than important. The practical advice is to pick a basis comfortably larger than you think you need and let the penalty do the work.
 
 ```{julia}
 laml_vals = [r.laml for r in knot_results]
-best_idx = argmin(laml_vals)
+best_idx = best_by_laml(laml_vals)
 best_nk = knot_results[best_idx].nk
 
 plot(knot_counts, laml_vals,
@@ -135,11 +156,11 @@ vline!([best_nk], ls=:dash, color=:red, label="Best ($best_nk knots)")
 
 ```{julia}
 #| output: asis
-println("| Knots | LAML | EDF | Data SS |")
-println("|------:|-----:|----:|--------:|")
+println("| Knots | LAML | EDF | Data SS | Selected |")
+println("|------:|-----:|----:|--------:|:--------:|")
 for r in knot_results
     marker = r.nk == best_nk ? " ✓" : ""
-    @printf("| %d | %.2f | %.1f | %.3f |%s\n", r.nk, r.laml, r.edf, r.ss, marker)
+    @printf("| %d | %.2f | %.1f | %.3f |%s |\n", r.nk, r.laml, r.edf, r.ss, marker)
 end
 ```
 
@@ -151,7 +172,7 @@ We plot the estimated $r(N)$ for a few representative knot counts against the tr
 N_grid = range(N_domain[1], N_domain[2], length=200)
 r_true = [0.5 * (1.0 - N / 10.0) for N in N_grid]
 
-selected_knots = [4, best_nk, 20]
+selected_knots = unique([4, best_nk, 20])
 p_uf = plot(N_grid, r_true, lw=3, ls=:dash, color=:black, label="True r(N)",
     xlabel="N", ylabel="r(N)", title="Estimated per-capita rate")
 
@@ -170,7 +191,7 @@ display(p_uf)
 ```
 
 ::: {.callout-note}
-The LAML-selected model typically recovers the linear truth well, while the 4-knot model is too rigid and the 20-knot model may show slight edge wiggles — though the smoothing penalty limits the damage.
+All of these curves lie essentially on top of one another, which is the point: with $\lambda$ estimated, the 4-knot and 20-knot bases recover the same linear $r(N)$. The extra knots do not buy extra wiggle, because the penalty removes it. Had we fixed $\lambda$ instead of estimating it, the knot count would have mattered a great deal.
 :::
 
 ## Section 2: Approximator Type Comparison
@@ -201,7 +222,7 @@ for (name, uf) in approx_specs
         obs_to_state=[1], known_params=(;),
         solver=Tsit5())
     sol = solve(prob, LAML(maxiters=80, verbose=false))
-    push!(approx_results, (name=name, laml=sol.objective, edf=sol.edf, ss=sol.data_loss))
+    push!(approx_results, (name=name, laml=sol.convergence.laml, edf=sol.edf, ss=sol.data_loss))
     approx_solutions[name] = sol
 end
 ```
@@ -210,12 +231,12 @@ end
 
 ```{julia}
 #| output: asis
-best_approx_idx = argmin([r.laml for r in approx_results])
-println("| Approximator | LAML | EDF | Data SS |")
-println("|:-------------|-----:|----:|--------:|")
+best_approx_idx = best_by_laml([r.laml for r in approx_results])
+println("| Approximator | LAML | EDF | Data SS | Selected |")
+println("|:-------------|-----:|----:|--------:|:--------:|")
 for (i, r) in enumerate(approx_results)
     marker = i == best_approx_idx ? " ✓" : ""
-    @printf("| %s | %.2f | %.1f | %.3f |%s\n", r.name, r.laml, r.edf, r.ss, marker)
+    @printf("| %s | %.2f | %.1f | %.3f |%s |\n", r.name, r.laml, r.edf, r.ss, marker)
 end
 ```
 
@@ -235,7 +256,9 @@ display(p_approx)
 ```
 
 ::: {.callout-note}
-For a smooth, nearly linear unknown function, B-splines and SPDE typically perform similarly. GP approximators may show slightly different behaviour near domain boundaries due to the squared-exponential kernel's stationarity. LAML provides a fair comparison across types by penalising complexity through the marginal likelihood.
+This comparison shows exactly why the criterion, and not the data SS, is the right thing to rank on. The SPDE fit achieves the **lowest** data SS of the three — it fits the observations best — but it does so with more than three times the effective degrees of freedom, and LAML scores it **worst**. The B-spline and GP fits both settle at EDF 2.0, recovering the linear truth, and score highest.
+
+Ranking by fit alone would have chosen the SPDE; ranking by the marginal likelihood chooses the models that match the truth. That is the complexity penalty doing its job, and it is why `sol.objective` — which contains no such penalty — must not be used for model selection.
 :::
 
 ## Section 3: Structural Model Selection
@@ -357,17 +380,23 @@ sol_C = solve(prob_C, lv_solver)
 ```{julia}
 #| output: asis
 struct_results = [
-    ("A: r(H) + δ(L) unknown", sol_A.objective, sol_A.edf, sol_A.data_loss),
-    ("B: r(H) unknown, δ const", sol_B.objective, sol_B.edf, sol_B.data_loss),
-    ("C: δ(L) unknown, r const", sol_C.objective, sol_C.edf, sol_C.data_loss),
+    ("A: r(H) + δ(L) unknown", sol_A),
+    ("B: r(H) unknown, δ const", sol_B),
+    ("C: δ(L) unknown, r const", sol_C),
 ]
 
-best_struct = argmin([r[2] for r in struct_results])
-println("| Model structure | LAML | EDF | Data SS |")
-println("|:----------------|-----:|----:|--------:|")
-for (i, (name, laml, edf, ss)) in enumerate(struct_results)
+# Score only the fits that pass the soundness check; a degenerate fit is not a
+# candidate model, it is a failed one.
+scores = [is_comparable(s) ? s.convergence.laml : -Inf for (_, s) in struct_results]
+best_struct = argmax(scores)
+
+println("| Model structure | LAML | EDF | Data SS | Sound? | Selected |")
+println("|:----------------|-----:|----:|--------:|:------:|:--------:|")
+for (i, (name, s)) in enumerate(struct_results)
     marker = i == best_struct ? " ✓" : ""
-    @printf("| %s | %.2f | %.1f | %.3f |%s\n", name, laml, edf, ss, marker)
+    sound = is_comparable(s) ? "yes" : "**no**"
+    @printf("| %s | %.2f | %.1f | %.3f | %s |%s |\n",
+            name, s.convergence.laml, s.edf, s.data_loss, sound, marker)
 end
 ```
 
@@ -401,7 +430,36 @@ plot(p1, p2, layout=(1, 2), size=(900, 400))
 ```
 
 ::: {.callout-note}
-Since the true predator death rate $\delta$ is constant, LAML should favour Model B (only $r(H)$ unknown) or Model A with a near-constant estimate for $\delta(L)$. Model C — which fixes $r$ as constant — should score worst because the true prey growth is nonlinear.
+Since the true predator death rate $\delta$ is constant, LAML should favour Model B (only $r(H)$ unknown). Model C — which fixes $r$ as constant — is the misspecified one, since the true prey growth is nonlinear. Model B is indeed selected, and it is the only one of the three whose fit is sound enough to compare (see the warning below).
+:::
+
+::: {.callout-warning}
+## A criterion is only as good as the fit underneath it
+
+Model C is worth studying rather than skipping past. Its smoothing parameter runs
+away (λ of order $10^{16}$), the spline collapses to an effective dimension of
+essentially zero — meaning there is no unknown function left in the model at all —
+and its data SS is four orders of magnitude worse than Model B's.
+
+It would be comfortable to blame misspecification: Model C does fix $r$ as
+constant when the true prey growth is nonlinear. But the table refutes that
+story. **Model A collapses in exactly the same way** — same runaway λ, same
+effective dimension of zero — and Model A is *not* misspecified: it leaves both
+functions free and so nests the truth. λ runaway is a failure of the fit, not a
+verdict on the model, and it can strike the most general model in the set.
+
+And yet **Model C posts by far the largest raw LAML score**, and its
+`convergence.converged` flag is `true`. Selecting by `argmax` on the raw
+criterion alone would pick the worst model in the set, and the usual convergence
+flag would not warn you.
+
+Two lessons follow. First, `converged` means "a stopping criterion fired", not
+"the answer is good" — for LAML fits, `convergence.stationarity` is the
+diagnostic that exposes this failure, and it differs by tens of orders of
+magnitude between the sound and the degenerate fits here. Second, a marginal
+likelihood is only comparable across models when each fit is individually sound;
+screen the fits first, then rank the survivors. That is what `is_comparable`
+does above, and it is why the table carries a "Sound?" column.
 :::
 
 ## Section 4: Diagnostics for the Best Knot Model
@@ -473,7 +531,7 @@ println("Residual ACF (lags 1–5): ", round.(acf_vals; digits=3))
 
 ### Guidelines for LAML-based model selection
 
-1. **Knot selection**: Start with a moderate number (6–10) and sweep upwards. LAML typically produces a clear minimum or plateau. Unlike cross-validation, LAML does not require held-out data or repeated fitting.
+1. **Knot selection**: Start with a moderate number (6–10) and sweep upwards. Remember LAML is *maximized*, so look for a peak or — as in Section 1 — a plateau, which is the common outcome once λ is estimated. Unlike cross-validation, LAML does not require held-out data or repeated fitting.
 
 2. **Approximator comparison**: LAML enables fair comparison across approximator types because it accounts for effective complexity (EDF), not just the number of parameters. A GP with 8 inducing points may have a very different EDF from a B-spline with 8 knots.
 
@@ -483,13 +541,17 @@ println("Residual ACF (lags 1–5): ", round.(acf_vals; digits=3))
 
 ### Relationship to other criteria
 
-| Criterion | Accounts for smoothing? | Requires refitting? | Bayesian? |
-|:----------|:-----------------------:|:-------------------:|:---------:|
-| AIC       | No                      | No                  | No        |
-| BIC       | No                      | No                  | No        |
-| GCV       | Yes                     | No                  | No        |
-| LAML      | Yes                     | No                  | Yes (approx.) |
-| WAIC/LOO  | Yes                     | Yes (MCMC)          | Yes       |
+The table below situates LAML among the criteria you may know from elsewhere. **Only the two marked "implemented" are available in this package** — `LAML` exposes `sol.convergence.laml`, and `GCVSolver` exposes `sol.convergence.gcv` (or `.ncv` with `criterion=:ncv`). The package exports no AIC, BIC, WAIC or LOO accessor; those rows are for orientation only, and computing them would be your own work.
+
+| Criterion | Accounts for smoothing? | Requires refitting? | Bayesian? | In this package |
+|:----------|:-----------------------:|:-------------------:|:---------:|:---------------:|
+| AIC       | No                      | No                  | No        | No              |
+| BIC       | No                      | No                  | No        | No              |
+| GCV       | Yes                     | No                  | No        | **Implemented** |
+| LAML      | Yes                     | No                  | Yes (approx.) | **Implemented** |
+| WAIC/LOO  | Yes                     | Yes (MCMC)          | Yes       | No              |
+
+Note also that GCV and NCV are **minimized** while LAML is **maximized**, so the direction of the comparison flips depending on which solver produced the fit.
 
 LAML and GCV are closely related — both optimise a criterion that balances fit against complexity. LAML has a more natural Bayesian interpretation as an approximate marginal likelihood, while GCV minimises an estimate of prediction error. In practice they often agree; when they differ, LAML tends to be more conservative (fewer EDF).
 

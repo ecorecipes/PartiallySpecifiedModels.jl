@@ -104,6 +104,7 @@ end
 | [`EnsembleKalmanSolver`](@ref) | Ensemble Kalman inversion | No | No | Iglesias et al. (2013) |
 | [`ODINSolver`](@ref) | ODIN-style Mahalanobis gradient matching | Yes | No | Wenk et al. (2020) |
 | [`RKHSSolver`](@ref) | Trajectory-in-RKHS gradient matching | Yes | No | González et al. (2014) |
+| [`FGPGMSolver`](@ref) | Fast GP-based gradient matching (posterior samples) | Yes | Yes | Wenk et al. (2019) |
 
 ### Approximators
 
@@ -117,6 +118,9 @@ end
 | [`GPApproximator`](@ref) | Gaussian process | GP hyperparameters |
 | [`ShapeConstrainedGPApproximator`](@ref) | GP + shape constraints | Constrained inducing values |
 | [`COMONetApproximator`](@ref) | Constrained monotone network | exp(W) weights |
+| [`TensorBSplineApproximator`](@ref) | Bivariate tensor-product spline, Kronecker-sum penalty | Tensor-product coefficients |
+| [`SingleIndexApproximator`](@ref) | Univariate smooth of one learned direction (Fasiolo et al. 2025) | Index loadings + outer-smooth coefficients |
+| [`TransformedCovariateApproximator`](@ref) | Smooth of a learned transform of an exogenous covariate | Transform + smooth coefficients |
 
 ### Likelihoods
 
@@ -126,4 +130,4 @@ end
 - [`TruncatedNormal`](@ref) — Continuous data bounded below (e.g. non-negative densities)
 - [`CustomLikelihood`](@ref) — User-defined likelihood
 
-See the [Getting Started](getting_started.md) guide for a detailed tutorial, or browse the [Solvers](solvers.md) and [Approximators](approximators.md) pages for full documentation. The [Vignettes](vignettes.md) page has 35 worked examples covering every solver and approximator.
+See the [Getting Started](getting_started.md) guide for a detailed tutorial. The [Vignettes](vignettes.md) page has 35 worked examples covering most of the solvers and approximators; for the complete reference, including the features no vignette yet demonstrates, browse the [Solvers](solvers.md) and [Approximators](approximators.md) pages.

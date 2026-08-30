@@ -123,10 +123,19 @@ accepts parameter proposals when simulated data are sufficiently close
 to observed data under a summary statistic.
 
 # Algorithm
-1. Draw `n_particles` parameter vectors from the prior (uniform around
-   the initial guess).
+1. Draw `n_particles` parameter vectors from the prior. The default
+   `prior=:smoothness` is a GMRF roughness prior
+   `β ~ N(β₀, prior_scale²·(S̄ + εI)⁻¹)`, where `S̄` is the block-diagonal
+   penalty structure with each block scaled to unit mean diagonal —
+   penalty-null (smooth) directions get standard deviation exactly
+   `prior_scale`, rougher directions less. `prior=:box` is the legacy
+   `Uniform(β₀ ± prior_scale)`.
 2. For each ABC-SMC generation, propagate particles through a Gaussian
-   kernel, simulate the model, and compute the summary statistic distance.
+   perturbation kernel, simulate the model, and compute the summary
+   statistic distance. The kernel bandwidth is **2× the weighted standard
+   deviation** of the current population, per dimension — note this is
+   twice the *standard deviation*, deliberately wider than the textbook
+   twice-the-*variance* (i.e. √2× std) choice.
 3. Accept particles within a shrinking tolerance schedule.
 4. Return posterior-mean point estimates and the particle ensemble.
 
@@ -135,8 +144,12 @@ to observed data under a summary statistic.
   parameter inference and model selection", JRSS-B.
 
 # Returns
-`PSMSolution` with fitted parameters, trajectory, unknown functions,
-and the particle ensemble in `sol.extras[:particles]`.
+`PSMSolution` whose `parameters` are the weighted posterior mean, with
+trajectory and unknown functions built from it. There is no `extras`
+field on `PSMSolution`: the ensemble is in `sol.convergence`, a
+`NamedTuple` carrying `method`, `particles`, `distances`, `weights`,
+`tolerance_history`, `best_idx` and `n_generations`. `sol.objective` is
+the best particle's summary-statistic distance.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
     _validate_problem(prob, "ABCSolver")

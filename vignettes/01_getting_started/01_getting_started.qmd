@@ -222,7 +222,9 @@ The **effective degrees of freedom (EDF)** measures model complexity. With 8 kno
 - **Small $\lambda$**: less smoothing, higher EDF, more flexible
 - **Large $\lambda$**: more smoothing, lower EDF, smoother curves
 
-For our example, the true $r(N)$ is linear, so an EDF near 2 would be ideal; the fit above reports an EDF of about 4, reflecting the extra flexibility LAML retains to accommodate the observation noise.
+For our example, the true $r(N)$ is linear, so an EDF of 2 is ideal — and that is exactly what LAML delivers. It selects a very large $\lambda$ (about $2.1\times10^{6}$ above), which drives the roughness penalty to dominate and collapses the 8-knot basis onto its 2-dimensional penalty null space: the straight lines. The fitted curve therefore *is* a straight line, recovering the linear truth without our having assumed linearity anywhere.
+
+This is the behaviour to expect whenever the truth lies in the penalty null space. It also shows why EDF, not the knot count, is the honest measure of complexity here: with the penalty doing its job, adding knots to this problem changes the fit very little.
 
 ## Diagnostic Plots
 

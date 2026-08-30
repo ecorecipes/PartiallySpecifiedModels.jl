@@ -144,10 +144,27 @@ The IRLS+PCLS linearization used by `LAML` works well for DDEs that approach a s
 For oscillatory DDEs, consider:
 
 - **`AdamSolver`** — uses autodiff through the DDE solve (works if the dynamics are differentiable)
-- **`CollocationLAML`** — avoids ODE integration; treats state values as free parameters
-- **`MCMCSolver`** — Bayesian inference that handles nonlinearity via sampling
+- **`GCVSolver`** — the same IRLS structure as `LAML`, but selects λ by cross-validation
+- **`VariationalSolver`** — approximate Bayesian inference, handling the nonlinear coupling by sampling from q(β)
 
 See [Vignette 03: Lotka–Volterra](../03_lotka_volterra/03_lotka_volterra.qmd) for a similar discussion of linearization limitations in oscillatory ODE systems.
+:::
+
+::: {.callout-important}
+## Solvers that do not support DDEs
+
+Not every solver accepts a delay problem, and two of the failures are noisy
+rather than graceful:
+
+- **`CollocationLAML`** rejects DDEs with an explicit, informative error: its
+  collocation residual evaluates the dynamics with the 4-argument ODE signature
+  and cannot supply the delayed history.
+- **`MCMCSolver`** and **`BNGSolver`** fail with a `MethodError` for the same
+  underlying reason — both build a 4-argument closure over the dynamics, so the
+  5-argument DDE signature `f!(du, u, h, p, t)` does not match. There is no
+  up-front guard, so the failure surfaces mid-solve.
+
+Use `LAML`, `GCVSolver`, `AdamSolver` or `VariationalSolver` for delay problems.
 :::
 
 ## DDE Problem Setup
@@ -159,9 +176,7 @@ See [Vignette 03: Lotka–Volterra](../03_lotka_volterra/03_lotka_volterra.qmd) 
 | **Delays** | None | `delays=[τ₁, τ₂, ...]` |
 | **Accessing delayed state** | N/A | `h(p, t - τ)` |
 | **Solver** | `Tsit5()` etc. | `MethodOfSteps(Tsit5())` (automatic) |
-| **Compatible PSM solvers** | All | LAML, AdamSolver, BNGSolver* |
-
-*BNGSolver works with DDEs when all states are observed, since it only uses smoothed derivatives.
+| **Compatible PSM solvers** | All | LAML, GCVSolver, AdamSolver, VariationalSolver |
 
 ## Diagnostic Plots
 
@@ -208,4 +223,4 @@ println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_wa
 
 ## Summary
 
-PartiallySpecifiedModels.jl supports delay differential equations through the `delays` and `history` keyword arguments to `PSMProblem`. The DDE dynamics function takes an extra history argument `h` that provides delayed state values. All standard solvers (LAML, Adam) work with DDEs via automatic wrapping with `MethodOfSteps`.
+PartiallySpecifiedModels.jl supports delay differential equations through the `delays` and `history` keyword arguments to `PSMProblem`. The DDE dynamics function takes an extra history argument `h` that provides delayed state values. Four solvers work with DDEs via automatic wrapping with `MethodOfSteps`: `LAML`, `GCVSolver`, `AdamSolver` and `VariationalSolver`.

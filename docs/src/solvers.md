@@ -176,7 +176,7 @@ DaltonSolver
 
 ### MCMCSolver
 
-Full Bayesian inference using **Hamiltonian Monte Carlo (HMC)** or **No-U-Turn Sampler (NUTS)**. Provides posterior distributions over all parameters including unknown function coefficients.
+Full Bayesian inference using the **No-U-Turn Sampler (NUTS)** from AdvancedHMC.jl — the sampler is not selectable. Provides posterior distributions over all parameters including unknown function coefficients.
 
 ```@docs
 MCMCSolver
