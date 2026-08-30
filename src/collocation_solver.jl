@@ -603,6 +603,18 @@ soft constraint.
 4. Use a continuation schedule on the ODE-fidelity weight to gradually
    tighten the dynamic constraint.
 
+# Likelihoods
+The data-fidelity block honors `prob.likelihood` via PIRLS: on the
+identity link the working response is `y` itself, so each Gauss–Newton
+sweep reweights the data rows by the family working weights
+(`irls_weights`, w̃ = w/V(μ) at the current iterate) and the line-search /
+convergence objective uses the deviance-scale `−2·loglik` in place of the
+data SS. The ODE-compliance and roughness rows stay Gaussian in the
+derivative residuals. The Fellner–Schall step builds `J'W̃J` from the same
+family weights and takes the Pearson dispersion (floored at 1) as its
+effective scale, mirroring `LAML`'s default `:working` criterion.
+`Gaussian` data follow the historical pure-least-squares path unchanged.
+
 # References
 - Ramsay et al. (2007), "Parameter estimation for differential equations:
   a generalized smoothing approach", JRSS-B.
@@ -615,6 +627,11 @@ converged, iterations, reason, iterations_total)` — see the
 """
 function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     _validate_problem(prob, "CollocationLAML")
+    # Sibling parity with LAML/GCVSolver: an unanchored SingleIndex under a
+    # λ-estimating criterion collapses to ‖a‖ → 0 (measured here: fitted
+    # loading −4.5e-10 with a normal-looking data loss). Same warning, same
+    # condition as solver.jl / gcv_solver.jl.
+    _warn_unanchored_index(prob, "CollocationLAML")
     isempty(prob.delays) ||
         error("CollocationLAML does not support DDE problems: " *
               "the collocation residual evaluates the dynamics with the " *
@@ -719,6 +736,40 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
         "masked (every weight is 0 or every value is non-finite); there " *
         "is nothing to fit.")
 
+    # ── Likelihood-aware data block (PIRLS) ───────────────────────
+    # The data-fidelity rows are √w̃·(y − α_obs). The package fits on the
+    # response scale (identity link), so the IRLS working response is y
+    # itself and Fisher scoring changes ONLY the weights: w̃ = w/V(μ)
+    # (`irls_weights`, the same working-model machinery as the main LAML
+    # loop) evaluated at the current iterate's μ = α_obs. The
+    # ODE-compliance and roughness rows are untouched — the collocation
+    # criterion becomes penalized deviance + λ_ode‖Dα − f‖², Ramsay's
+    # generalized profiling with a non-Gaussian fidelity term.
+    # Gaussian keeps the historical path bit-identical: `w_iter === w_vec`
+    # and the residual-SS objective below are the pre-fix computations.
+    lik = prob.likelihood
+    is_gauss = lik isa Gaussian
+    # y flattened obs-major (matches w_vec). Masked cells carry y = 0
+    # beside their zero weight so `_usable` drops them and no NaN can leak
+    # into irls_weights/log_likelihood.
+    y_flat = zeros(T_pts * n_obs)
+    for j in 1:n_obs, i in 1:T_pts
+        y_flat[(j - 1) * T_pts + i] = usable_cell(prob, i, j) ?
+                                      Float64(prob.data_values[i, j]) : 0.0
+    end
+    mu_flat = zeros(T_pts * n_obs)   # μ = α_obs at the accepted iterate
+    mu_ls = zeros(T_pts * n_obs)     # line-search candidate buffer
+    # μ = α at the observed states, flattened obs-major.
+    fill_mu! = function (mu::Vector{Float64}, a::Matrix{Float64})
+        for j in 1:n_obs
+            sk = prob.obs_to_state[j]
+            for i in 1:T_pts
+                mu[(j - 1) * T_pts + i] = a[i, sk]
+            end
+        end
+        mu
+    end
+
     # Continuation schedule for λ_ode
     # For discrete models, cap λ_ode_end at 100: the compliance penalty
     # sqrt(λ) * (α[t+1] - F[t]) couples only consecutive pairs (unlike the
@@ -796,9 +847,19 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
         for iter in 1:alg.maxiters
             conv_iters = iter
             conv_iters_total += 1
+            # PIRLS: refresh the working weights at the current iterate.
+            # Frozen through the Gauss–Newton step and its line search
+            # (standard Fisher scoring); Gaussian passes the base weights
+            # through untouched — the pre-fix path, bit-identical.
+            w_iter = if is_gauss
+                w_vec
+            else
+                fill_mu!(mu_flat, alpha)
+                irls_weights(lik, y_flat, mu_flat, w_vec)
+            end
             # Compute combined residual and Jacobian
             resid, J_full = collocation_residual_jacobian(
-                prob, times, alpha, beta, D, lambda_ode, w_vec;
+                prob, times, alpha, beta, D, lambda_ode, w_iter;
                 jac=alg.jac, fd_cfg=fd_cfg)
 
             # Build penalty for beta only (alpha is unpenalized)
@@ -815,11 +876,20 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
             B_full = zeros(n_total, n_total)
             B_full[n_alpha+1:end, n_alpha+1:end] .= B_beta
 
-            # Current objective
+            # Current objective. Gaussian: the historical residual-SS form,
+            # bit-identical. Non-Gaussian: the data block is the
+            # deviance-scale −2·loglik at μ = α_obs — the working SS in
+            # `resid` is only the Fisher-scoring surrogate that produces the
+            # step direction, and comparing IT across iterates would let the
+            # re-computed weights themselves game the convergence test and
+            # line search. The compliance/roughness rows are weight-free, so
+            # their SS is the same in both forms.
             data_ss = sum(resid[1:T_pts*n_obs].^2)
             ode_ss = sum(resid[T_pts*n_obs+1:end].^2)
             pen = dot(beta, B_beta * beta)
-            curr_obj = sum(resid.^2) + pen
+            curr_obj = is_gauss ? sum(resid.^2) + pen :
+                -2.0 * log_likelihood(lik, y_flat, mu_flat, w_vec) +
+                    ode_ss + pen
 
             if verbose && (iter <= 3 || iter % 10 == 0)
                 println("  iter $iter: data_SS=$(round(data_ss, sigdigits=5)) " *
@@ -868,9 +938,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                 beta_new = params_new[n_alpha+1:end]
 
                 resid_new = collocation_residual_only(
-                    prob, times, alpha_new, beta_new, D, lambda_ode, w_vec)
+                    prob, times, alpha_new, beta_new, D, lambda_ode, w_iter)
                 pen_new = dot(beta_new, B_beta * beta_new)
-                obj_new = sum(resid_new.^2) + pen_new
+                # Same objective form as curr_obj (candidates must be
+                # compared on the criterion actually being minimized).
+                obj_new = if is_gauss
+                    sum(resid_new.^2) + pen_new
+                else
+                    fill_mu!(mu_ls, alpha_new)
+                    -2.0 * log_likelihood(lik, y_flat, mu_ls, w_vec) +
+                        sum(resid_new[T_pts*n_obs+1:end].^2) + pen_new
+                end
 
                 if obj_new < best_obj
                     best_obj = obj_new
@@ -968,7 +1046,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                         Jb[:, b] .= (ord(pp) .- mu_base) ./ step
                     end
                 end
-                JWJ = Jb' * Diagonal(w_vec2) * Jb
+                # Family working weights at the simulated means, mirroring
+                # the main LAML loop's JWJ = J'W̃J (irls_weights); Gaussian
+                # passes w_vec2 through bit-identically.
+                w_fs = is_gauss ? w_vec2 :
+                       irls_weights(lik, y_vec2, mu_base, w_vec2)
+                JWJ = Jb' * Diagonal(w_fs) * Jb
                 S_full = zeros(n_beta, n_beta)
                 for l in 1:m
                     idx = (uf_offsets[l]+1):(uf_offsets[l]+uf_nk[l])
@@ -979,8 +1062,30 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                 for i in 1:n_beta; H[i, i] += 1e-10 * (maxd + 1); end
                 H_inv = try; inv(cholesky(Symmetric(H))); catch; pinv(H); end
                 edf_total = clamp(tr(H_inv * JWJ), 1.0, Float64(n_beta))
-                sigma2_est = sum(w_vec2 .* (y_vec2 .- mu_base).^2) /
-                             max(n_eff_cells - edf_total, 1.0)
+                sigma2_est = if is_gauss
+                    sum(w_vec2 .* (y_vec2 .- mu_base).^2) /
+                        max(n_eff_cells - edf_total, 1.0)
+                else
+                    # Pearson dispersion as the effective Fellner–Schall
+                    # scale — the same treatment as LAML's default :working
+                    # criterion (`estimate_smoothing_params`, laml.jl): with
+                    # identity-link count families the working weights
+                    # 1/V(μ) shrink as the mean grows, and a raw RSS scale
+                    # collapses λ; φ̂ = Σ w(y−μ)²/V(μ) over dof, floored at
+                    # 1.0 (the families' known dispersion), keeps the update
+                    # calibrated in the quasi-likelihood sense. The dof is
+                    # this block's own n_eff − edf convention (laml.jl uses
+                    # n − Σrank(S_k); both are residual-dof estimates).
+                    pearson = 0.0
+                    for c in eachindex(y_vec2)
+                        w_vec2[c] > 0 || continue
+                        pearson += w_vec2[c] * (y_vec2[c] - mu_base[c])^2 /
+                                   max(_variance_function(lik,
+                                                          abs(mu_base[c])),
+                                       1e-10)
+                    end
+                    max(pearson / max(n_eff_cells - edf_total, 1.0), 1.0)
+                end
                 if alg.sigma2_init !== nothing
                     sigma2_est = min(sigma2_est, alg.sigma2_init)
                 end

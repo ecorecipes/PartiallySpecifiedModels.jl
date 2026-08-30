@@ -56,6 +56,8 @@ GCVSolver
 
 **Generalized profiling** (collocation) approach. Fits spline approximations to the state variables first, then optimizes the unknown function parameters to match the implied derivatives. Can be more robust than direct ODE fitting for stiff or chaotic systems.
 
+The data-fidelity block is likelihood-aware: non-Gaussian families (`Poisson`, `NegativeBinomial`, `TruncatedNormal`, `CustomLikelihood`) are fitted by PIRLS working weights on the identity link with a deviance-scale objective, mirroring `LAML`'s default `:working` criterion; the ODE-compliance penalty stays Gaussian in the derivative residuals, and Gaussian data follow the plain least-squares path unchanged. Note that `PSMSolution.objective` and `data_loss` remain squared-error quantities for all families (the pre-existing cross-solver reporting convention), so the reported objective is not the internal deviance criterion the solver optimizes for non-Gaussian data (e.g. 223.005 reported vs 90.07 internal on a Poisson fixture, as measured by the review).
+
 ```@docs
 CollocationLAML
 ```

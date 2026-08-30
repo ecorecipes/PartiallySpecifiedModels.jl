@@ -9105,6 +9105,40 @@ end
         end
     end
 
+    @testset "SingleIndexApproximator — free mode warns under CollocationLAML" begin
+        PSM = PartiallySpecifiedModels
+        # Sibling parity with the LAML/GCV testset above: CollocationLAML also
+        # estimates λ, so the same ‖a‖ → 0 degeneracy applies (measured on the
+        # unanchored probe fixture: fitted loading −4.51e-10 with a
+        # normal-looking data loss and NO warning before the fix). Same
+        # warning, same condition, same wording as the LAML path.
+        dyn_c!(du, u, p, t) = (du[1] = -p.f(u[1], u[2]) * u[1];
+                               du[2] = -0.2 * u[2]; nothing)
+        tc = collect(0.0:0.25:3.0)
+        refc = OrdinaryDiffEq.solve(
+            ODEProblem((du, u, p, t) -> (du[1] = -0.3 * u[1]; du[2] = -0.2 * u[2];
+                                         nothing),
+                       [2.0, 1.0], (0.0, 3.0)), Tsit5(), saveat=0.25)
+        dc = reduce(hcat, refc.u)'
+        ac = SingleIndexApproximator(:f, 2, 6; anchor=nothing,
+                                     index_stats=(zeros(2), Matrix(1.0I, 2, 2)))
+        prob_c = PSMProblem(dyn_c!, [2.0, 1.0], (0.0, 3.0), [ac];
+            data_times=tc, data_values=dc, obs_to_state=[1, 2],
+            known_params=NamedTuple(), likelihood=PSM.Gaussian())
+        @test_logs (:warn, r"anchor=nothing") match_mode=:any begin
+            solve(prob_c, CollocationLAML(maxiters=3, n_continuation=2))
+        end
+        # the default anchored mode must NOT warn
+        aca = SingleIndexApproximator(:f, 2, 6;
+                                      index_stats=(zeros(2), Matrix(1.0I, 2, 2)))
+        prob_ca = PSMProblem(dyn_c!, [2.0, 1.0], (0.0, 3.0), [aca];
+            data_times=tc, data_values=dc, obs_to_state=[1, 2],
+            known_params=NamedTuple(), likelihood=PSM.Gaussian())
+        @test_logs min_level=Base.CoreLogging.Warn match_mode=:any begin
+            solve(prob_ca, CollocationLAML(maxiters=3, n_continuation=2))
+        end
+    end
+
     # ── The recovery / discriminator fixture ───────────────────────────
     #
     # Damped predator–prey whose unknown per-capita prey growth is a
@@ -10500,6 +10534,107 @@ end
                   sol_g.data_loss +
                   colloc_reported_penalty(prob_f1b_g, sol_g) rtol=1e-8
         end
+    end
+
+    @testset "CollocationLAML — likelihood-aware data block" begin
+        # Before this fix CollocationLAML silently ignored `prob.likelihood`
+        # and ran Gaussian least squares for every family: on the probe
+        # fixture a Poisson() and a Gaussian() problem produced BIT-IDENTICAL
+        # fits (measured max |Δparam| = 0.0, identical θ). The data-fidelity
+        # block is now PIRLS: identity link means the working response is y
+        # itself, so the family enters through the working weights
+        # (irls_weights), the deviance-scale line-search objective, and the
+        # Pearson-dispersion Fellner–Schall scale — while the ODE-compliance
+        # rows stay Gaussian in the derivative residuals.
+        #
+        # Fixture: logistic growth du = r(N)·N with TRUE r(N) = 0.5(1 − N/40),
+        # u0 = 5, y_i ~ Poisson(N(t_i)). Counts drawn once (Xoshiro(7)) and
+        # hardcoded so the fit is identical across Julia/RNG versions.
+        growth_lik!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        t_lik = collect(range(0.5, 8.0, length=16))
+        counts_lik = [8.0, 15.0, 7.0, 7.0, 17.0, 12.0, 13.0, 24.0, 21.0, 27.0,
+                      28.0, 28.0, 38.0, 28.0, 34.0, 35.0]
+        mk_lik(lik) = PSMProblem(growth_lik!, [5.0], (0.0, 8.0),
+            [BSplineApproximator(:r, (0.0, 45.0), 6)];
+            data_times=t_lik, data_values=reshape(counts_lik, :, 1),
+            obs_to_state=[1], likelihood=lik)
+        alg_lik = CollocationLAML(maxiters=60, n_continuation=6, verbose=false)
+        sol_lik_p = solve(mk_lik(Poisson()), alg_lik)
+        sol_lik_g = solve(mk_lik(Gaussian()), alg_lik)
+
+        # ── The old bit-identity is dead: Poisson ≠ Gaussian ──
+        # Measured max |Δparam| = 0.0917 (was exactly 0.0 pre-fix); the gate
+        # 0.01 sits 9× below the measured separation.
+        @test collect(sol_lik_p.parameters) != collect(sol_lik_g.parameters)
+        @test maximum(abs.(collect(sol_lik_p.parameters) .-
+                           collect(sol_lik_g.parameters))) > 0.01
+        @test sol_lik_p.smoothing_params != sol_lik_g.smoothing_params
+
+        # ── Poisson truth recovery ──
+        # Measured max |r̂ − r_true| over N ∈ [8, 35] (the data-visited
+        # range): 0.0962 against a true r spanning [0.06, 0.4] there; gate
+        # 0.2 gives 2.1× headroom. Trajectory: measured max |α̂ − truth| =
+        # 1.496 on states up to 35.5; gate 3.0 gives 2× headroom.
+        @test sol_lik_p.convergence.converged
+        r_true_lik(N) = 0.5 * (1 - N / 40.0)
+        @test maximum(abs(sol_lik_p.unknown_functions[:r](N) - r_true_lik(N))
+                      for N in 8.0:1.0:35.0) < 0.2
+        truth_lik = [40.0 / (1 + 7 * exp(-0.5t)) for t in t_lik]
+        @test maximum(abs.(vec(sol_lik_p.fitted_values) .- truth_lik)) < 3.0
+
+        # ── Gaussian regression: the supported case is unchanged ──
+        # The Gaussian path was verified BIT-IDENTICAL to the pre-fix code
+        # this session (full dump — params, objective, data_loss, edf, θ,
+        # fitted values — byte-equal on two fixtures, this one included, in
+        # a fixed environment). Pin the fit to the values measured from the
+        # PRE-FIX code so any future drift of the Gaussian path fails
+        # loudly. The tolerances absorb only environment variation
+        # (measured across package-env vs test-env under
+        # --check-bounds=yes: objective rel. drift 2.9e-9, params max
+        # 2.2e-7, θ 7.4e-6 — the FS θ amplifies simulate()-Jacobian
+        # differences, hence its looser gate; headroom 340×/45×/134×).
+        @test sol_lik_g.objective ≈ 219.87762299644993 rtol=1e-6
+        @test sol_lik_g.smoothing_params[1] ≈ 574.8416021041469 rtol=1e-3
+        @test collect(sol_lik_g.parameters) ≈
+              [0.4491316170905447, 0.35307334667918966, 0.2568887910564222,
+               0.15994752621420202, 0.06236049914556764,
+               -0.0352819716010285] rtol=1e-5
+        # Gaussian recovery on the same fixture (measured 0.0363; gate 0.1
+        # gives 2.8× headroom) — the count data are informative under both
+        # families, the fits are just no longer the same fit.
+        @test maximum(abs(sol_lik_g.unknown_functions[:r](N) - r_true_lik(N))
+                      for N in 8.0:1.0:35.0) < 0.1
+
+        # ── Low-count discrimination: the recovery gate above alone does
+        # not discriminate (a Gaussian fit of the high-count fixture passes
+        # it at r̂ error 0.0363 vs gate 0.2 — a regression to unweighted
+        # least squares would slip through). At LOW counts the Poisson
+        # variance structure carries real information: same logistic model,
+        # true r(N) = 0.6(1 − N/8), u0 = 0.5, y_i ~ Poisson(N(t_i)) with
+        # means 0.6–7 (counts hardcoded once). Measured in the test env
+        # under --check-bounds=yes: Poisson max |r̂ − r_true| = 0.1357
+        # (gate 0.3, 2.2× headroom); Gaussian 0.8758 (lower-bound gate
+        # 0.45, 1.9× margin); both solves converge. Cross-env
+        # corroboration: the independent review measured 0.1358 / 0.8758
+        # in the package env.
+        t_lc = collect(range(0.5, 10.0, length=20))
+        counts_lc = Float64.([1, 3, 2, 1, 2, 0, 0, 1, 3, 5, 6, 4, 9, 4, 9,
+                              5, 10, 7, 5, 6])
+        mk_lc(lik) = PSMProblem(growth_lik!, [0.5], (0.0, 10.0),
+            [BSplineApproximator(:r, (0.0, 10.0), 6)];
+            data_times=t_lc, data_values=reshape(counts_lc, :, 1),
+            obs_to_state=[1], likelihood=lik)
+        sol_lc_p = solve(mk_lc(Poisson()), alg_lik)
+        sol_lc_g = solve(mk_lc(Gaussian()), alg_lik)
+        r_true_lc(N) = 0.6 * (1 - N / 8.0)
+        @test sol_lc_p.convergence.converged
+        @test sol_lc_g.convergence.converged
+        @test maximum(abs(sol_lc_p.unknown_functions[:r](N) - r_true_lc(N))
+                      for N in 1.0:0.5:7.0) < 0.3
+        # The Gaussian fit must FAIL this fixture — that failure is what
+        # proves the Poisson path is doing likelihood-specific work.
+        @test maximum(abs(sol_lc_g.unknown_functions[:r](N) - r_true_lc(N))
+                      for N in 1.0:0.5:7.0) > 0.45
     end
 
 end
