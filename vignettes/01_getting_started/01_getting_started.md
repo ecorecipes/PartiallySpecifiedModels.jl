@@ -1,12 +1,11 @@
 # Getting Started with PartiallySpecifiedModels.jl
 Simon Frost
-2026-06-12
+2026-08-30
 
 - [Overview](#overview)
 - [Vignette Guide](#vignette-guide)
 - [Setup](#setup)
-- [A Simple Example: Logistic
-  Growth](#a-simple-example-logistic-growth)
+- [A Simple Example: Logistic Growth](#a-simple-example-logistic-growth)
   - [Generate synthetic data](#generate-synthetic-data)
   - [Define the PSM](#define-the-psm)
   - [Choose an approximator](#choose-an-approximator)
@@ -173,9 +172,9 @@ The `LAML()` algorithm estimates the spline coefficients and the
 smoothing parameter $\lambda$ simultaneously. For Gaussian data, LAML is
 equivalent to **Restricted Maximum Likelihood (REML)**.
 
-    Data loss (SS): 2.46
-    EDF:            4.02
-    Smoothing λ:    [0.1941]
+    Data loss (SS): 2.66
+    EDF:            2.0
+    Smoothing λ:    [2.109e6]
 
 ### Inspect the solution
 
@@ -260,9 +259,18 @@ $\lambda$ to balance fit and smoothness:
 - **Small $\lambda$**: less smoothing, higher EDF, more flexible
 - **Large $\lambda$**: more smoothing, lower EDF, smoother curves
 
-For our example, the true $r(N)$ is linear, so an EDF near 2 would be
-ideal; the fit above reports an EDF of about 4, reflecting the extra
-flexibility LAML retains to accommodate the observation noise.
+For our example, the true $r(N)$ is linear, so an EDF of 2 is ideal —
+and that is exactly what LAML delivers. It selects a very large
+$\lambda$ (about $2.1\times10^{6}$ above), which drives the roughness
+penalty to dominate and collapses the 8-knot basis onto its
+2-dimensional penalty null space: the straight lines. The fitted curve
+therefore *is* a straight line, recovering the linear truth without our
+having assumed linearity anywhere.
+
+This is the behaviour to expect whenever the truth lies in the penalty
+null space. It also shows why EDF, not the knot count, is the honest
+measure of complexity here: with the penalty doing its job, adding knots
+to this problem changes the fit very little.
 
 ## Diagnostic Plots
 
@@ -304,7 +312,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](01_getting_started_files/figure-commonmark/cell-10-output-1.svg)
 
-    Durbin-Watson: 1.751
+    Durbin-Watson: 1.636
 
 ## Summary
 

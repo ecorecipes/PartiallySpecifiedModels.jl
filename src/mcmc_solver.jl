@@ -226,9 +226,10 @@ end
     solve(prob::PSMProblem, alg::MCMCSolver)
 
 Fit a partially specified model using Markov Chain Monte Carlo sampling.
-Supports Hamiltonian Monte Carlo (HMC), the No-U-Turn Sampler (NUTS),
-and Metropolis–Hastings (MH), providing full posterior distributions
-over the unknown-function parameters.
+Sampling is by the No-U-Turn Sampler (NUTS) with ForwardDiff gradients;
+NUTS is the only sampler — `MCMCSolver` has no sampler-selection field,
+and only `target_accept` tunes the adaptation. This provides full
+posterior distributions over the unknown-function parameters.
 
 The observation model follows `prob.likelihood`. Gaussian data get a
 sampled (or fixed, via `obs_sigma`) noise parameter σ; Poisson,
@@ -240,18 +241,21 @@ family object). Passing `obs_sigma` with a non-Gaussian family errors.
 # Algorithm
 1. Initialise parameters and define the log-posterior (log-likelihood +
    optional smoothing-penalty prior).
-2. Run the selected MCMC sampler (`AdvancedMH.jl`) for `n_samples`
-   iterations with `n_warmup` adaptation/burn-in steps.
-3. Compute posterior mean parameters and reconstruct trajectories.
-4. Return the full chain alongside point estimates.
+2. Run NUTS (`AdvancedHMC.jl`) for `n_samples` iterations with
+   `n_warmup` adaptation/burn-in steps, over `n_chains` chains.
+3. Take the MAP draw (the pooled sample maximising the log-posterior)
+   as the point estimate and reconstruct trajectories from it.
+4. Return the full chain alongside that point estimate.
 
 # References
 - Hoffman & Gelman (2014), "The No-U-Turn Sampler", JMLR.
 - Neal (2011), "MCMC using Hamiltonian dynamics", Handbook of MCMC.
 
 # Returns
-`PSMSolution` with fitted parameters, trajectory, unknown functions,
-and the full MCMC chain in `sol.extras[:chain]`.
+`PSMSolution` whose `parameters` are the MAP draw, with trajectory and
+unknown functions built from it. `sol.convergence` **is** the full
+`MCMCChains.Chains` object (iterations × parameters × chains) — there is
+no `extras` field on `PSMSolution`.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     _validate_problem(prob, "MCMCSolver")

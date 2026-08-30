@@ -1,6 +1,6 @@
 # Model Selection with Marginal Likelihood
 Simon Frost
-2026-06-12
+2026-08-30
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -59,14 +59,24 @@ $$\mathcal{V}(\lambda) = \ell(\hat{\boldsymbol\beta}) - \tfrac{1}{2}\hat{\boldsy
 where $\mathbf{S}_\lambda$ is the penalty matrix scaled by the smoothing
 parameter $\lambda$, $|\cdot|_+$ denotes the pseudo-determinant (the
 product of the positive eigenvalues, since $\mathbf{S}_\lambda$ is rank
-deficient), $\mathbf{H}$ is the Hessian of the penalized
-log-likelihood, and $M_p$ is the penalty null-space dimension. For
-Gaussian data with unknown $\sigma^2$ this reduces to profiled REML.
-The criterion is maximized internally when selecting $\lambda$. Note
-that the `sol.objective` field recorded below is not this marginal
-likelihood but the final penalized objective
-$\tfrac{1}{2}(\|\mathbf{y}-\hat{\mathbf{y}}\|^2 + \hat{\boldsymbol\beta}'\mathbf{S}_\lambda\hat{\boldsymbol\beta})$,
-for which lower values indicate a better penalized fit.
+deficient), $\mathbf{H}$ is the Hessian of the penalized log-likelihood,
+and $M_p$ is the penalty null-space dimension. For Gaussian data with
+unknown $\sigma^2$ this reduces to profiled REML.
+
+**Which field to select on.** The criterion value $\mathcal{V}$ at the
+returned fit is exposed as `sol.convergence.laml`, and it is
+**maximized** — larger is better. This is the quantity every table below
+reports and every selection below uses. It is *not* `sol.objective`,
+which for `LAML` is the final penalized objective
+$\tfrac{1}{2}(\|\mathbf{y}-\hat{\mathbf{y}}\|^2 + \hat{\boldsymbol\beta}'\mathbf{S}_\lambda\hat{\boldsymbol\beta})$
+— a measure of penalized fit that carries **no complexity term**, so
+ranking models by it simply rewards whichever model fits hardest. Two
+further caveats: `convergence.laml` is `NaN` when a fit has no penalized
+term or the criterion evaluation failed (the helper below treats `NaN`
+as the worst score), and it exists only on `LAML` solutions —
+`GCVSolver` reports `convergence.gcv`/`convergence.ncv` (both
+*minimized*), and `CollocationLAML` exposes no comparable criterion at
+all.
 
 This vignette demonstrates LAML-based model selection on two example
 systems: logistic growth and Lotka–Volterra predator–prey.
@@ -82,9 +92,24 @@ using Random
 using DataFrames
 using Printf
 Random.seed!(42)
+
+# LAML is a MAXIMIZED criterion, and `sol.convergence.laml` is NaN when a
+# fit has no penalized term or the criterion evaluation failed. Selecting
+# with a bare `argmax` would be unreliable in that case, so treat NaN as
+# the worst possible score.
+best_by_laml(v) = argmax([isnan(x) ? -Inf : x for x in Float64.(v)])
+
+# A LAML score is only meaningful if the fit it came from is itself sound. A
+# runaway λ can collapse a spline onto nothing (EDF → 0), which removes the
+# unknown function from the model entirely — and such a degenerate fit can post
+# a very large LAML score. Note `converged` does NOT catch this; the
+# `stationarity` diagnostic does. Section 3 has a live example.
+is_comparable(sol) = isfinite(sol.convergence.laml) && sol.edf > 0.5 &&
+                     isfinite(sol.convergence.stationarity) &&
+                     sol.convergence.stationarity < 1e3
 ```
 
-    TaskLocalRNG()
+    is_comparable (generic function with 1 method)
 
 ## Logistic Growth with Unknown Per-Capita Rate
 
@@ -164,24 +189,37 @@ for nk in knot_counts
         obs_to_state=[1], known_params=(;),
         solver=Tsit5())
     sol = solve(prob, LAML(maxiters=80, verbose=false))
-    push!(knot_results, (nk=nk, laml=sol.objective, edf=sol.edf, ss=sol.data_loss))
+    push!(knot_results, (nk=nk, laml=sol.convergence.laml, edf=sol.edf, ss=sol.data_loss))
 end
 ```
 
 ### LAML vs number of knots
 
 In principle the criterion balances underfitting (too few knots) against
-overfitting (too many knots). In practice the curve below is not a clean
-U shape: most knot counts reach similar objective values (roughly
-0.8–2.3), while the 6- and 10-knot fits converged to poor local optima
-(data SS of 27.8 and 19.2, versus ≈1.4–4.2 for the others), which
-dominates their criterion values. This is a useful reminder to inspect
-the individual fits — not just the selection criterion — before
-comparing models.
+overfitting (too many knots), and one expects a peak at some
+intermediate knot count. What the table below actually shows is more
+interesting, and is the standard result for a well-penalized spline:
+**every knot count from 4 to 20 produces the same fit** — identical
+effective degrees of freedom (2.0) and identical data SS (1.753).
+
+The reason is that $\lambda$ is estimated, not fixed. The true $r(N)$ is
+linear, so LAML drives $\lambda$ up until the fit collapses onto the
+penalty null space — the straight lines — and that null space is
+two-dimensional no matter how many knots the basis started with. Extra
+knots add flexibility that the penalty then removes.
+
+So the knot count is not really a model-selection question here: **once
+the smoothing parameter is estimated, the basis size stops mattering,
+provided it is generous enough to contain the truth.** The LAML values
+do drift slightly upward with more knots, so `argmax` formally selects
+the largest basis, but the differences are small and the fitted function
+is unchanged — the choice is immaterial rather than important. The
+practical advice is to pick a basis comfortably larger than you think
+you need and let the penalty do the work.
 
 ``` julia
 laml_vals = [r.laml for r in knot_results]
-best_idx = argmin(laml_vals)
+best_idx = best_by_laml(laml_vals)
 best_nk = knot_results[best_idx].nk
 
 plot(knot_counts, laml_vals,
@@ -197,23 +235,23 @@ vline!([best_nk], ls=:dash, color=:red, label="Best ($best_nk knots)")
 ### Summary table
 
 ``` julia
-println("| Knots | LAML | EDF | Data SS |")
-println("|------:|-----:|----:|--------:|")
+println("| Knots | LAML | EDF | Data SS | Selected |")
+println("|------:|-----:|----:|--------:|:--------:|")
 for r in knot_results
     marker = r.nk == best_nk ? " ✓" : ""
-    @printf("| %d | %.2f | %.1f | %.3f |%s\n", r.nk, r.laml, r.edf, r.ss, marker)
+    @printf("| %d | %.2f | %.1f | %.3f |%s |\n", r.nk, r.laml, r.edf, r.ss, marker)
 end
 ```
 
-| Knots |  LAML |  EDF | Data SS |
-|------:|------:|-----:|--------:|
-|     4 |  0.98 |  3.3 |   1.923 |
-|     6 | 13.88 |  6.0 |  27.753 |
-|     8 |  1.11 |  7.2 |   1.920 |
-|    10 | 11.50 |  9.5 |  19.155 |
-|    12 |  0.82 |  6.8 |   1.379 |
-|    15 |  0.82 |  5.0 |   1.559 |
-|    20 |  2.33 | 14.3 |   4.223 |
+| Knots |  LAML | EDF | Data SS | Selected |
+|------:|------:|----:|--------:|:--------:|
+|     4 | 31.44 | 2.0 |   1.753 |          |
+|     6 | 31.76 | 2.0 |   1.753 |          |
+|     8 | 32.00 | 2.0 |   1.753 |          |
+|    10 | 32.20 | 2.0 |   1.753 |          |
+|    12 | 32.36 | 2.0 |   1.753 |          |
+|    15 | 32.57 | 2.0 |   1.753 |          |
+|    20 | 32.84 | 2.0 |   1.753 |    ✓     |
 
 ### Recovered unknown functions
 
@@ -224,7 +262,7 @@ against the truth.
 N_grid = range(N_domain[1], N_domain[2], length=200)
 r_true = [0.5 * (1.0 - N / 10.0) for N in N_grid]
 
-selected_knots = [4, best_nk, 20]
+selected_knots = unique([4, best_nk, 20])
 p_uf = plot(N_grid, r_true, lw=3, ls=:dash, color=:black, label="True r(N)",
     xlabel="N", ylabel="r(N)", title="Estimated per-capita rate")
 
@@ -246,9 +284,11 @@ display(p_uf)
 
 > [!NOTE]
 >
-> The LAML-selected model typically recovers the linear truth well,
-> while the 4-knot model is too rigid and the 20-knot model may show
-> slight edge wiggles — though the smoothing penalty limits the damage.
+> All of these curves lie essentially on top of one another, which is
+> the point: with $\lambda$ estimated, the 4-knot and 20-knot bases
+> recover the same linear $r(N)$. The extra knots do not buy extra
+> wiggle, because the penalty removes it. Had we fixed $\lambda$ instead
+> of estimating it, the knot count would have mattered a great deal.
 
 ## Section 2: Approximator Type Comparison
 
@@ -283,7 +323,7 @@ for (name, uf) in approx_specs
         obs_to_state=[1], known_params=(;),
         solver=Tsit5())
     sol = solve(prob, LAML(maxiters=80, verbose=false))
-    push!(approx_results, (name=name, laml=sol.objective, edf=sol.edf, ss=sol.data_loss))
+    push!(approx_results, (name=name, laml=sol.convergence.laml, edf=sol.edf, ss=sol.data_loss))
     approx_solutions[name] = sol
 end
 ```
@@ -291,20 +331,20 @@ end
 ### Comparison table
 
 ``` julia
-best_approx_idx = argmin([r.laml for r in approx_results])
-println("| Approximator | LAML | EDF | Data SS |")
-println("|:-------------|-----:|----:|--------:|")
+best_approx_idx = best_by_laml([r.laml for r in approx_results])
+println("| Approximator | LAML | EDF | Data SS | Selected |")
+println("|:-------------|-----:|----:|--------:|:--------:|")
 for (i, r) in enumerate(approx_results)
     marker = i == best_approx_idx ? " ✓" : ""
-    @printf("| %s | %.2f | %.1f | %.3f |%s\n", r.name, r.laml, r.edf, r.ss, marker)
+    @printf("| %s | %.2f | %.1f | %.3f |%s |\n", r.name, r.laml, r.edf, r.ss, marker)
 end
 ```
 
-| Approximator                | LAML | EDF | Data SS |
-|:----------------------------|-----:|----:|--------:|
-| B-spline (8 knots)          | 1.11 | 7.2 |   1.920 |
-| SPDE (Matérn ν=1.5, 8 mesh) | 0.88 | 7.1 |   1.361 |
-| GP (SE, 8 inducing)         | 0.87 | 2.2 |   1.727 |
+| Approximator                |  LAML | EDF | Data SS | Selected |
+|:----------------------------|------:|----:|--------:|:--------:|
+| B-spline (8 knots)          | 32.00 | 2.0 |   1.753 |    ✓     |
+| SPDE (Matérn ν=1.5, 8 mesh) | 27.56 | 6.4 |   1.350 |          |
+| GP (SE, 8 inducing)         | 32.00 | 2.0 |   1.753 |          |
 
 ### Recovered unknown functions by approximator type
 
@@ -325,12 +365,17 @@ display(p_approx)
 
 > [!NOTE]
 >
-> For a smooth, nearly linear unknown function, B-splines and SPDE
-> typically perform similarly. GP approximators may show slightly
-> different behaviour near domain boundaries due to the
-> squared-exponential kernel’s stationarity. LAML provides a fair
-> comparison across types by penalising complexity through the marginal
-> likelihood.
+> This comparison shows exactly why the criterion, and not the data SS,
+> is the right thing to rank on. The SPDE fit achieves the **lowest**
+> data SS of the three — it fits the observations best — but it does so
+> with more than three times the effective degrees of freedom, and LAML
+> scores it **worst**. The B-spline and GP fits both settle at EDF 2.0,
+> recovering the linear truth, and score highest.
+>
+> Ranking by fit alone would have chosen the SPDE; ranking by the
+> marginal likelihood chooses the models that match the truth. That is
+> the complexity penalty doing its job, and it is why `sol.objective` —
+> which contains no such penalty — must not be used for model selection.
 
 ## Section 3: Structural Model Selection
 
@@ -460,31 +505,37 @@ prob_C = PSMProblem(lv_delta_only!, u0_lv, tspan_lv, [uf_δ_C];
 sol_C = solve(prob_C, lv_solver)
 ```
 
-    PSMSolution((δ = [-12.883509282090364, -20.909436674756513, -10.762296439010708, 0.8006404477007374, -0.5609687224247226, -0.24782666897820388, 0.09623901873735259, 0.09584108957050289]), 148521.1790372217, 276702.5232506282, 2.1366031075096155, [0.07530695768038627], [6.432125074999585 2.5210677339983913; 10.34055097759363 2.525670584967232; … ; 27.890664375482494 42.17731627996809; 28.848795213430478 51.42339061131636], [5.397618111676317 1.412112277516411; 6.180136366182137 1.1671751794770528; … ; 9.675345953433288 0.1; 10.552385211138148 0.1], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0  …  31.0, 32.0, 33.0, 34.0, 35.0, 36.0, 37.0, 38.0, 39.0, 40.0], Dict{Symbol, Any}(:δ => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([-12.883509282090364, -20.909436674756513, -10.762296439010708, 0.8006404477007374, -0.5609687224247226, -0.24782666897820388, 0.09623901873735259, 0.09584108957050289], [0.1, 0.9428571428571428, 1.7857142857142858, 2.6285714285714286, 3.4714285714285715, 4.314285714285714, 5.1571428571428575, 6.0], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 0.8428571428571429, 0.842857142857143, 0.8428571428571427, 0.842857142857143, 0.8428571428571425, 0.8428571428571434, 0.8428571428571425], [0.0, 38.09673662377174, 1.100036634850212, -30.539278584491214, 11.898314683578558, -2.90928438049921, -8.192922275496763e-7, 0.0], DataInterpolations.ExtrapolationType.Extension, DataInterpolations.ExtrapolationType.Extension, FindFirstFunctions.Guesser{Vector{Float64}}([0.1, 0.9428571428571428, 1.7857142857142858, 2.6285714285714286, 3.4714285714285715, 4.314285714285714, 5.1571428571428575, 6.0], Base.RefValue{Int64}(1), true), false, false)), (V_beta = [9.727718564120218e-7 9.710575143894164e-11 … -1.7754530968123832e-10 -1.740873685584656e-10; 9.710575143894164e-11 9.725249655663428e-7 … 1.088130619605939e-9 1.066503582991337e-9; … ; -1.7754530968123832e-10 1.088130619605939e-9 … 3.4080695244611314e-7 3.3379590771294405e-7; -1.740873685584656e-10 1.066503582991337e-9 … 3.3379590771294405e-7 3.2701625139962954e-7], sigma2 = 3553.6919052309554))
+    PSMSolution((δ = [-16062.577342910165, -15760.152346849894, -15457.72735078963, -15155.302354729458, -14852.87735866942, -14550.45236260947, -14248.027366549535, -13945.602370489576]), -6.326341023286257e11, 82272.4126450235, 4.232598042395698e-9, [2.3538526683702056e16], [4.211069186413606 44.86645038475608; 4.432891348933726 44.8664563634304; … ; 29.6176995878095 44.867158142001216; 31.177614174949895 44.867201774020735], [5.397618111676317 1.412112277516411; 6.180136366182137 1.1671751794770528; … ; 9.675345953433288 0.1; 10.552385211138148 0.1], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0  …  31.0, 32.0, 33.0, 34.0, 35.0, 36.0, 37.0, 38.0, 39.0, 40.0], Dict{Symbol, Any}(:δ => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([-16062.577342910165, -15760.152346849894, -15457.72735078963, -15155.302354729458, -14852.87735866942, -14550.45236260947, -14248.027366549535, -13945.602370489576], [0.1, 0.9428571428571428, 1.7857142857142858, 2.6285714285714286, 3.4714285714285715, 4.314285714285714, 5.1571428571428575, 6.0], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 0.8428571428571429, 0.842857142857143, 0.8428571428571427, 0.842857142857143, 0.8428571428571425, 0.8428571428571434, 0.8428571428571425], [0.0, 2.5444500243592775e-11, -1.4817764592922725e-10, -2.1559304245105946e-10, -1.2678101641580016e-10, -1.3202842099970371e-11, 5.38817188333387e-11, 0.0], DataInterpolations.ExtrapolationType.Linear, DataInterpolations.ExtrapolationType.Linear, FindFirstFunctions.Guesser{Vector{Float64}}([0.1, 0.9428571428571428, 1.7857142857142858, 2.6285714285714286, 3.4714285714285715, 4.314285714285714, 5.1571428571428575, 6.0], Base.RefValue{Int64}(1), true), false, false)), (V_beta = [3.6014477902254233e-9 2.8811569639810574e-9 … -7.202971660090793e-10 -1.440587991835432e-9; 2.8811569639810574e-9 2.3666679382786785e-9 … -2.0577719019022334e-10 -7.202662158255216e-10; … ; -7.202971660090793e-10 -2.0577719019022334e-10 … 2.3668226891964864e-9 2.8813426650824257e-9; -1.440587991835432e-9 -7.202662158255216e-10 … 2.8813426650824257e-9 3.601664441510353e-9], sigma2 = 1028.405158117204, converged = true, iterations = 17, reason = :converged_tol, laml_failures = 0, criterion = :working, laml = 2670.8529720669944, stationarity = 2.9264188250739167e41, smoothing_advanced = true))
 
 ### Structural comparison
 
 ``` julia
 struct_results = [
-    ("A: r(H) + δ(L) unknown", sol_A.objective, sol_A.edf, sol_A.data_loss),
-    ("B: r(H) unknown, δ const", sol_B.objective, sol_B.edf, sol_B.data_loss),
-    ("C: δ(L) unknown, r const", sol_C.objective, sol_C.edf, sol_C.data_loss),
+    ("A: r(H) + δ(L) unknown", sol_A),
+    ("B: r(H) unknown, δ const", sol_B),
+    ("C: δ(L) unknown, r const", sol_C),
 ]
 
-best_struct = argmin([r[2] for r in struct_results])
-println("| Model structure | LAML | EDF | Data SS |")
-println("|:----------------|-----:|----:|--------:|")
-for (i, (name, laml, edf, ss)) in enumerate(struct_results)
+# Score only the fits that pass the soundness check; a degenerate fit is not a
+# candidate model, it is a failed one.
+scores = [is_comparable(s) ? s.convergence.laml : -Inf for (_, s) in struct_results]
+best_struct = argmax(scores)
+
+println("| Model structure | LAML | EDF | Data SS | Sound? | Selected |")
+println("|:----------------|-----:|----:|--------:|:------:|:--------:|")
+for (i, (name, s)) in enumerate(struct_results)
     marker = i == best_struct ? " ✓" : ""
-    @printf("| %s | %.2f | %.1f | %.3f |%s\n", name, laml, edf, ss, marker)
+    sound = is_comparable(s) ? "yes" : "**no**"
+    @printf("| %s | %.2f | %.1f | %.3f | %s |%s |\n",
+            name, s.convergence.laml, s.edf, s.data_loss, sound, marker)
 end
 ```
 
-| Model structure          |      LAML | EDF |    Data SS |
-|:-------------------------|----------:|----:|-----------:|
-| A: r(H) + δ(L) unknown   |      1.88 | 6.4 |      3.656 |
-| B: r(H) unknown, δ const |      2.27 | 5.0 |      4.395 |
-| C: δ(L) unknown, r const | 148521.18 | 2.1 | 276702.523 |
+| Model structure          |    LAML | EDF |   Data SS | Sound? | Selected |
+|:-------------------------|--------:|----:|----------:|:------:|:--------:|
+| A: r(H) + δ(L) unknown   | 2574.00 | 0.0 | 10940.649 | **no** |          |
+| B: r(H) unknown, δ const |  105.02 | 2.0 |     4.504 |  yes   |    ✓     |
+| C: δ(L) unknown, r const | 2670.85 | 0.0 | 82272.413 | **no** |          |
 
 ### Recovered unknown functions
 
@@ -520,9 +571,43 @@ plot(p1, p2, layout=(1, 2), size=(900, 400))
 > [!NOTE]
 >
 > Since the true predator death rate $\delta$ is constant, LAML should
-> favour Model B (only $r(H)$ unknown) or Model A with a near-constant
-> estimate for $\delta(L)$. Model C — which fixes $r$ as constant —
-> should score worst because the true prey growth is nonlinear.
+> favour Model B (only $r(H)$ unknown). Model C — which fixes $r$ as
+> constant — is the misspecified one, since the true prey growth is
+> nonlinear. Model B is indeed selected, and it is the only one of the
+> three whose fit is sound enough to compare (see the warning below).
+
+> [!WARNING]
+>
+> ### A criterion is only as good as the fit underneath it
+>
+> Model C is worth studying rather than skipping past. Its smoothing
+> parameter runs away (λ of order $10^{16}$), the spline collapses to an
+> effective dimension of essentially zero — meaning there is no unknown
+> function left in the model at all — and its data SS is four orders of
+> magnitude worse than Model B’s.
+>
+> It would be comfortable to blame misspecification: Model C does fix $r$
+> as constant when the true prey growth is nonlinear. But the table
+> refutes that story. **Model A collapses in exactly the same way** —
+> same runaway λ, same effective dimension of zero — and Model A is *not*
+> misspecified: it leaves both functions free and so nests the truth. λ
+> runaway is a failure of the fit, not a verdict on the model, and it can
+> strike the most general model in the set.
+>
+> And yet **Model C posts by far the largest raw LAML score**, and its
+> `convergence.converged` flag is `true`. Selecting by `argmax` on the
+> raw criterion alone would pick the worst model in the set, and the
+> usual convergence flag would not warn you.
+>
+> Two lessons follow. First, `converged` means “a stopping criterion
+> fired”, not “the answer is good” — for LAML fits,
+> `convergence.stationarity` is the diagnostic that exposes this
+> failure, and it differs by tens of orders of magnitude between the
+> sound and the degenerate fits here. Second, a marginal likelihood is
+> only comparable across models when each fit is individually sound;
+> screen the fits first, then rank the survivors. That is what
+> `is_comparable` does above, and it is why the table carries a “Sound?”
+> column.
 
 ## Section 4: Diagnostics for the Best Knot Model
 
@@ -537,7 +622,7 @@ prob_best = PSMProblem(logistic!, [1.0], tspan, [uf_best];
 sol_best = solve(prob_best, LAML(maxiters=80, verbose=false))
 ```
 
-    PSMSolution((r = [0.4135407259235328, 0.4059448006819599, 0.3976221046372005, 0.3855104255437301, 0.3646613821471564, 0.3325045028881764, 0.2898003491798962, 0.2414484068220883, 0.19629509981574172, 0.15882322269535015, 0.1263314079409585, 0.09162893962516754, 0.05343737460976776, 0.010294838915470292, -0.03519457376705063]), 0.8181227805490461, 1.5586358670820382, 5.024347695359861, [0.05129721869866111], [1.2233318187903846; 1.494486839062224; … ; 9.89631037678892; 9.904271389988459;;], [1.4850697682783507; 1.28432364973933; … ; 9.73668371630828; 9.64864965922381;;], [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0  …  10.5, 11.0, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0], Dict{Symbol, Any}(:r => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([0.4135407259235328, 0.4059448006819599, 0.3976221046372005, 0.3855104255437301, 0.3646613821471564, 0.3325045028881764, 0.2898003491798962, 0.2414484068220883, 0.19629509981574172, 0.15882322269535015, 0.1263314079409585, 0.09162893962516754, 0.05343737460976776, 0.010294838915470292, -0.03519457376705063], [0.1, 0.8428571428571429, 1.5857142857142856, 2.3285714285714287, 3.0714285714285716, 3.8142857142857145, 4.557142857142857, 5.3, 6.042857142857143, 6.785714285714286, 7.5285714285714285, 8.271428571428572, 9.014285714285714, 9.757142857142858, 10.5], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 0.7428571428571429, 0.7428571428571428, 0.7428571428571431, 0.7428571428571429, 0.7428571428571429, 0.7428571428571424, 0.7428571428571429, 0.7428571428571429, 0.7428571428571429, 0.7428571428571429, 0.7428571428571438, 0.742857142857142, 0.7428571428571438, 0.742857142857142], [0.0, -0.0004873860073507902, -0.005952475798143036, -0.016899493948043683, -0.021448997563246728, -0.020252139450871627, -0.01222065055391278, 0.007727572178314502, 0.016088423724147375, 0.011437238341914326, -0.007690249295799433, -0.004712193342569911, -0.011397161863692051, -0.003529979453989361, 0.0], DataInterpolations.ExtrapolationType.Extension, DataInterpolations.ExtrapolationType.Extension, FindFirstFunctions.Guesser{Vector{Float64}}([0.1, 0.8428571428571429, 1.5857142857142856, 2.3285714285714287, 3.0714285714285716, 3.8142857142857145, 4.557142857142857, 5.3, 6.042857142857143, 6.785714285714286, 7.5285714285714285, 8.271428571428572, 9.014285714285714, 9.757142857142858, 10.5], Base.RefValue{Int64}(1), true), false, false)), (V_beta = [0.014686855043522164 0.008680793213919085 … 0.0004999378825603097 -0.00045144254849477405; 0.008680793213919085 0.007525924577029164 … 0.0002676563698959926 -0.00028173848126329605; … ; 0.0004999378825603097 0.0002676563698959926 … 0.0005461768089064928 0.0009737909709510925; -0.00045144254849477405 -0.00028173848126329605 … 0.0009737909709510925 0.008237497339726034], sigma2 = 0.06240621258138129))
+    PSMSolution((r = [0.4960425763389873, 0.4686699094719531, 0.4412972426004149, 0.4139245748107459, 0.3865519006979239, 0.35917921066663294, 0.3318064937174607, 0.3044337394795158, 0.2770609393161219, 0.24968808781526627, 0.22231518336539882, 0.1949422258593134, 0.16756921423901114, 0.14019614610056175, 0.11282301690533325, 0.08544982482483286, 0.05807657555759959, 0.03070328066668578, 0.003329960460910368, -0.024043363234119357]), 0.8766451619056769, 1.7532840787788684, 2.0001029111499875, [27150.937500330747], [1.2491998388019596; 1.549829217384459; … ; 9.956408146065023; 9.970259496594556;;], [1.4850697682783507; 1.28432364973933; … ; 9.73668371630828; 9.64864965922381;;], [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0  …  10.5, 11.0, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0], Dict{Symbol, Any}(:r => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([0.4960425763389873, 0.4686699094719531, 0.4412972426004149, 0.4139245748107459, 0.3865519006979239, 0.35917921066663294, 0.3318064937174607, 0.3044337394795158, 0.2770609393161219, 0.24968808781526627, 0.22231518336539882, 0.1949422258593134, 0.16756921423901114, 0.14019614610056175, 0.11282301690533325, 0.08544982482483286, 0.05807657555759959, 0.03070328066668578, 0.003329960460910368, -0.024043363234119357], [0.1, 0.6473684210526316, 1.194736842105263, 1.7421052631578948, 2.289473684210526, 2.836842105263158, 3.3842105263157896, 3.931578947368421, 4.478947368421053, 5.026315789473684, 5.573684210526316, 6.121052631578947, 6.668421052631579, 7.21578947368421, 7.7631578947368425, 8.310526315789474, 8.857894736842105, 9.405263157894737, 9.952631578947368, 10.5], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 0.5473684210526316, 0.5473684210526315, 0.5473684210526317, 0.5473684210526313, 0.547368421052632, 0.5473684210526315, 0.5473684210526315, 0.5473684210526315, 0.5473684210526315, 0.5473684210526315, 0.5473684210526315, 0.5473684210526315, 0.5473684210526315, 0.5473684210526324, 0.5473684210526315, 0.5473684210526315, 0.5473684210526315, 0.5473684210526315, 0.5473684210526315], [0.0, -3.489691984406758e-11, 4.939196523092683e-11, -1.854905595173818e-8, -5.2479919694497575e-8, -9.031273373628404e-8, -1.2532361077890784e-7, -1.5513359143365876e-7, -1.7383990199237616e-7, -1.7758503794093043e-7, -1.7617090400819797e-7, -1.8022920226153988e-7, -1.8659750937466748e-7, -2.0520682060877182e-7, -2.1529140135108615e-7, -1.9296095986586451e-7, -1.5807984259641224e-7, -8.837436695181054e-8, 4.6247380840089784e-9, 0.0], DataInterpolations.ExtrapolationType.Linear, DataInterpolations.ExtrapolationType.Linear, FindFirstFunctions.Guesser{Vector{Float64}}([0.1, 0.6473684210526316, 1.194736842105263, 1.7421052631578948, 2.289473684210526, 2.836842105263158, 3.3842105263157896, 3.931578947368421, 4.478947368421053, 5.026315789473684, 5.573684210526316, 6.121052631578947, 6.668421052631579, 7.21578947368421, 7.7631578947368425, 8.310526315789474, 8.857894736842105, 9.405263157894737, 9.952631578947368, 10.5], Base.RefValue{Int64}(1), true), false, false)), (V_beta = [0.0009506175432486755 0.0008808599170822942 … -0.0003024572594974647 -0.00037194723747336597; 0.0008808599170822942 0.0008167843361333314 … -0.00027058507217731805 -0.00033445043716256697; … ; -0.0003024572594974647 -0.00027058507217731805 … 0.00027146940415672955 0.0003033817705102071; -0.00037194723747336597 -0.00033445043716256697 … 0.0003033817705102071 0.00034095617625022015], sigma2 = 0.06261751867213301, converged = true, iterations = 19, reason = :converged_tol, laml_failures = 0, criterion = :working, laml = 32.841490502269096, stationarity = 1.1411467591118353e-6, smoothing_advanced = true))
 
 ### Fitted trajectory
 
@@ -586,17 +671,18 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ### Durbin–Watson and residual autocorrelation
 
-    Durbin-Watson: 2.033
-    Residual ACF (lags 1–5): [-0.06, -0.268, -0.118, -0.263, 0.087]
+    Durbin-Watson: 1.844
+    Residual ACF (lags 1–5): [0.026, -0.2, -0.089, -0.234, 0.07]
 
 ## Discussion
 
 ### Guidelines for LAML-based model selection
 
 1.  **Knot selection**: Start with a moderate number (6–10) and sweep
-    upwards. LAML typically produces a clear minimum or plateau. Unlike
-    cross-validation, LAML does not require held-out data or repeated
-    fitting.
+    upwards. Remember LAML is *maximized*, so look for a peak or — as in
+    Section 1 — a plateau, which is the common outcome once λ is
+    estimated. Unlike cross-validation, LAML does not require held-out
+    data or repeated fitting.
 
 2.  **Approximator comparison**: LAML enables fair comparison across
     approximator types because it accounts for effective complexity
@@ -616,13 +702,24 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ### Relationship to other criteria
 
-| Criterion | Accounts for smoothing? | Requires refitting? |   Bayesian?   |
-|:----------|:-----------------------:|:-------------------:|:-------------:|
-| AIC       |           No            |         No          |      No       |
-| BIC       |           No            |         No          |      No       |
-| GCV       |           Yes           |         No          |      No       |
-| LAML      |           Yes           |         No          | Yes (approx.) |
-| WAIC/LOO  |           Yes           |     Yes (MCMC)      |      Yes      |
+The table below situates LAML among the criteria you may know from
+elsewhere. **Only the two marked “implemented” are available in this
+package** — `LAML` exposes `sol.convergence.laml`, and `GCVSolver`
+exposes `sol.convergence.gcv` (or `.ncv` with `criterion=:ncv`). The
+package exports no AIC, BIC, WAIC or LOO accessor; those rows are for
+orientation only, and computing them would be your own work.
+
+| Criterion | Accounts for smoothing? | Requires refitting? | Bayesian? | In this package |
+|:---|:--:|:--:|:--:|:--:|
+| AIC | No | No | No | No |
+| BIC | No | No | No | No |
+| GCV | Yes | No | No | **Implemented** |
+| LAML | Yes | No | Yes (approx.) | **Implemented** |
+| WAIC/LOO | Yes | Yes (MCMC) | Yes | No |
+
+Note also that GCV and NCV are **minimized** while LAML is
+**maximized**, so the direction of the comparison flips depending on
+which solver produced the fit.
 
 LAML and GCV are closely related — both optimise a criterion that
 balances fit against complexity. LAML has a more natural Bayesian

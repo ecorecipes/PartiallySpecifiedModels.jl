@@ -1,6 +1,6 @@
 # Fisheries Stock-Recruitment with Poisson Counts
 Simon Frost
-2026-06-12
+2026-08-30
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -50,9 +50,17 @@ from the data, subject only to biologically motivated shape constraints:
 
 The constraint `:inc_concave` enforces both properties simultaneously,
 which is appropriate for **compensatory** stock-recruitment
-(Beverton-Holt type). This vignette also demonstrates **Poisson
-likelihood** for count data, which is natural when abundance is measured
-as integer counts from survey or catch data.
+(Beverton-Holt type).
+
+The observations here are **Poisson-generated counts**, as abundance
+data from survey or catch records typically are. The fits below
+nevertheless use a **Gaussian** likelihood: with counts in the hundreds
+the Gaussian approximation to the Poisson is close, and it keeps the
+focus of this vignette on the shape constraint. The Poisson family
+enters only at the diagnostic stage, where
+`appraise(sol; family=Poisson())` computes deviance residuals
+appropriate to the counts. See the note at the end for what fitting a
+genuine Poisson likelihood would involve.
 
 ## Setup
 
@@ -145,10 +153,16 @@ y_pois = _sample_pois.(N_true)
     Spawning stock range: 100.0 – 2000.0
     Observed count range: 213 – 4106
     Mean count: 3506.0
-    Var/Mean ratio: 296.52 (≈1 for Poisson)
+    Var/Mean ratio: 296.52 (≈1 only for a CONSTANT Poisson mean)
 
-The variance-to-mean ratio near 1 confirms equidispersion, consistent
-with Poisson sampling.
+Note that this variance-to-mean ratio is **far above 1**, and that is
+expected here rather than evidence against Poisson sampling. The ≈1 rule
+applies to repeated draws from a *single* Poisson mean. These counts are
+drawn from a mean that changes substantially over the series, so the
+marginal variance picks up the variation in the mean itself on top of
+the Poisson noise. Equidispersion would have to be assessed
+conditionally — from the residuals about the fitted mean, which is what
+the deviance-residual diagnostics later in this vignette do.
 
 ## The PSM Model
 
@@ -198,7 +212,7 @@ println("Unconstrained — Data loss: $(round(sol_unc.data_loss, sigdigits=4)), 
     "EDF: $(round(sol_unc.edf, digits=1))")
 ```
 
-    Unconstrained — Data loss: 218000.0, EDF: 5.1
+    Unconstrained — Data loss: 213200.0, EDF: 6.9
 
 ## Shape-Constrained Fit
 
@@ -224,7 +238,7 @@ println("Inc+Concave — Data loss: $(round(sol_sc.data_loss, sigdigits=4)), " *
     "EDF: $(round(sol_sc.edf, digits=1))")
 ```
 
-    Inc+Concave — Data loss: 603100.0, EDF: 2.2
+    Inc+Concave — Data loss: 231000.0, EDF: 3.7
 
 ### Compare recovered R(S) curves
 
@@ -267,12 +281,19 @@ p_fit
 
     Stock-Recruitment Model — Comparison
     ────────────────────────────────────────────────────────────
-      Unconstrained:  data_loss=218000.0, EDF=5.1, cor(R̂,R)=0.996
-      Inc+Concave:    data_loss=603100.0, EDF=2.2, cor(R̂,R)=0.953
+      Unconstrained:  data_loss=213200.0, EDF=6.9, cor(R̂,R)=0.982
+      Inc+Concave:    data_loss=231000.0, EDF=3.7, cor(R̂,R)=0.995
 
-The shape constraint typically produces a smoother, more biologically
-plausible curve with comparable or slightly higher data loss — the small
-price of enforcing prior knowledge.
+The shape constraint produces a smoother, more biologically plausible
+curve at a slightly higher data loss and roughly half the effective
+degrees of freedom. Note what it buys: despite fitting the observations
+less closely, the constrained curve correlates *more* strongly with the
+true recruitment function than the unconstrained one does. That is the
+constraint doing its job — the extra flexibility the unconstrained fit
+spends on the noise is flexibility spent moving away from the truth.
+Where prior knowledge about shape is genuinely correct, enforcing it can
+improve recovery of the underlying function even as it worsens the
+apparent fit to data.
 
 ## Bootstrap Confidence Intervals
 
@@ -368,7 +389,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](28_fisheries_files/figure-commonmark/cell-17-output-1.svg)
 
-    Durbin-Watson: 0.978
+    Durbin-Watson: 2.064
 
 For well-specified Poisson models, the deviance residuals should be
 approximately standard normal. Patterns in “Residuals vs Fitted” would
@@ -437,7 +458,7 @@ This vignette demonstrated:
 | Feature | Implementation |
 |----|----|
 | **Discrete-time model** | `DiscreteProblem` with `f!(u_next, u, p, t)` |
-| **Poisson likelihood** | `likelihood=PartiallySpecifiedModels.Poisson()` |
+| **Poisson-generated counts, Gaussian fit** | `likelihood=PartiallySpecifiedModels.Gaussian()` |
 | **Shape constraints** | `ShapeConstrainedBSplineApproximator(:R, ..., :inc_concave)` |
 | **Bootstrap CIs** | `bootstrap(sol, prob, alg; nboot=50, method=:parametric)` |
 | **Diagnostics** | `appraise(sol; family=Poisson())` for deviance residuals |
@@ -445,15 +466,22 @@ This vignette demonstrated:
 
 **Key takeaways:**
 
-1.  **Poisson likelihood** is appropriate for count data — it models the
-    mean-variance relationship correctly, avoiding the bias of Gaussian
-    likelihood on small counts.
+1.  **The fits here use a Gaussian likelihood on Poisson-generated
+    counts.** That is defensible at these count magnitudes (hundreds),
+    where the Gaussian approximation to the Poisson is good. It would
+    *not* be defensible on small counts, where the Gaussian mis-states
+    the mean-variance relationship and biases the fit. To fit the counts
+    properly, pass `likelihood=PartiallySpecifiedModels.Poisson()` to
+    `PSMProblem` instead of `Gaussian()`; `LAML`’s penalized IRLS loop
+    is family-generic and handles it, and the parametric bootstrap would
+    then resample from the Poisson rather than the Gaussian.
 2.  **`:inc_concave` shape constraints** encode the biologically
     motivated assumption that recruitment is a saturating function of
     spawning stock, ruling out overcompensation (Ricker-type decline)
     while remaining flexible.
-3.  **Parametric bootstrap** with Poisson resampling gives honest
-    uncertainty quantification that accounts for both estimation noise
-    and the flexibility of the nonparametric fit.
+3.  **Parametric bootstrap** — here resampling from the fitted Gaussian,
+    matching the likelihood actually used — gives uncertainty
+    quantification that accounts for both estimation noise and the
+    flexibility of the nonparametric fit.
 4.  **Discrete-time dynamics** are natural for annually-censused fish
     populations — `DiscreteProblem` handles this directly.

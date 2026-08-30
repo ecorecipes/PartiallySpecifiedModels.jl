@@ -282,16 +282,20 @@ CustomLikelihood use the family's pointwise log-likelihood with
    q(β) = N(μ, diag(σ²)).
 3. Estimate the ELBO gradient via the reparametrisation trick and update
    (μ, log σ) with Adam.
-4. Return the posterior mean as point estimate and the variational
-   parameters in `sol.extras`.
+4. Return the variational mean μ as point estimate, with the variational
+   parameters in `sol.convergence`.
 
 # References
 - Blei, Kucukelbir & McAuliffe (2017), "Variational Inference: A Review
   for Statisticians", JASA.
 
 # Returns
-`PSMSolution` with fitted parameters, trajectory, unknown functions,
-and variational parameters `μ`, `σ` in `sol.extras`.
+`PSMSolution` with fitted parameters, trajectory and unknown functions.
+There is no `extras` field on `PSMSolution`: the variational parameters
+live in `sol.convergence`, a `Dict{Symbol,Any}` with `:method`,
+`:posterior_mean` (μ), `:posterior_std` (σ), `:final_elbo`,
+`:elbo_history`, `:obs_noise_var` and `:n_iters`. `sol.objective` is the
+negated best ELBO.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     _validate_problem(prob, "VariationalSolver")
