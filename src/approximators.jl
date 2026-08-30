@@ -346,8 +346,10 @@ computed as `β = Σ · _apply_constraint_transform(γ)` (free components
 linear, the rest softplus'd), then interpolated with the GP predictive-mean
 formula (`_gp_mean_interpolant`, shared with `GPApproximator`), including
 its linear extrapolation outside the inducing range. Shape constraints are
-enforced at the inducing values; the kernel interpolation between points
-may slightly overshoot.
+enforced at the inducing values ONLY; the kernel interpolant between them
+can violate the constraint materially (measured dip −0.505 against a max
+of 5.6 on an all-positive-inducing-value `:positive` fixture — see the
+`ShapeConstrainedGPApproximator` docstring and `check_constraints`).
 
 For zero-at-endpoint constraints the interpolant is centered by subtracting
 its value at the pinned endpoint — a constant shift that preserves
@@ -488,8 +490,10 @@ Build a callable evaluator from unconstrained parameters γ.
 Applies the SCOP-spline reparameterization: mesh node values are computed
 as `β = Σ · _apply_constraint_transform(γ)` (free components linear, the
 rest softplus'd), then interpolated with a cubic spline.
-Shape constraints are enforced at mesh nodes; the cubic spline interpolation
-between nodes may slightly overshoot.
+Shape constraints are enforced at mesh nodes ONLY; the cubic interpolant
+between them can violate the constraint (measured dip −0.121 on an
+all-positive-node `:positive` fixture — see the
+`ShapeConstrainedSPDEApproximator` docstring and `check_constraints`).
 """
 function build_constrained_spde_evaluator(a::ShapeConstrainedSPDEApproximator,
                                           gamma::AbstractVector)

@@ -175,6 +175,7 @@ export spline_penalty_matrix, penalty_matrix, penalty_blocks
 export nparams, initial_params, build_evaluator
 export optimize_spde_range, with_range_param
 export residual_diagnostics, durbin_watson, residual_acf, semivariogram
+export check_constraints
 export appraise, deviance_residuals
 export bootstrap, BootstrapResult
 export confidence_band

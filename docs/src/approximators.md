@@ -264,7 +264,7 @@ approx_scspde = ShapeConstrainedSPDEApproximator(:f, (0.0, 10.0), 10, :increasin
                                                   nu = 1.5, range_param = 3.0)
 ```
 
-Constraints are enforced at mesh nodes via a cumulative-sum reparameterization through `softplus`. The cubic spline interpolation between nodes may slightly overshoot; use more basis functions to reduce this.
+Constraints are enforced at mesh nodes via a cumulative-sum reparameterization through `softplus`, and they hold **at the nodes only**: the cubic-spline interpolant between nodes has cardinal functions that take negative values (measured minimum −0.17), so the fitted function can violate the constraint between nodes — a `:positive` fixture with all-positive node values (alternating ≈5 / ≈0.007) dipped to −0.121. Adding mesh nodes does not cure this (the worst-case dip per unit node value grows slightly with `n_basis`, measured 0.24 → 0.27 for 6 → 40 nodes); it helps only indirectly, by letting the fitted node values vary more smoothly relative to the spacing. Audit a fitted result with [`check_constraints`](@ref), and use [`ShapeConstrainedBSplineApproximator`](@ref) when the constraint must hold everywhere — its B-spline convex-hull property makes all 14 constraints exact.
 
 !!! tip
     Simple constraints (`:increasing`, `:decreasing`, `:concave`) tend to converge more reliably than combined constraints (`:inc_concave`, `:dec_positive`) which can trap the optimizer in local optima.
@@ -309,7 +309,7 @@ Combines the GP predictive-mean interpolation of [`GPApproximator`](@ref) with t
 approx_scgp = ShapeConstrainedGPApproximator(:f, (0.0, 10.0), 10, :increasing)
 ```
 
-Constraints are enforced at the inducing-point values via a cumulative-sum reparameterization through `softplus`; the kernel interpolation between points may slightly overshoot — use more inducing points to reduce this. Kernel hyperparameters adapt during LAML/GCV fits exactly as for `GPApproximator` (pass an explicit `lengthscale` to fix them).
+Constraints are enforced at the inducing-point values via a cumulative-sum reparameterization through `softplus`, and they hold **at the inducing values only**: the kernel interpolant between them has cardinal functions that take negative values (measured minimum −0.26 for the default `:sqexp` kernel), so the fitted function can violate the constraint between points — a `:positive` fixture with all-positive inducing values (alternating ≈5 / ≈0.007) dipped to −0.505 against a maximum of 5.6. Adding inducing points does **not** cure this — the worst-case dip per unit inducing value grows with `n_inducing` (measured 0.35 → 0.57 for 6 → 40 points at default kernel settings). What measurably reduces it on that fixture: a rougher kernel (`kernel=:matern32` at its default lengthscale cut the dip from −0.505 to −0.023) or a shorter explicit `lengthscale` (0.5× the default eliminated it), both at the cost of wigglier interpolation. Audit a fitted result with [`check_constraints`](@ref), and use [`ShapeConstrainedBSplineApproximator`](@ref) when the constraint must hold everywhere. Kernel hyperparameters adapt during LAML/GCV fits exactly as for `GPApproximator` (pass an explicit `lengthscale` to fix them — required if you rely on a short lengthscale to limit violations).
 
 ```@docs
 ShapeConstrainedGPApproximator

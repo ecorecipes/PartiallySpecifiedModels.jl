@@ -6665,6 +6665,160 @@ end
         @test maximum(abs(fa(x) - f_true_gp(x)) for x in grid) < 0.2
     end
 
+    @testset "check_constraints — between-node constraint honesty" begin
+        import PartiallySpecifiedModels as PSM
+        dom_cc = (0.3, 2.7)
+        γ_alt = [iseven(i) ? 5.0 : -5.0 for i in 1:10]
+
+        # SCOP-GP: all 10 inducing VALUES are positive (alternating ≈5 /
+        # ≈0.007), yet the kernel interpolant dips to −0.500 between them
+        # (measured on the default 201-point grid; −0.505 on a 2001-point
+        # grid) against a max of 5.6 — the checker must fire.
+        a_gp = ShapeConstrainedGPApproximator(:f, dom_cc, 10, :positive)
+        @test all(PSM.gamma_to_inducing_values(a_gp, γ_alt) .> 0)
+        f_gp = PSM.build_constrained_gp_evaluator(a_gp, γ_alt)
+        r_gp = check_constraints(f_gp, :positive, dom_cc)
+        @test !r_gp.satisfied
+        @test r_gp.worst_quantity == :value
+        @test 0.45 < r_gp.worst_absolute < 0.55   # measured 0.49994
+        @test 0.08 < r_gp.worst_relative < 0.10   # measured 0.08917
+        @test 2.4 < r_gp.worst_location < 2.6     # measured 2.496
+
+        # Sibling parity: SCOP-SPDE cubic interpolation, same all-positive
+        # node values, smaller but real dip (measured −0.11917)
+        a_sp = ShapeConstrainedSPDEApproximator(:g, dom_cc, 10, :positive)
+        @test all(PSM.gamma_to_mesh_values(a_sp, γ_alt) .> 0)
+        r_sp = check_constraints(
+            PSM.build_constrained_spde_evaluator(a_sp, γ_alt), :positive, dom_cc)
+        @test !r_sp.satisfied
+        @test r_sp.worst_quantity == :value
+        @test 0.09 < r_sp.worst_absolute < 0.15   # measured 0.11917
+
+        # Contrast: the SCOP B-spline is exact EVERYWHERE (B-spline convex
+        # hull property) — the same parameters pass, and random draws pass
+        # for every one of the 14 constraints (measured worst relative
+        # violation 0.0 over 14 × 50 draws in the design probe).
+        a_b = ShapeConstrainedBSplineApproximator(:g, dom_cc, 10, :positive)
+        f_b = PSM.build_constrained_bspline_evaluator(a_b, γ_alt)
+        r_b = check_constraints(f_b, :positive, dom_cc)
+        @test r_b.satisfied
+        @test r_b.worst_relative == 0.0
+        rng_cc = StableRNG(11)
+        for c in SHAPE_CONSTRAINTS
+            ac = ShapeConstrainedBSplineApproximator(:f, dom_cc, 10, c)
+            for _ in 1:5
+                γc = 2.0 .* randn(rng_cc, nparams(ac))
+                rc = check_constraints(
+                    PSM.build_constrained_bspline_evaluator(ac, γc), c, dom_cc)
+                @test rc.satisfied
+            end
+        end
+
+        # Clean fixtures stay clean: a smooth positive target resolved by
+        # the nodes (measured min f = 0.047 for the GP; the SPDE cubic of a
+        # positive near-linear target has no dip at all)
+        bump = x -> 0.05 + exp(-8.0 * (x - 1.0)^2)
+        a_gpc = ShapeConstrainedGPApproximator(:f, dom_cc, 10, :positive;
+                                               initial=bump)
+        @test check_constraints(
+            PSM.build_constrained_gp_evaluator(a_gpc, initial_params(a_gpc)),
+            :positive, dom_cc).satisfied
+        a_spc = ShapeConstrainedSPDEApproximator(:f, dom_cc, 10, :positive;
+                                                 initial=x -> 1.0 + 0.2 * x)
+        @test check_constraints(
+            PSM.build_constrained_spde_evaluator(a_spc, initial_params(a_spc)),
+            :positive, dom_cc).satisfied
+
+        # Branch coverage: every fixture above exercises the :value branch
+        # only, so a sign flip in the slope, curvature or endpoint branch
+        # would go unnoticed. Pin each of those branches with a violating
+        # and a satisfying counterpart, and both sign arms of the slope and
+        # curvature branches. All numbers measured this session on
+        # dom_cc = (0.3, 2.7) at the default 201-point grid.
+        r_slope = check_constraints(x -> -x, :increasing, dom_cc)
+        @test !r_slope.satisfied
+        @test r_slope.worst_quantity == :slope
+        @test r_slope.worst_absolute ≈ 1.0 rtol = 1e-6   # measured 1.0 (f′ ≡ −1)
+        @test r_slope.worst_relative ≈ 1.0 rtol = 1e-6   # measured 1.0
+        @test check_constraints(x -> x, :increasing, dom_cc).satisfied
+        r_slope_d = check_constraints(x -> x, :decreasing, dom_cc)
+        @test !r_slope_d.satisfied
+        @test r_slope_d.worst_quantity == :slope
+        @test r_slope_d.worst_absolute ≈ 1.0 rtol = 1e-6 # measured 1.0 (f′ ≡ +1)
+        @test check_constraints(x -> -x, :decreasing, dom_cc).satisfied
+
+        r_curv = check_constraints(x -> -x^2, :convex, dom_cc)
+        @test !r_curv.satisfied
+        @test r_curv.worst_quantity == :curvature
+        @test r_curv.worst_absolute ≈ 2.0 rtol = 1e-5    # measured 2.0 (f″ ≡ −2)
+        @test r_curv.worst_relative ≈ 1.0 rtol = 1e-5    # measured 1.0
+        @test check_constraints(x -> x^2, :convex, dom_cc).satisfied
+        r_curv_c = check_constraints(x -> x^2, :concave, dom_cc)
+        @test !r_curv_c.satisfied
+        @test r_curv_c.worst_quantity == :curvature
+        @test r_curv_c.worst_absolute ≈ 2.0 rtol = 1e-5  # measured 2.0 (f″ ≡ +2)
+        @test check_constraints(x -> -x^2, :concave, dom_cc).satisfied
+
+        r_end = check_constraints(x -> x + 1.0, :inc_zero_left, dom_cc)
+        @test !r_end.satisfied
+        @test r_end.worst_quantity == :endpoint
+        @test r_end.worst_absolute ≈ 1.3 rtol = 1e-8     # measured 1.3 = f(0.3)
+        @test r_end.worst_relative ≈ 0.351351 rtol = 1e-5 # measured 0.3513514
+        @test r_end.worst_location ≈ 0.3 rtol = 1e-8     # measured 0.3 (left end)
+        @test check_constraints(x -> x - dom_cc[1], :inc_zero_left,
+                                dom_cc).satisfied
+
+        # Finite-difference round-off must not be reported as a violation.
+        # f(x) = x is exactly convex, so its second differences are pure
+        # round-off (≈ eps·yscale/h²) and must be gated away at every domain
+        # scale and grid resolution. Measured this session BEFORE the
+        # per-quantity noise gate: worst_relative 0.231 on (0.0, 0.2) at
+        # grid 201, 1.0 at grid 1001 (worst_absolute 6.94e−10), 0.0074 on
+        # (0.0, 2.0) at grid 201 and 0.185 at grid 1001 — all satisfied=false.
+        # After the gate: 0.0 and satisfied=true in all four.
+        @test check_constraints(x -> x, :convex, (0.0, 0.2)).satisfied
+        @test check_constraints(x -> x, :convex, (0.0, 0.2);
+                                grid_size=1001).satisfied
+        @test check_constraints(x -> x, :convex, (0.0, 2.0);
+                                grid_size=1001).satisfied
+        # Same defect on the slope quantity: cos²+sin² ≡ 1 is (weakly)
+        # increasing but its forward differences carry ≈1e−14 of round-off,
+        # measured 1.67e−4 relative and satisfied=false before the gate.
+        @test check_constraints(x -> cos(x)^2 + sin(x)^2, :increasing,
+                                dom_cc).satisfied
+
+        # Validation
+        @test_throws ArgumentError check_constraints(identity, :bogus, dom_cc)
+        @test_throws ArgumentError check_constraints(identity, :positive,
+                                                     dom_cc; grid_size=2)
+
+        # Solution-level API: audits every SCOP approximator of the problem,
+        # warns for the violating SCGP, is quiet about the exact SCB, and
+        # skips the unconstrained B-spline; warn=false silences the warning
+        # but not the result.
+        dyn_cc!(du, u, p, t) = (du[1] = -p.f(u[1]))
+        prob_cc = PSMProblem(dyn_cc!, [1.0], (0.0, 1.0),
+            [a_gp, a_b, BSplineApproximator(:h, dom_cc, 5)];
+            data_times=[0.0, 1.0], data_values=reshape([1.0, 0.5], :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=Gaussian(), solver=Tsit5())
+        sol_cc = PSMSolution(
+            PSM.ComponentArrays.ComponentArray(f=γ_alt, g=γ_alt),
+            0.0, 0.0, 0.0, Float64[], zeros(1, 1), zeros(1, 1), [0.0],
+            Dict{Symbol, Any}(:f => f_gp, :g => f_b, :h => (x -> 1.0)),
+            nothing)
+        res_cc = @test_logs (:warn, r"violates its declared :positive") match_mode=:any begin
+            check_constraints(sol_cc, prob_cc)
+        end
+        @test !res_cc[:f].satisfied
+        @test res_cc[:g].satisfied
+        @test !haskey(res_cc, :h)
+        res_quiet = @test_logs min_level=Base.CoreLogging.Warn begin
+            check_constraints(sol_cc, prob_cc; warn=false)
+        end
+        @test !res_quiet[:f].satisfied
+    end
+
     @testset "LAML full Laplace criterion (construction + Gaussian reduction)" begin
         # Construction validation: criterion is checked at construction
         @test LAML().criterion == :working

@@ -479,10 +479,21 @@ are stored in unconstrained space (γ). During evaluation, mesh node values are
 computed as `β = Σ * d(γ)` (free level/slope components pass through linearly; the rest are softplus'd) where Σ is a constraint matrix, then
 interpolated with a cubic spline.
 
-**Note:** Shape constraints are enforced at mesh nodes. The cubic spline
-interpolation between nodes can slightly overshoot, so constraints hold
-approximately (not exactly) between nodes. Use more basis functions to
-reduce overshoot.
+**Note — constraints hold at the mesh nodes, NOT between them.** The cubic
+spline interpolant's cardinal functions take negative values (measured
+minimum −0.17), so the constraint satisfied by the node values does not
+transfer to the interpolant: on a `:positive` fixture whose 10 node values
+were all positive (alternating ≈5 / ≈0.007) the evaluator dipped to −0.121.
+Every one of the 14 constraints is affected
+(`ShapeConstrainedGPApproximator` shares the problem at larger magnitude;
+`ShapeConstrainedBSplineApproximator` is exact everywhere by the B-spline
+convex-hull property). Adding mesh nodes does NOT cure it — the worst-case
+dip per unit node value grows slightly with `n_basis` (measured
+0.24 → 0.27 for n = 6 → 40); more nodes help only indirectly, by letting
+the fitted values vary more smoothly relative to the spacing. Audit any
+fitted result with [`check_constraints`](@ref); use
+`ShapeConstrainedBSplineApproximator` when the constraint must hold
+exactly.
 
 # Arguments
 - `name`: symbol for the unknown function
@@ -771,11 +782,29 @@ interpolated with the GP predictive-mean formula `k(x,X)K⁻¹β` exactly as
 every solver fits this approximator through the ordinary `build_evaluator`
 protocol with no constraint handling of its own.
 
-**Note:** shape constraints are enforced at the inducing-point values. The
-kernel interpolation between points can slightly overshoot (as the cubic
-interpolation of `ShapeConstrainedSPDEApproximator` can), so constraints
-hold approximately (not exactly) between points. Use more inducing points
-to reduce overshoot.
+**Note — constraints hold at the inducing values, NOT between them.** The
+kernel interpolant's cardinal functions take negative values (measured
+minimum −0.26 for the default `:sqexp` kernel at the spacing-matched
+default lengthscale), so the constraint satisfied by the inducing values
+does not transfer to the interpolant: on a `:positive` fixture whose 10
+inducing values were all positive (alternating ≈5 / ≈0.007) the evaluator
+dipped to −0.505 against a maximum of 5.6 — a 9% violation, not a slight
+overshoot. Every one of the 14 constraints is affected (the
+`ShapeConstrainedSPDEApproximator` cubic interpolation shares the problem
+at smaller magnitude; `ShapeConstrainedBSplineApproximator` is exact
+everywhere by the B-spline convex-hull property). Adding inducing points
+does NOT cure it — the worst-case dip per unit inducing value GROWS with
+`n_inducing` (measured 0.35 → 0.57 for n = 6 → 40 at the default kernel
+settings); more points help only indirectly, by letting the fitted values
+vary more smoothly relative to the spacing. What measurably reduces the
+violation on the fixture above: a rougher kernel (`kernel=:matern32` at
+its default lengthscale cut the dip from −0.505 to −0.023) or a shorter
+explicit `lengthscale` (0.5× the default eliminated it), both at the cost
+of wigglier interpolation — note an explicit `lengthscale` is also needed
+to keep empirical-Bayes adaptation from re-lengthening it during a fit.
+Audit any fitted result with [`check_constraints`](@ref); use
+`ShapeConstrainedBSplineApproximator` when the constraint must hold
+exactly.
 
 Kernel hyperparameters follow `GPApproximator`: `lengthscale=nothing`
 (default) starts at the spacing-matched default and is re-estimated by
