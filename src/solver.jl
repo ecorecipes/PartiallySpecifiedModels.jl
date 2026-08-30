@@ -493,14 +493,36 @@ end
 
 """
     compute_jacobian!(J, prob, beta, f0, n_times, n_obs; dam, jac=:fd,
-                      fd_cfg=nothing)
+                      fd_cfg=nothing, grow=true)
 
 Compute Jacobian of model predictions w.r.t. parameters.
 
 `jac=:fd` (default, historical behavior): central finite differences with
 adaptive step sizes — one full model solve per perturbed column, 2·n_p
-solves per call. `dam` contains the adaptive fractional FD intervals per
-parameter and is updated in place.
+solves per call, plus one nudge solve that measures the model's re-solve
+output jitter (adaptive integrators re-select their step sequence under a
+tiny parameter perturbation, so two solves at nearly identical parameters
+differ at far above machine precision). A column whose central-difference
+signal falls below `_FD_SNR_TRIGGER`× that measured jitter — the
+qualitative-garbage regime — is recomputed at grown steps (never shrunk on
+noise) until its signal clears `_FD_SNR_TARGET`× the noise or the step
+hits a cap, with each grown step validated against the previous column
+(`_FD_GROW_TOL`) and a curvature guard (`_FD_CURV_MAX`) stopping growth
+once truncation is resolved above the noise. Columns already at trigger
+SNR or better keep the historical fixed-step behavior. `dam` contains the
+adaptive fractional FD intervals per parameter and is updated in place by
+the historical truncation/cancellation heuristic only — noise-driven
+growth is per-call and never persisted, so J stays a pure function of
+`(prob, beta, dam)`.
+
+`grow=false` disables the noise measurement and growth loop entirely,
+reproducing the historical fixed-step FD policy byte-for-byte. GCVSolver
+passes it: its `search=:direct` vs `search=:reuse` equivalence contract
+(agreement to 1e-6) requires a Jacobian that is CONTINUOUS in `beta` —
+threshold-triggered growth flips with the chaotic re-solve jitter, and on
+the W10 two-approximator fixture a single mid-search call whose jitter
+spiked to 2.7e-7 grew three columns and drove the two searches to λ̂
+pairs far apart (measured 0.756 vs 0.253 against a 1e-4 log gate).
 
 `jac=:forwarddiff`: forward-mode AD through the model solve (see
 [`_forwarddiff_jacobian!`](@ref)); `fd_cfg` is the per-solve
@@ -515,7 +537,7 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
                            beta::AbstractVector, f0::AbstractVector,
                            n_times::Int, n_obs::Int;
                            dam::Vector{Float64}, jac::Symbol=:fd,
-                           fd_cfg=nothing)
+                           fd_cfg=nothing, grow::Bool=true)
     if jac === :forwarddiff
         _forwarddiff_jacobian!(J, prob, beta, n_times, n_obs, fd_cfg) &&
             return
@@ -528,6 +550,7 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
     p_pert = copy(beta)
     fp = zeros(n_data)
     fb = zeros(n_data)
+    jprev = zeros(n_data)   # last accepted column during validated growth
 
     # Absolute FD step floor. DDEfit's fully relative step (da = dam·|β|,
     # floored at 1e-8·dam ≈ 1e-16 for β = 0) was safe there because Wood
@@ -535,55 +558,224 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
     # and unperturbed trajectories, so integrator error cancels in the
     # difference; simulate() re-solves adaptively per perturbation, so a
     # 1e-16 step measures pure solver noise. Tie the floor to the solver
-    # tolerance instead: differences must exceed integration error.
+    # tolerance instead: differences must exceed integration error. The
+    # floor is the STARTING step only — measured on a noise-free logistic
+    # ODE fixture (default tolerances, zero initial coefficients) the
+    # central-difference error is minimal exactly here (6.7e-11 at h=1e-6,
+    # rising in both directions), while noisy fixtures are handled by the
+    # signal-to-noise growth loop below, not by a larger floor.
     reltol_ode = Float64(get(prob.ode_kwargs, :reltol, 1e-8))
     abs_floor = max(100.0 * reltol_ode, 1e-7)
 
-    for j in 1:n_p
-        da = max(dam[j] * abs(beta[j]), abs_floor)
-
-        # Forward perturbation
-        p_pert[j] = beta[j] + da
-        pred_fwd = try
-            simulate(prob, p_pert)
+    # Measure the actual re-solve output jitter once per call: nudge every
+    # parameter by an FD-invisible 1e-13·max(1,|βⱼ|) and re-solve. Adaptive
+    # integrators re-select their accepted-step sequence under the nudge,
+    # exposing the true perturbation-to-perturbation noise, which is far
+    # above both machine precision and the naive tolerance guess (measured
+    # on the exact-reference quadrature fixture at reltol=abstol=1e-8:
+    # jitter 1.5e-6 ≈ 146·reltol; on the noise-free logistic fixture:
+    # 6.7e-14). For noise-free paths (e.g. discrete maps) the measurement
+    # collapses to ‖J‖·1e-13 — a harmless overestimate that still accepts
+    # the floor step immediately in the growth loop below.
+    eps_noise = 1e-15 * max(1.0, maximum(abs, f0))
+    grow && let nudged = copy(beta)
+        for j in 1:n_p
+            nudged[j] += 1e-13 * max(1.0, abs(beta[j]))
+        end
+        pred_n = try
+            simulate(prob, nudged)
         catch e
             _is_program_error(e) && rethrow()
-            p_pert[j] = beta[j]
-            J[:, j] .= 0.0   # don't leak the previous iteration's column
-            continue
+            nothing
         end
-        p_pert[j] = beta[j]
-
-        # Backward perturbation
-        p_pert[j] = beta[j] - da
-        pred_bwd = try
-            simulate(prob, p_pert)
-        catch
-            # Fall back to forward differences
+        if pred_n !== nothing
             k = 1
             for oi in 1:n_obs, ti in 1:n_times
-                J[k, j] = (pred_fwd[ti, oi] - f0[k]) / da
+                d = abs(pred_n[ti, oi] - f0[k])
+                isfinite(d) && (eps_noise = max(eps_noise, d))
                 k += 1
             end
-            p_pert[j] = beta[j]
-            continue
         end
-        p_pert[j] = beta[j]
+    end
 
-        # Flatten and compute central differences
+    for j in 1:n_p
+        # Step cap: on the exact-reference quadrature fixture (‖J‖=1.196,
+        # jitter 1.5e-6) the weakest columns need h up to ~1e-1 before
+        # their signal clears the noise, and the measured error still
+        # FALLS through that range (1.3e-5 at h=1e-1 vs 9.9e-5 at h=1e-2 —
+        # the growth is only taken when smaller steps are provably noise,
+        # so a large cap is safe). The cap must bound the STARTING step
+        # too, not just the growth: dam is shared across IRLS/λ iterations
+        # while β moves, so a fractional step persisted at a tiny |βⱼ|
+        # replayed at a larger |βⱼ| would otherwise start (and accept)
+        # far above the cap — measured on the quadrature fixture: dam
+        # grown to 2.1045 at β₁=1e-3 would start the next call at 1.0523
+        # for β₁=0.5, 10.5× the cap; the clamp starts it at 0.1.
+        da_cap = 0.1 * max(1.0, abs(beta[j]))
+        da = clamp(dam[j] * abs(beta[j]), abs_floor, da_cap)
+        grew = false
+        have_col = false
+        adapt_col = false    # run dam adaptation only on a full central diff
+        reverted = false     # a grown step was computed and rejected
+        pending_validate = false   # this iteration recomputes a grown step
+        da_prev = da
+        da_used = da         # the step of the last SUCCESSFUL central diff
+        while true
+            # Forward perturbation
+            p_pert[j] = beta[j] + da
+            pred_fwd = try
+                simulate(prob, p_pert)
+            catch e
+                _is_program_error(e) && rethrow()
+                nothing
+            end
+            p_pert[j] = beta[j]
+            if pred_fwd === nothing
+                # Keep the last accepted (smaller-step) column if we have
+                # one; otherwise don't leak the previous iteration's column.
+                have_col || (J[:, j] .= 0.0)
+                break
+            end
+
+            # Backward perturbation
+            p_pert[j] = beta[j] - da
+            pred_bwd = try
+                simulate(prob, p_pert)
+            catch
+                nothing
+            end
+            p_pert[j] = beta[j]
+            if pred_bwd === nothing
+                if !have_col
+                    # Fall back to forward differences (historical path;
+                    # skips step adaptation like it always did)
+                    k = 1
+                    for oi in 1:n_obs, ti in 1:n_times
+                        J[k, j] = (pred_fwd[ti, oi] - f0[k]) / da
+                        k += 1
+                    end
+                end
+                break
+            end
+
+            # Flatten and compute central differences
+            k = 1
+            signal = 0.0
+            d2max = 0.0
+            for oi in 1:n_obs, ti in 1:n_times
+                fp[k] = pred_fwd[ti, oi]
+                fb[k] = pred_bwd[ti, oi]
+                J[k, j] = (fp[k] - fb[k]) / (2.0 * da)
+                signal = max(signal, abs(fp[k] - fb[k]))
+                d2max = max(d2max, abs(fp[k] - 2.0 * f0[k] + fb[k]))
+                k += 1
+            end
+            # Validated growth: a grown step is kept only if the column
+            # moved by no more than the noise it was supposed to remove.
+            # When the smaller-step column was noise-limited, its error is
+            # ≈ eps_noise/(2·da_prev), so the recomputed column should
+            # differ by about that much; a change far beyond it means the
+            # larger step introduced REAL error (truncation, or a
+            # nonlinearity/clamp kink in the perturbed dynamics) and the
+            # smaller-step column was already the better estimate — keep
+            # it and stop. This is the safety net that no base-point
+            # noise/curvature statistic can provide, because the jitter is
+            # measured once at beta and can misclassify a mid-fit column.
+            if pending_validate
+                change = 0.0
+                for k2 in 1:n_data
+                    change = max(change, abs(J[k2, j] - jprev[k2]))
+                end
+                if change > _FD_GROW_TOL * eps_noise / (2.0 * da_prev)
+                    @inbounds for k2 in 1:n_data
+                        J[k2, j] = jprev[k2]
+                    end
+                    da_used = da_prev
+                    reverted = true
+                    break
+                end
+                pending_validate = false
+            end
+            have_col = true
+            adapt_col = true
+            da_used = da
+
+            # Noise-domination check: the FD error in this column is
+            # ≈ eps_noise/(2·da) = (eps_noise/signal)·max|J[:,j]|, so
+            # requiring signal ≥ _FD_SNR_TARGET·eps_noise bounds the
+            # column's noise-induced relative error by 1/_FD_SNR_TARGET.
+            # When noise dominates, GROW the step (the old te/ce heuristic
+            # misread noise in the second difference as truncation error
+            # and shrank it — measured dam 1e-8 → 1e-9 on every column of
+            # the quadrature fixture, error 0.645 on a scale-1.196 matrix).
+            # Growth is additionally allowed only while the column is
+            # PROVABLY noise-limited: once the second difference rises
+            # clearly above the jitter (d2max > _FD_CURV_MAX·eps_noise)
+            # the column is truncation-limited and a larger step trades
+            # bounded noise error for unbounded truncation error — on a
+            # stiff-sensitivity SIR fixture (‖J‖=2e4, truncation error
+            # 0.295 at h=1e-5 rising to 1.5e4 at h=1e-2) unrestricted
+            # growth collapsed whole LAML fits (edf → 0).
+            # Growth is TRIGGERED only for catastrophically noise-dominated
+            # columns (SNR below _FD_SNR_TRIGGER — the B1 defect regime,
+            # where the column is qualitatively garbage); a column that
+            # already resolves its signal at ≥ trigger SNR keeps the
+            # historical floor-step behavior. Once triggered, the column
+            # grows all the way to the _FD_SNR_TARGET accuracy.
+            snr_gate = grew ? _FD_SNR_TARGET : _FD_SNR_TRIGGER
+            (!grow || signal >= snr_gate * eps_noise || da >= da_cap ||
+             d2max > _FD_CURV_MAX * eps_noise) && break
+            # Jump toward the step that reaches the target SNR (signal
+            # scales linearly in da once above the noise), at least ×10.
+            @inbounds for k2 in 1:n_data
+                jprev[k2] = J[k2, j]
+            end
+            da_prev = da
+            pending_validate = true
+            da = min(da_cap,
+                     max(10.0 * da,
+                         da * _FD_SNR_TARGET * eps_noise / max(signal, 1e-300)))
+            grew = true
+        end
+        # After a revert, fp/fb hold the REJECTED step's values, so the
+        # te/ce adaptation below would be inconsistent — skip it (dam is
+        # left untouched, like the historical failure paths).
+        (adapt_col && !reverted) || continue
+
+        # Noise-grown steps are deliberately NOT persisted into dam: the
+        # Jacobian must be a pure function of (prob, beta, dam-in) up to
+        # the historical ±10× te/ce drift, because designed equivalence
+        # contracts (GCVSolver search=:direct vs :reuse, suite W10) compare
+        # solves whose compute_jacobian! call counts differ — a persisted
+        # step makes J history-dependent and was measured to break that
+        # equivalence (λ̂ log-mismatch ≥ 1e-4, fitted-value diff 1.96e-2
+        # against 1e-6 gates on the two-approximator coordinate-descent
+        # fixture). Each call re-pays its growth retries instead; the
+        # starting-step clamp above stays as a guard on the te/ce drift.
+
+        # Adapt step size — the HISTORICAL heuristic, byte-identical to
+        # the pre-B1 code, and deliberately free of eps_noise: the jitter
+        # measurement is itself chaotic in β (a re-solve step-sequence
+        # artifact), so letting it into dam — state shared across IRLS/λ
+        # iterations — injects that chaos into every subsequent Jacobian.
+        # Measured on the W10 two-approximator GCV fixture: with the
+        # measured noise in these gates the contractually equivalent
+        # :direct and :reuse searches diverged to λ̂ pairs e^18 apart and
+        # objectives 0.000159 vs 0.003618 against 1e-6 agreement gates;
+        # with the historical gates they agree again. The B1 wrong-way
+        # shrink (noise read as truncation, dam 1e-8 → 1e-9) is fixed one
+        # level up instead: a column the SNR loop grew (`grew`) skips
+        # adaptation entirely — its fp/fb sit at the grown step, and its
+        # noise handling belongs to the growth loop, per call.
+        grew && continue
         k = 1
         mean_te = 0.0
         mean_ce = 0.0
         for oi in 1:n_obs, ti in 1:n_times
-            fp[k] = pred_fwd[ti, oi]
-            fb[k] = pred_bwd[ti, oi]
-            J[k, j] = (fp[k] - fb[k]) / (2.0 * da)
-            mean_te += 0.5 * (fp[k] - 2.0 * f0[k] + fb[k]) / da
-            mean_ce += 2.0 * max(abs(f0[k]), abs(fp[k])) * 1e-15 / da
+            mean_te += 0.5 * (fp[k] - 2.0 * f0[k] + fb[k]) / da_used
+            mean_ce += 2.0 * max(abs(f0[k]), abs(fp[k])) * 1e-15 / da_used
             k += 1
         end
-
-        # Adapt step size
         if dam[j] >= 1e-10 && abs(mean_te) > 10.0 * abs(mean_ce)
             dam[j] /= 10.0
         end
@@ -592,6 +784,69 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
         end
     end
 end
+
+# Target signal-to-noise ratio for an accepted central-difference column:
+# the noise-induced relative error of the column is ≈ 1/_FD_SNR_TARGET.
+# 1e4 measured on both calibration fixtures this session: the
+# exact-reference quadrature fixture (O(1) sensitivities, jitter 1.5e-6)
+# lands at steps 1e-2..1e-1 with max error 9.9e-5..1.3e-5 (≤ 8.3e-5 of
+# scale), and the noise-free logistic/discrete fixtures accept the 1e-6
+# floor step immediately (signal ~3e-6 ≫ 1e4·6.7e-14), leaving their
+# measured 6.7e-11 / 8.2e-11 accuracy untouched.
+const _FD_SNR_TARGET = 1.0e4
+
+# Growth trigger: a column enters the growth loop only when its measured
+# SNR at the starting step is below this — i.e. its noise-induced relative
+# error exceeds ~10%, the qualitative-garbage regime the B1 fix exists
+# for (the exact-reference fixture measures floor-step SNR of roughly 2–5
+# across chaotic jitter draws, with 54%-of-scale error). Columns already
+# at SNR ≥ 10 keep the historical floor-step behavior: measured on the
+# SIR-Poisson warm-start fixture, growing such columns (e.g. col 8, floor
+# SNR 2023, error 4.8e-3 → 5.8e-6 when grown — individually BETTER) still
+# perturbs the chaotic warm-started IRLS path into a λ-clamp dead-zone
+# basin (J ≡ 0, edf → 0, data_loss 5.2e5 vs 3342 for jac=:forwarddiff),
+# so unnecessary growth is a stability hazard, not an accuracy win.
+# KNOWN LIMITATION (measured, independent review of B1): the SNR is
+# computed against a single base-point nudge jitter, which can
+# underestimate the realized per-column ±h re-solve noise by ~6–11×. A
+# noise-inflated signal can then clear the trigger and keep a garbage
+# column: on a one-coefficient variant of the reference fixture
+# (β₁ = 1e-3), columns at measured SNR 12.55 and 18.15 escaped the
+# trigger with errors of 0.31 and 0.45 of column scale. Closing this
+# needs per-column noise estimation (e.g. a second nudge or the ±h pair
+# asymmetry) — see the review record before changing the constant alone.
+const _FD_SNR_TRIGGER = 10.0
+
+# Curvature guard for the growth loop: a column may only grow while its
+# max second difference is within _FD_CURV_MAX× the measured jitter — at
+# that level the second difference is indistinguishable from noise (it
+# combines the noise of three solves), so a larger step provably reduces
+# total error; above it, truncation is already resolved and growth would
+# increase it. Calibrated on both regimes this session: noise-dominated
+# columns that MUST grow show worst-col D2/jitter of 6.0–8.4 (quadrature
+# fixture, every step 1e-6..1e-1) and 0.0 (weakest W11-zero column),
+# while truncation-limited columns that must NOT grow show 82.6–3798 at
+# the floor step (SIR-Poisson warm-start fixture, cols 1–4). 25 sits
+# between with ~3.0× margin below and ~3.3× above.
+const _FD_CURV_MAX = 25.0
+
+# Validated-growth tolerance: a recomputed (grown) column is kept only if
+# max|Δcolumn| ≤ _FD_GROW_TOL · eps_noise/(2·da_prev). Calibrated this
+# session: on the quadrature fixture (growth MUST be accepted) the
+# measured change/prediction ratio is 0.47–2.60 on the two columns probed
+# across step decades 1e-6→1e-1, while on the truncation-limited
+# SIR-Poisson columns (growth must be rejected) it is 40.9 → 4.5e7. 8
+# sits between with 3.1× margin below and 5.1× above.
+# KNOWN LIMITATION (measured, independent review of B1): the tolerance is
+# denominated in the base-point nudge jitter, so when the realized ±h
+# re-solve noise is much larger than the nudge measured, a LEGITIMATE
+# growth can be rejected and the column falls back to the (garbage) floor
+# step — pre-fix behavior, not a regression, but an incomplete repair: on
+# the one-coefficient reference-fixture variant, a needed growth was
+# rejected at measured change 0.95 vs tolerance 0.685, keeping a 0.95
+# error on column scale 1.08. Same root cause and same fix direction as
+# the _FD_SNR_TRIGGER limitation above.
+const _FD_GROW_TOL = 8.0
 
 # ─── Penalty matrix assembly ─────────────────────────────────────
 
