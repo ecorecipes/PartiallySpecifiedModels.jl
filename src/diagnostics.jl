@@ -517,3 +517,171 @@ function _eval_approx_at(approx, p::Vector{Float64}, x::Real)
     error("confidence_band: unsupported approximator type $(typeof(approx))")
 end
 
+# ─── Post-fit shape-constraint audit ──────────────────────────────
+
+"""
+The SCOP-reparameterized approximator types whose constraints hold exactly
+at their node/inducing values but only approximately between them
+(`ShapeConstrainedSPDEApproximator`, `ShapeConstrainedGPApproximator`) —
+plus `ShapeConstrainedBSplineApproximator`, whose B-spline convex-hull
+property makes the constraints exact everywhere and which is included so a
+mixed-approximator audit reports on every declared constraint.
+"""
+const _SHAPE_CHECKABLE = Union{ShapeConstrainedBSplineApproximator,
+                               ShapeConstrainedSPDEApproximator,
+                               ShapeConstrainedGPApproximator}
+
+"""
+    check_constraints(f, constraint, domain; grid_size=201, tol=1e-6)
+
+Audit a fitted callable `f` against a declared shape constraint (one of
+`SHAPE_CONSTRAINTS`) on a `grid_size`-point uniform grid over
+`domain = (lo, hi)`.
+
+Motivation: `ShapeConstrainedSPDEApproximator` and
+`ShapeConstrainedGPApproximator` enforce their constraint only AT the mesh
+nodes / inducing-point values; the interpolant between them (cubic spline /
+GP kernel) has cardinal functions that take negative values, so the fitted
+function can violate the constraint between nodes — measured dips of −0.505
+(SCGP) and −0.121 (SCSPDE) on an all-positive-node `:positive` fixture with
+node values alternating between ≈5 and ≈0. This checker makes such
+violations visible after a fit. (`ShapeConstrainedBSplineApproximator` is
+exact everywhere by the B-spline convex-hull property and should always
+pass.)
+
+Violations are measured per constrained quantity:
+- value (`:positive`, `:dec_positive`): `max(0, -f)`;
+- slope (monotone families): forward differences divided by the grid step;
+- curvature (`:convex`/`:concave` families): second differences over step²;
+- endpoint pin (zero-at-endpoint families): `|f(endpoint)|`.
+
+Each is normalized by the maximum absolute value of the same quantity on
+the grid (with a small floor), and the function fails the check when the
+worst normalized violation exceeds `tol`. A violation at or below the
+finite-difference round-off level of its own quantity
+(`8·eps·yscale/h^k`, with `k = 0, 1, 2` for value, slope and curvature and
+`h` the grid step) is treated as exactly zero, so a function that satisfies
+its constraint exactly passes at any `grid_size`.
+
+Returns a NamedTuple `(constraint, satisfied, worst_relative,
+worst_absolute, worst_quantity, worst_location, grid_size, tol)` where
+`worst_quantity` is `:value`, `:slope`, `:curvature`, `:endpoint`, or
+`:none` and `worst_absolute` is in the units of that quantity (function
+value, f′, f″, or endpoint value respectively).
+
+Note the audit is grid-based: it can miss a violation narrower than the
+grid spacing, so it is a diagnostic, not a certificate.
+"""
+function check_constraints(f, constraint::Symbol, domain::Tuple{<:Real,<:Real};
+                           grid_size::Int=201, tol::Real=1e-6)
+    constraint in SHAPE_CONSTRAINTS || throw(ArgumentError(
+        "Unknown constraint :$constraint. Must be one of $SHAPE_CONSTRAINTS"))
+    grid_size >= 3 || throw(ArgumentError("grid_size must be ≥ 3, got $grid_size"))
+    lo, hi = Float64(domain[1]), Float64(domain[2])
+    xs = collect(range(lo, hi, length=grid_size))
+    h = xs[2] - xs[1]
+    ys = Float64[f(x) for x in xs]
+    d1 = diff(ys) ./ h        # forward-difference slope estimates
+    d2 = diff(d1) ./ h        # second-difference curvature estimates
+    yscale = maximum(abs, ys)
+    # Absolute floor keeps a flat function's O(eps) finite-difference noise
+    # from being magnified into a spurious relative violation.
+    floorv = 1e-10 * (1.0 + yscale)
+    # Per-quantity noise gate. `floorv` alone is not enough: it is in VALUE
+    # units, but the slope and curvature violations are differenced 1 and 2
+    # times, so their round-off noise is ≈ eps·yscale/h^k (k = differencing
+    # order) — which exceeds any fixed value-unit floor and GROWS as the grid
+    # is refined. Without this gate, exactly-satisfying functions report
+    # violations that get worse with `grid_size`: measured on f(x) = x under
+    # :convex, worst_relative 0.0074 (domain (0,2), grid 201) → 0.185 (grid
+    # 1001), and 0.231 → 1.0 on domain (0,0.2); :increasing on
+    # cos(x)^2+sin(x)^2 reported 1.67e-4. A violation at or below the noise
+    # level for its own quantity is therefore treated as exactly zero.
+    fd_noise(k) = 8 * eps(Float64) * yscale / h^k
+
+    worst_rel = 0.0
+    worst_abs = 0.0
+    worst_q = :none
+    worst_x = lo
+    consider = (viol, scale, q, x, k) -> begin
+        viol > fd_noise(k) || return nothing
+        rel = viol / max(scale, floorv)
+        if rel > worst_rel
+            worst_rel = rel; worst_abs = viol; worst_q = q; worst_x = x
+        end
+        nothing
+    end
+
+    if constraint in (:increasing, :inc_convex, :inc_concave,
+                      :inc_zero_left, :inc_zero_right)
+        i = argmin(d1)
+        consider(max(0.0, -d1[i]), maximum(abs, d1), :slope, xs[i], 1)
+    elseif constraint in (:decreasing, :dec_convex, :dec_concave,
+                          :dec_positive, :dec_zero_left, :dec_zero_right)
+        i = argmax(d1)
+        consider(max(0.0, d1[i]), maximum(abs, d1), :slope, xs[i], 1)
+    end
+    if constraint in (:convex, :inc_convex, :dec_convex)
+        i = argmin(d2)
+        consider(max(0.0, -d2[i]), maximum(abs, d2), :curvature, xs[i + 1], 2)
+    elseif constraint in (:concave, :inc_concave, :dec_concave)
+        i = argmax(d2)
+        consider(max(0.0, d2[i]), maximum(abs, d2), :curvature, xs[i + 1], 2)
+    end
+    if constraint in (:positive, :dec_positive)
+        i = argmin(ys)
+        consider(max(0.0, -ys[i]), yscale, :value, xs[i], 0)
+    end
+    if constraint in _ZERO_ENDPOINT_CONSTRAINTS
+        x0 = constraint in (:inc_zero_left, :dec_zero_left) ? lo : hi
+        consider(abs(Float64(f(x0))), yscale, :endpoint, x0, 0)
+    end
+
+    (constraint=constraint, satisfied=(worst_rel <= tol),
+     worst_relative=worst_rel, worst_absolute=worst_abs,
+     worst_quantity=worst_q, worst_location=worst_x,
+     grid_size=grid_size, tol=Float64(tol))
+end
+
+"""
+    check_constraints(sol::PSMSolution, prob::PSMProblem;
+                      grid_size=201, tol=1e-6, warn=true)
+
+Audit every shape-constrained SCOP approximator of `prob`
+(`ShapeConstrainedBSplineApproximator`, `ShapeConstrainedSPDEApproximator`,
+`ShapeConstrainedGPApproximator`) against its declared constraint, using
+the fitted evaluators in `sol.unknown_functions`. Other approximator types
+are skipped.
+
+Returns a `Dict{Symbol,NamedTuple}` keyed by approximator name with the
+per-function results of the single-function method (see
+[`check_constraints(f, constraint, domain)`](@ref check_constraints)).
+With `warn=true` (default) a `@warn` is logged for each function whose
+declared constraint is violated beyond `tol` — expected only for the SPDE
+and GP variants, whose between-node interpolation does not preserve the
+constraint that holds exactly at their node values.
+"""
+function check_constraints(sol::PSMSolution, prob::PSMProblem;
+                           grid_size::Int=201, tol::Real=1e-6,
+                           warn::Bool=true)
+    results = Dict{Symbol,NamedTuple}()
+    for a in prob.approximators
+        a isa _SHAPE_CHECKABLE || continue
+        haskey(sol.unknown_functions, a.name) || continue
+        r = check_constraints(sol.unknown_functions[a.name], a.constraint,
+                              a.domain; grid_size=grid_size, tol=tol)
+        results[a.name] = r
+        if warn && !r.satisfied
+            @warn("Fitted function :$(a.name) violates its declared " *
+                  ":$(a.constraint) constraint between nodes " *
+                  "(worst relative violation $(round(r.worst_relative, sigdigits=3)) " *
+                  "in $(r.worst_quantity) at x = " *
+                  "$(round(r.worst_location, sigdigits=4))). " *
+                  "$(nameof(typeof(a))) enforces the constraint at its " *
+                  "node/inducing values only; see the approximator docstring " *
+                  "for what reduces between-node violations.")
+        end
+    end
+    results
+end
+

@@ -111,4 +111,5 @@ residual_diagnostics
 durbin_watson
 residual_acf
 semivariogram
+check_constraints
 ```
