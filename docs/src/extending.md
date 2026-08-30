@@ -102,7 +102,7 @@ Three caveats for custom types:
 - A handful of solver capabilities are gated on the built-in types (e.g. `AdaptiveGradientMatching`'s population-MCMC mode rejects `NeuralApproximator`; `optimize_spde_range` only operates on SPDE approximators). Custom types pass these gates like any non-listed type.
 - Six solvers (`TwoStageSolver`, `IntegralMatchingSolver`, `MagiSolver`, `AdaptiveGradientMatching`, `RodeoSolver`, `DaltonSolver`) assemble their smoothing penalty through per-type code whose built-in treatment is historical and deliberately preserved (the lists differ between solvers, and some build spline penalties on domain rather than unit knots). Custom types are **not** affected by those quirks: every one of these sites falls back to the generic `penalty_matrix(approx)` for any non-built-in type, so a custom penalty flows in everywhere — as it always did in the penalized-likelihood, through-the-solver, and MCMC/VI/ABC families.
 - The adaptive GP hyperparameter refitting inside `LAML`/`GCVSolver` is specific to `GPApproximator`; custom types keep whatever structure their four methods define.
-- `confidence_band` (diagnostics) evaluates approximators through its own restricted mechanism and supports only the built-in basis-expansion types — custom types (like `NeuralApproximator`/`COMONetApproximator`) are not supported there and will error.
+- `confidence_band` (diagnostics) evaluates approximators through its own restricted mechanism and supports only the built-in basis-expansion types — custom types (like `NeuralApproximator`/`COMONetApproximator`) are not supported there and will error. `bootstrap`'s unknown-function band is **not** subject to that limitation: it grids whatever [`band_domain`](@ref PartiallySpecifiedModels.band_domain) returns, and simply skips the band (with a warning, keeping the rest of the bootstrap) when that is `nothing`.
 
 One further subtlety: the default penalty enumeration only includes a term
 when the approximator has at least 3 parameters (the gate lives in the
@@ -110,6 +110,31 @@ default `penalty_blocks` method), so a 1–2 parameter custom type is
 effectively unpenalized under `LAML`/`GCVSolver` even if its
 `penalty_matrix` is nonzero — unless it overrides `penalty_blocks`, which
 may declare blocks of any size.
+
+## Optional: a confidence-band domain (`band_domain`)
+
+`bootstrap` produces a confidence band for each unknown function by
+gridding an interval and evaluating every replicate's fitted curve on it.
+A `domain` field is **not** part of the interface above, so the interval is
+requested through a second optional protocol function, `band_domain(a)`,
+which returns a `(lo, hi)` tuple or `nothing`. Like `penalty_blocks` and the
+four required functions, it is exported — but adding a *method* to it still
+needs the qualified name (or an explicit `import`), as below.
+
+The default method reads an `a.domain` field when the type has one and
+returns `nothing` otherwise, so every built-in — and every custom type that
+happens to carry a `domain` — needs no method. A type that stores its range
+under another name, or computes it, opts into a band with one line:
+
+```julia
+PartiallySpecifiedModels.band_domain(a::MyApproximator) = (a.lo, a.hi)
+```
+
+Without such a method `bootstrap` warns and skips **only that band**; the
+coefficient and fitted-value intervals are still produced. (Previously the
+field was read directly, so a protocol-conforming type with no `domain`
+raised a `FieldError` in the grid loop — before any replicate was fitted —
+and lost the entire bootstrap, not just the band.)
 
 ## Optional: multiple penalty blocks (`penalty_blocks`)
 
@@ -185,4 +210,5 @@ If you pass an approximator type that does not implement the interface, `build_e
 ```@docs
 build_evaluator
 penalty_blocks
+PartiallySpecifiedModels.band_domain
 ```

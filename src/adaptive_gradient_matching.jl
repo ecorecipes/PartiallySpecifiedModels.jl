@@ -723,6 +723,23 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     K_states = length(prob.u0)
     n_obs = size(prob.data_values, 2)
 
+    # Rows of the gradient-matching system that carry a REAL target.
+    #
+    # A discrete map matches f(x_t) ≈ x_{t+1}, and x_{T+1} is not observed, so
+    # only T−1 rows are matchable — the same convention the sibling
+    # `GradientMatching` uses (`n_match = prob.discrete ? T_pts - 1 : T_pts`,
+    # gradient_matching.jl). Row T used to be filled with x_T under the
+    # comment "unused padding", but it is NOT unused: `agm_loss` reads every
+    # row of `grad_means` and projects the residual through the DENSE
+    # eigenbasis V of A_k, so that row contaminates every component of the
+    # quadratic form rather than contributing one droppable additive term.
+    # What it silently asserted was f(x_T) = x_T — a fixed point exactly at
+    # the last observed state, which on an oscillating map is maximally
+    # false. Truncating to `n_match` here is what makes the row unreachable.
+    #
+    # Continuous problems take n_match == T_pts and are bit-identical.
+    n_match = prob.discrete ? T_pts - 1 : T_pts
+
     if verbose
         println("AdaptiveGradientMatching: kernel=$(alg.kernel), " *
                 "fit_gamma=$(alg.fit_gamma)")
@@ -766,11 +783,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
             xs = xs .+ ȳ
             x_smooth[:, sk] .= xs
 
-            # For discrete: "gradient_mean" = next state value (forward shift)
+            # For discrete: "gradient_mean" = next state value (forward shift).
+            # Row T_pts is deliberately LEFT AT ZERO and never read — see the
+            # `n_match` comment above; it is truncated away before the loss.
             for i in 1:(T_pts-1)
                 grad_means[i, sk] = xs[i+1]
             end
-            grad_means[T_pts, sk] = xs[T_pts]  # unused padding
 
             # Use GP state covariance as gradient covariance proxy
             # (uncertainty in predicting next state)
@@ -811,7 +829,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
         if !isassigned(grad_covs, k)
             x_smooth[:, k] .= (prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)[k]
             grad_means[:, k] .= 0.0
-            grad_covs[k] = Matrix(1e6 * I(T_pts))  # Large uncertainty
+            # Sized at n_match so every grad_covs entry agrees with the
+            # truncated system below (no-op when n_match == T_pts).
+            grad_covs[k] = Matrix(1e6 * I(n_match))  # Large uncertainty
         end
     end
 
@@ -820,7 +840,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     A_eigvals = Vector{Vector{Float64}}(undef, K_states)
     A_eigvecs = Vector{Matrix{Float64}}(undef, K_states)
     for k in 1:K_states
-        E = eigen(Symmetric(grad_covs[k]))
+        # Restrict to the matchable rows before decomposing: the eigenbasis is
+        # what spreads a row across the whole quadratic form, so the
+        # truncation has to happen HERE, not just in the residual.
+        # `[1:n_match, 1:n_match]` is a no-op when n_match == T_pts.
+        E = eigen(Symmetric(grad_covs[k][1:n_match, 1:n_match]))
         A_eigvals[k] = E.values
         A_eigvecs[k] = E.vectors
         if verbose
@@ -843,8 +867,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     du_init = zeros(K_states)
     mismatch_var = zeros(K_states)
     for k in 1:K_states
-        resids = zeros(T_pts)
-        for i in 1:T_pts
+        resids = zeros(n_match)
+        for i in 1:n_match
             u = x_smooth[i, :]
             prob.dynamics!(du_init, u, p_init, times[i])
             resids[i] = du_init[k] - grad_means[i, k]
@@ -878,10 +902,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     # Step 3: Optimize using L-BFGS
     if verbose; println("\nStep 3: L-BFGS optimization"); end
 
+    # The loss sees only the matchable rows. Slices are MATERIALISED (not
+    # views): `agm_loss`'s signature pins `Matrix{Float64}` for both arrays,
+    # and these are tiny. `agm_loss` derives its own T from `length(times)`,
+    # so nothing inside it changes. No-op copies when n_match == T_pts.
+    times_m = times[1:n_match]
+    x_m     = x_smooth[1:n_match, :]
+    gm_m    = grad_means[1:n_match, :]
+
     function loss_fn(z_)
         β_ = z_[1:n_beta]
         lg_ = alg.fit_gamma ? z_[n_beta+1:end] : log_gamma
-        agm_loss(prob, β_, lg_, times, x_smooth, grad_means, A_eigvals, A_eigvecs;
+        agm_loss(prob, β_, lg_, times_m, x_m, gm_m, A_eigvals, A_eigvecs;
                  smoothing_lambda=smoothing_lambda)
     end
 
@@ -923,12 +955,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     # Derivative matching loss
     p_opt = build_param_struct(prob, beta_opt)
     du = zeros(K_states)
-    F_final = zeros(T_pts, K_states)
-    for i in 1:T_pts
+    # Reported over the matchable rows only, for the same reason the loss is:
+    # the discrete row T has no target. (`pred` and the returned `x_smooth`
+    # stay at full T_pts — the trajectory IS reported at every observation
+    # time; it is only the DERIVATIVE match that loses a row.)
+    F_final = zeros(n_match, K_states)
+    for i in 1:n_match
         prob.dynamics!(du, x_smooth[i, :], p_opt, times[i])
         F_final[i, :] .= du
     end
-    deriv_loss = sum((grad_means .- F_final).^2)
+    deriv_loss = sum((grad_means[1:n_match, :] .- F_final).^2)
 
     # Build evaluators
     uf_evals = Dict{Symbol, Any}()
