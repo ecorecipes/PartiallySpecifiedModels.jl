@@ -2111,6 +2111,15 @@ models** (e.g., Lotka–Volterra) where the standard IRLS linearization
 fails because the ODE trajectory is extremely sensitive to parameter
 changes.  See Fasiolo, Pya & Wood (2016), Statistical Science 31(1).
 
+The data-fidelity block honors `prob.likelihood` (all built-in families
+and `CustomLikelihood`) via PIRLS working weights on the identity link,
+with a deviance-scale objective and a Pearson-dispersion Fellner–Schall
+scale mirroring `LAML`'s default `:working` criterion; the ODE-compliance
+rows stay Gaussian in the derivative residuals. `Gaussian` data follow
+the historical pure-least-squares path unchanged. (Before this, the
+likelihood was silently ignored — every family was fitted by Gaussian
+least squares.)
+
 # Keyword arguments
 - `maxiters::Int=50`: IRLS iterations per continuation level
 - `tol::Float64=1e-6`: convergence tolerance
