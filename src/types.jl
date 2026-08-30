@@ -2272,6 +2272,17 @@ Requires that all state variables are observed (no latent states).
     `σ̂² = RSS / #{residuals with nonzero weight}`, not `RSS / #residuals`.
     Unobserved-state rows are zero-weighted; counting them biased σ̂² low
     and over-smoothed the unknown functions.
+
+!!! note "ODE problems only"
+    DDE problems are REJECTED with an error. The objective evaluates the dynamics
+    through the 4-argument ODE signature on a smoothed trajectory.
+    A PSM DDE's dynamics have the 5-argument signature
+    `f!(du, u, h, p, t)`, so the delayed history can never be supplied
+    and the model would be fitted as though it had no delays.
+    Use [`LAML`](@ref), [`GCVSolver`](@ref), [`AdamSolver`](@ref),
+    [`VariationalSolver`](@ref), [`MCMCSolver`](@ref),
+    [`DerivativeFreeSolver`](@ref) or
+    [`ProfileLikelihoodSolver`](@ref) for DDEs.
 """
 struct GradientMatching
     maxiters::Int
@@ -2475,6 +2486,17 @@ where:
     `x − m_k`. A zero-mean GP prior on uncentered data pulls the
     trajectory toward zero, which biased the fitted unknown functions on
     data far from the origin.
+
+!!! note "ODE problems only"
+    DDE problems are REJECTED with an error. The objective evaluates the dynamics
+    through the 4-argument ODE signature on a smoothed trajectory.
+    A PSM DDE's dynamics have the 5-argument signature
+    `f!(du, u, h, p, t)`, so the delayed history can never be supplied
+    and the model would be fitted as though it had no delays.
+    Use [`LAML`](@ref), [`GCVSolver`](@ref), [`AdamSolver`](@ref),
+    [`VariationalSolver`](@ref), [`MCMCSolver`](@ref),
+    [`DerivativeFreeSolver`](@ref) or
+    [`ProfileLikelihoodSolver`](@ref) for DDEs.
 """
 struct AdaptiveGradientMatching
     maxiters::Int
@@ -2517,6 +2539,17 @@ approximate the ODE solution and compute an approximate marginal likelihood.
   recursion is used unchanged.
 - `maxiters`: max L-BFGS iterations (default: 200)
 - `verbose`: print progress (default: false)
+
+!!! note "ODE problems only"
+    DDE problems are REJECTED with an error. It builds a probabilistic ODE / GP
+    state-space manifold from the 4-argument ODE signature.
+    A PSM DDE's dynamics have the 5-argument signature
+    `f!(du, u, h, p, t)`, so the delayed history can never be supplied
+    and the model would be fitted as though it had no delays.
+    Use [`LAML`](@ref), [`GCVSolver`](@ref), [`AdamSolver`](@ref),
+    [`VariationalSolver`](@ref), [`MCMCSolver`](@ref),
+    [`DerivativeFreeSolver`](@ref) or
+    [`ProfileLikelihoodSolver`](@ref) for DDEs.
 """
 struct RodeoSolver
     n_steps::Int
@@ -2577,6 +2610,14 @@ Uses LogDensityProblems.jl + AdvancedHMC.jl.
   non-reproducible). Matches the `rng_seed` convention of
   `AdaptiveGradientMatching`/`BNGSolver`; does not touch the global RNG.
 - `verbose`: print progress
+
+!!! note "Problem classes"
+    Discrete maps, ODEs and DDEs are all supported: the log-density and
+    the MAP-prediction path both go through the shared
+    `_variational_simulate`, which dispatches on `prob.discrete` and
+    `prob.delays`. (Before that unification the ODE-only branch built a
+    4-argument `ODEFunction` closure and a DDE raised a raw `MethodError`
+    from inside NUTS.)
 """
 struct MCMCSolver
     n_samples::Int
@@ -2648,6 +2689,17 @@ Returns an `MCMCChains.Chains` object with posterior samples.
 # References
 - Yang, Wong & Kou (2021) PNAS 118(15): "Inference of dynamic systems
   from noisy and sparse data via manifold-constrained Gaussian processes"
+
+!!! note "ODE problems only"
+    DDE problems are REJECTED with an error. It builds a probabilistic ODE / GP
+    state-space manifold from the 4-argument ODE signature.
+    A PSM DDE's dynamics have the 5-argument signature
+    `f!(du, u, h, p, t)`, so the delayed history can never be supplied
+    and the model would be fitted as though it had no delays.
+    Use [`LAML`](@ref), [`GCVSolver`](@ref), [`AdamSolver`](@ref),
+    [`VariationalSolver`](@ref), [`MCMCSolver`](@ref),
+    [`DerivativeFreeSolver`](@ref) or
+    [`ProfileLikelihoodSolver`](@ref) for DDEs.
 """
 struct MagiSolver
     n_samples::Int
@@ -2716,6 +2768,17 @@ member's plateau flag (alongside the existing `n_ensemble`,
 - Bonnaffé & Coulson (2023), "Fast fitting of neural ordinary
   differential equations by Bayesian neural gradient matching to infer
   ecological interactions from time-series data", Methods Ecol Evol 14
+
+!!! note "ODE problems only"
+    DDE problems are REJECTED with an error. The objective evaluates the dynamics
+    through the 4-argument ODE signature on a smoothed trajectory.
+    A PSM DDE's dynamics have the 5-argument signature
+    `f!(du, u, h, p, t)`, so the delayed history can never be supplied
+    and the model would be fitted as though it had no delays.
+    Use [`LAML`](@ref), [`GCVSolver`](@ref), [`AdamSolver`](@ref),
+    [`VariationalSolver`](@ref), [`MCMCSolver`](@ref),
+    [`DerivativeFreeSolver`](@ref) or
+    [`ProfileLikelihoodSolver`](@ref) for DDEs.
 """
 struct BNGSolver
     k_obs::Int
@@ -2764,6 +2827,17 @@ filter passes — one joint (ODE + observations) and one marginal (ODE only).
   standard covariance recursion is used unchanged.
 - `maxiters`: optimization iterations (default 200)
 - `verbose`: print progress
+
+!!! note "ODE problems only"
+    DDE problems are REJECTED with an error. It builds a probabilistic ODE / GP
+    state-space manifold from the 4-argument ODE signature.
+    A PSM DDE's dynamics have the 5-argument signature
+    `f!(du, u, h, p, t)`, so the delayed history can never be supplied
+    and the model would be fitted as though it had no delays.
+    Use [`LAML`](@ref), [`GCVSolver`](@ref), [`AdamSolver`](@ref),
+    [`VariationalSolver`](@ref), [`MCMCSolver`](@ref),
+    [`DerivativeFreeSolver`](@ref) or
+    [`ProfileLikelihoodSolver`](@ref) for DDEs.
 """
 struct DaltonSolver
     n_steps::Int
@@ -2834,6 +2908,17 @@ adaptive random-walk Metropolis (the proposal scale is tuned toward
   the standard sampler is never needed. With `false` the standard
   covariance recursion is used unchanged.
 - `verbose`: print progress
+
+!!! note "ODE problems only"
+    DDE problems are REJECTED with an error. It builds a probabilistic ODE / GP
+    state-space manifold from the 4-argument ODE signature.
+    A PSM DDE's dynamics have the 5-argument signature
+    `f!(du, u, h, p, t)`, so the delayed history can never be supplied
+    and the model would be fitted as though it had no delays.
+    Use [`LAML`](@ref), [`GCVSolver`](@ref), [`AdamSolver`](@ref),
+    [`VariationalSolver`](@ref), [`MCMCSolver`](@ref),
+    [`DerivativeFreeSolver`](@ref) or
+    [`ProfileLikelihoodSolver`](@ref) for DDEs.
 """
 struct PseudoMarginalSolver
     n_samples::Int
@@ -3029,6 +3114,17 @@ This is the original approach from Wood (2001) / deGradInfer (Macdonald & Husmei
 with the standard honest-convergence keys (see [`PSMSolution`](@ref));
 `converged=true` with `reason=:plateau` when the matching loss stagnated
 over a 30-iteration window, `reason=:maxiters` otherwise.
+
+!!! note "ODE problems only"
+    DDE problems are REJECTED with an error. The objective evaluates the dynamics
+    through the 4-argument ODE signature on a smoothed trajectory.
+    A PSM DDE's dynamics have the 5-argument signature
+    `f!(du, u, h, p, t)`, so the delayed history can never be supplied
+    and the model would be fitted as though it had no delays.
+    Use [`LAML`](@ref), [`GCVSolver`](@ref), [`AdamSolver`](@ref),
+    [`VariationalSolver`](@ref), [`MCMCSolver`](@ref),
+    [`DerivativeFreeSolver`](@ref) or
+    [`ProfileLikelihoodSolver`](@ref) for DDEs.
 """
 struct TwoStageSolver
     n_basis_smooth::Int
@@ -3220,6 +3316,17 @@ over a 30-iteration window, `reason=:maxiters` otherwise.
 # References
 - Dattner & Klaassen (2015), EJS 9(2), 1939–1973
 - R package `simode` (Yaari & Dattner)
+
+!!! note "ODE problems only"
+    DDE problems are REJECTED with an error. The objective evaluates the dynamics
+    through the 4-argument ODE signature on a smoothed trajectory.
+    A PSM DDE's dynamics have the 5-argument signature
+    `f!(du, u, h, p, t)`, so the delayed history can never be supplied
+    and the model would be fitted as though it had no delays.
+    Use [`LAML`](@ref), [`GCVSolver`](@ref), [`AdamSolver`](@ref),
+    [`VariationalSolver`](@ref), [`MCMCSolver`](@ref),
+    [`DerivativeFreeSolver`](@ref) or
+    [`ProfileLikelihoodSolver`](@ref) for DDEs.
 """
 struct IntegralMatchingSolver
     lambda_smooth::Float64
@@ -3315,6 +3422,17 @@ sees the same trajectory as every other solver.
 # References
 - Iglesias, Law & Stuart (2013), Inverse Problems
 - Schillings & Stuart (2017), SIAM J Numer Anal
+
+!!! note "ODE problems only"
+    DDE problems are REJECTED with an error. It builds a probabilistic ODE / GP
+    state-space manifold from the 4-argument ODE signature.
+    A PSM DDE's dynamics have the 5-argument signature
+    `f!(du, u, h, p, t)`, so the delayed history can never be supplied
+    and the model would be fitted as though it had no delays.
+    Use [`LAML`](@ref), [`GCVSolver`](@ref), [`AdamSolver`](@ref),
+    [`VariationalSolver`](@ref), [`MCMCSolver`](@ref),
+    [`DerivativeFreeSolver`](@ref) or
+    [`ProfileLikelihoodSolver`](@ref) for DDEs.
 """
 struct EnsembleKalmanSolver
     n_ensemble::Int
@@ -3381,6 +3499,17 @@ the reported misfit exactly in proportion to their weight.
 # References
 - Wenk, Abbati et al. (2020), AAAI — ODIN
 - Wenk et al. (2019), AISTATS — FGPGM
+
+!!! note "ODE problems only"
+    DDE problems are REJECTED with an error. The objective evaluates the dynamics
+    through the 4-argument ODE signature on a smoothed trajectory.
+    A PSM DDE's dynamics have the 5-argument signature
+    `f!(du, u, h, p, t)`, so the delayed history can never be supplied
+    and the model would be fitted as though it had no delays.
+    Use [`LAML`](@ref), [`GCVSolver`](@ref), [`AdamSolver`](@ref),
+    [`VariationalSolver`](@ref), [`MCMCSolver`](@ref),
+    [`DerivativeFreeSolver`](@ref) or
+    [`ProfileLikelihoodSolver`](@ref) for DDEs.
 """
 struct ODINSolver
     maxiters::Int
@@ -3468,6 +3597,17 @@ run by the R̂/ESS of `convergence.chains`.
 - Wenk, Gotovos, Bauer, Gorbach, Krause & Buhmann (2019), "Fast
   Gaussian process based gradient matching for parameter identification
   in systems of nonlinear ODEs", AISTATS 89:1351-1360.
+
+!!! note "ODE problems only"
+    DDE problems are REJECTED with an error. The objective evaluates the dynamics
+    through the 4-argument ODE signature on a smoothed trajectory.
+    A PSM DDE's dynamics have the 5-argument signature
+    `f!(du, u, h, p, t)`, so the delayed history can never be supplied
+    and the model would be fitted as though it had no delays.
+    Use [`LAML`](@ref), [`GCVSolver`](@ref), [`AdamSolver`](@ref),
+    [`VariationalSolver`](@ref), [`MCMCSolver`](@ref),
+    [`DerivativeFreeSolver`](@ref) or
+    [`ProfileLikelihoodSolver`](@ref) for DDEs.
 """
 struct FGPGMSolver
     n_samples::Int
@@ -3554,6 +3694,17 @@ objective change fell below tolerance, `:maxiters` otherwise.
 
 # References
 - González et al. (2014), Pattern Recognition Letters
+
+!!! note "ODE problems only"
+    DDE problems are REJECTED with an error. The objective evaluates the dynamics
+    through the 4-argument ODE signature on a smoothed trajectory.
+    A PSM DDE's dynamics have the 5-argument signature
+    `f!(du, u, h, p, t)`, so the delayed history can never be supplied
+    and the model would be fitted as though it had no delays.
+    Use [`LAML`](@ref), [`GCVSolver`](@ref), [`AdamSolver`](@ref),
+    [`VariationalSolver`](@ref), [`MCMCSolver`](@ref),
+    [`DerivativeFreeSolver`](@ref) or
+    [`ProfileLikelihoodSolver`](@ref) for DDEs.
 """
 struct RKHSSolver
     kernel::Symbol
@@ -3859,9 +4010,25 @@ Result of fitting a PSM.
   - `reason::Symbol` — why the loop stopped: `:converged_tol` (tolerance
     criterion met), `:plateau` (objective stagnated over a window / no
     improving step existed), `:maxiters` (budget exhausted without a
-    criterion firing), or `:early_break` (internal failure such as a
-    simulation error or singular linear system),
+    criterion firing), `:early_break` (internal failure such as a
+    simulation error or singular linear system), or `:dynamics_failure`
+    (see below),
   plus solver-specific additional keys documented on each solver type.
+
+  The gradient-matching family (`GradientMatching`, `TwoStageSolver`,
+  `IntegralMatchingSolver`, `ODINSolver`, `RKHSSolver`, `BNGSolver`)
+  additionally reports
+  - `n_dynamics_failures::Int` — how many evaluation points fell back to
+    the large failure sentinel at the FITTED parameters, because the user
+    dynamics raised there. `0` on a clean fit. When it is nonzero the fit
+    is driven partly by fictitious residuals, so `converged` is forced to
+    `false` and `reason` to `:dynamics_failure`, with a warning; when
+    EVERY point fails, nothing was fitted and `solve` errors instead of
+    returning the initial guess. Measured before this accounting existed:
+    a plain ODE whose dynamics threw on 31% of the smoothed trajectory was
+    reported as `converged = true, reason = :objective_tol` with a
+    function-recovery RMSE 17× worse than the same fixture without the
+    throwing band.
   A few solvers put a whole object here instead of a NamedTuple (for
   example `MCMCSolver` stores its `MCMCChains.Chains`). Note there is no
   `extras` field: solver-specific output lives in `convergence`.

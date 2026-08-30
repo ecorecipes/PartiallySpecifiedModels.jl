@@ -115,7 +115,8 @@ sampler has no stopping criterion, so judge it by the R̂/ESS of
 `convergence.chains` and the acceptance rates.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::FGPGMSolver)
-    _validate_problem(prob, "FGPGMSolver"; require_continuous=true)
+    _validate_problem(prob, "FGPGMSolver"; require_continuous=true,
+                      reject_delays=true)
     # The product-of-experts density assumes Gaussian observation noise
     # (the data expert is a Gaussian quadratic form), so refuse other
     # families rather than silently fitting Gaussian (MagiSolver style).
@@ -237,7 +238,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::FGPGMSolver)
         for i in 1:n_times
             try
                 prob.dynamics!(du, X[i, :], p, times[i])
-            catch
+            catch e
+                _is_program_error(e) && rethrow()
                 return -Inf
             end
             F[i, :] .= du

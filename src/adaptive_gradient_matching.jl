@@ -128,7 +128,10 @@ function optimize_gp_hyperparams(times::Vector{Float64}, y::Vector{Float64},
                         best_ℓ = ℓ_try
                         best_σn² = σn²_try
                     end
-                catch
+                catch e
+                    # A non-PSD trial covariance is a legitimately skipped
+                    # grid point; a program error (or a Ctrl-C) is not.
+                    _is_program_error(e) && rethrow()
                 end
             end
         end
@@ -242,7 +245,8 @@ function agm_loss(prob::PSMProblem, beta::AbstractVector,
         u = T.(x_smooth[i, :])
         try
             prob.dynamics!(du, u, p, times[i])
-        catch
+        catch e
+            _is_program_error(e) && rethrow()
             return T(1e10)
         end
         F[i, :] .= du
@@ -471,7 +475,8 @@ function _agm_population_mcmc(prob::PSMProblem, alg::AdaptiveGradientMatching)
         for i in 1:T_pts
             try
                 prob.dynamics!(du, X[i, :], p, times[i])
-            catch
+            catch e
+                _is_program_error(e) && rethrow()
                 return -Inf
             end
             F[i, :] .= du
@@ -715,7 +720,7 @@ population-MCMC sampler over states, parameters, and mismatch variances
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
-    _validate_problem(prob, "AdaptiveGradientMatching")
+    _validate_problem(prob, "AdaptiveGradientMatching"; reject_delays=true)
     alg.n_samples > 0 && return _agm_population_mcmc(prob, alg)
     verbose = alg.verbose
     times = Float64.(prob.data_times)

@@ -255,7 +255,9 @@ are dropped from the data term, the GP hyperparameter fit and the state
 initialization.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
-    _validate_problem(prob, "MagiSolver"; require_continuous=true)
+    _validate_problem(prob, "MagiSolver"; require_continuous=true,
+                      reject_delays=true, delay_reason=
+                      "It builds a probabilistic ODE / GP state-space manifold from the 4-argument ODE signature f!(du, u, p, t).")
     # The manifold-constrained GP posterior assumes Gaussian observation
     # noise (the data term is a Gaussian quadratic form on the state grid),
     # so refuse other families rather than silently fitting Gaussian.

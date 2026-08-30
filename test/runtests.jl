@@ -2095,6 +2095,116 @@ end
         @test abs(sol_dde.unknown_functions[:f](0.8) - 0.4) < 0.1  # f(x)=0.5x
     end
 
+    @testset "DDE support is honest across the solver family" begin
+        using DelayDiffEq
+        # The regression net for B6. A PSM DDE's dynamics have the 5-argument
+        # signature f!(du, u, h, p, t); every solver that evaluates the
+        # right-hand side through the 4-argument ODE signature therefore
+        # raises a MethodError at EVERY point. PRE-FIX, measured on this
+        # fixture: GradientMatching, TwoStageSolver, IntegralMatchingSolver,
+        # ODINSolver and RKHSSolver each swallowed that MethodError into
+        # their 1e6 sentinel, ran to completion with ZERO successful dynamics
+        # evaluations, and returned the initial guess — function RMSE
+        # 0.111355 to 0.111360 against a no-learning baseline of 0.111355 —
+        # with GradientMatching stamping converged=true, reason=:objective_tol.
+        # Seven more surfaced a raw MethodError from deep inside their loops.
+        function dde_hf!(du, u, h, p, t); du[1] = -0.5 * h(p, t - 1.0)[1]; end
+        h_hf(p, t) = [1.0]
+        st_hf = OrdinaryDiffEq.solve(
+            DDEProblem(dde_hf!, [1.0], h_hf, (0.0, 10.0); constant_lags=[1.0]),
+            MethodOfSteps(Tsit5()); saveat=0.5)
+        t_hf = collect(st_hf.t)
+        rng_hf = Random.Xoshiro(42)
+        d_hf = reshape([max(st_hf.u[i][1] + 0.02randn(rng_hf), 0.001)
+                        for i in eachindex(t_hf)], :, 1)
+        mkp_hf() = PSMProblem(
+            (du, u, h, p, t) -> (du[1] = -p.f(h(p, t - 1.0)[1]); nothing),
+            [1.0], (0.0, 10.0),
+            [BSplineApproximator(:f, (0.0, 1.5), 6; initial=x -> 0.3x)];
+            data_times=t_hf, data_values=d_hf, obs_to_state=[1],
+            likelihood=Gaussian(), delays=[1.0], history=h_hf)
+
+        # (a) Every solver that cannot supply the delayed history says so.
+        for alg in (GradientMatching(maxiters=5, verbose=false),
+                    TwoStageSolver(maxiters=5, verbose=false),
+                    IntegralMatchingSolver(maxiters=5, verbose=false),
+                    ODINSolver(maxiters=5, verbose=false),
+                    RKHSSolver(maxiters=5, verbose=false),
+                    BNGSolver(k_obs=1, k_proc=1, maxiters=5, rng_seed=1,
+                              verbose=false),
+                    AdaptiveGradientMatching(maxiters=5, verbose=false),
+                    FGPGMSolver(n_samples=5, n_warmup=2, rng_seed=1,
+                                verbose=false),
+                    MagiSolver(n_samples=5, n_warmup=2, n_gridpoints=20,
+                               verbose=false),
+                    RodeoSolver(maxiters=2, verbose=false),
+                    DaltonSolver(maxiters=2, verbose=false),
+                    PseudoMarginalSolver(n_samples=5, n_warmup=2, rng_seed=1,
+                                         verbose=false),
+                    EnsembleKalmanSolver(n_ensemble=6, n_iterations=2,
+                                         verbose=false))
+            err_hf = try; solve(mkp_hf(), alg); nothing; catch e; e end
+            @test err_hf isa ErrorException        # never a raw MethodError
+            @test occursin("does not support DDE", err_hf.msg)
+        end
+        # CollocationLAML and MultipleShootingSolver already had their own
+        # designed guards; they must keep refusing, with their own wording.
+        for alg in (CollocationLAML(maxiters=2, verbose=false),
+                    MultipleShootingSolver(n_intervals=2, maxiters_inner=2,
+                                           maxiters_outer=1, verbose=false))
+            err_hg = try; solve(mkp_hf(), alg); nothing; catch e; e end
+            @test err_hg isa ErrorException
+        end
+
+        # (b) Every solver that DOES support DDEs still recovers f(x) = 0.5x.
+        #     No-learning baseline on the grid [0.2, 0.5, 0.8] is RMSE
+        #     0.111355. Measured on the fixed tree: LAML 0.02278,
+        #     GCVSolver 0.02319, AdamSolver 0.04595, VariationalSolver 0.06403,
+        #     DerivativeFreeSolver 0.08703 — the 0.10 bound clears all five
+        #     (the tightest margin is DerivativeFreeSolver's 1.15x) and still
+        #     beats the baseline.
+        for alg in (LAML(maxiters=10, verbose=false),
+                    GCVSolver(maxiters=10, verbose=false),
+                    AdamSolver(maxiters=20, verbose=false),
+                    VariationalSolver(maxiters=30, verbose=false),
+                    DerivativeFreeSolver(maxiters=30, n_particles=8,
+                                         verbose=false))
+            s_hf = solve(mkp_hf(), alg)
+            rm_hf = sqrt(sum((s_hf.unknown_functions[:f].([0.2, 0.5, 0.8]) .-
+                              0.5 .* [0.2, 0.5, 0.8]).^2) / 3)
+            @test rm_hf < 0.10
+        end
+
+        # (c) MCMCSolver gains REAL DDE support (sibling parity with
+        #     VariationalSolver, which has dispatched on `!isempty(delays)`
+        #     since variational_solver.jl:26-27). PRE-FIX: a raw MethodError
+        #     from mcmc_solver.jl:93, where the 5-argument DDE dynamics were
+        #     called through a 4-argument ODEFunction closure, after ~9 s of
+        #     NUTS setup and zero successful dynamics evaluations.
+        #     The sampling budget is deliberately small: this assertion is
+        #     the costliest in the testset, and 60/30 gives the same signal
+        #     as 200/100 (RMSE 0.004519 vs 0.003437, both ~25x better than
+        #     the no-learning baseline) for 34 s less wall time
+        #     (45.2 s vs 79.2 s standalone, --check-bounds=yes).
+        s_mc = solve(mkp_hf(), MCMCSolver(n_samples=60, n_warmup=30,
+                                          rng_seed=1, verbose=false))
+        @test s_mc isa PSMSolution
+        @test isfinite(s_mc.data_loss)
+        @test haskey(s_mc.unknown_functions, :f)
+        @test all(isfinite, s_mc.fitted_values)
+        rm_mc = sqrt(sum((s_mc.unknown_functions[:f].([0.2, 0.5, 0.8]) .-
+                          0.5 .* [0.2, 0.5, 0.8]).^2) / 3)
+        # Measured at this 60/30 budget on the fixed tree, under
+        # --check-bounds=yes: RMSE 0.004518538832408908 — 24.6x better than
+        # the no-learning baseline of 0.11135528725660045 (the approximator's
+        # own initial guess 0.3x on this grid), and the best of any
+        # DDE-capable solver on this fixture. The 0.05 bound leaves 11.1x
+        # headroom above the measurement and still sits 2.2x BELOW the
+        # baseline, so the assertion cannot pass on a solver that learned
+        # nothing.
+        @test rm_mc < 0.05
+    end
+
     # ─── New solver tests ─────────────────────────────────────────────
 
     @testset "GCVSolver — logistic growth" begin
@@ -4437,7 +4547,12 @@ end
             @test c.converged isa Bool
             @test c.iterations isa Int
             @test c.reason isa Symbol
-            @test c.reason in (:converged_tol, :plateau, :maxiters, :early_break)
+            # B6: the gradient-matching family can now also report
+            # :dynamics_failure, when the fitted right-hand side fell back to
+            # the failure sentinel at some evaluation points. `prob_conv` is
+            # clean, so it never fires here — but the tuple must admit it.
+            @test c.reason in (:converged_tol, :plateau, :maxiters,
+                               :early_break, :dynamics_failure)
         end
 
         @testset "LAML" begin
@@ -5961,11 +6076,125 @@ end
             @test s_g.convergence.reason isa Symbol
             @test s_g.convergence.reason in
                   (:objective_tol, :maxiters, :plateau,
-                   :line_search_failure, :singular_system)
+                   :line_search_failure, :singular_system,
+                   # B6: forced when the dynamics fell back to the failure
+                   # sentinel at some (but not all) evaluation points.
+                   :dynamics_failure)
             @test 1 <= s_g.convergence.iterations <= 40
+            # B6: the sentinel-substitution count is reported unconditionally
+            # so a caller can machine-check it; this fixture is clean.
+            @test haskey(s_g.convergence, :n_dynamics_failures)
+            @test s_g.convergence.n_dynamics_failures == 0
             # `converged` is only ever true alongside a criterion reason.
             @test !s_g.convergence.converged ||
                   s_g.convergence.reason in (:objective_tol, :plateau)
+        end
+
+        # ── B6/D2: a never-evaluable RHS cannot be reported as a fit ────
+        @testset "GradientMatching: a never-evaluable RHS cannot report a fit" begin
+            # This is an ODE test on purpose: the defect is NOT about DDEs.
+            # `p.kk` does not exist; the approximator is `:k`. PRE-FIX this
+            # was swallowed into the 1e6 sentinel at gradient_matching.jl:177
+            # and the solver returned a PSMSolution with coefficients BITWISE
+            # at initial_params and objective = 0.1000804433 (measured) —
+            # which is exactly the data smoother's residual sum of squares on
+            # this fixture, i.e. indistinguishable from a healthy fit. No
+            # error, no warning.
+            #
+            # POST-FIX on Julia >= 1.12 the FieldError is classified as a
+            # program error and rethrown on the first evaluation; on <= 1.11
+            # the same misspelling raises an unclassifiable ErrorException and
+            # the total-failure count (n_failed == n_points) is what errors.
+            # Either way, `solve` must throw.
+            ts_ne = collect(range(0.0, 8.0, length=41))
+            dv_ne = reshape([2.0 * exp(-0.5t) for t in ts_ne], :, 1)
+            bad_ne!(du, u, p, t) = (du[1] = -p.kk(u[1]) * u[1]; nothing)
+            prob_ne = PSMProblem(bad_ne!, [2.0], (0.0, 8.0),
+                [BSplineApproximator(:k, (-1.0, 2.5), 8; initial=x -> 0.3)];
+                data_times=ts_ne, data_values=dv_ne, obs_to_state=[1],
+                likelihood=Gaussian())
+            @test_throws Exception solve(prob_ne,
+                GradientMatching(maxiters=20, verbose=false))
+
+            # A DomainError raised at EVERY point is a numerical failure, not
+            # a program error, so it is NOT rethrown — the total-failure count
+            # is the only thing that catches it. This is the arm that pins
+            # counting-over-rethrowing.
+            allbad!(du, u, p, t) = throw(DomainError(u[1], "never valid"))
+            prob_ab = PSMProblem(allbad!, [2.0], (0.0, 8.0),
+                [BSplineApproximator(:k, (-1.0, 2.5), 8; initial=x -> 0.3)];
+                data_times=ts_ne, data_values=dv_ne, obs_to_state=[1],
+                likelihood=Gaussian())
+            err_ab = try
+                solve(prob_ab, GradientMatching(maxiters=20, verbose=false))
+                nothing
+            catch e; e end
+            @test err_ab isa ErrorException
+            @test occursin("every one of", err_ab.msg)
+        end
+
+        # ── B6/D2: partial sentinel substitution blocks a converged report ──
+        @testset "GradientMatching: sentinel substitutions block convergence" begin
+            # Logistic fixture with a user validity band. PRE-FIX, measured:
+            # 392 of 1260 right-hand-side evaluations (31.1%) fell back to the
+            # 1e6 sentinel — 14 of the 45 smoothed time points at the fitted
+            # parameters — and the solver reported converged=true,
+            # reason=:objective_tol, with a function-recovery RMSE of 0.051973
+            # against 0.003050 for the identical fixture without the band.
+            rng_sf = Random.Xoshiro(11)
+            r_true_sf(N) = 0.5 * (1.0 - N / 10.0)
+            ts_sf = collect(range(0.0, 12.0, length=45))
+            true_sf = OrdinaryDiffEq.solve(
+                ODEProblem((du, u, p, t) -> (du[1] = r_true_sf(u[1]) * u[1]; nothing),
+                           [0.5], (0.0, 12.0)), Tsit5(); saveat=ts_sf)
+            dv_sf = reshape([true_sf.u[i][1] + 0.03 * randn(rng_sf)
+                             for i in eachindex(ts_sf)], :, 1)
+            band_sf!(du, u, p, t) = begin
+                2.5 <= u[1] <= 7.0 && throw(DomainError(u[1], "band"))
+                du[1] = p.r(u[1]) * u[1]; nothing
+            end
+            mkp_sf(f) = PSMProblem(f, [0.5], (0.0, 12.0),
+                [BSplineApproximator(:r, (0.0, 10.0), 8; initial=x -> 0.25)];
+                data_times=ts_sf, data_values=dv_sf, obs_to_state=[1],
+                likelihood=Gaussian())
+
+            s_sf = @test_logs (:warn,) match_mode=:any solve(mkp_sf(band_sf!),
+                        GradientMatching(maxiters=50, tol=1e-8, verbose=false))
+            @test haskey(s_sf.convergence, :n_dynamics_failures)
+            @test s_sf.convergence.n_dynamics_failures > 0
+            @test s_sf.convergence.n_dynamics_failures < length(ts_sf)
+            @test s_sf.convergence.converged == false
+            @test s_sf.convergence.reason == :dynamics_failure
+
+            # The clean control still converges honestly with a zero count and
+            # recovers the function. Measured on the fixed tree: r(5.0) =
+            # 0.2468 against a truth of 0.25, and function RMSE 0.003050 on
+            # the grid [1,3,5,7,9]; the 0.02 bound leaves ~6x headroom.
+            clean_sf!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1]; nothing)
+            s_cl = solve(mkp_sf(clean_sf!),
+                         GradientMatching(maxiters=50, tol=1e-8, verbose=false))
+            @test s_cl.convergence.n_dynamics_failures == 0
+            @test s_cl.convergence.reason != :dynamics_failure
+            @test abs(s_cl.unknown_functions[:r](5.0) - 0.25) < 0.02
+        end
+
+        # ── B6/D2: the exception classifier ────────────────────────────
+        @testset "_is_program_error classifies a misspelt parameter name" begin
+            using PartiallySpecifiedModels: _is_program_error
+            p_pe = (; k = x -> 0.3)
+            err_pe = try; p_pe.kk; catch e; e; end
+            # Julia >= 1.12 raises FieldError; <= 1.11 raises a plain
+            # ErrorException, which cannot be classified by type without
+            # matching on message text — a documented limitation.
+            if isdefined(Base, :FieldError)
+                @test err_pe isa getfield(Base, :FieldError)
+                @test _is_program_error(err_pe)
+            end
+            @test _is_program_error(MethodError(sin, (1, 2)))
+            @test _is_program_error(BoundsError([1, 2], 5))
+            # A DomainError is a NUMERICAL failure: it must NOT be rethrown,
+            # which is exactly why the sentinel substitutions are counted.
+            @test !_is_program_error(DomainError(-1.0, "sqrt"))
         end
 
         # ── D3: _vi_edf uses the family's curvature ───────────────────

@@ -54,7 +54,14 @@ member's parameters. `sol.convergence` carries the honest-convergence keys
 the `BNGSolver` docstring for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
-    _validate_problem(prob, "BNGSolver")
+    # DELIBERATE: BNGSolver keeps failing loudly on DDEs rather than being
+    # "repaired" at its final-prediction block (`:333`, an ODEProblem built
+    # from the 4-argument signature). Its FIT is gradient matching — `bng_loss`
+    # evaluates the right-hand side on smoothed states with no history
+    # mechanism at all — so fixing only the reporting site would turn a hard
+    # error into a SILENT wrong answer, which is strictly worse. Real support
+    # needs a history-from-the-smoother rework; that is a feature, not a fix.
+    _validate_problem(prob, "BNGSolver"; reject_delays=true)
     verbose = alg.verbose
 
     times = Float64.(prob.data_times)
@@ -190,7 +197,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
             u = T_el.(y_smooth[i, :])
             try
                 prob.dynamics!(du, u, p, times[i])
-            catch
+            catch e
+                _is_program_error(e) && rethrow()
                 du .= T_el(1e6)
             end
             for k in 1:n_vars
@@ -272,6 +280,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     member_losses = Float64[]
     member_plateaued = Bool[]
     total_iters = 0
+    # The unbootstrapped (ko = 1) smoothed trajectory, kept so the sentinel
+    # accounting below can be taken on the same states `bng_loss` matched
+    # against — see `_dynamics_failure_verdict` (solver.jl).
+    y_smooth_base = zeros(n_times, n_vars)
     for ko in 1:alg.k_obs
         data_ko = if ko == 1
             Float64.(prob.data_values)
@@ -283,6 +295,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
             base_fit .+ resid[idx_boot, :]
         end
         y_smooth, dydt = smooth_targets(data_ko)
+        ko == 1 && (y_smooth_base .= y_smooth)
         for kp in 1:alg.k_proc
             beta_fit, loss_fit, it, plat = fit_member(init_beta(kp), y_smooth, dydt)
             push!(member_betas, beta_fit)
@@ -304,6 +317,19 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
                 "loss=$(round(best_loss, sigdigits=5))")
     end
 
+    # Sentinel accounting at the best member's parameters on the
+    # unbootstrapped smoothed trajectory — see `_dynamics_failure_verdict`
+    # (solver.jl). `bng_loss` substitutes a 1e6 sentinel wherever the dynamics
+    # raise, so without this a model that never evaluates is reported as an
+    # ordinary ensemble fit. Taken BEFORE the prediction block below, whose
+    # ODE solve re-enters the same dynamics and would propagate the user's
+    # exception verbatim (loud, but uninformative) before this ran.
+    bng_converged = member_plateaued[best_idx]
+    bng_reason = bng_converged ? :plateau : :maxiters
+    n_dyn_fail = _count_dynamics_failures(prob, times, y_smooth_base, beta)
+    bng_converged, bng_reason = _dynamics_failure_verdict(
+        "BNGSolver", n_dyn_fail, n_times, bng_converged, bng_reason)
+
     # ── Build solution ───────────────────────────────────────────
 
     # Simulate with the best member's parameters for trajectory predictions
@@ -316,7 +342,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
         for step in 1:(n_times - 1)
             try
                 prob.dynamics!(u_next_sim, u_sim, p_sim, times[step])
-            catch
+            catch e
+                _is_program_error(e) && rethrow()
                 u_next_sim .= 1e6
             end
             u_sim = copy(u_next_sim)
@@ -423,9 +450,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     PSMSolution(params, best_loss, data_loss, edf, Float64[],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (converged=member_plateaued[best_idx], iterations=total_iters,
-                 reason=(member_plateaued[best_idx] ? :plateau : :maxiters),
-                 method=:bng,
+                (converged=bng_converged, iterations=total_iters,
+                 reason=bng_reason,
+                 method=:bng, n_dynamics_failures=n_dyn_fail,
                  n_ensemble=K_total, member_losses=member_losses,
                  member_weights=w_members, member_converged=member_plateaued,
                  ensemble_std=ensemble_std))
