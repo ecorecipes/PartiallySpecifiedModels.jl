@@ -6992,6 +6992,56 @@ end
         end
     end
 
+    @testset "C5: Rodeo/Dalton FS use LAML's degenerate-case policy" begin
+        # Both clamped the Fellner-Schall NUMERATOR to [0.01, np_k], which
+        # converted LAML's two NAMED degenerate cases into arbitrary λ:
+        #   * edf_k <= 0  -> λ = σ²·0.01/bSb, size set by bSb rather than a
+        #     controlled step. LAML releases λ/10, bounded.
+        #   * bSb ~ 0     -> with bSb floored at 1e-20, σ²·0.01/1e-20 rails
+        #     straight to exp(RHO_MAX) ≈ 2.4e17, i.e. maximum smoothing —
+        #     the boundary solution laml.jl deliberately DECLINES. Now holds.
+        #   * non-finite λ* -> `clamp(NaN,…)` is NaN in Julia and every
+        #     comparison against NaN is false, so the convergence test would
+        #     have declared success on it. Now guarded by isfinite.
+        rng = StableRNG(3)
+        ts = collect(0.0:0.5:8.0)
+        mu = [1.0 * exp(0.1 * t) for t in ts]
+        y = mu .+ 0.05 .* randn(rng, length(ts))
+        # Truth r ≡ 0.1 is CONSTANT, so it lies in the null space of the
+        # curvature penalty — which is exactly where laml.jl's notes say this
+        # branch fires AT the optimum.
+        dyn!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        uf = BSplineApproximator(:r, (0.5, 2.5), 6; initial=x -> 0.1)
+        prob = PSMProblem(dyn!, [1.0], (0.0, 8.0), [uf];
+            data_times=ts, data_values=reshape(y, :, 1), obs_to_state=[1],
+            known_params=NamedTuple(), solver=Tsit5())
+
+        rail = exp(40.0)   # exp(RHO_MAX)
+        # Measured, deterministic across repeated runs (pre-fix -> post-fix):
+        #   Rodeo   λ 0.00728639 -> 0.00444492,  edf 3.74003 -> 3.62772
+        #   Dalton  λ 0.000294265 -> 0.000118949, edf 3.98371 -> 3.86439
+        # rtol 0.2 excludes the pre-fix value by 1.37× (Rodeo) and 2.06×
+        # (Dalton) — thin for Rodeo, but this is a policy change with a small
+        # λ signature, not a large numerical one.
+        for (alg, lam_ref) in ((RodeoSolver(maxiters=30, verbose=false), 0.00444492),
+                               (DaltonSolver(maxiters=30, verbose=false), 0.000118949))
+            sol = solve(prob, alg)
+            lam = sol.smoothing_params[1]
+            @test isfinite(lam)          # the NaN hole named above
+            @test 0 < lam < rail / 1e6   # nowhere near the RHO_MAX rail
+            @test isfinite(sol.edf)
+            @test lam ≈ lam_ref rtol = 0.2
+        end
+
+        # DELIBERATELY NOT GATED: recovery of the constant truth. It moved in
+        # OPPOSITE directions for the two solvers — max|r-0.1| 0.2507 -> 0.0869
+        # for Rodeo (2.9× better) but 0.3143 -> 0.5474 for Dalton (1.74×
+        # worse). This is a degenerate-case POLICY fix that makes both agree
+        # with laml.jl and closes a NaN hole; it is not a fit-quality fix, and
+        # gating on either solver's recovery would be picking the flattering
+        # number.
+    end
+
     @testset "B7: GradientMatching's discrete branch is unchanged" begin
         # Regression guard. The discrete branch ALREADY simulated (its own
         # comment names the same defect), so B7 must not perturb it.

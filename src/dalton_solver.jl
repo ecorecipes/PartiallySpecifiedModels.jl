@@ -543,7 +543,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
             for (k, (S, off)) in enumerate(zip(smooth_mats, smooth_offsets))
                 np_k = size(S, 1)
                 β_k = beta_opt[off+1:off+np_k]
-                bSb = max(dot(β_k, S * β_k), 1e-20)
+                bSb = dot(β_k, S * β_k)   # raw: LAML's own 1e-30 test below
                 S_full = zeros(n_beta, n_beta)
                 for (kk, (Sk, offk)) in enumerate(zip(smooth_mats, smooth_offsets))
                     npk = size(Sk, 1); idx = (offk+1):(offk+npk)
@@ -558,8 +558,38 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
                 # the hat-trace form included the penalty null space.
                 r_k = _rank_penalty(S)
                 trHS = tr(H_inv[idx_k, idx_k] * S)
-                fs_num = clamp(r_k - smooth_lambdas[k] * trHS, 0.01, Float64(np_k))
-                smooth_lambdas[k] = clamp(σ²_hat * fs_num / bSb, exp(RHO_MIN), exp(RHO_MAX))
+                # Fellner-Schall step, matching `laml.jl`'s degenerate-case
+                # policy VERBATIM (see the long note there for why each
+                # branch is what it is). This previously clamped the
+                # NUMERATOR to [0.01, np_k], which silently converted the
+                # two degenerate cases into arbitrary lambda values instead
+                # of naming them:
+                #   * edf_k <= 0: clamping to 0.01 makes
+                #     lambda = sigma2*0.01/bSb, whose SIZE is set by bSb --
+                #     not a step in any controlled direction. LAML releases
+                #     lambda/10, bounded and monotone.
+                #   * bSb ~ 0: with bSb floored at 1e-20 (as it was here),
+                #     sigma2*0.01/1e-20 overflows straight to the RHO_MAX
+                #     rail -- maximum smoothing, the boundary solution
+                #     "carrying no usable uncertainty" that laml.jl
+                #     deliberately DECLINES. LAML holds instead. The floor is
+                #     therefore removed and LAML's raw `bSb > 1e-30` test used.
+                #   * non-finite lambda*: `clamp(NaN, lo, hi)` returns NaN in
+                #     Julia, and every comparison against NaN is false, so the
+                #     convergence test would have declared success on it --
+                #     exactly the hole laml.jl's isfinite guard names.
+                edf_k = r_k - smooth_lambdas[k] * trHS
+                lam_new = if bSb > 1e-30
+                    if edf_k > 0
+                        lf = σ²_hat * edf_k / bSb
+                        isfinite(lf) ? lf : smooth_lambdas[k]
+                    else
+                        smooth_lambdas[k] / 10.0    # lambda* <= 0 — release
+                    end
+                else
+                    smooth_lambdas[k]               # 0/0 or no finite lambda* — hold
+                end
+                smooth_lambdas[k] = clamp(lam_new, exp(RHO_MIN), exp(RHO_MAX))
                 edf_total = clamp(tr(H_inv * JWJ), 1.0, Float64(n_beta))
             end
 
