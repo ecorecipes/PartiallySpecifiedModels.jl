@@ -423,7 +423,11 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
     # β̂(λ) = (J'WJ + S_λ)⁻¹ J'Wz (Wood & Fasiolo 2017 alternate FS and β̂
     # updates; iterating λ to a fixed point against a FROZEN β̂ solves a
     # different — frozen-β — criterion and can drift far from REML).
-    z_work = y .- mu .+ J * beta
+    # (z − η) is the family's working residual, NOT `y − μ`: the two differ
+    # for TruncatedNormal, where using `y − μ` inverts the sign of the step
+    # wherever the bound bites. `_working_residual` is `y .- mu` for every
+    # other family, so this line is bit-identical off the truncated path.
+    z_work = _working_residual(family, y, mu, w_data) .+ J * beta
     JWJ = J' * Diagonal(W_irls) * J
     JWz = J' * (W_irls .* z_work)
     beta_fs = copy(beta)

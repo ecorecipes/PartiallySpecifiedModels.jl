@@ -1474,8 +1474,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         # Compute IRLS weights from current predictions
         w_irls = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
 
-        # Form pseudodata z = y - f + J*β
-        z_pseudo = y_vec .- f_vec .+ J * beta
+        # Form pseudodata z = (z − η) + J*β. The working residual is the
+        # family's, not `y − f`: they coincide for Gaussian/Poisson/NegBin
+        # (bit-identical) and diverge for TruncatedNormal — see
+        # `_working_residual`. The Gaussian warm-start above deliberately
+        # keeps `y − f`: it IS a Gaussian solve whatever the declared family.
+        z_pseudo = _working_residual(prob.likelihood, y_vec, f_vec, w_vec) .+ J * beta
 
         # PCLS with current (accepted) θ
         a0_pcls, B_old, fac0 = pcls_step(J, z_pseudo, otheta, w_irls)
