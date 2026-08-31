@@ -333,6 +333,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     # ── Build solution ───────────────────────────────────────────
 
     # Simulate with the best member's parameters for trajectory predictions
+    # Set by the continuous fallback below when the ODE solve fails; the
+    # discrete path builds `pred` by stepping and cannot fail this way.
+    sim_failed = false
     if prob.discrete
         p_sim = build_param_struct(prob, beta)
         u_sim = Float64.(prob.u0 isa Function ? prob.u0(p_sim) : prob.u0)
@@ -375,8 +378,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
                 end
             end
         else
-            # Fallback: use the base smoother fit as predictions
-            if verbose; println("  ODE simulation failed, using smoothed values"); end
+            # Fifth member of the family B7 fixed in four solvers: on a
+            # non-Success retcode the reported `fitted_values` silently
+            # became the base smoother, so `data_loss` measured the SMOOTHER
+            # rather than the model — and it was announced only under
+            # `verbose`, i.e. never, by default. Same warning and same
+            # `convergence.simulation_failed` flag as the rest of the family.
+            sim_failed = true
+            @warn "BNGSolver: integrating the fitted dynamics from u0 " *
+                  "failed (retcode $(sol_ode.retcode)). Reporting the base " *
+                  "data smoother as `fitted_values`; `data_loss` therefore " *
+                  "measures the SMOOTHER, not the model fit. See " *
+                  "`convergence.simulation_failed`."
             for j in 1:n_obs
                 pred[:, j] .= base_fit[:, j]
             end
@@ -455,5 +468,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
                  method=:bng, n_dynamics_failures=n_dyn_fail,
                  n_ensemble=K_total, member_losses=member_losses,
                  member_weights=w_members, member_converged=member_plateaued,
+                 simulation_failed=sim_failed,
                  ensemble_std=ensemble_std))
 end

@@ -1034,6 +1034,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
                 (method=:adaptive_gradient_matching,
+                 # These three were absent, so `sol.convergence.converged`
+                 # raised a FieldError on this path while the verbose branch
+                 # above was already printing `Optim.converged(result)` —
+                 # the data was in hand and simply not reported. Keys match
+                 # `DerivativeFreeSolver`, the nearest sibling that also
+                 # wraps Optim; no `reason` there or here, because Optim's
+                 # stop condition does not map onto the LAML taxonomy
+                 # without inventing one.
+                 converged=Optim.converged(result),
+                 iterations=Optim.iterations(result),
+                 f_calls=Optim.f_calls(result),
                  gp_hyperparams=gp_hyperparams,
                  gamma=gamma_opt,
                  deriv_loss=deriv_loss,
