@@ -224,6 +224,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
     end
 
     # ── generation 0: sample from prior, accept all ──────────────────
+    # Counts simulations that failed for MODEL reasons (a bad draw whose
+    # trajectory blows up). Program errors are rethrown, not counted — see
+    # the catches below. Reported so a run where most draws never simulated
+    # cannot look like a healthy posterior.
+    n_sim_failed = 0
     particles = Vector{Vector{Float64}}(undef, N)
     distances = Vector{Float64}(undef, N)
     weights   = fill(1.0 / N, N)
@@ -233,8 +238,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
         try
             pred = simulate(prob, particles[i])
             distances[i] = summary_fn(pred, prob.data_values)
-        catch
+        catch e
+            # A genuine integration failure means this particle is a bad
+            # draw, and Inf is the right distance. A PROGRAM error (typo,
+            # MethodError, BoundsError in the user's dynamics) is not a bad
+            # draw — scoring it as "infinitely bad" makes every particle
+            # look rejected and the solver reports a converged-looking fit
+            # built entirely on nothing. Same policy as LAML and
+            # DerivativeFreeSolver: bugs raise, model failures score.
+            _is_program_error(e) && rethrow()
             distances[i] = Inf
+            n_sim_failed += 1
         end
     end
 
@@ -280,7 +294,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
                 try
                     pred = simulate(prob, theta_star)
                     d = summary_fn(pred, prob.data_values)
-                catch
+                catch e
+                    # Same policy as the prior-sampling loop above: a bug in
+                    # the dynamics must raise rather than be silently
+                    # skipped as a rejected proposal.
+                    _is_program_error(e) && rethrow()
+                    n_sim_failed += 1
                     continue
                 end
 
@@ -394,6 +413,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
         Float64.(prob.data_times),
         uf_evals,
         (method            = :abc_smc,
+         n_sim_failed      = n_sim_failed,
          particles         = particles,
          distances         = distances,
          weights           = weights,

@@ -767,7 +767,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
     params = ComponentArray(NamedTuple(ca_entries))
     pen_ss = m > 0 ? sum(theta[l] * dot(beta[uf_offsets[l]+1:uf_offsets[l]+uf_nk[l]],
                   S_list[l] * beta[uf_offsets[l]+1:uf_offsets[l]+uf_nk[l]]) for l in 1:m) : 0.0
-    obj_val = data_loss + pen_ss
+    # `objective` must be the criterion this solver MINIMISES. The
+    # Gauss-Newton loop above minimises `resid_ss + pen_ss` (line ~412) and
+    # `deriv_loss` is that same derivative-matching SS recomputed at the
+    # final β, so `deriv_loss + pen_ss` is it. The old `data_loss + pen_ss`
+    # was never optimised — and since B7 made `pred` a real simulation,
+    # `data_loss` is a SIMULATED loss, so the old sum mixed two quantities
+    # that never appeared in one objective. TwoStageSolver and
+    # IntegralMatchingSolver already report their minimised `best_loss`;
+    # this was the odd sibling.
+    obj_val = deriv_loss + pen_ss
 
     if verbose
         println("\nFinal: data_SS=$(round(data_loss, sigdigits=5)) " *

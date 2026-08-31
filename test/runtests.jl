@@ -1967,6 +1967,13 @@ end
 
         @test sol_bng isa PSMSolution
         @test sol_bng.data_loss < 2.0   # noise floor ≈ 0.16 (16 pts × 0.1²)
+        # C3: BNGSolver was the fifth member of B7's family — on a
+        # non-Success retcode it silently reported the base smoother as
+        # `fitted_values`, announced only under `verbose`. It now warns
+        # unconditionally and carries the family's flag, which must be
+        # present (and false) on a healthy fit like this one.
+        @test hasproperty(sol_bng.convergence, :simulation_failed)
+        @test sol_bng.convergence.simulation_failed == false
         @test haskey(sol_bng.unknown_functions, :r)
         r_fitted = sol_bng.unknown_functions[:r]
         @test abs(r_fitted(5.0) - 0.25) < 0.12   # true r(5) = 0.5(1 − 5/10)
@@ -6756,6 +6763,113 @@ end
                 # `data_loss` that does not measure the model must say so.
             end
         end
+    end
+
+    # ─── C3: convergence/objective reporting honesty ─────────────────
+    # Completes the families B6 (silent failures) and B7 (fitted_values that
+    # are not the model) in the solvers those batches left alone.
+    @testset "C3: ABC classifies program errors instead of scoring them" begin
+        PSM = PartiallySpecifiedModels
+        # MEASURED NEGATIVE RESULT — do not "simplify" this fixture back.
+        # The obvious test (a misspelled approximator name, `p.typo`) does
+        # NOT discriminate: ABC already raises FieldError on it via the
+        # up-front validation probe, identically with and without the guard.
+        # The bare catch only bites for a program error that appears AFTER
+        # that probe, i.e. one reachable for some particles and not for the
+        # initial parameters — a bug in a rarely-taken branch. Measured with
+        # the guard removed: ABC returned a normal-looking solution having
+        # silently scored 5 of 20 particles as "infinitely bad draws".
+        rng = StableRNG(31)
+        st = OrdinaryDiffEq.solve(
+            ODEProblem((du, u, p, t) -> (du[1] = 0.5 * u[1] * (1 - u[1] / 8)),
+                       [1.0], (0.0, 8.0)), Tsit5(); saveat=0.5)
+        y = [st(t)[1] + 0.1 * randn(rng) for t in st.t]
+        lookup = [1.0, 2.0, 3.0]
+        # Zero-initialised coefficients keep u ≡ 1.0, so the buggy branch is
+        # unreachable at the initial parameters and the probe passes; drawn
+        # particles with positive g cross 2.0 and hit the BoundsError.
+        function bad!(du, u, p, t)
+            du[1] = p.g(u[1])
+            if u[1] > 2.0
+                du[1] *= lookup[10]     # a real bug, not a bad draw
+            end
+        end
+        uf = BSplineApproximator(:g, (0.0, 9.0), 6)
+        prob_bad = PSMProblem(bad!, [1.0], (0.0, 8.0), [uf];
+            data_times=collect(st.t), data_values=reshape(y, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(), solver=Tsit5())
+        @test_throws BoundsError solve(prob_bad, ABCSolver(n_particles=20,
+                                                            n_generations=2))
+
+        # A well-posed problem still solves, and now reports how many
+        # simulations failed for MODEL reasons.
+        good!(du, u, p, t) = (du[1] = p.g(u[1]))
+        prob_ok = PSMProblem(good!, [1.0], (0.0, 8.0), [uf];
+            data_times=collect(st.t), data_values=reshape(y, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(), solver=Tsit5())
+        sol_ok = solve(prob_ok, ABCSolver(n_particles=8, n_generations=2))
+        @test hasproperty(sol_ok.convergence, :n_sim_failed)
+        @test sol_ok.convergence.n_sim_failed >= 0
+    end
+
+    @testset "C3: GradientMatching reports the objective it minimises" begin
+        # The Gauss-Newton loop minimises `deriv_loss + pen`; `objective`
+        # reported `data_loss + pen`, which is not that — and since B7 made
+        # `pred` a real simulation, `data_loss` is a SIMULATED loss, so the
+        # old sum mixed two quantities that never appeared in one objective.
+        # TwoStage and IntegralMatching already reported their minimised
+        # `best_loss`; GM was the odd sibling.
+        rng = StableRNG(11)
+        st = OrdinaryDiffEq.solve(
+            ODEProblem((du, u, p, t) -> (du[1] = 0.6 * u[1] * (1 - u[1] / 10)),
+                       [1.0], (0.0, 12.0)), Tsit5(); saveat=0.4)
+        y = [st(t)[1] + 0.15 * randn(rng) for t in st.t]
+        dyn!(du, u, p, t) = (du[1] = p.g(u[1]))
+        uf = BSplineApproximator(:g, (0.0, 11.0), 8)
+        prob = PSMProblem(dyn!, [1.0], (0.0, 12.0), [uf];
+            data_times=collect(st.t), data_values=reshape(y, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(), solver=Tsit5())
+        sol = solve(prob, GradientMatching(maxiters=60, verbose=false))
+        dl = sol.convergence.deriv_loss
+        pen = sol.objective - dl
+        @test pen >= 0                       # objective = deriv_loss + pen
+        # Measured: objective 0.047618 = deriv_loss 0.030962 + pen 0.016656,
+        # where the old form would have reported 2.364653 — 49.7× larger.
+        # THE discriminator. Pre-fix `objective = data_loss + pen`, which is
+        # necessarily > data_loss (pen >= 0); post-fix it is
+        # deriv_loss + pen, far BELOW data_loss here. Measured: objective
+        # 0.047618 vs data_loss 2.347997, and the old form would have
+        # reported 2.364653 — 49.7× the criterion actually minimised.
+        # (An earlier draft asserted `objective < data_loss + pen` with pen
+        # derived from `objective`; that is satisfied pre-fix too whenever
+        # deriv_loss < data_loss, i.e. it did not discriminate at all.)
+        @test sol.objective < sol.data_loss
+        @test sol.objective >= dl               # = deriv_loss + (pen >= 0)
+        @test sol.data_loss / sol.objective > 5 # measured 49.3×
+    end
+
+    @testset "C3: AGM's deterministic path reports convergence" begin
+        # `sol.convergence.converged` raised a FieldError on this path while
+        # the verbose branch was already printing `Optim.converged(result)` —
+        # the data was in hand and simply not reported. Same class as B4/D2.
+        rng = StableRNG(77)
+        st = OrdinaryDiffEq.solve(
+            ODEProblem((du, u, p, t) -> (du[1] = 0.5 * u[1] * (1 - u[1] / 8)),
+                       [1.0], (0.0, 8.0)), Tsit5(); saveat=0.5)
+        y = [st(t)[1] + 0.1 * randn(rng) for t in st.t]
+        dyn!(du, u, p, t) = (du[1] = p.g(u[1]))
+        uf = BSplineApproximator(:g, (0.0, 9.0), 6)
+        prob = PSMProblem(dyn!, [1.0], (0.0, 8.0), [uf];
+            data_times=collect(st.t), data_values=reshape(y, :, 1),
+            obs_to_state=[1], known_params=NamedTuple(), solver=Tsit5())
+        sol = solve(prob, AdaptiveGradientMatching(maxiters=30, verbose=false))
+        @test hasproperty(sol.convergence, :converged)
+        @test sol.convergence.converged isa Bool
+        @test hasproperty(sol.convergence, :iterations)
+        @test sol.convergence.iterations >= 0
+        @test hasproperty(sol.convergence, :f_calls)
+        # the key B7 added must still be there
+        @test hasproperty(sol.convergence, :simulation_failed)
     end
 
     @testset "B7: GradientMatching's discrete branch is unchanged" begin
