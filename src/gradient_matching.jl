@@ -161,7 +161,14 @@ end
 
 """
 Evaluate ODE RHS at all time points using smoothed state values.
-Returns (T × K) matrix of f(ŷ(t), p, t).
+
+Returns `(F, n_failed)` where `F` is the (T × K) matrix of f(ŷ(t), p, t)
+and `n_failed` counts the time points whose evaluation raised and
+therefore hold the `1e6` failure sentinel rather than a real derivative.
+Same `(values, failure-count)` shape as `eval_ode_rhs_masked`
+(collocation_solver.jl), and for the same reason: a caller that cannot
+see how much of `F` is fictitious cannot report an honest convergence
+verdict (see [`_dynamics_failure_verdict`](@ref)).
 """
 function eval_rhs_at_smooth(prob::PSMProblem, times::Vector{Float64},
                             y_smooth::Matrix{Float64}, beta::Vector{Float64})
@@ -169,17 +176,20 @@ function eval_rhs_at_smooth(prob::PSMProblem, times::Vector{Float64},
     F = zeros(T, K)
     p = build_param_struct(prob, beta)
     du = zeros(K)
+    n_failed = 0
 
     for i in 1:T
         u = y_smooth[i, :]
         try
             prob.dynamics!(du, u, p, times[i])
-        catch
+        catch e
+            _is_program_error(e) && rethrow()
             du .= 1e6
+            n_failed += 1
         end
         F[i, :] .= du
     end
-    F
+    F, n_failed
 end
 
 """
@@ -195,7 +205,7 @@ function gm_residual_jacobian(prob::PSMProblem, times::Vector{Float64},
     n_beta = length(beta)
     n_match = prob.discrete ? T - 1 : T
 
-    F = eval_rhs_at_smooth(prob, times, y_smooth, beta)
+    F, _ = eval_rhs_at_smooth(prob, times, y_smooth, beta)
 
     # Residual: √w × (dydt - F)
     resid = zeros(n_match * K)
@@ -212,7 +222,7 @@ function gm_residual_jacobian(prob::PSMProblem, times::Vector{Float64},
         beta_p = copy(beta)
         step = max(eps, abs(beta[b]) * eps)
         beta_p[b] += step
-        F_p = eval_rhs_at_smooth(prob, times, y_smooth, beta_p)
+        F_p, _ = eval_rhs_at_smooth(prob, times, y_smooth, beta_p)
         for k in 1:K, i in 1:n_match
             idx = (k - 1) * n_match + i
             wi = idx <= length(w) ? sqrt(w[idx]) : 1.0
@@ -248,7 +258,7 @@ the smoothed derivatives to the model right-hand side.
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
-    _validate_problem(prob, "GradientMatching")
+    _validate_problem(prob, "GradientMatching"; reject_delays=true)
     times = Float64.(prob.data_times)
     T_pts = length(times)
     K = length(prob.u0)
@@ -358,7 +368,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
 
     # Loss function for derivative/map matching (with per-state weights)
     function gm_loss(β_eval)
-        F = eval_rhs_at_smooth(prob, times, y_smooth, β_eval)
+        F, _ = eval_rhs_at_smooth(prob, times, y_smooth, β_eval)
         loss_val = 0.0
         for k in 1:K, i in 1:n_match
             idx = (k - 1) * n_match + i
@@ -417,10 +427,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
             neg_Jtr = -(J' * resid)
             delta = try
                 JtJ \ neg_Jtr
-            catch
+            catch e
+                _is_program_error(e) && rethrow()
                 try
                     (JtJ + 1e-6 * I) \ neg_Jtr
-                catch
+                catch e2
+                    _is_program_error(e2) && rethrow()
                     # Even the ridged normal equations are unsolvable — a
                     # numerical failure, not a converged fit.
                     conv_reason = :singular_system
@@ -521,7 +533,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
                 u = eltype(β_eval).(y_smooth[i, :])
                 try
                     prob.dynamics!(du, u, p, times[i])
-                catch
+                catch e
+                    _is_program_error(e) && rethrow()
                     du .= eltype(β_eval)(1e6)
                 end
                 for k in 1:K
@@ -649,7 +662,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
         for step in 1:(T_pts-1)
             try
                 prob.dynamics!(u_next_sim, u_sim, p_sim, times[step])
-            catch
+            catch e
+                _is_program_error(e) && rethrow()
                 u_next_sim .= 1e6
             end
             u_sim = copy(u_next_sim)
@@ -673,8 +687,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
     data_loss = weighted_data_loss(prob, pred)
 
     # Derivative matching loss
-    F_final = eval_rhs_at_smooth(prob, times, y_smooth, beta)
+    F_final, n_dyn_fail = eval_rhs_at_smooth(prob, times, y_smooth, beta)
     deriv_loss = sum((dydt .- F_final).^2)
+
+    # Sentinel accounting at the FITTED parameters. `_dynamics_failure_verdict`
+    # errors on total failure (nothing was fitted) and downgrades a partial
+    # failure to converged=false, reason=:dynamics_failure. Without it, a
+    # measured 31% sentinel substitution on a plain ODE was reported as
+    # converged=true, reason=:objective_tol.
+    conv_converged, conv_reason = _dynamics_failure_verdict(
+        "GradientMatching", n_dyn_fail, T_pts, conv_converged, conv_reason)
 
     # Build evaluators
     p_opt = build_param_struct(prob, beta)
@@ -711,5 +733,5 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
                 Float64.(prob.data_times), uf_evals,
                 (deriv_loss=deriv_loss, method=:gradient_matching,
                  converged=conv_converged, reason=conv_reason,
-                 iterations=conv_iters))
+                 iterations=conv_iters, n_dynamics_failures=n_dyn_fail))
 end

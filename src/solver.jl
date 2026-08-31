@@ -42,13 +42,34 @@ function _warn_unanchored_index(prob::PSMProblem, solver_name::String)
 end
 
 """
-    _validate_problem(prob, solver_name; require_continuous=false)
+    _validate_problem(prob, solver_name; require_continuous=false,
+                      reject_delays=false)
 
 Common input validation for all solve methods. Checks data dimensions,
 approximator configuration, and observation mapping consistency.
+
+`require_continuous=true` rejects discrete-time maps.
+
+`reject_delays=true` rejects DDE problems, for the solvers that evaluate
+the dynamics through the 4-argument ODE signature `f!(du, u, p, t)`. A
+PSM DDE's `dynamics!` has the 5-argument signature `f!(du, u, h, p, t)`
+(see `dde_solver.jl`), so those calls raise a `MethodError` at every
+point. Measured before this guard existed: `GradientMatching`,
+`TwoStageSolver`, `IntegralMatchingSolver`, `ODINSolver` and
+`RKHSSolver` swallowed that `MethodError` into their `1e6` failure
+sentinel and returned the initial guess as though it were a fit, while
+seven other solvers surfaced a raw `MethodError` from deep inside their
+inner loops. Supplying the delayed history to a gradient-matching
+objective is a feature (the smoother would have to yield a history
+callable, including for unobserved states), not a fix.
 """
 function _validate_problem(prob::PSMProblem, solver_name::String;
-                           require_continuous::Bool=false)
+                           require_continuous::Bool=false,
+                           reject_delays::Bool=false,
+                           delay_reason::String=
+                               "It evaluates the dynamics through the " *
+                               "4-argument ODE signature f!(du, u, p, t) on " *
+                               "a smoothed trajectory.")
     n_times = length(prob.data_times)
     n_obs = size(prob.data_values, 2)
 
@@ -72,6 +93,15 @@ function _validate_problem(prob::PSMProblem, solver_name::String;
         any(s -> s < 1 || s > length(prob.u0), prob.obs_to_state) &&
             error("$solver_name: obs_to_state contains indices outside " *
                   "range 1:$(length(prob.u0))")
+    end
+    if reject_delays && !isempty(prob.delays)
+        error("$solver_name does not support DDE problems. $delay_reason " *
+              "A PSM DDE's dynamics function has the 5-argument signature " *
+              "f!(du, u, h, p, t), so the delayed history can never be " *
+              "supplied and the model would be fitted as though it had no " *
+              "delays. Use LAML, GCVSolver, AdamSolver, VariationalSolver, " *
+              "MCMCSolver, DerivativeFreeSolver or ProfileLikelihoodSolver " *
+              "for DDEs.")
     end
     if require_continuous && prob.discrete
         error("$solver_name does not support discrete-time models. " *
@@ -230,6 +260,24 @@ be converted into a large-but-finite penalty for the optimizer.
 DataInterpolations when a diverged trajectory reaches a spline) is a
 numerical failure the optimizer must survive, while converting a finite
 value (`Int(3.7)`) is a genuine bug.
+
+`FieldError` (Julia ≥ 1.12) is classified as a program error: it is what
+`p.typo` raises when a user misspells an approximator name in their
+dynamics function. Measured before this classification was added, such a
+typo was absorbed into the `1e6` failure sentinel at every
+gradient-matching site and the solver returned `initial_params` with a
+healthy-looking objective and no warning.
+
+On Julia ≤ 1.11 the same misspelling raises a plain `ErrorException`
+("type NamedTuple has no field kk"), which cannot be distinguished from a
+user's own `error(...)` without matching on message text, so it is
+deliberately NOT classified there. The practical consequence is
+cosmetic rather than a hole in the invariant: a never-evaluable
+right-hand side is caught anyway by the total-failure branch of
+[`_dynamics_failure_verdict`](@ref), which errors with "raised at every
+one of the N evaluation points" instead of surfacing the underlying
+`FieldError`. What is lost on those versions is the specific exception
+type in the message, not the refusal to report a fit.
 """
 function _is_program_error(e::InexactError)
     # Julia ≥ 1.12 stores the offending value as the last element of e.args;
@@ -237,7 +285,7 @@ function _is_program_error(e::InexactError)
     val = hasfield(InexactError, :val) ? e.val : e.args[end]
     val isa Number && isfinite(val)
 end
-_is_program_error(e) = e isa Union{MethodError, BoundsError, UndefVarError,
+const _PROGRAM_ERROR_TYPES = Union{MethodError, BoundsError, UndefVarError,
                                    TypeError, KeyError, DimensionMismatch,
                                    UndefRefError,
                                    # Not a "program error" as such, but it
@@ -247,6 +295,149 @@ _is_program_error(e) = e isa Union{MethodError, BoundsError, UndefVarError,
                                    # failure at ~20 rethrow sites, making
                                    # long solves uninterruptible.
                                    InterruptException}
+
+# `FieldError` was added in Julia 1.12; the package supports ≥ 1.10, so the
+# reference is resolved at load time rather than written literally (a bare
+# `Base.FieldError` in the Union would be an UndefVarError on 1.10/1.11).
+const _HAS_FIELD_ERROR = isdefined(Base, :FieldError)
+
+@static if _HAS_FIELD_ERROR
+    _is_program_error(e) = e isa _PROGRAM_ERROR_TYPES ||
+                           e isa getfield(Base, :FieldError)
+else
+    _is_program_error(e) = e isa _PROGRAM_ERROR_TYPES
+end
+
+"""
+    _count_dynamics_failures(prob, times, states, beta) -> Int
+
+Evaluate the dynamics once per row of `states` at the FITTED parameters
+and count how many points raise a (numerical) exception. Program errors
+are rethrown, as everywhere else.
+
+Why this exists. The gradient-matching family replaces a throwing
+right-hand side with a `1e6` failure sentinel so the optimizer survives a
+model that is undefined on part of its state range. Rethrowing program
+errors alone does not make that safe: `DomainError` is correctly NOT a
+program error, so a user's own validity guard (`sqrt`, `log`, a
+non-negativity floor) is still absorbed. Measured on a plain ODE fixture
+with a validity band, 392 of 1260 right-hand-side evaluations (31.1%)
+fell back to the sentinel and `GradientMatching` reported
+`converged = true, reason = :objective_tol` with a function-recovery
+RMSE of 0.051973 against 0.003050 for the same fixture without the band.
+Counting the substitutions is what makes that outcome reportable.
+
+The count is taken over the FINAL evaluation at the fitted parameters,
+not over the whole run: a transient failure at a trial step inside a line
+search is not a defect in the reported fit.
+"""
+function _count_dynamics_failures(prob::PSMProblem, times::AbstractVector,
+                                  states::AbstractMatrix, beta::AbstractVector)
+    p = build_param_struct(prob, beta)
+    K = size(states, 2)
+    du = zeros(K)
+    n_failed = 0
+    for i in axes(states, 1)
+        u = Vector{Float64}(@view states[i, :])
+        try
+            prob.dynamics!(du, u, p, times[i])
+        catch e
+            _is_program_error(e) && rethrow()
+            n_failed += 1
+        end
+    end
+    n_failed
+end
+
+"""
+    _dynamics_failure_verdict(solver_name, n_failed, n_points, converged, reason)
+        -> (converged, reason)
+
+The package-wide policy for a fit whose right-hand side fell back to the
+failure sentinel, applied by every solver that carries one (see
+[`_count_dynamics_failures`](@ref)):
+
+- `n_failed == n_points` — not one dynamics evaluation succeeded, so
+  nothing was fitted and the returned coefficients are bit-for-bit the
+  initial guess. `error`, because there is no fit to report. Measured
+  before this guard: a one-character typo (`p.kk` for `p.k`) in an
+  ordinary ODE model returned a `PSMSolution` with no error and no
+  warning, coefficients bitwise at `initial_params`, and
+  `objective = 0.1000804433` — which is exactly the data smoother's
+  residual sum of squares on that fixture, i.e. indistinguishable from a
+  healthy fit.
+- `0 < n_failed < n_points` — a partial fit. Warn, and force
+  `converged = false, reason = :dynamics_failure`; a convergence
+  criterion that fired against sentinel residuals is not evidence of a
+  fit.
+- `n_failed == 0` — untouched.
+
+`n_dynamics_failures` is reported in the convergence `NamedTuple`
+unconditionally (`0` on a clean fit) so the condition is machine-checkable.
+
+ZERO TOLERANCE, deliberately. There is no threshold: ONE failing
+evaluation point out of any number forces `converged = false`. (The
+independent review of this change measured `RKHSSolver` firing the
+verdict at `n_dynamics_failures = 1` of 30 grid points.) The rule is
+strict because the count is reported alongside it — a caller who judges
+one bad point in thirty acceptable can read `n_dynamics_failures` and
+decide that for themselves; what the solver must not do is decide it for
+them by stamping `converged = true`.
+
+WHAT THIS DOES NOT CATCH. Detection is by EXCEPTION TYPE ONLY. A
+right-hand side that returns a large finite derivative WITHOUT throwing
+is invisible to this machinery — and "return a big penalty in the bad
+region" is a common idiom, so this is not a hypothetical. Measured on the
+fixture of the `sentinel substitutions block convergence` testset
+(runtests.jl), with `throw(DomainError(...))` inside the 2.5 ≤ u ≤ 7 band
+replaced by `du[1] = 1e6`: `GradientMatching` reports
+`converged = true, reason = :objective_tol`, `n_dynamics_failures = 0`,
+`objective = 0.030088129645966723` and function-recovery RMSE
+0.0519726780631551 — bit-for-bit the objective and RMSE of the THROWING
+version that this verdict now rejects, i.e. the pre-fix defect reproduced
+exactly. The reason is structural, not an oversight in the classifier:
+the sentinel substituted on a caught exception IS `1e6`, so a user
+penalty of that magnitude is by construction indistinguishable from a
+swallowed exception, and only the exception form is counted.
+
+A `NaN` derivative returned without throwing is likewise not counted.
+Measured on the same fixture: `GradientMatching` gives
+`converged = false, reason = :singular_system`; `TwoStageSolver`,
+`IntegralMatchingSolver` and `ODINSolver` give
+`converged = false, reason = :maxiters` with `objective = Inf` — all four
+with `n_dynamics_failures = 0`. Those are INCIDENTAL rescues by the
+linear algebra, not by this guard, and must not be credited to it.
+(`RKHSSolver` does error on that input, but through the total-failure
+branch above: the NaN states drive the dynamics into raising at all 30
+grid points, so there the exception path is reached after all.)
+"""
+function _dynamics_failure_verdict(solver_name::String, n_failed::Int,
+                                   n_points::Int, converged::Bool,
+                                   reason::Symbol)
+    n_failed == 0 && return (converged, reason)
+    if n_failed >= n_points
+        error("$solver_name: the dynamics function raised at every one of " *
+              "the $n_points evaluation points, so not a single right-hand " *
+              "side evaluation succeeded and nothing was fitted — the " *
+              "coefficients returned would be bit-for-bit the initial guess " *
+              "and the reported objective would reflect only the data " *
+              "smoother. Check the dynamics function: a misspelt " *
+              "approximator name (`p.kk` where the approximator is `:k`), a " *
+              "state that is outside the model's domain everywhere, or a " *
+              "DDE passed to an ODE-only solver all produce this. Re-run " *
+              "the dynamics by hand at one smoothed state to see the " *
+              "underlying exception.")
+    end
+    @warn "$solver_name: the dynamics function raised at $n_failed of " *
+          "$n_points evaluation points at the fitted parameters " *
+          "($(round(100 * n_failed / n_points, digits=1))%); those points " *
+          "used a large failure sentinel instead of a real right-hand side, " *
+          "so the fit is driven partly by fictitious residuals. Reporting " *
+          "converged=false, reason=:dynamics_failure. Widen the model's " *
+          "domain (clamp rather than throw), restrict the approximator " *
+          "domain, or drop the affected times."
+    (false, :dynamics_failure)
+end
 
 """
     _adapt_gp_approximators!(prob, beta) -> Bool

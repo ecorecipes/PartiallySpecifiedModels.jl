@@ -282,7 +282,9 @@ masking-capable solvers (`LAML`, `GCVSolver`, `CollocationLAML`,
 `ProfileLikelihoodSolver`).
 """
 function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
-    _validate_problem(prob, "DaltonSolver"; require_continuous=true)
+    _validate_problem(prob, "DaltonSolver"; require_continuous=true,
+                      reject_delays=true, delay_reason=
+                      "It builds a probabilistic ODE / GP state-space manifold from the 4-argument ODE signature f!(du, u, p, t).")
     _reject_masked_data(prob, "DaltonSolver")
     verbose = alg.verbose
     n_vars = length(prob.u0)

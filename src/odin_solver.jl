@@ -45,7 +45,8 @@ convergence keys `(converged, iterations, reason)` — see the `ODINSolver`
 docstring.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
-    _validate_problem(prob, "ODINSolver"; require_continuous=true)
+    _validate_problem(prob, "ODINSolver"; require_continuous=true,
+                      reject_delays=true)
     if (alg.gp_lengthscale === nothing) != (alg.gp_variance === nothing)
         throw(ArgumentError(
             "ODINSolver: supply BOTH gp_lengthscale and gp_variance to fix " *
@@ -194,7 +195,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
             u = Vector{T_el}(@view X[i, :])
             try
                 prob.dynamics!(du, u, p, times[i])
-            catch
+            catch e
+                _is_program_error(e) && rethrow()
                 du .= T_el(1e6)
             end
             F[i, :] .= du
@@ -308,6 +310,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
     # reported loss NaN. Every other solver reports via this helper.
     data_loss = weighted_data_loss(prob, pred)
 
+    # Sentinel accounting along the JOINTLY FITTED trajectory (`X_fit`), which
+    # is the trajectory `odin_risk` evaluated the dynamics on — see
+    # `_dynamics_failure_verdict` (solver.jl).
+    n_dyn_fail = _count_dynamics_failures(prob, times, X_fit, beta)
+    conv_converged, conv_reason = _dynamics_failure_verdict(
+        "ODINSolver", n_dyn_fail, n_times, conv_converged, conv_reason)
+
     uf_evals = Dict{Symbol, Any}()
     offset = 0
     for approx in prob.approximators
@@ -333,5 +342,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
                 Float64.(prob.data_times), uf_evals,
                 (converged=conv_converged, iterations=conv_iters,
                  reason=conv_reason, method=:odin,
+                 n_dynamics_failures=n_dyn_fail,
                  gp_hyperparams=[hyper[k] for k in 1:n_vars]))
 end

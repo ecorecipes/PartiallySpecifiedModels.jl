@@ -42,7 +42,7 @@ nonlinear least squares against those smoothed derivatives.
 — see the `TwoStageSolver` docstring for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
-    _validate_problem(prob, "TwoStageSolver")
+    _validate_problem(prob, "TwoStageSolver"; reject_delays=true)
     verbose = alg.verbose
 
     times = Float64.(prob.data_times)
@@ -164,7 +164,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
             u = T_el.(y_smooth[i, :])
             try
                 prob.dynamics!(du, u, p, times[i])
-            catch
+            catch e
+                _is_program_error(e) && rethrow()
                 du .= T_el(1e6)
             end
             for k in 1:n_vars
@@ -287,6 +288,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
     # Data loss against original observations
     data_loss = weighted_data_loss(prob, pred)
 
+    # Sentinel accounting at the fitted parameters — see
+    # `_dynamics_failure_verdict` (solver.jl). The loss above falls back to a
+    # 1e6 sentinel wherever the dynamics raise; without counting, a model that
+    # is undefined on part of its range is fitted against fictitious residuals
+    # and still reported as converged.
+    n_dyn_fail = _count_dynamics_failures(prob, times, y_smooth, beta)
+    conv_converged, conv_reason = _dynamics_failure_verdict(
+        "TwoStageSolver", n_dyn_fail, n_times, conv_converged, conv_reason)
+
     # Build evaluators for each approximator
     uf_evals = Dict{Symbol, Any}()
     offset = 0
@@ -317,5 +327,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
                 (converged=conv_converged, iterations=final_iter,
-                 reason=conv_reason, method=:two_stage))
+                 reason=conv_reason, method=:two_stage,
+                 n_dynamics_failures=n_dyn_fail))
 end
