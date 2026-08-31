@@ -42,7 +42,8 @@ integration, providing a robust and computationally efficient estimator.
 — see the `IntegralMatchingSolver` docstring for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
-    _validate_problem(prob, "IntegralMatchingSolver"; require_continuous=true)
+    _validate_problem(prob, "IntegralMatchingSolver"; require_continuous=true,
+                      reject_delays=true)
     verbose = alg.verbose
 
     times = Float64.(prob.data_times)
@@ -158,7 +159,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
             u = T_el.(y_smooth[i, :])
             try
                 prob.dynamics!(du, u, p, times[i])
-            catch
+            catch e
+                _is_program_error(e) && rethrow()
                 du .= T_el(1e6)
             end
             for k in 1:n_vars
@@ -290,10 +292,42 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
     if verbose; println("  Best loss: $(round(best_loss, sigdigits=5))"); end
 
     # ── Build solution ───────────────────────────────────────────
-    pred = zeros(n_times, n_obs)
-    for j in 1:n_obs
-        sk = prob.obs_to_state[j]
-        pred[:, j] .= y_smooth[:, sk]
+    # Sentinel accounting at the fitted parameters — see
+    # `_dynamics_failure_verdict` (solver.jl). It runs BEFORE the reporting
+    # simulation below, because it ERRORS when nothing was fitted at all:
+    # simulating a non-fit first emitted a warning promising to report the
+    # smoother on a call that then threw. It is also the only thing here that
+    # forces `converged`/`reason`; the simulation fallback sets `sim_ok` and
+    # nothing else, so the two never conflict.
+    n_dyn_fail = _count_dynamics_failures(prob, times, y_smooth, beta)
+    conv_converged, conv_reason = _dynamics_failure_verdict(
+        "IntegralMatchingSolver", n_dyn_fail, n_times, conv_converged,
+        conv_reason)
+
+    # Fitted values: the trajectory the fitted model produces, integrated from
+    # `prob.u0` at the fitted beta.
+    #
+    # Before B7 this projected the stage-1 smoother (`y_smooth[:, sk]`), which
+    # made `fitted_values` and `data_loss` functions of the DATA ALONE:
+    # measured, two problems differing only in u0 (1.0 vs 4.0) returned bitwise
+    # identical `data_loss` (0.09625512373) while their simulated losses were
+    # 0.18993396 and 205.61006, a factor of 1083.
+    sim_ok = true
+    pred = try
+        simulate(prob, beta)
+    catch e
+        _is_program_error(e) && rethrow()
+        sim_ok = false
+        @warn "IntegralMatchingSolver: integrating the fitted dynamics from " *
+              "u0 failed ($(sprint(showerror, e))). Reporting the stage-1 " *
+              "data smoother as `fitted_values`; `data_loss` therefore " *
+              "measures the SMOOTHER, not the model fit. See " *
+              "`convergence.simulation_failed`."
+        pr = zeros(n_times, n_obs)
+        for j in 1:n_obs
+            pr[:, j] .= y_smooth[:, prob.obs_to_state[j]]
+        end
+        pr
     end
 
     data_loss = weighted_data_loss(prob, pred)
@@ -322,5 +356,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
                 (converged=conv_converged, iterations=final_iter,
-                 reason=conv_reason, method=:integral_matching))
+                 reason=conv_reason, method=:integral_matching,
+                 n_dynamics_failures=n_dyn_fail,
+                 simulation_failed=!sim_ok))
 end

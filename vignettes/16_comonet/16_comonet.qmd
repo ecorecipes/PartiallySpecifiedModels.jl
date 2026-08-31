@@ -21,7 +21,7 @@ When modeling ecological systems, we often know qualitative properties of unknow
 
 1. **`ShapeConstrainedBSplineApproximator`** (SCBS) — B-spline basis functions with reparameterized coefficients (SCOP-splines, following Pya & Wood 2015). Uses the convex hull property of B-splines to guarantee constraints globally.
 
-2. **`COMONetApproximator`** — Neural networks with positive weights (`exp(W)`) and monotone activations (ReLU). Compositional structure guarantees shape constraints by construction.
+2. **`COMONetApproximator`** — Neural networks with positive weights (`exp(W)`) and monotone activations. Compositional structure guarantees shape constraints by construction.
 
 This vignette compares both constrained approximators against an unconstrained B-spline baseline on a logistic growth model.
 
@@ -115,7 +115,11 @@ sol_scbs = solve(prob_scbs, LAML(maxiters=60, verbose=false))
 
 ### Approach 3: COMONet (Decreasing)
 
-COMONet uses a neural network with positive weights (`exp(W̃)`) and monotone activations. For a `:decreasing` constraint, the input is negated before the forward pass. The default ReLU activation gives fast convergence; the optional `activation=:softplus` gives smoother (C∞) derivatives but is harder to optimize.
+COMONet uses a neural network with positive weights (`exp(W̃)`) and monotone activations. For a `:decreasing` constraint, the input is negated before the forward pass.
+
+The `:increasing` and `:decreasing` classes used here are built from a **tanh** network: positive `exp(W̃)` weights with tanh hidden units and a linear output layer `exp(W̃)·h + b` carrying an unconstrained bias `b`. Positive weights composed with a nondecreasing activation guarantee monotonicity, while tanh leaves the curvature free, so sigmoid-like and other monotone-but-non-convex shapes remain representable.
+
+Note that the `activation` keyword (`:relu` by default, or `:softplus`) does **not** apply here: it is consulted only for the curvature-constrained classes (`:convex`, `:concave`, `:inc_convex`, `:inc_concave`, `:dec_convex`, `:dec_concave`). The purely monotone classes ignore it.
 
 ```{julia}
 uf_como = COMONetApproximator(:r, (0.5, 10.5), (8,), :decreasing;
@@ -162,9 +166,13 @@ p_fn
 
 ### Edge Saturation in COMONet
 
-Notice that COMONet **saturates at the domain edges**: it flattens out near N=0.5 (overestimates r) and cannot produce negative values near N=10 (where the true r crosses zero). This is an architectural property, not a fitting failure — with `:decreasing`, COMONet computes `g(-x)` where `g` uses ReLU/softplus activations with positive weights, which are bounded below by zero. The function therefore has a floor it cannot cross.
+Edge saturation is the characteristic failure mode to watch for with this architecture, so it is worth being precise about how much of it is actually present here — the answer is: much less than you might expect.
 
-SCBS and unconstrained B-splines do not have this limitation — they can represent functions that cross zero freely. This makes COMONet best suited for functional responses that are **strictly positive** (e.g., Holling-type responses) or where edge behavior is less important than guaranteed monotonicity in the interior.
+The mechanism is real. The `:increasing`/`:decreasing` classes use tanh hidden units, and tanh flattens once its pre-activation grows large, so a COMONet fit can lose slope toward the ends of its domain where data are sparse. In the comparison table below, that shows up as a gentle shallowing: the fitted slope runs about $-0.052$ per unit $N$ at the bottom of the domain and about $-0.046$ at the top, against a constant true slope of $-0.05$. That is a modest effect, and across the interior the fit tracks the linear truth closely.
+
+**Saturation constrains the slope, not the sign.** This is worth stating plainly because it is easy to assume otherwise. The monotone network's output layer is `exp(W̃)·h + b` with `h ∈ (−1,1)` and an *unconstrained* bias `b`, so its range is `(b − Σ|W|, b + Σ|W|)` — sign-unrestricted, with no floor at zero. The fit above bears this out: it passes through zero near N=10 and continues negative to the top of the domain, following the true `r(N)`, which crosses zero at exactly N=10.
+
+The practical caveat is therefore about *flexibility* near a boundary, not about sign. Where a function must turn sharply at the edge of its domain, tanh saturation will fight you and SCBS or an unconstrained B-spline will follow the data more closely. COMONet's compensating advantage is that monotonicity holds *by construction* across the whole real line, rather than being enforced at a finite set of knots.
 
 ### Verify Monotonicity
 
@@ -294,7 +302,7 @@ rmse_como = sqrt(sum(res_como.^2) / length(res_como))
 |---------|---------|------|---------|
 | **Constraint** | None | Coefficient reparameterization | Positive weights + monotone activations |
 | **Parameters** | 10 (knot coefficients) | 10 (unconstrained γ) | 25 (weights + biases) |
-| **Smoothness** | Cubic (C²) | Cubic (C²) | ReLU: piecewise linear (C⁰); `activation=:softplus`: smooth (C∞) but slower to converge |
+| **Smoothness** | Cubic (C²) | Cubic (C²) | Monotone classes (used here): tanh, smooth (C∞). Curvature-constrained classes: ReLU piecewise linear (C⁰), or C∞ with `activation=:softplus` |
 | **Monotonicity** | Not guaranteed | Guaranteed | Guaranteed |
 | **Compatible solvers** | All (LAML, Adam, MCMC, ...) | All (LAML preferred) | Adam, MCMC, GradientMatching |
 | **Formal proofs** | — | Convex hull property | Lean 4 verified (43 theorems) |
@@ -313,11 +321,11 @@ rmse_como = sqrt(sum(res_como.^2) / length(res_como))
 
 **When to use COMONet:**
 
-- Need formally verified constraint guarantees
-- Unknown function is **strictly positive** (e.g., functional responses, mortality rates) — COMONet's ReLU architecture naturally enforces non-negativity
+- Need formally verified constraint guarantees that hold everywhere, not just at knots
 - Complex constraints (e.g., combinations of monotonicity and convexity)
-- Choose `activation=:softplus` when smooth derivatives are needed, or `:relu` (default) for faster convergence
-- **Caveat**: COMONet saturates at domain edges and cannot represent functions that cross zero — use SCBS instead if the function may change sign
+- For the curvature-constrained classes, choose `activation=:softplus` when smooth derivatives are needed, or `:relu` (default) for faster convergence. The monotone classes `:increasing`/`:decreasing` ignore this setting and always use tanh
+- **Caveat**: COMONet saturates at the domain edges, so it is a poor choice when the function must turn sharply near a boundary — use SCBS there. Note that saturation does *not* restrict sign: the monotone classes have a free output bias and can cross zero, as the fit above does
+- If you need a **guaranteed non-negative** function, use the `:positive` constraint, which wraps the network in `exp(·)`. Monotonicity alone does not imply positivity
 
 ## Diagnostic Plots
 

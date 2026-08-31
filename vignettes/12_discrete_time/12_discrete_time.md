@@ -322,9 +322,9 @@ p3
 
 ![](12_discrete_time_files/figure-commonmark/cell-15-output-1.svg)
 
-All three solvers recover the **linear negative competition effect**
+Both solvers recover the **linear negative competition effect**
 $g(N_2)$ within the observed data range. Unlike the Ricker model, the
-competition dynamics have a longer transient, giving all solvers more
+competition dynamics have a longer transient, giving both solvers more
 information across the domain of $N_2$. The slope reveals the
 competition coefficient $\alpha_{12}$ without assuming any parametric
 functional form.
@@ -378,11 +378,27 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 | Time stepping | Adaptive ODE solver | Explicit iteration |
 | SciML problem type | `ODEProblem(f!, u0, tspan)` | `DiscreteProblem(f!, u0, tspan)` |
 | Default solver | `Tsit5()` | `nothing` |
-| Supported solvers | All 7 solvers | LAML, GradientMatching, AGM, Adam, MultipleShootingSolver, CollocationLAML\* |
+| Supported solvers | All 23 solvers | 15 of the 23 — see below |
 
-The only solver **not** supporting discrete-time is `RodeoSolver`, which
-relies on continuous-time Kalman filtering with an integrated Brownian
-motion prior.
+Fifteen of the 23 exported solvers accept a `DiscreteProblem`-derived
+`PSMProblem`: `LAML`, `GCVSolver`, `CollocationLAML`, `GradientMatching`,
+`AdaptiveGradientMatching` (MAP mode only — see below), `TwoStageSolver`,
+`BNGSolver`, `AdamSolver`, `MultipleShootingSolver`,
+`DerivativeFreeSolver`, `MCMCSolver`, `VariationalSolver`, `ABCSolver`,
+`EnsembleKalmanSolver` and `ProfileLikelihoodSolver`.
+
+Eight solvers reject a discrete problem up front, all through the same
+`_validate_problem(...; require_continuous=true)` guard: `RodeoSolver`,
+`DaltonSolver`, `PseudoMarginalSolver`, `MagiSolver`,
+`IntegralMatchingSolver`, `ODINSolver`, `RKHSSolver` and `FGPGMSolver`.
+These are the probabilistic-ODE and GP-gradient methods, which assume a
+continuous-time generative model — an integrated Brownian motion prior, a
+GP derivative operator, or a cumulative time integral — that a map does
+not have.
+
+`AdaptiveGradientMatching` is discrete-capable only in its MAP mode
+(`n_samples=0`, the default). Setting `n_samples > 0` selects the
+tempered population-MCMC path, which errors on a discrete problem.
 
 ### Solver recommendations for discrete models
 

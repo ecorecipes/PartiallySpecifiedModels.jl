@@ -287,10 +287,26 @@ loglik_pointwise(fam::CustomLikelihood, y::Real, mu::Real) =
 """
     irls_weights(fam, y, mu, w)
 
-Compute IRLS working weights W̃ = w / V(μ) for identity-link Fisher scoring.
+Compute IRLS working weights for identity-link Fisher scoring.
 
-The PSM solver operates on the response scale (identity link), so
-the working weight is the inverse variance: W̃_i = w_i / V(μ_i).
+The PSM solver operates on the response scale (identity link), so the
+working weight is the observed/Fisher information of the family:
+
+    W̃_i = w_i × I(μ_i),   I(μ) = −∂²ℓ/∂μ²
+
+For `Gaussian`, `Poisson` and `NegativeBinomial` — identity-link
+exponential families whose mean parameter IS the mean — this coincides
+with the inverse variance, `W̃_i = w_i / V(μ_i)`, and those methods are
+written that way.
+
+`TruncatedNormal` is the exception, and its method is NOT `w/V(μ)`: there
+`μ` is the latent normal location, and
+`I(μ) = (1 − ξλ(ξ) − λ(ξ)²)/σ² = V(μ)/σ⁴`, which is not `1/V(μ)` (the two
+differ by a factor `V(μ)²/σ⁴`; measured at μ = 0.2, σ = 0.15,
+`I = 32.30232` against `1/V = 61.15068`). The information is the correct
+curvature and is what the method uses — only this generic summary was
+wrong. `CustomLikelihood` obtains `−∂²ℓ/∂μ²` by automatic differentiation,
+so it follows the general rule directly.
 
 Unusable cells (`_usable` false: zero weight or non-finite datum) get working
 weight exactly 0, so they drop out of `J'W̃J`, out of the EDF trace and

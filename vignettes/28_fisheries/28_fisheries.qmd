@@ -39,9 +39,16 @@ subject only to biologically motivated shape constraints:
 - **Concave**: diminishing returns — recruitment saturates at high stock sizes
 
 The constraint `:inc_concave` enforces both properties simultaneously, which is
-appropriate for **compensatory** stock-recruitment (Beverton-Holt type). This
-vignette also demonstrates **Poisson likelihood** for count data, which is
-natural when abundance is measured as integer counts from survey or catch data.
+appropriate for **compensatory** stock-recruitment (Beverton-Holt type).
+
+The observations here are **Poisson-generated counts**, as abundance data from
+survey or catch records typically are. The fits below nevertheless use a
+**Gaussian** likelihood: with counts in the hundreds the Gaussian approximation
+to the Poisson is close, and it keeps the focus of this vignette on the shape
+constraint. The Poisson family enters only at the diagnostic stage, where
+`appraise(sol; family=Poisson())` computes deviance residuals appropriate to the
+counts. See the note at the end for what fitting a genuine Poisson likelihood
+would involve.
 
 ## Setup
 
@@ -120,11 +127,16 @@ println("Population range: $(round(minimum(N_true), digits=1)) – $(round(maxim
 println("Spawning stock range: $(round(minimum(N_true .* p_s), digits=1)) – $(round(maximum(N_true .* p_s), digits=1))")
 println("Observed count range: $(Int(minimum(y_pois))) – $(Int(maximum(y_pois)))")
 println("Mean count: $(round(mean(y_pois), digits=1))")
-println("Var/Mean ratio: $(round(var(y_pois) / mean(y_pois), digits=2)) (≈1 for Poisson)")
+println("Var/Mean ratio: $(round(var(y_pois) / mean(y_pois), digits=2)) (≈1 only for a CONSTANT Poisson mean)")
 ```
 
-The variance-to-mean ratio near 1 confirms equidispersion, consistent with
-Poisson sampling.
+Note that this variance-to-mean ratio is **far above 1**, and that is expected
+here rather than evidence against Poisson sampling. The ≈1 rule applies to
+repeated draws from a *single* Poisson mean. These counts are drawn from a mean
+that changes substantially over the series, so the marginal variance picks up
+the variation in the mean itself on top of the Poisson noise. Equidispersion
+would have to be assessed conditionally — from the residuals about the fitted
+mean, which is what the deviance-residual diagnostics later in this vignette do.
 
 ## The PSM Model
 
@@ -244,9 +256,15 @@ println("  Inc+Concave:    data_loss=$(round(sol_sc.data_loss, sigdigits=4)), " 
     "EDF=$(round(sol_sc.edf, digits=1)), cor(R̂,R)=$cor_sc")
 ```
 
-The shape constraint typically produces a smoother, more biologically plausible
-curve with comparable or slightly higher data loss — the small price of
-enforcing prior knowledge.
+The shape constraint produces a smoother, more biologically plausible curve at
+a slightly higher data loss and roughly half the effective degrees of freedom.
+Note what it buys: despite fitting the observations less closely, the
+constrained curve correlates *more* strongly with the true recruitment function
+than the unconstrained one does. That is the constraint doing its job — the
+extra flexibility the unconstrained fit spends on the noise is flexibility spent
+moving away from the truth. Where prior knowledge about shape is genuinely
+correct, enforcing it can improve recovery of the underlying function even as it
+worsens the apparent fit to data.
 
 ## Bootstrap Confidence Intervals
 
@@ -401,7 +419,7 @@ This vignette demonstrated:
 | Feature | Implementation |
 |---------|---------------|
 | **Discrete-time model** | `DiscreteProblem` with `f!(u_next, u, p, t)` |
-| **Poisson likelihood** | `likelihood=PartiallySpecifiedModels.Poisson()` |
+| **Poisson-generated counts, Gaussian fit** | `likelihood=PartiallySpecifiedModels.Gaussian()` |
 | **Shape constraints** | `ShapeConstrainedBSplineApproximator(:R, ..., :inc_concave)` |
 | **Bootstrap CIs** | `bootstrap(sol, prob, alg; nboot=50, method=:parametric)` |
 | **Diagnostics** | `appraise(sol; family=Poisson())` for deviance residuals |
@@ -409,14 +427,20 @@ This vignette demonstrated:
 
 **Key takeaways:**
 
-1. **Poisson likelihood** is appropriate for count data — it models the
-   mean-variance relationship correctly, avoiding the bias of Gaussian
-   likelihood on small counts.
+1. **The fits here use a Gaussian likelihood on Poisson-generated counts.**
+   That is defensible at these count magnitudes (hundreds), where the Gaussian
+   approximation to the Poisson is good. It would *not* be defensible on small
+   counts, where the Gaussian mis-states the mean-variance relationship and
+   biases the fit. To fit the counts properly, pass
+   `likelihood=PartiallySpecifiedModels.Poisson()` to `PSMProblem` instead of
+   `Gaussian()`; `LAML`'s penalized IRLS loop is family-generic and handles it,
+   and the parametric bootstrap would then resample from the Poisson rather than
+   the Gaussian.
 2. **`:inc_concave` shape constraints** encode the biologically motivated
    assumption that recruitment is a saturating function of spawning stock,
    ruling out overcompensation (Ricker-type decline) while remaining flexible.
-3. **Parametric bootstrap** with Poisson resampling gives honest uncertainty
-   quantification that accounts for both estimation noise and the flexibility
-   of the nonparametric fit.
+3. **Parametric bootstrap** — here resampling from the fitted Gaussian, matching
+   the likelihood actually used — gives uncertainty quantification that accounts
+   for both estimation noise and the flexibility of the nonparametric fit.
 4. **Discrete-time dynamics** are natural for annually-censused fish
    populations — `DiscreteProblem` handles this directly.

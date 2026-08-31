@@ -38,6 +38,8 @@ Neither `GCVSolver` nor `CollocationLAML` reports these yet, and neither can reu
 
 Both `LAML` and `GCVSolver` (and `CollocationLAML`) accept `jac=:forwarddiff` to compute the working-model Jacobian of the predictions by forward-mode AD (`ForwardDiff`) straight through the ODE/map/DDE solve instead of the default adaptive central finite differences (`jac=:fd`): exact to solver precision and roughly an order of magnitude faster per Jacobian (one chunked Dual sweep replaces 2·p perturbed solves), with an automatic per-iteration fallback to finite differences if the Dual-valued solve fails. For `CollocationLAML` the option also covers the pointwise state Jacobian and the ∂F/∂β block of the collocation residual, preserving the failure-sentinel convention exactly (failed collocation points keep a large residual and a zero Jacobian; the sentinel is never differentiated).
 
+The `:fd` path carries a **residual noise floor** that `:forwarddiff` does not: adaptive integrators re-select their accepted-step sequence under each parameter perturbation, so two solves at nearly identical parameters differ by an integration jitter far above machine precision (measured 1.5e-6 on a Tsit5 quadrature fixture at the default `reltol=abstol=1e-8`). The FD path measures that jitter once per Jacobian with a nudge solve, and a column whose central-difference signal falls below 10× the measured jitter — the qualitatively-garbage regime, where the noise floor used to produce entries wrong by half their scale — is recomputed at grown steps until its signal clears 1e4× the noise, each grown step validated against the previous column and guarded against growing into truncation. On an exact-reference fixture with O(1) sensitivities this repairs the FD Jacobian from 54%-of-scale error to 5.7e-5 of scale (vs 2.2e-6 for `:forwarddiff`). Noise-free problems such as discrete maps keep the historical tolerance-tied floor step and their ~1e-10 accuracy; but on *noisy* problems a column that measures above the 10× trigger keeps the historical floor step **and its historical noise floor** — the trigger's jitter estimate comes from a single base-point nudge solve, which can underestimate the realized per-column re-solve noise by ~10×, and on a one-coefficient variant of the reference fixture untriggered columns at measured SNR 12–18 retained errors of ~0.3–0.95 of column scale. These bounds are as-measured on these fixtures, not a guarantee. One exception by design: `GCVSolver` pins the historical fixed-step FD policy (no growth) inside its λ search, because its `search=:direct` vs `search=:reuse` equivalence contract requires a Jacobian that responds continuously to the coefficients, which a jitter-triggered step policy does not. The consequence is that `GCVSolver`'s `:fd` path retains the original noise floor on noisy problems in full; prefer `jac=:forwarddiff` there whenever the dynamics accept Dual numbers. Prefer `jac=:forwarddiff` when the dynamics are generic enough to accept Dual numbers — it is exact to solver precision and roughly 9–19× faster per Jacobian in this package's microbenchmarks (measured 14.1× on a spline fixture at p=8, 9.0× on a neural fixture at p=13, and 19.1× on a noisy fixture where the FD path pays signal-growth retries); `:fd` remains the default because it makes no genericity demands on user dynamics.
+
 ```@docs
 LAML
 ```
@@ -53,6 +55,8 @@ GCVSolver
 ### CollocationLAML
 
 **Generalized profiling** (collocation) approach. Fits spline approximations to the state variables first, then optimizes the unknown function parameters to match the implied derivatives. Can be more robust than direct ODE fitting for stiff or chaotic systems.
+
+The data-fidelity block is likelihood-aware: non-Gaussian families (`Poisson`, `NegativeBinomial`, `TruncatedNormal`, `CustomLikelihood`) are fitted by PIRLS working weights on the identity link with a deviance-scale objective, mirroring `LAML`'s default `:working` criterion; the ODE-compliance penalty stays Gaussian in the derivative residuals, and Gaussian data follow the plain least-squares path unchanged. Note that `PSMSolution.objective` and `data_loss` remain squared-error quantities for all families (the pre-existing cross-solver reporting convention), so the reported objective is not the internal deviance criterion the solver optimizes for non-Gaussian data (e.g. 223.005 reported vs 90.07 internal on a Poisson fixture, as measured by the review).
 
 ```@docs
 CollocationLAML
@@ -172,7 +176,7 @@ DaltonSolver
 
 ### MCMCSolver
 
-Full Bayesian inference using **Hamiltonian Monte Carlo (HMC)** or **No-U-Turn Sampler (NUTS)**. Provides posterior distributions over all parameters including unknown function coefficients.
+Full Bayesian inference using the **No-U-Turn Sampler (NUTS)** from AdvancedHMC.jl — the sampler is not selectable. Provides posterior distributions over all parameters including unknown function coefficients.
 
 ```@docs
 MCMCSolver

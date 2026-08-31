@@ -48,7 +48,8 @@ through the ODE term alone. All approximator types are supported.
 values are the RKHS trajectory at the data times.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
-    _validate_problem(prob, "RKHSSolver"; require_continuous=true)
+    _validate_problem(prob, "RKHSSolver"; require_continuous=true,
+                      reject_delays=true)
     verbose = alg.verbose
 
     times = Float64.(prob.data_times)
@@ -181,7 +182,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
             u = Vector{T_el}(@view Xg[i, :])
             try
                 prob.dynamics!(du, u, p, t_grid[i])
-            catch
+            catch e
+                _is_program_error(e) && rethrow()
                 du .= T_el(1e6)
             end
             F[i, :] .= du
@@ -256,7 +258,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
             Ji = try
                 ForwardDiff.jacobian((du, u) -> prob.dynamics!(du, u, p_now, t_grid[i]),
                                      du_buf, u_i)
-            catch
+            catch e
+                _is_program_error(e) && rethrow()
                 zeros(n_vars, n_vars)
             end
             G[i, :, :] = Ji
@@ -369,6 +372,49 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
     # one missing observation does not turn the reported loss into NaN).
     data_loss = weighted_data_loss(prob, pred)
 
+    # Sentinel accounting on the COLLOCATION GRID, which is where
+    # `rhs_on_grid` evaluates the dynamics — see `_dynamics_failure_verdict`
+    # (solver.jl). Pre-fix this solver stamped `converged = true,
+    # reason = :converged_tol` on a fit in which every grid evaluation had
+    # fallen back to the sentinel.
+    #
+    # KNOWN LIMITATION — and it is a CLASS boundary, not an RKHS quirk.
+    #
+    # The count is COMPLETE for the smooth-then-match solvers
+    # (GradientMatching, TwoStageSolver, IntegralMatchingSolver, BNGSolver):
+    # they count over `y_smooth`, which is β-INDEPENDENT, so this final sweep
+    # evaluates exactly the states every iteration evaluated. It is
+    # INCOMPLETE here and in ODINSolver, because both estimate the trajectory
+    # JOINTLY with β — so the final sweep sees a different trajectory from
+    # the one the optimisation ran on, and the sentinel can push the states
+    # off the throwing region entirely, leaving the count at 0.
+    #
+    # The count is therefore UNSTABLE for this solver. On a logistic fixture
+    # whose dynamics raise for 2.5 ≤ u ≤ 7, the independent review of this
+    # change measured 9 (maxiters, n_repr_points) settings: 7 read
+    # `n_dynamics_failures = 0` with objectives from 7.6e7 to 1.9e12, and 2
+    # read 1. Re-measured here on the runtests.jl `sentinel substitutions
+    # block convergence` fixture (`Random.Xoshiro(11)`, maxiters=50):
+    # `n_dynamics_failures = 0`, `objective = 8.9e9`, `reason = :maxiters`.
+    #
+    # A DIVERGENT OBJECTIVE IS NOT A USABLE RULE: across the same probes the
+    # objective on a garbage fit ranged from 13990 to 7.8e10, so no fixed
+    # figure separates the cases. What DID hold across all 19 settings the
+    # review tried is that a garbage fit never reached `converged = true`:
+    # every `converged = true` coincided with a genuinely clean fit (function
+    # RMSE 0.1133, matching the clean control), and every garbage case
+    # reported `converged = false, reason = :maxiters`.
+    #
+    # FOLLOW-UP, not implemented: a principled non-magic guard is available
+    # here, because the sentinel is a known constant. With `n_g` grid points
+    # each contributing at most a `1e6` residual to a clean fit,
+    # `objective > 1e6 * n_g` is a threshold derived from the sentinel rather
+    # than tuned to a fixture.
+    n_dyn_fail = _count_dynamics_failures(prob, t_grid, X_g(B), beta)
+    conv_reason_rkhs = converged ? :converged_tol : :maxiters
+    converged, conv_reason_rkhs = _dynamics_failure_verdict(
+        "RKHSSolver", n_dyn_fail, n_g, converged, conv_reason_rkhs)
+
     uf_evals = Dict{Symbol, Any}()
     offset = 0
     for approx in prob.approximators
@@ -393,6 +439,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
                 (converged=converged, iterations=final_iter,
-                 reason=(converged ? :converged_tol : :maxiters), method=:rkhs,
+                 reason=conv_reason_rkhs, method=:rkhs,
+                 n_dynamics_failures=n_dyn_fail,
                  kernel=alg.kernel, lengthscale=ℓ))
 end

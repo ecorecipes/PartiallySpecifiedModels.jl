@@ -42,7 +42,7 @@ nonlinear least squares against those smoothed derivatives.
 — see the `TwoStageSolver` docstring for the key taxonomy.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
-    _validate_problem(prob, "TwoStageSolver")
+    _validate_problem(prob, "TwoStageSolver"; reject_delays=true)
     verbose = alg.verbose
 
     times = Float64.(prob.data_times)
@@ -164,7 +164,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
             u = T_el.(y_smooth[i, :])
             try
                 prob.dynamics!(du, u, p, times[i])
-            catch
+            catch e
+                _is_program_error(e) && rethrow()
                 du .= T_el(1e6)
             end
             for k in 1:n_vars
@@ -276,12 +277,49 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
 
     # ── Build solution ───────────────────────────────────────────
 
-    # Fitted values: use smoothed states projected to observed variables
-    # (no ODE integration needed — this is the two-stage advantage)
-    pred = zeros(n_times, n_obs)
-    for j in 1:n_obs
-        sk = prob.obs_to_state[j]
-        pred[:, j] .= y_smooth[:, sk]
+    # Sentinel accounting at the fitted parameters — see
+    # `_dynamics_failure_verdict` (solver.jl). The fitting loss falls back to a
+    # 1e6 sentinel wherever the dynamics raise; without counting, a model that
+    # is undefined on part of its range is fitted against fictitious residuals
+    # and still reported as converged.
+    #
+    # This runs BEFORE the reporting simulation below, because it ERRORS when
+    # nothing was fitted at all: simulating a non-fit first emitted a warning
+    # promising to report the smoother on a call that then threw. It is also
+    # the only thing here that forces `converged`/`reason`; the simulation
+    # fallback sets `sim_ok` and nothing else, so the two never conflict.
+    n_dyn_fail = _count_dynamics_failures(prob, times, y_smooth, beta)
+    conv_converged, conv_reason = _dynamics_failure_verdict(
+        "TwoStageSolver", n_dyn_fail, n_times, conv_converged, conv_reason)
+
+    # Fitted values: the trajectory the fitted model produces, integrated from
+    # `prob.u0` at the fitted beta. `simulate` dispatches to the ODE, discrete
+    # and DDE paths, so no branch on `prob.discrete` is needed here.
+    #
+    # Before B7 this projected the stage-1 smoother (`y_smooth[:, sk]`) and was
+    # captioned "no ODE integration needed — this is the two-stage advantage".
+    # That advantage is real but it is about the FITTING LOOP; keeping the
+    # sentence next to the reporting line is how this defect survived. The
+    # smoother made `fitted_values` and `data_loss` functions of the DATA
+    # ALONE: measured, two problems differing only in u0 (1.0 vs 4.0) returned
+    # bitwise identical `data_loss` (0.09625512373) while their simulated
+    # losses were 0.11172338 and 200.92415, a factor of 1798.
+    sim_ok = true
+    pred = try
+        simulate(prob, beta)
+    catch e
+        _is_program_error(e) && rethrow()
+        sim_ok = false
+        @warn "TwoStageSolver: integrating the fitted dynamics from u0 " *
+              "failed ($(sprint(showerror, e))). Reporting the stage-1 data " *
+              "smoother as `fitted_values`; `data_loss` therefore measures " *
+              "the SMOOTHER, not the model fit. See " *
+              "`convergence.simulation_failed`."
+        pr = zeros(n_times, n_obs)
+        for j in 1:n_obs
+            pr[:, j] .= y_smooth[:, prob.obs_to_state[j]]
+        end
+        pr
     end
 
     # Data loss against original observations
@@ -317,5 +355,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
                 (converged=conv_converged, iterations=final_iter,
-                 reason=conv_reason, method=:two_stage))
+                 reason=conv_reason, method=:two_stage,
+                 n_dynamics_failures=n_dyn_fail,
+                 simulation_failed=!sim_ok))
 end

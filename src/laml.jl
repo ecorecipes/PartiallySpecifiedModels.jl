@@ -27,6 +27,35 @@ function _variance_function(fam::TruncatedNormal, mu)
     λξ = _normpdf(ξ) / Φξ
     σ^2 * max(1.0 - λξ * (ξ + λξ), 0.01)
 end
+# Mean of the RESPONSE, E[Y | μ] — the centre the Pearson dispersion must
+# subtract.
+#
+# For every family whose mean parameter IS the mean this is the identity.
+# `TruncatedNormal` is the exception: there `μ` is the LATENT normal
+# location, and for Y ~ N(μ, σ²) truncated to Y ≥ a,
+#     E[Y | Y ≥ a] = μ + σ·λ(ξ),   ξ = (μ − a)/σ,  λ(ξ) = φ(ξ)/Φ(ξ)
+# (the inverse Mills ratio), while `_variance_function` above already
+# returns the matching TRUNCATED variance σ²(1 − ξλ − λ²). Before this
+# accessor the two halves of the Pearson statistic were on different
+# footings — a truncated denominator under a latent-centred numerator —
+# which added the non-negative bias term Σ wᵢσ²λ(ξᵢ)²/V(μᵢ) and so inflated
+# φ̂ one-directionally, over-smoothing through the Fellner–Schall fixed
+# point λ* = φ̂·edf/βᵀSβ. Since E[Y] → μ as ξ → ∞, the correction is a no-op
+# on weakly truncated fits and only bites where the bound actually bites.
+#
+# `CustomLikelihood` keeps the identity deliberately: the mean of an
+# arbitrary user kernel is not recoverable from `loglik_scalar`.
+_family_mean(::Gaussian, mu) = mu
+_family_mean(::Poisson, mu) = mu
+_family_mean(::NegativeBinomial, mu) = mu
+_family_mean(::CustomLikelihood, mu) = mu
+function _family_mean(fam::TruncatedNormal, mu)
+    σ = fam.sigma; a = fam.lower
+    ξ = (mu - a) / σ
+    # Same Φ guard as `_variance_function`, so the two agree in the far tail.
+    mu + σ * (_normpdf(ξ) / max(_normcdf(ξ), 1e-15))
+end
+
 function _variance_function(fam::CustomLikelihood, mu)
     # V(μ) ≈ 1/(-∂²ℓ/∂μ²) evaluated at y = μ. Evaluating the curvature at
     # the mean recovers the exact variance function for exponential-family
@@ -441,7 +470,11 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
             pearson = 0.0
             for i in eachindex(y)
                 _usable(y[i], w_data[i]) || continue
-                pearson += w_data[i] * (y[i] - mu[i])^2 /
+                # Centre on E[Y|μ], NOT on μ: the denominator is the family's
+                # variance function, so the numerator must use the family's
+                # MEAN. Identity for every family but `TruncatedNormal`
+                # (see `_family_mean`), where μ is the latent location.
+                pearson += w_data[i] * (y[i] - _family_mean(family, mu[i]))^2 /
                            max(_variance_function(family, abs(mu[i])), 1e-10)
             end
             phi = max(pearson / max(n - sum(ranks), 1), 1.0)

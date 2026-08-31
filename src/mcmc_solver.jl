@@ -82,28 +82,25 @@ function _psm_logdensity(ld::PSMLogDensity, theta)
     end
 
     # --- Log-likelihood: simulate and compare to data ---
-    p = build_autodiff_param_struct(prob, beta)
-
-    if prob.discrete
-        pred = adam_simulate_discrete(prob, p, T)
-    else
-        u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
-        u0_T = T.(u0)
-        ode_fn = ODEFunction{true, SciMLBase.FullSpecialize}(
-            (du, u, params, t) -> prob.dynamics!(du, u, params, t))
-        ode_prob = ODEProblem(ode_fn, u0_T, prob.tspan, p)
-        sol = OrdinaryDiffEq.solve(ode_prob, prob.ode_solver;
-                                   saveat=prob.data_times,
-                                   abstol=1e-7, reltol=1e-7,
-                                   maxiters=10000)
-
-        if sol.retcode != :Success && sol.retcode != SciMLBase.ReturnCode.Success
-            return T(-1e20)
-        end
-
-        n_t = length(prob.data_times)
-        n_obs = size(prob.data_values, 2)
-    end
+    #
+    # `_variational_simulate` (variational_solver.jl) is the shared simulator
+    # that already covers all three problem classes — discrete map, ODE and
+    # DDE. Using it here closes a sibling-parity gap: this block previously
+    # branched on `prob.discrete` vs ODE only and built a 4-ARGUMENT
+    # `ODEFunction` closure, so a PSM DDE (whose dynamics have the 5-argument
+    # signature `f!(du, u, h, p, t)`) raised a raw `MethodError` from inside
+    # NUTS after ~9 s of setup, while `VariationalSolver` — which dispatches
+    # on `!isempty(prob.delays)` — handled the same problem.
+    #
+    # The ODE branch is byte-for-byte the code deleted here (the same
+    # `ODEFunction{true, FullSpecialize}` wrapper, the same
+    # `abstol=reltol=1e-7`, `maxiters=10000`, the same retcode test), and the
+    # DDE branch goes through `adam_solve_dde`, which uses those same
+    # tolerances. Measured: on this fixture the ODE path's reported
+    # `r(5.0)`, `objective`, `data_loss` and `fitted_values` are unchanged
+    # to the last printed digit.
+    pred = _variational_simulate(prob, beta)
+    pred === nothing && return T(-1e20)
 
     # Observation log-likelihood, dispatched through prob.likelihood
     # (accumulated as a scalar to preserve Dual type). Weight-zero and NaN
@@ -118,11 +115,11 @@ function _psm_logdensity(ld::PSMLogDensity, theta)
             y = prob.data_values[i, j]
             _usable(y, w) || continue
             n_eff += 1
-            pred_ij = if prob.discrete
-                pred[i, j]
-            else
-                i <= length(sol.t) ? sol[prob.obs_to_state[j], i] : T(0)
-            end
+            # `_variational_simulate` returns an (n_t × n_obs) matrix already
+            # projected onto the observation mapping and zero-filled past the
+            # end of a short solve, so the former `prob.discrete` branch here
+            # (and its `sol[obs_to_state[j], i]` indexing) is gone.
+            pred_ij = pred[i, j]
             if fam isa Gaussian
                 ll -= T(0.5) * w * (pred_ij - T(y))^2 / sigma2
             else
@@ -226,9 +223,10 @@ end
     solve(prob::PSMProblem, alg::MCMCSolver)
 
 Fit a partially specified model using Markov Chain Monte Carlo sampling.
-Supports Hamiltonian Monte Carlo (HMC), the No-U-Turn Sampler (NUTS),
-and Metropolis–Hastings (MH), providing full posterior distributions
-over the unknown-function parameters.
+Sampling is by the No-U-Turn Sampler (NUTS) with ForwardDiff gradients;
+NUTS is the only sampler — `MCMCSolver` has no sampler-selection field,
+and only `target_accept` tunes the adaptation. This provides full
+posterior distributions over the unknown-function parameters.
 
 The observation model follows `prob.likelihood`. Gaussian data get a
 sampled (or fixed, via `obs_sigma`) noise parameter σ; Poisson,
@@ -240,18 +238,21 @@ family object). Passing `obs_sigma` with a non-Gaussian family errors.
 # Algorithm
 1. Initialise parameters and define the log-posterior (log-likelihood +
    optional smoothing-penalty prior).
-2. Run the selected MCMC sampler (`AdvancedMH.jl`) for `n_samples`
-   iterations with `n_warmup` adaptation/burn-in steps.
-3. Compute posterior mean parameters and reconstruct trajectories.
-4. Return the full chain alongside point estimates.
+2. Run NUTS (`AdvancedHMC.jl`) for `n_samples` iterations with
+   `n_warmup` adaptation/burn-in steps, over `n_chains` chains.
+3. Take the MAP draw (the pooled sample maximising the log-posterior)
+   as the point estimate and reconstruct trajectories from it.
+4. Return the full chain alongside that point estimate.
 
 # References
 - Hoffman & Gelman (2014), "The No-U-Turn Sampler", JMLR.
 - Neal (2011), "MCMC using Hamiltonian dynamics", Handbook of MCMC.
 
 # Returns
-`PSMSolution` with fitted parameters, trajectory, unknown functions,
-and the full MCMC chain in `sol.extras[:chain]`.
+`PSMSolution` whose `parameters` are the MAP draw, with trajectory and
+unknown functions built from it. `sol.convergence` **is** the full
+`MCMCChains.Chains` object (iterations × parameters × chains) — there is
+no `extras` field on `PSMSolution`.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     _validate_problem(prob, "MCMCSolver")
@@ -379,29 +380,30 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     map_beta = map_theta[1:n_beta]
 
     # Build solution from MAP estimate
-    p_opt = build_param_struct(prob, map_beta)
-
     n_t = length(prob.data_times)
     n_obs = size(prob.data_values, 2)
 
-    if prob.discrete
-        p_ad = build_autodiff_param_struct(prob, map_beta)
-        pred = Float64.(adam_simulate_discrete(prob, p_ad, Float64))
+    # Same shared simulator as the log-density above, for the same reason:
+    # the ODE-only branch this replaces raised a raw `MethodError` on a DDE.
+    # `build_autodiff_param_struct` and `build_param_struct` have identical
+    # bodies, so for a Float64 `map_beta` this builds the same parameter
+    # struct the deleted block used.
+    #
+    # BEHAVIOUR CHANGE, on the FAILED-SOLVE path only. The block this
+    # replaces had no retcode test: a solve that stopped early at the MAP
+    # left `pred` partially filled and reported it as `fitted_values`.
+    # `_variational_simulate` returns `nothing` on any non-Success retcode,
+    # so that case now warns and reports zeros instead. On Success — which
+    # is every in-tree fixture, and why the ODE path is bitwise unchanged —
+    # the two are identical; "bitwise identical" does NOT cover this path.
+    pred_map = _variational_simulate(prob, Float64.(map_beta))
+    pred = if pred_map === nothing
+        @warn "MCMCSolver: simulation at the MAP parameters failed " *
+              "(non-Success retcode); fitted_values are reported as zeros " *
+              "and data_loss does not measure the model fit."
+        zeros(n_t, n_obs)
     else
-        u0 = prob.u0 isa Function ? prob.u0(p_opt) : prob.u0
-        ode_prob = ODEProblem((du, u, params, t) -> prob.dynamics!(du, u, p_opt, t),
-                              Float64.(u0), prob.tspan)
-        sol_ode = OrdinaryDiffEq.solve(ode_prob, prob.ode_solver;
-                                       saveat=prob.data_times,
-                                       abstol=1e-7, reltol=1e-7,
-                                       maxiters=10000)
-        pred = zeros(n_t, n_obs)
-        for j in 1:n_obs
-            sk = prob.obs_to_state[j]
-            for i in 1:min(n_t, length(sol_ode.t))
-                pred[i, j] = sol_ode[sk, i]
-            end
-        end
+        Float64.(pred_map)
     end
 
     # Masked/NaN cells are skipped (0 * NaN = NaN would make data_loss NaN).

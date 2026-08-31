@@ -171,9 +171,32 @@ integration required — fast but relies on good derivative estimates.
 
 > [!NOTE]
 >
-> GradientMatching may report `data_loss ≈ 0` because it optimises
-> derivative match rather than data fit. The recovered function shape is
-> still meaningful.
+> `data_loss` is comparable across every solver in this vignette: each one
+> reports the weighted residual sum of squares of its fitted model,
+> evaluated at the fitted parameters. Eight of the eleven obtain that
+> trajectory by integrating the dynamics from `u0`. `CollocationLAML`,
+> `ODINSolver` and `RKHSSolver` do not: they estimate the state
+> trajectory jointly with the coefficients and report that estimate,
+> which is coupled to the fitted parameters but does not start exactly at
+> `u0`. See the `fitted_values` docstring for the two conventions.
+>
+> This was not always so. `GradientMatching`, `TwoStageSolver`,
+> `IntegralMatchingSolver` and `AdaptiveGradientMatching` (its default,
+> deterministic path) used to report the stage-1 data smoother as their
+> `fitted_values`, which made their `data_loss` a function of the
+> data alone — near zero simply because a smoothing spline nearly
+> interpolates its own data, and identical for two problems with
+> completely different dynamics. An earlier version of this callout
+> attributed that near-zero value to these solvers "optimising derivative
+> match rather than data fit"; that explanation was wrong, and the number
+> is now a genuine model-vs-data fit statistic. Gradient matching still
+> never integrates the ODE *while fitting* — the simulation happens once,
+> at the end, purely for reporting.
+>
+> The printed outputs below still show the pre-fix numbers: note that
+> GradientMatching, IntegralMatching and TwoStage all report exactly
+> `1023.4`, the same smoother SSE three times over. They will separate
+> when this vignette is next re-rendered.
 
 ### 4. AdamSolver
 

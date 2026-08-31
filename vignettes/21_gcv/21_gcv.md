@@ -201,11 +201,11 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 | Criterion | GCV | LAML |
 |----|----|----|
 | **Speed** | Faster (no Hessian computation) | Slower (Fellner-Schall + Newton) |
-| **Simplicity** | Simpler (golden-section on one λ) | More complex (per-term λ estimation) |
+| **Simplicity** | Simpler (grid + golden section, then per-block coordinate descent) | More complex (Fellner–Schall + Newton) |
 | **Abundant data** | Works well | Works well |
 | **Sparse data** | Tends to undersmooth | Better (marginal likelihood is more robust) |
 | **Non-Gaussian** | Not recommended | Supported (Poisson, NegBin, etc.) |
-| **Multiple smooth terms** | Single shared λ only | Independent λ per term |
+| **Multiple smooth terms** | Independent λ per penalty block (coordinate descent from the shared-λ optimum) | Independent λ per term |
 | **Model selection** | GCV score is comparable across models | LAML value is an approximate marginal likelihood |
 
 **Recommendation**: Use LAML as the default. GCV is useful as a fast
