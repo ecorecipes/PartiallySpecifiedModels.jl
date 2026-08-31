@@ -679,6 +679,14 @@ function _agm_population_mcmc(prob::PSMProblem, alg::AdaptiveGradientMatching)
                 Float64.(prob.data_times), uf_evals,
                 (method=:adaptive_gradient_matching,
                  sampler=:population_mcmc,
+                 # Present so that `convergence.simulation_failed` is
+                 # readable on EVERY AdaptiveGradientMatching solution
+                 # rather than raising a FieldError on this path. `false`
+                 # is the honest value: `pred` above comes from `X_mean`,
+                 # the posterior mean of the jointly sampled state block,
+                 # so this path never runs a reporting simulation and has
+                 # nothing that can fail.
+                 simulation_failed=false,
                  gp_hyperparams=gp_hyperparams,
                  gamma=gamma_mean,
                  beta_samples=beta_samples,
@@ -948,11 +956,36 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     end
 
     # Step 4: Build solution
-    # Compute data-space predictions from smoothed states
-    pred = zeros(T_pts, n_obs)
-    for j in 1:n_obs
-        sk = prob.obs_to_state[j]
-        pred[:, j] .= x_smooth[:, sk]
+    # Fitted values: the trajectory the fitted model produces, integrated from
+    # `prob.u0` at `beta_opt`.
+    #
+    # This is the DETERMINISTIC solve path. The population-MCMC path builds its
+    # `pred` from `X_mean` — the posterior mean of the jointly sampled state
+    # block — which is a genuine estimate of the state trajectory and is
+    # correct as it stands; do not "fix" it to match this.
+    #
+    # Before B7 this projected `x_smooth`, which is filled in Step 1 BEFORE
+    # beta is optimised and never updated, so `fitted_values` and `data_loss`
+    # were functions of the DATA ALONE. Measured: two problems differing only
+    # in u0 (1.0 vs 4.0) returned bitwise identical `data_loss` (0.1172433922)
+    # while their simulated losses were 0.39703987 and 197.00363, a factor
+    # of 496.
+    sim_ok = true
+    pred = try
+        simulate(prob, beta_opt)
+    catch e
+        _is_program_error(e) && rethrow()
+        sim_ok = false
+        @warn "AdaptiveGradientMatching: integrating the fitted dynamics " *
+              "from u0 failed ($(sprint(showerror, e))). Reporting the " *
+              "smoothed states as `fitted_values`; `data_loss` therefore " *
+              "measures the SMOOTHER, not the model fit. See " *
+              "`convergence.simulation_failed`."
+        pr = zeros(T_pts, n_obs)
+        for j in 1:n_obs
+            pr[:, j] .= x_smooth[:, prob.obs_to_state[j]]
+        end
+        pr
     end
 
     data_loss = weighted_data_loss(prob, pred)
@@ -1003,5 +1036,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
                 (method=:adaptive_gradient_matching,
                  gp_hyperparams=gp_hyperparams,
                  gamma=gamma_opt,
-                 deriv_loss=deriv_loss))
+                 deriv_loss=deriv_loss,
+                 simulation_failed=!sim_ok))
 end

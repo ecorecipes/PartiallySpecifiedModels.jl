@@ -103,6 +103,12 @@ for (name, sol, t) in [
 end
 ```
 
+::: {.callout-note}
+The `Data Loss` column is a like-for-like comparison: every solver in this table reports the weighted residual sum of squares of its fitted model, evaluated at the fitted parameters. `GradientMatching`, `AGM`, `LAML`, `AdamSolver` and `RodeoSolver` obtain that trajectory by integrating the dynamics from `u0`. `CollocationLAML` does not: it estimates the state trajectory jointly with the coefficients and reports that estimate, which is coupled to the fitted parameters but does not start exactly at `u0`. See the `fitted_values` docstring for the two conventions.
+
+`GradientMatching` and `AGM` previously reported the stage-1 data smoother instead, so their entries measured the smoother's fit to the data rather than the model's, and were not comparable with the integration-based rows beside them. The `data_loss` figures printed here are from a render that predates that fix.
+:::
+
 ### Compare recovered β(prevalence)
 
 ```{julia}

@@ -962,6 +962,12 @@ end
         sol_pm = solve(prob, AdaptiveGradientMatching(n_samples=300,
             n_chains=6, rng_seed=3, verbose=false))
         @test sol_pm.convergence.sampler == :population_mcmc
+        # B7/N2: `simulation_failed` is readable on EVERY
+        # AdaptiveGradientMatching solution, not only the deterministic path
+        # — this read used to raise a FieldError. It is always `false` here:
+        # `fitted_values` comes from `X_mean`, the posterior mean of the
+        # jointly sampled state block, so nothing is simulated for reporting.
+        @test sol_pm.convergence.simulation_failed == false
         @test size(sol_pm.convergence.beta_samples) == (300, 6)
         @test size(sol_pm.convergence.gamma_samples, 1) == 300
         @test length(sol_pm.convergence.temperatures) == 6
@@ -6125,12 +6131,26 @@ end
                 [BSplineApproximator(:k, (-1.0, 2.5), 8; initial=x -> 0.3)];
                 data_times=ts_ne, data_values=dv_ne, obs_to_state=[1],
                 likelihood=Gaussian())
-            err_ab = try
-                solve(prob_ab, GradientMatching(maxiters=20, verbose=false))
-                nothing
-            catch e; e end
+            # B6/B7 ORDERING GUARD. `_dynamics_failure_verdict` must run
+            # BEFORE B7's reporting `simulate` call. Move it back after, and
+            # this fixture emits B7's "integrating the fitted dynamics from
+            # u0 failed ... Reporting the smoothed states" warning on a
+            # `solve` that then throws — a promise about a returned value
+            # there is no returned value for. That reordering changes NO
+            # NUMBER anywhere (verified by the reviewer against a tree with
+            # the reorder undone), so only a log assertion can catch it.
+            # Measured on the ordering as committed: 0 warnings, and 1 with
+            # the verdict moved back after the simulation.
+            tl_ab = Test.TestLogger(min_level=Base.CoreLogging.Warn)
+            err_ab = Base.CoreLogging.with_logger(tl_ab) do
+                try
+                    solve(prob_ab, GradientMatching(maxiters=20, verbose=false))
+                    nothing
+                catch e; e end
+            end
             @test err_ab isa ErrorException
             @test occursin("every one of", err_ab.msg)
+            @test count(r -> r.level >= Base.CoreLogging.Warn, tl_ab.logs) == 0
         end
 
         # ── B6/D2: partial sentinel substitution blocks a converged report ──
@@ -6384,6 +6404,150 @@ end
             @test isapprox(s_nm.convergence.sigma2, s_np.convergence.sigma2;
                            rtol=0.02)
         end
+    end
+
+    # ── B7: the gradient-matching family reports a SIMULATED fit ────────
+    # PRE-FIX, `GradientMatching` (continuous branch), `TwoStageSolver`,
+    # `IntegralMatchingSolver` and `AdaptiveGradientMatching`'s deterministic
+    # solve path all reported the stage-1 DATA SMOOTHER as `fitted_values`.
+    # `data_loss` was therefore a function of the DATA ALONE — measured
+    # bitwise equal to `weighted_data_loss(prob, y_smooth)` — and could not
+    # distinguish a good fit from a catastrophic one.
+    @testset "B7: gradient-matching fitted_values are a simulation" begin
+        function f_b7!(du, u, p, t)
+            du[1] = 0.5 * (1 - u[1] / 10) * u[1]
+            nothing
+        end
+        ts_b7 = collect(range(0.0, 20.0, length=45))
+        st_b7 = OrdinaryDiffEq.solve(ODEProblem(f_b7!, [1.0], (0.0, 20.0)),
+                                     Tsit5(); saveat=ts_b7)
+        rng_b7 = Random.Xoshiro(20250830)
+        dv_b7 = reshape([st_b7.u[i][1] + 0.05 * randn(rng_b7)
+                         for i in eachindex(ts_b7)], :, 1)
+        function dyn_b7!(du, u, p, t)
+            du[1] = p.r(u[1]) * u[1]
+            nothing
+        end
+        mk_b7(u0; kw...) = PSMProblem(dyn_b7!, u0, (0.0, 20.0),
+            [BSplineApproximator(:r, (0.5, 10.5), 8; initial=x -> 0.05)];
+            data_times=ts_b7, data_values=dv_b7, obs_to_state=[1],
+            likelihood=PartiallySpecifiedModels.Gaussian(), kw...)
+
+        @testset "u0 lever: $nm" for (nm, alg) in (
+                ("GradientMatching",  GradientMatching(maxiters=60, verbose=false)),
+                ("TwoStageSolver",    TwoStageSolver(maxiters=300, verbose=false)),
+                ("IntegralMatching",  IntegralMatchingSolver(maxiters=300, verbose=false)),
+                ("AdaptiveGradMatch", AdaptiveGradientMatching(maxiters=60, verbose=false)))
+            # Two problems identical EXCEPT u0. Gradient matching never sees
+            # u0, so beta is bitwise identical (measured ||dbeta|| = 0) — yet
+            # the models they describe have trajectories ~1000x apart in data
+            # loss. PRE-FIX both `data_loss` and `fitted_values` were BITWISE
+            # identical between the two, so the number could not tell them
+            # apart at all.
+            p_ok  = mk_b7([1.0]);  s_ok  = solve(p_ok,  alg)
+            p_bad = mk_b7([4.0]);  s_bad = solve(p_bad, alg)
+
+            # (a) the trajectory starts AT the stated initial condition.
+            # PRE-FIX both were 0.9784188774 (the smoother at t=0).
+            # Measured post-fix: exactly 1.0 and 4.0.
+            @test s_ok.fitted_values[1, 1]  ≈ 1.0 atol=1e-6
+            @test s_bad.fitted_values[1, 1] ≈ 4.0 atol=1e-6
+
+            # (b) the two are distinguishable — the property violated BITWISE.
+            @test s_ok.fitted_values != s_bad.fitted_values
+            @test s_ok.data_loss != s_bad.data_loss
+
+            # (c) and by a wide margin. Measured post-fix wrong/right ratios:
+            # GM 1237.23, TwoStage 1798.41, IntegralMatching 1082.53,
+            # AGM 496.181. Gate at 100x — 4.96x headroom on the tightest (AGM).
+            @test s_bad.data_loss > 100 * s_ok.data_loss
+
+            # (d) the correct one is a good fit of a 45-point, 0.05-noise
+            # series. Measured post-fix: GM 0.162944523, TS 0.111723383,
+            # IM 0.189933963, AGM 0.397039870. Gate at 1.0 — 2.52x headroom
+            # on the largest (AGM).
+            @test s_ok.data_loss < 1.0
+
+            # A clean solve never takes the fallback.
+            @test s_ok.convergence.simulation_failed == false
+        end
+
+        @testset "data_loss is no longer the stage-1 smoother SSE" begin
+            # PRE-FIX `sol.data_loss` was BITWISE EQUAL to
+            # `weighted_data_loss(prob, y_smooth)` = 0.096255123727051681,
+            # whatever beta was. Measured post-fix: 0.16294452314794891,
+            # which is exactly the simulated loss.
+            p_s = mk_b7([1.0])
+            ysm, _ = PartiallySpecifiedModels.smooth_and_differentiate(
+                         ts_b7, Float64.(dv_b7), [1], 1)
+            smoother_ss = PartiallySpecifiedModels.weighted_data_loss(
+                              p_s, reshape(ysm[:, 1], :, 1))
+            s_s = solve(p_s, GradientMatching(maxiters=60, verbose=false))
+            @test !(s_s.data_loss ≈ smoother_ss)
+            @test s_s.data_loss ≈ PartiallySpecifiedModels.weighted_data_loss(
+                      p_s, PartiallySpecifiedModels.simulate(
+                               p_s, Vector(s_s.parameters))) rtol=1e-10
+        end
+
+        @testset "a failed reporting simulation warns and is recorded" begin
+            # `maxiters=1` is forwarded to the ODE solver, so the FIT (which
+            # never integrates) is unaffected while the post-hoc reporting
+            # solve fails deterministically. Measured: `simulate` throws
+            # ErrorException("ODE solve failed: MaxIters"), which is NOT a
+            # program error, so the fallback catches it for all four solvers.
+            for alg in (GradientMatching(maxiters=60, verbose=false),
+                        TwoStageSolver(maxiters=300, verbose=false),
+                        IntegralMatchingSolver(maxiters=300, verbose=false),
+                        AdaptiveGradientMatching(maxiters=60, verbose=false))
+                # Match the MESSAGE, not just the level: a bare `(:warn,)`
+                # would be satisfied by any unrelated warning. All four
+                # solvers name the same thing they failed to do.
+                s_f = @test_logs (:warn, r"integrating the fitted dynamics") match_mode=:any solve(
+                          mk_b7([1.0]; maxiters=1), alg)
+                @test s_f isa PSMSolution
+                @test s_f.convergence.simulation_failed == true
+                # Falls back to the smoother rather than erroring, and the
+                # reported loss stays finite so downstream code survives.
+                @test isfinite(s_f.data_loss)
+                # The warning is unconditional (NOT verbose-gated): a
+                # `data_loss` that does not measure the model must say so.
+            end
+        end
+    end
+
+    @testset "B7: GradientMatching's discrete branch is unchanged" begin
+        # Regression guard. The discrete branch ALREADY simulated (its own
+        # comment names the same defect), so B7 must not perturb it.
+        # Measured on this fixture: data_loss 0.22321184 BOTH before and
+        # after the B7 change, bitwise; r(5) = 0.25312121 unchanged.
+        # By contrast TwoStage moved 0.1482822962 -> 0.2334070613 and AGM
+        # 0.148926349 -> 0.2269386352 on this same discrete fixture.
+        r_b7d(N) = 0.5 * (1.0 - N / 10.0)
+        function ricker_b7!(u_next, u, p, t)
+            u_next[1] = u[1] * exp(p.r(u[1]))
+        end
+        rng_b7d = Random.Xoshiro(123)
+        N0_b7 = 2.0
+        T_b7 = 30
+        t_b7d = collect(0.0:1.0:T_b7)
+        N_b7 = zeros(length(t_b7d))
+        N_b7[1] = N0_b7
+        for i in 1:(length(t_b7d)-1)
+            N_b7[i+1] = N_b7[i] * exp(r_b7d(N_b7[i]))
+        end
+        data_b7d = N_b7 .+ 0.1*randn(rng_b7d, length(t_b7d))
+        prob_b7d = PSMProblem(ricker_b7!, [N0_b7], (0.0, Float64(T_b7)),
+            [BSplineApproximator(:r, (0.0, 12.0), 8)];
+            data_times=t_b7d, data_values=reshape(max.(data_b7d, 0.01), :, 1),
+            obs_to_state=[1], known_params=NamedTuple(),
+            likelihood=PartiallySpecifiedModels.Gaussian(), discrete=true)
+
+        s_b7d = solve(prob_b7d, GradientMatching(maxiters=50, verbose=false))
+        # rtol 1e-4 against a measured 0.22321184. The pre- and post-B7 runs
+        # agreed BITWISE, so the tolerance is pure headroom for platform and
+        # dependency drift, not a fitted margin.
+        @test s_b7d.data_loss ≈ 0.22321184 rtol=1e-4
+        @test s_b7d.convergence.simulation_failed == false
     end
 
     @testset "approximator extension protocol" begin

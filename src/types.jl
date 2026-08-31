@@ -3998,7 +3998,58 @@ Result of fitting a PSM.
   a fixed point at λ̂ (measured: refitting moves β̂ by up to 5e-5 on
   converged fits). The λ̂ it reports is still the one β̂ was fitted under. `RodeoSolver` and `DaltonSolver` also populate this field; their
   pairing has not been audited to the same standard.
-- `fitted_values`: predicted values at data times (n_times × n_obs)
+- `fitted_values`: predicted values at data times (n_times × n_obs).
+
+  For almost every solver this is the MODEL TRAJECTORY: the dynamics
+  integrated from `u0` at the fitted parameters, evaluated at
+  `data_times` and projected through `obs_to_state`. `data_loss` is its
+  weighted residual sum of squares, so the number measures the fitted
+  MODEL against the data and is comparable across those solvers.
+
+  The exception is the solvers that estimate the state trajectory as a
+  parameter, jointly with β — `CollocationLAML`, `ODINSolver`,
+  `RKHSSolver`, `MagiSolver`, `FGPGMSolver`, and
+  `AdaptiveGradientMatching`'s population-MCMC path (`n_samples > 0`).
+  Those report that jointly-estimated trajectory, because it is the
+  quantity their own objective penalises. It is β-coupled, so unlike the
+  data smoother below it does move when the fit moves.
+
+  Do NOT read it as a model-vs-data statistic, and do not treat it as a
+  conservative one: the state block can absorb model error, so it is
+  optimistic without bound. Measured on a 45-point logistic fixture with
+  a right-hand side that CANNOT reproduce the data (`du/dt = -r(u)^2*u`,
+  forced non-increasing, against data rising from 1 to 10) — `LAML`,
+  which integrates, reports 2399.9513; `CollocationLAML` reports
+  1.7043728e-06, understating that same model's own simulated loss by a
+  factor of 1.4e9; `RKHSSolver` 0.69481787 (3454x understated);
+  `ODINSolver` 110.75749 (21.67x). All three are also blind to `u0`: on
+  the same data, moving `u0` from 1.0 to 4.0 changes their `data_loss` by
+  a ratio of 1.000 (bitwise unchanged for `ODINSolver` and `RKHSSolver`)
+  where `LAML` moves by 341x — the same insensitivity that motivated the
+  change described below. Compare these numbers only across solvers of
+  this kind, and call `simulate` yourself if you need to score the model.
+  (`MagiSolver`, `FGPGMSolver` and the AGM-MCMC path were not measured.)
+
+  A third convention used to ship under this same name and no longer
+  does: `GradientMatching` (continuous), `TwoStageSolver`,
+  `IntegralMatchingSolver` and `AdaptiveGradientMatching`'s deterministic
+  path reported the STAGE-1 DATA SMOOTHER, into which β never entered.
+  Their `data_loss` was consequently a function of the data alone —
+  measured bitwise equal to `weighted_data_loss(prob, y_smooth)`, and
+  identical between two problems differing only in `u0` whose true
+  trajectories were a factor of 1237 apart in loss. They now simulate.
+
+  If that reporting simulation fails, the solver warns, falls back to the
+  smoother, and sets `convergence.simulation_failed = true`; `data_loss`
+  then measures the smoother rather than the model. The flag is defined
+  by those four solvers and ONLY those four, where it is `false` on every
+  clean fit; on `AdaptiveGradientMatching`'s population-MCMC path it is
+  present but always `false`, because that path reports the sampled state
+  block and never runs a reporting simulation at all. Every other solver
+  omits the key, so guard with `haskey(sol.convergence, :simulation_failed)`
+  before reading it off an arbitrary `PSMSolution`. It is independent of
+  `n_dynamics_failures`, which counts failure-sentinel substitutions
+  DURING the fit.
 - `unknown_functions`: Dict of name => callable evaluator
 - `convergence`: convergence information. For the iterative optimisers
   (LAML, GCVSolver, CollocationLAML, AdamSolver, MultipleShootingSolver,
