@@ -797,8 +797,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
         # Compute IRLS weights from current predictions
         w_irls = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
 
-        # Form pseudodata z = y − f + J·β
-        z_pseudo = y_vec .- f_vec .+ J * beta
+        # Form pseudodata z = (z − η) + J·β — the family's working residual;
+        # `y − f` for every family but TruncatedNormal (see
+        # `_working_residual`), so this is bit-identical off that path.
+        z_pseudo = _working_residual(prob.likelihood, y_vec, f_vec, w_vec) .+ J * beta
 
         # ── GCV/NCV smoothing parameter selection ──
         if m > 0

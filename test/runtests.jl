@@ -3077,9 +3077,21 @@ end
             @test length(dr_nb) == 4
             @test all(isfinite, dr_nb)
 
-            # TruncatedNormal: same as Gaussian
-            dr_tn = deviance_residuals(TruncatedNormal(), y, mu)
-            @test dr_tn ≈ y .- mu
+            # TruncatedNormal: NOT the same as Gaussian. Response-scale
+            # residuals centre on the observable's mean E[Y|μ] = μ + σλ(ξ),
+            # not on the latent location μ. The old assertion here
+            # (`dr_tn ≈ y .- mu`) encoded the defect: it made a
+            # correctly-specified truncated fit report residuals with a
+            # systematic positive mean, which ACF/Durbin-Watson then read as
+            # structure. Fixed with the N1 working-residual batch.
+            fam_tn = TruncatedNormal()
+            dr_tn = deviance_residuals(fam_tn, y, mu)
+            @test dr_tn ≈ y .- PartiallySpecifiedModels._family_mean.(Ref(fam_tn), mu)
+            # and it is genuinely different from the Gaussian centring here
+            @test !isapprox(dr_tn, y .- mu; atol=1e-8)
+            # equals the Gaussian centring in the weak-truncation limit
+            mu_far = fill(40.0, length(y))   # ξ = 40 ≫ 4
+            @test deviance_residuals(fam_tn, y, mu_far) ≈ y .- mu_far atol=1e-8
 
             # appraise with Poisson family
             diag_p = appraise(sol; family=Poisson())
@@ -3194,6 +3206,237 @@ end
                 @test isapprox(wi, fd_info; rtol=1e-3)
                 @test 0.0 < wi < 1.0 / fam.sigma^2 + 1e-12  # I(μ) ∈ (0, 1/σ²)
             end
+        end
+
+        # ─── N1: the PIRLS/Fisher-scoring working residual (z − η) ───
+        # Every penalized-likelihood solver forms pseudodata from a working
+        # residual: LAML/GCV build z = (z−η) + Jβ, CollocationLAML builds
+        # √W̃·(z−η) rows. The identity that makes the resulting fixed point
+        # the actual penalized MLE — rather than some nearby quantity — is
+        #     (★)   W̃ᵢ · (z−η)ᵢ  ≡  wᵢ · ∂ℓᵢ/∂μᵢ
+        # Since `irls_weights` uses W̃ = w·I(μ), (★) forces (z−η) = score/I.
+        # That collapses to `y − μ` for every identity-link exponential-family
+        # kernel, which is why the plain form survived; TruncatedNormal is the
+        # family for which it does NOT collapse.
+        @testset "TruncatedNormal working residual (score identity)" begin
+            using PartiallySpecifiedModels: log_likelihood, irls_weights
+            PSM = PartiallySpecifiedModels
+            # ForwardDiff is a package dep, reached through PSM rather than
+            # added to [extras] just for this test.
+            FD = PSM.ForwardDiff
+            # relative error of the two sides of (★), worst over observations
+            function score_err(fam, y, mu, w)
+                sc = FD.gradient(m -> log_likelihood(fam, y, m, w), mu)
+                W  = irls_weights(fam, y, mu, w)
+                r  = PSM._working_residual(fam, y, mu, w)
+                maximum(abs.(W .* r .- sc) ./ max.(abs.(sc), 1e-12))
+            end
+
+            w = [1.0, 2.0, 0.5, 1.0, 1.5, 1.0]
+            # Families whose score IS (y−μ)/V(μ): identity already held, and
+            # must keep holding to roundoff (measured 0.0, 9.25e-16, 9.87e-16).
+            mu_g = [0.5, 1.0, 2.0, 3.0, 5.0, 8.0]
+            @test score_err(Gaussian(), mu_g .+ 0.3, mu_g, w) < 1e-12
+            @test score_err(Poisson(), round.(mu_g .* 1.2), mu_g, w) < 1e-12
+            @test score_err(NegativeBinomial(3.0), round.(mu_g .* 1.2), mu_g, w) < 1e-12
+
+            # TruncatedNormal across the range where the bound bites.
+            fam = TruncatedNormal(sigma=1.0, lower=0.0)
+            mu_t = [-1.0, 0.0, 0.5, 1.0, 2.0, 4.0]
+            # 1e-5 gate: measured 1.55e-7 here (≈65× headroom). The residual
+            # is NOT roundoff — it is `_normcdf`'s own documented |ε| < 7.5e-8
+            # (Abramowitz & Stegun 26.2.17) showing through λ(ξ) = φ/Φ, which
+            # `irls_weights` already carries. Worst case over a dense sweep
+            # (σ ∈ [0.25,5], ξ ∈ [-4,6]) was 2.24e-5, hence the looser gate on
+            # the sweep below rather than here.
+            @test score_err(fam, mu_t .+ 0.3, mu_t, w) < 1e-5
+
+            # DEFECT-PRESENCE: the pre-fix residual `y − μ` does not merely
+            # bias this — it inverts the SIGN of the step wherever ξ ≲ 1, so
+            # PIRLS pushed μ̂ AWAY from the optimum. Pin that, so a revert is
+            # loud rather than a slow drift in fit quality.
+            let y = mu_t .+ 0.3
+                sc  = FD.gradient(m -> log_likelihood(fam, y, m, w), mu_t)
+                W   = irls_weights(fam, y, mu_t, w)
+                pre = W .* (y .- mu_t)          # the pre-fix form
+                # ξ = -1, 0, 0.5 → true score negative, pre-fix positive
+                @test all(sc[1:3] .< 0)
+                @test all(pre[1:3] .> 0)
+                # and it decays to a no-op once the bound stops binding:
+                # measured rel err 8.93e-5 at ξ = 4 (index 6)
+                @test abs(pre[6] - sc[6]) / abs(sc[6]) < 1e-3
+                # while being O(1)-wrong or worse where it bites
+                @test abs(pre[1] - sc[1]) / abs(sc[1]) > 0.5
+            end
+
+            # Bit-identity: families other than TruncatedNormal must get the
+            # byte-for-byte pre-fix arithmetic, since the whole "no-op
+            # elsewhere" claim rests on it.
+            let mu = [0.7, 1.3, 2.9], y = [1.0, 1.0, 3.0], w1 = ones(3)
+                for fam2 in (Gaussian(), Poisson(), NegativeBinomial(4.0))
+                    @test all(PSM._working_residual(fam2, y, mu, w1) .=== (y .- mu))
+                end
+                @test !all(PSM._working_residual(TruncatedNormal(), y, mu, w1) .=== (y .- mu))
+            end
+
+            # CustomLikelihood is the OTHER family whose score is not
+            # (y−μ)/V(μ): a user kernel has no reason to satisfy it. Found by
+            # asking what else shares the defect rather than by a report.
+            let mu = [0.5, 1.0, 2.0, 3.0], ys = [0.9, 0.6, 2.6, 2.2], w4 = ones(4)
+                # Gaussian-shaped kernel: derivatives are exact for a
+                # quadratic, so this stays bit-identical to `y − μ`.
+                cg = CustomLikelihood((y, m) -> -0.5 * (y - m)^2)
+                @test PSM._working_residual(cg, ys, mu, w4) ≈ ys .- mu atol=1e-12
+                @test score_err(cg, ys, mu, w4) < 1e-12          # measured 0.0
+                # Skewed kernel: `y − μ` was off by 45.3%; the derived form
+                # satisfies the identity exactly (measured 0.0).
+                cs = CustomLikelihood((y, m) -> -(y - m) - exp(-(y - m)))
+                @test score_err(cs, ys, mu, w4) < 1e-10
+                Wc = irls_weights(cs, ys, mu, w4)
+                scc = FD.gradient(m -> log_likelihood(cs, ys, m, w4), mu)
+                pre_err = maximum(abs.(Wc .* (ys .- mu) .- scc) ./ abs.(scc))
+                @test pre_err > 0.1                              # measured 0.453
+            end
+
+            # The vector form must be exactly a broadcast of the scalar one —
+            # they are used by different solvers (pseudodata vs collocation
+            # rows) and drifting apart is this package's signature defect.
+            let mu = [0.2, 0.9, 2.5], y = [0.4, 1.4, 2.0], w1 = ones(3)
+                for fam2 in (Gaussian(), Poisson(), TruncatedNormal(sigma=1.5, lower=0.0))
+                    @test PSM._working_residual(fam2, y, mu, w1) ==
+                          PSM._working_residual_scalar.(Ref(fam2), y, mu)
+                end
+            end
+        end
+
+        # The estimating equation must be UNBIASED at the true parameter:
+        # E[W̃·(z−η)] = E[w·∂ℓ/∂μ] = 0 when μ is the truth. If it is not, the
+        # root of the equation is not μ, and no amount of iterating gets μ̂
+        # there. This is the direct, sharp statement of the bias that the
+        # single-draw fit below can only hint at.
+        @testset "TruncatedNormal estimating equation is unbiased" begin
+            using PartiallySpecifiedModels: irls_weights
+            PSM = PartiallySpecifiedModels
+            rng = StableRNG(4242)
+            N = 20_000
+            σ, a = 1.0, 0.0
+            fam = TruncatedNormal(sigma=σ, lower=a)
+            for (ξ, old_min_se) in ((0.0, 15.0), (0.5, 15.0), (1.0, 15.0),
+                                    (2.0, 4.0), (4.0, 0.0))
+                mu = a + σ * ξ
+                ys = Float64[]
+                while length(ys) < N            # rejection: true truncated draws
+                    y = mu + σ * randn(rng)
+                    y >= a && push!(ys, y)
+                end
+                mus = fill(mu, N); w = ones(N)
+                W = irls_weights(fam, ys, mus, w)
+                new_eq = W .* PSM._working_residual(fam, ys, mus, w)
+                old_eq = W .* (ys .- mus)        # the pre-fix form
+                m = sum(new_eq) / N
+                se = sqrt(sum((new_eq .- m) .^ 2) / (N - 1) / N)
+
+                # Corrected: unbiased at every ξ. Measured |mean|/SE was
+                # 0.3, 0.5, 0.4, 0.9, 0.8 → gate 4 SE (≥4.4× headroom).
+                @test abs(m) < 4 * se
+
+                # Pre-fix: biased by 67.5, 50.2, 31.6, 8.1, 0.8 SE at these
+                # ξ. The gates are set well under each (≥2.1× headroom) and
+                # ξ=4 is deliberately ungated — that is the weak-truncation
+                # limit where the two forms MUST agree, checked below.
+                mo = sum(old_eq) / N
+                old_min_se > 0 && @test abs(mo) > old_min_se * se
+                if ξ == 4.0
+                    @test abs(mo) < 4 * se        # no-op limit: measured 0.8 SE
+                end
+            end
+        end
+
+        # End-to-end companion to the score-identity test above. The
+        # existing "LAML solver with TruncatedNormal" fit below is WEAKLY
+        # truncated (I ~ 10² against σ=5, so ξ ≫ 4) — the regime where the
+        # correction is provably inert, so it pins no-regression but proves
+        # nothing. This fixture puts ξ in [0.26, 3.33], where the bound
+        # actually bites.
+        @testset "TruncatedNormal fit maximises its own likelihood" begin
+            using PartiallySpecifiedModels: log_likelihood
+            PSM = PartiallySpecifiedModels
+            ktrue(N) = 0.15 + 0.02N
+            rng = StableRNG(20260831)
+            f_true(du, u, p, t) = (du[1] = -ktrue(u[1]) * u[1])
+            st = OrdinaryDiffEq.solve(
+                ODEProblem(f_true, [10.0], (0.0, 12.0)), Tsit5(); saveat=0.5)
+            mu_true = [st(t)[1] for t in st.t]
+            σ, a = 3.0, 0.0
+            # Proper truncated-normal draws by rejection. NOT max(y, ε): that
+            # puts a point mass at the bound, which is a different model and
+            # would let a latent-centred fit off the hook.
+            ydat = map(mu_true) do m
+                v = a
+                for _ in 1:10_000
+                    y = m + σ * randn(rng)
+                    if y >= a; v = y; break; end
+                end
+                v
+            end
+            @test 0.2 < minimum(mu_true) / σ < 0.4     # truncation really bites
+            fam = TruncatedNormal(sigma=σ, lower=a)
+
+            dyn!(du, u, p, t) = (du[1] = -max(p.k(u[1]), 0.0) * u[1])
+            uf = BSplineApproximator(:k, (0.0, 11.0), 6; initial=x -> 0.15 + 0.02x)
+            prob = PSMProblem(dyn!, [10.0], (0.0, 12.0), [uf];
+                data_times=collect(st.t), data_values=reshape(ydat, :, 1),
+                obs_to_state=[1], known_params=NamedTuple(),
+                likelihood=fam, solver=Tsit5())
+            sol = solve(prob, LAML(maxiters=80, verbose=false, warmup=10,
+                                   sigma2_init=σ^2))
+            fit = sol.fitted_values[:]
+            w1 = ones(length(fit))
+
+            # THE discriminator. A maximiser must beat the true parameter
+            # value in-sample on finite noisy data. Measured: post-fix
+            # -53.563 at the fit vs -54.117 at the true latent μ; the pre-fix
+            # working residual scored -55.069, i.e. WORSE than the truth,
+            # which is self-evidently not maximising anything.
+            ll_fit  = log_likelihood(fam, ydat, fit, w1)
+            ll_true = log_likelihood(fam, ydat, mu_true, w1)
+            @test ll_fit > ll_true
+
+            # CollocationLAML runs the SAME correction through a different
+            # code path (√W̃·(z−η) Gauss-Newton rows, not pseudodata), and
+            # before this batch the suite had NO CollocationLAML +
+            # TruncatedNormal test at all — the collocation half of the fix
+            # would have shipped unexercised. Same fixture, same property.
+            # Measured here: ll_fit −48.140 > ll_true −49.700. On an
+            # independent draw (StableRNG(777)) the pre-fix code gave
+            # ll_fit −48.997 < ll_true −47.846, i.e. it fails this gate.
+            sol_c = solve(prob, CollocationLAML(maxiters=40, verbose=false))
+            fit_c = sol_c.fitted_values[:]
+            @test log_likelihood(fam, ydat, fit_c, w1) > ll_true
+            # Same optimistic-loss artifact on this path: measured RSS 133.53
+            # corrected vs 58.90 defective on the seed-777 draw.
+
+            # DELIBERATELY NOT GATED: RMSE(μ̂ vs latent μ) and the drift of
+            # μ̂ toward E[Y|μ]. Both were measured on two different draws and
+            # they do NOT agree in direction:
+            #
+            #   draw                RMSE pre → post     drift pre → post
+            #   MersenneTwister     1.291 → 0.337       1.041 → 0.106
+            #   StableRNG (here)    0.968 → 1.211       0.583 → −0.648
+            #
+            # On this draw the corrected fit is FURTHER from the truth. That
+            # is ordinary bias–variance, not a defect: with σ=3, 25 points
+            # and a free spline, the (now genuine) maximiser has more
+            # variance than the biased estimator it replaces, and on any one
+            # draw it can land further out. Gating on single-draw RMSE would
+            # be fixture-shopping, so the only end-to-end gate here is the
+            # likelihood property above, which fails pre-fix on BOTH draws.
+            # The bias itself is pinned directly — and far more sharply — by
+            # the estimating-equation test below.
+            #
+            # Also note `sol.data_loss` is the weighted RSS Σw(y−μ)², which
+            # is MINIMISED by fitting E[Y]: it is LOWER for the defective fit
+            # (75.00 vs 136.10 here) and must never be used as the gate.
         end
 
         @testset "LAML solver with TruncatedNormal" begin
@@ -11663,15 +11906,32 @@ end
         # Strongly truncated: latent mean decays 0.30 → 0.02 against σ = 0.15.
         lam_tn, edf_tn = d5_run(fam_d5, collect(range(0.30, 0.02, length=25)),
                                 (m, r) -> max.(m .+ 0.15 .* randn(r, 25), 0.0))
-        # Measured before → after: λ̂ 6.960485e6 → 3.178556e6 (2.19× LESS
-        # smoothing), edf 1.912379 → 1.958939.  The direction is forced: the
-        # latent centring adds the non-negative bias term Σwσ²λ(ξ)²/V(μ), so
-        # φ̂ — and hence λ* = φ̂·edf/βᵀSβ — could only be inflated.
-        @test 2.2e6 < lam_tn[1] < 4.5e6   # 1.45×/1.42× round the fixed
-                                          # 3.179e6; excludes the old
-                                          # 6.960e6 by 1.55×
-        @test edf_tn ≈ 1.958939 rtol = 5e-3   # broken 1.912379 is 2.38%
-                                              # away — 4.8× outside the gate
+        # RE-PINNED BY N1. These are coupled fixed-point quantities, and N1
+        # changed the working residual that feeds the same iteration, so the
+        # whole (λ̂, edf) pair moved. Re-measured under N1, D5 broken → fixed:
+        #     λ̂   1.102507e7 → 1.611606e7   (1.46× MORE smoothing)
+        #     edf 1.864907   → 1.808879     (3.10% apart)
+        #
+        # CORRECTION to the reasoning this comment used to carry. It claimed
+        # "the direction is forced ... φ̂ could only be inflated", predicting
+        # the fix always yields LESS smoothing (it recorded 6.960e6 → 3.179e6).
+        # Under the corrected working residual the direction REVERSES. The
+        # argument is sound for φ̂ in isolation — the latent centring really
+        # does add the non-negative Σwσ²λ(ξ)²/V(μ) — but λ* = φ̂·edf/βᵀSβ is a
+        # FIXED POINT in which β̂ and edf move too, so monotonicity in φ̂ does
+        # not carry to λ*. The old direction held under the old (defective)
+        # residual; it was never forced.
+        #
+        # The separation also shrank, 2.19× → 1.46×, so these windows are
+        # necessarily tighter than B4's ±42%. If this pair ever proves flaky
+        # cross-machine, LOOSEN OR DROP part (b) rather than re-tuning it:
+        # part (a) above pins D5's actual claim exactly (rtol 1e-12), and
+        # that is where the discrimination really lives.
+        @test 1.35e7 < lam_tn[1] < 1.95e7  # 1.19×/1.21× round the fixed
+                                           # 1.6116e7; excludes the broken
+                                           # 1.1025e7 by 1.22×
+        @test edf_tn ≈ 1.808879 rtol = 5e-3   # broken 1.864907 is 3.10%
+                                              # away — 6.2× outside the gate
 
         # (c) every other family is untouched.  These λ̂/edf came out
         # BITWISE identical in the before and after runs; the loose rtol

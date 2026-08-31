@@ -396,3 +396,130 @@ function irls_weights(fam::CustomLikelihood, y::AbstractVector,
     wt
 end
 
+# ─── Working residual (z − η) for Fisher scoring ────────────────────
+
+"""
+    _working_residual_scalar(fam, y, mu) -> Real
+    _working_residual(fam, y, mu, w) -> Vector   (broadcast of the above)
+
+The PIRLS/Fisher-scoring working residual `z − η`, i.e. the quantity that
+pairs with `irls_weights` so that
+
+    W̃ᵢ · (z − η)ᵢ  ≡  wᵢ · ∂ℓᵢ/∂μᵢ                                    (★)
+
+holds exactly. (★) is the whole point: the normal equations `J'W̃(z − Jβ)`
+are then the true penalized score, so the fixed point of the iteration is
+the actual MLE and not some nearby quantity.
+
+`irls_weights` uses the convention `W̃ = w · I(μ)` with `I` the Fisher
+information for μ, so (★) forces `(z − η) = (∂ℓ/∂μ) / I(μ)`.
+
+For every family with an identity link and an exponential-family kernel
+this collapses to the textbook `y − μ`, because the score is `(y − μ)/V(μ)`
+and `I = 1/V(μ)`:
+
+| family          | ∂ℓ/∂μ      | I(μ)   | (z − η) |
+|-----------------|------------|--------|---------|
+| Gaussian        | (y−μ)/σ²   | 1/σ²   | y − μ   |
+| Poisson         | (y−μ)/μ    | 1/μ    | y − μ   |
+| NegativeBinomial| (y−μ)/V    | 1/V    | y − μ   |
+
+`TruncatedNormal` is the family that does NOT collapse, and it is the
+reason this function exists — see its method below.
+
+The `AbstractLikelihood` fallback is `y .- mu`, so every family that has
+not opted in keeps its pre-existing arithmetic bit-for-bit. NaN/masked
+observations are passed through untouched here (they are neutralized by
+the zero weight at the call site, exactly as before).
+"""
+_working_residual_scalar(::AbstractLikelihood, y::Real, mu::Real) = y - mu
+
+"""
+    _working_residual_scalar(fam::TruncatedNormal, y, mu)
+
+For `TruncatedNormal(a, σ)` with `ξ = (μ-a)/σ` and `λ(ξ) = φ(ξ)/Φ(ξ)`:
+
+    ∂ℓ/∂μ = (y − μ)/σ² − λ(ξ)/σ = (y − E[Y|μ]) / σ²
+    I(μ)  = (1 − ξλ − λ²) / σ²                        (see `irls_weights`)
+    ⇒ (z − η) = (y − μ − σλ) / (1 − ξλ − λ²)
+
+so BOTH corrections matter and they are independent:
+
+1. **Centring.** The numerator is `y − E[Y|μ]`, not `y − μ`. μ is the
+   LATENT location; the observable's mean is `E[Y|μ] = μ + σλ` (that is
+   `_family_mean`, added for the Pearson dispersion in the same campaign).
+2. **Scaling.** The `1/(1 − ξλ − λ²)` factor. It is identically 1 for the
+   families in the table above, which is why the plain `y − μ` form
+   survived so long — nothing else in the package needed it.
+
+Using `y − μ` here does not merely bias the fit, it points the step the
+WRONG WAY wherever the bound bites. Measured against the ForwardDiff score
+(relative error of `W̃·(z−η)` vs `w·∂ℓ/∂μ`, invariant in σ and a):
+
+| ξ    | W̃·(y−μ) | w·∂ℓ/∂μ  | rel. err |
+|------|----------|----------|----------|
+| −1.0 | +0.0597  | −1.225   | 1.05     |
+| 0.0  | +0.109   | −0.498   | 1.22     |
+| 0.5  | +0.146   | −0.209   | 1.70     |
+| 1.0  | +0.189   | +0.0124  | 14.2     |
+| 2.0  | +0.266   | +0.245   | 0.0866   |
+| 4.0  | +0.300   | +0.300   | 8.93e-5  |
+
+The sign is inverted for ξ ≲ 1 — PIRLS pushed μ̂ away from the optimum
+and stopped where the two errors happened to cancel. The corrected form
+reproduces the score to machine precision (≤1.11e-16) at every ξ above.
+The error decays as the truncation stops binding (8.93e-5 by ξ = 4), so
+this is a no-op on weakly truncated fits and only bites where the bound
+actually bites — the same "only bites where it bites" property
+`_family_mean` has.
+
+The `Φ` and information floors are the SAME guards `irls_weights` applies
+(`max(Φ(ξ), 1e-15)`, `max(I, 1e-10)`). They have to be, or (★) would fail
+in the far tail where one side is clamped and the other is not.
+"""
+function _working_residual_scalar(fam::TruncatedNormal, y::Real, mu::Real)
+    σ = fam.sigma
+    a = fam.lower
+    ξ = (mu - a) / σ
+    Φξ = max(_normcdf(ξ), 1e-15)
+    λξ = _normpdf(ξ) / Φξ
+    # Same guarded information as `irls_weights`, so W̃·(z−η) = w·score holds
+    # even where the floor is active.
+    info = max((1.0 - ξ * λξ - λξ^2) / σ^2, 1e-10)
+    score = (y - mu) / σ^2 - λξ / σ            # = (y − E[Y|μ])/σ²
+    score / info
+end
+
+"""
+    _working_residual_scalar(fam::CustomLikelihood, y, mu)
+
+A user-supplied kernel has no reason to satisfy `∂ℓ/∂μ = (y−μ)/V(μ)`, so
+`y − μ` is not its working residual either. `irls_weights` already derives
+this family's curvature by ForwardDiff; this derives the matching score the
+same way, with the SAME `max(·, 1e-10)` floor, so (★) holds by construction.
+
+Measured: on a Gaussian-shaped kernel `-(y-μ)²/2` the two forms agree to
+0.0 exactly (the derivatives are exact for a quadratic), so every custom
+kernel of that shape — which is what the package's own fixtures use — is
+bit-identical. On a skewed kernel `-(y-μ) - exp(-(y-μ))` the old `y − μ`
+form was off by 45.3%.
+
+The cost is one extra first-derivative sweep alongside the second-derivative
+sweep `irls_weights` already performs.
+"""
+function _working_residual_scalar(fam::CustomLikelihood, y::Real, mu::Real)
+    score = ForwardDiff.derivative(m -> fam.loglik_scalar(y, m), mu)
+    neg_d2l = -ForwardDiff.derivative(
+        m -> ForwardDiff.derivative(m2 -> fam.loglik_scalar(y, m2), m), mu)
+    score / max(neg_d2l, 1e-10)
+end
+
+# The vector form is a broadcast of the scalar one — deliberately ONE
+# implementation. Two parallel implementations of this arithmetic (a vector
+# one for the LAML/GCV pseudodata and a scalar one for the collocation
+# residual rows) is precisely how a fix lands in one solver and not its
+# sibling, which is the defect class this package keeps rediscovering.
+_working_residual(fam::AbstractLikelihood, y::AbstractVector,
+                  mu::AbstractVector, w::AbstractVector) =
+    _working_residual_scalar.(Ref(fam), y, mu)
+

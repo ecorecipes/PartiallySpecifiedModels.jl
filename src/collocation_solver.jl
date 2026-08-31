@@ -341,8 +341,16 @@ function collocation_residual_jacobian(
             # Gauss-Newton step all-NaN, the line search rejects every
             # step, and the solver reports `:plateau` convergence at its
             # initialization. (The Jacobian row is already a clean 0.)
+            # `(y − α)` is the working residual only for families whose score
+            # is (y−μ)/V(μ); TruncatedNormal's is not, and using `y − α`
+            # there inverts the Gauss–Newton step wherever the bound bites.
+            # `_working_residual_scalar` is `y - α` for every other family,
+            # so this row is bit-identical off that path. The JACOBIAN row
+            # is deliberately unchanged: holding ∂r/∂μ = −1 is what makes
+            # this Fisher scoring rather than a full Newton step.
             data_resid[idx] = usable_cell(prob, i, j) ?
-                sqrt(w_vec[idx]) * (prob.data_values[i, j] - alpha[i, sk]) : 0.0
+                sqrt(w_vec[idx]) * _working_residual_scalar(
+                    prob.likelihood, prob.data_values[i, j], alpha[i, sk]) : 0.0
         end
     end
 
@@ -543,8 +551,16 @@ function collocation_residual_only(
             # Gauss-Newton step all-NaN, the line search rejects every
             # step, and the solver reports `:plateau` convergence at its
             # initialization. (The Jacobian row is already a clean 0.)
+            # `(y − α)` is the working residual only for families whose score
+            # is (y−μ)/V(μ); TruncatedNormal's is not, and using `y − α`
+            # there inverts the Gauss–Newton step wherever the bound bites.
+            # `_working_residual_scalar` is `y - α` for every other family,
+            # so this row is bit-identical off that path. The JACOBIAN row
+            # is deliberately unchanged: holding ∂r/∂μ = −1 is what makes
+            # this Fisher scoring rather than a full Newton step.
             data_resid[idx] = usable_cell(prob, i, j) ?
-                sqrt(w_vec[idx]) * (prob.data_values[i, j] - alpha[i, sk]) : 0.0
+                sqrt(w_vec[idx]) * _working_residual_scalar(
+                    prob.likelihood, prob.data_values[i, j], alpha[i, sk]) : 0.0
         end
     end
 

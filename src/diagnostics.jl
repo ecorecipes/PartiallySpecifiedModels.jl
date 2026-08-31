@@ -81,8 +81,14 @@ function deviance_residuals(fam::NegativeBinomial, y::AbstractVector, mu::Abstra
     end for i in eachindex(y)]
 end
 
-function deviance_residuals(::TruncatedNormal, y::AbstractVector, mu::AbstractVector)
-    y .- mu  # same as Gaussian for response-scale residuals
+function deviance_residuals(fam::TruncatedNormal, y::AbstractVector, mu::AbstractVector)
+    # Response-scale residuals centre on the OBSERVABLE's mean E[Y|μ] = μ+σλ,
+    # not on the latent location μ. Centring on μ gives residuals with a
+    # systematic positive mean (E[Y]−μ reaches 1.525σ at ξ=−1, 0.798σ at
+    # ξ=0), which the autocorrelation and Durbin–Watson diagnostics then read
+    # as structure in a correctly-specified fit. `_family_mean` is the same
+    # E[Y|μ] the Pearson dispersion uses. Identical to `y − μ` as ξ → ∞.
+    y .- _family_mean.(Ref(fam), mu)   # scalar method; broadcast over μ
 end
 
 # Fallback for unknown families — use raw residuals
