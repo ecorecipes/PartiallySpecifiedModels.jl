@@ -651,6 +651,40 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
     end
 
     # Build solution
+
+    # Derivative matching loss
+    F_final, n_dyn_fail = eval_rhs_at_smooth(prob, times, y_smooth, beta)
+    deriv_loss = sum((dydt .- F_final).^2)
+
+    # Sentinel accounting at the FITTED parameters. `_dynamics_failure_verdict`
+    # errors on total failure (nothing was fitted) and downgrades a partial
+    # failure to converged=false, reason=:dynamics_failure. Without it, a
+    # measured 31% sentinel substitution on a plain ODE was reported as
+    # converged=true, reason=:objective_tol.
+    #
+    # ORDERING against B7's simulation (deliberate, and load-bearing in ONE
+    # direction only). The two signals are independent and cannot fight over
+    # `reason`: `_dynamics_failure_verdict` is the only thing here that forces
+    # `converged`/`reason`, while the B7 fallback below sets `sim_ok` and
+    # nothing else. They mean different things — `n_dynamics_failures` counts
+    # sentinel substitutions DURING the fit, `simulation_failed` records one
+    # failed post-hoc integration used only for REPORTING — so a failed
+    # simulation must never be laundered into `:dynamics_failure`: gradient
+    # matching legitimately fits models whose trajectory is stiff or divergent.
+    #
+    # But the verdict must run FIRST. It ERRORS when nothing was fitted at all,
+    # and simulating a non-fit before that check emitted a warning promising to
+    # "report the stage-1 smoother" on a call that then threw — measured on the
+    # `allbad!` fixture (an RHS that raises DomainError at every point), where
+    # the spurious warning preceded the real error. Establish that there is a
+    # fit, then report it.
+    conv_converged, conv_reason = _dynamics_failure_verdict(
+        "GradientMatching", n_dyn_fail, T_pts, conv_converged, conv_reason)
+
+    # `fitted_values` is the trajectory the FITTED model produces, in both
+    # branches below. `sim_ok` records whether that trajectory was actually
+    # obtainable; it is reported as `convergence.simulation_failed`.
+    sim_ok = true
     # For discrete models, simulate forward to get actual trajectory predictions
     # (instead of using smoothed states which give misleading data_loss=0)
     if prob.discrete
@@ -675,28 +709,40 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
             pred[:, j] .= sim_states[:, sk]
         end
     else
-        # Continuous: use smoothed states as predictions
-        pred = zeros(T_pts, n_obs)
-        for j in 1:n_obs
-            sk = prob.obs_to_state[j]
-            pred[:, j] .= y_smooth[:, sk]
+        # Continuous: report the trajectory the fitted dynamics actually
+        # produce, integrated from `prob.u0` at the fitted beta — parity with
+        # the discrete branch above (whose comment names this same problem)
+        # and with every other simulating solver.
+        #
+        # Before B7 this read `pred[:, j] .= y_smooth[:, sk]`, which made
+        # `fitted_values` and `data_loss` functions of the DATA ALONE.
+        # Measured on a logistic fixture: `data_loss` was bitwise equal to
+        # `weighted_data_loss(prob, y_smooth)` = 0.096255123727051681, and
+        # two problems differing ONLY in u0 (1.0 vs 4.0), for which gradient
+        # matching returns a bitwise identical beta (||dbeta|| = 0), returned
+        # bitwise identical `fitted_values` and `data_loss` — while their
+        # simulated data losses were 0.162944523148 and 201.599216257, a
+        # factor of 1237.
+        pred = try
+            simulate(prob, beta)
+        catch e
+            _is_program_error(e) && rethrow()
+            sim_ok = false
+            @warn "GradientMatching: integrating the fitted dynamics from u0 " *
+                  "failed ($(sprint(showerror, e))). Reporting the stage-1 " *
+                  "data smoother as `fitted_values`; `data_loss` therefore " *
+                  "measures the SMOOTHER, not the model fit. See " *
+                  "`convergence.simulation_failed`."
+            pr = zeros(T_pts, n_obs)
+            for j in 1:n_obs
+                pr[:, j] .= y_smooth[:, prob.obs_to_state[j]]
+            end
+            pr
         end
     end
 
     # Data loss (against original data, not derivatives)
     data_loss = weighted_data_loss(prob, pred)
-
-    # Derivative matching loss
-    F_final, n_dyn_fail = eval_rhs_at_smooth(prob, times, y_smooth, beta)
-    deriv_loss = sum((dydt .- F_final).^2)
-
-    # Sentinel accounting at the FITTED parameters. `_dynamics_failure_verdict`
-    # errors on total failure (nothing was fitted) and downgrades a partial
-    # failure to converged=false, reason=:dynamics_failure. Without it, a
-    # measured 31% sentinel substitution on a plain ODE was reported as
-    # converged=true, reason=:objective_tol.
-    conv_converged, conv_reason = _dynamics_failure_verdict(
-        "GradientMatching", n_dyn_fail, T_pts, conv_converged, conv_reason)
 
     # Build evaluators
     p_opt = build_param_struct(prob, beta)
@@ -733,5 +779,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
                 Float64.(prob.data_times), uf_evals,
                 (deriv_loss=deriv_loss, method=:gradient_matching,
                  converged=conv_converged, reason=conv_reason,
-                 iterations=conv_iters, n_dynamics_failures=n_dyn_fail))
+                 iterations=conv_iters, n_dynamics_failures=n_dyn_fail,
+                 simulation_failed=!sim_ok))
 end
