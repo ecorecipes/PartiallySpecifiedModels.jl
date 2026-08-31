@@ -242,11 +242,29 @@ function _vi_edf(prob::PSMProblem, mu_opt::Vector{Float64},
     w_gn = if fam isa Gaussian
         [Float64(prob.data_weights[i, j]) / obs_noise_var for (i, j) in keep]
     else
-        # Same μ ≤ 0 regularization (`abs`) and variance floor as
-        # `laml.jl`'s Pearson dispersion, so the two curvatures agree.
-        [Float64(prob.data_weights[i, j]) /
-         max(_variance_function(fam, abs(base[i, j])), 1e-10)
-         for (i, j) in keep]
+        # CALL `irls_weights` rather than re-deriving the weight from
+        # `_variance_function`. The docstring above promises this curvature
+        # "matches `irls_weights` and the LAML/GCV curvature", and the
+        # hand-rolled `w / V(μ̂)` did not, for two families:
+        #
+        #  * TruncatedNormal. `irls_weights` is w·I(μ) with the Fisher
+        #    information I = Var/σ⁴, NOT w/Var. The two differ by k² where
+        #    k = 1 − ξλ(ξ) − λ(ξ)², so the EDF was wrong by that factor
+        #    exactly where the truncation bites.
+        #  * CustomLikelihood. `_variance_function` evaluates the curvature
+        #    at y = μ (an EXPECTED variance); `irls_weights` evaluates it at
+        #    the observed yᵢ, which is what the IRLS loop actually uses.
+        #    Identical whenever the curvature is y-free (any Gaussian-shaped
+        #    kernel), different exactly when it is not.
+        #
+        # Poisson and NegativeBinomial are unchanged for |μ| ≥ 1e-6 (both
+        # forms reduce to w/V); below that `irls_weights` floors μ at 1e-6
+        # where this floored V at 1e-10 — a regime no fit survives anyway,
+        # and agreeing with the IRLS loop is the point.
+        yk = [Float64(prob.data_values[i, j]) for (i, j) in keep]
+        muk = [base[i, j] for (i, j) in keep]
+        wk = [Float64(prob.data_weights[i, j]) for (i, j) in keep]
+        irls_weights(fam, yk, muk, wk)
     end
     all(isfinite, w_gn) || return NaN
     H = J' * Diagonal(w_gn) * J

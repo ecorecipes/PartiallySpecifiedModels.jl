@@ -6872,6 +6872,126 @@ end
         @test hasproperty(sol.convergence, :simulation_failed)
     end
 
+    # ─── C4: EDF curvature parity, and simulated-loss companions ─────
+    @testset "C4: _vi_edf uses the same curvature as irls_weights" begin
+        PSM = PartiallySpecifiedModels
+        using PartiallySpecifiedModels: irls_weights
+        # `_vi_edf` built its Gauss-Newton weight as `w / V(μ̂)` while its own
+        # docstring promised it "matches `irls_weights` and the LAML/GCV
+        # curvature". It did for Poisson/NegBin; it did not for two families.
+        vold(fam, mu, w) = w / max(PSM._variance_function(fam, abs(mu)), 1e-10)
+
+        # TruncatedNormal: irls_weights is w·I(μ) with I = Var/σ⁴, not w/Var.
+        # Measured ratio new/old: 0.132, 0.236, 0.397, 0.786, 0.999 at
+        # ξ = 0, 0.5, 1, 2, 4 — i.e. the EDF was wrong by up to 7.6× where the
+        # bound bites, decaying to a no-op once it stops binding.
+        fam = TruncatedNormal(sigma=1.0, lower=0.0)
+        ratios = Float64[]
+        for xi in (0.0, 0.5, 1.0, 2.0, 4.0)
+            mu = [xi]; y = [xi + 0.3]; w = [1.0]
+            push!(ratios, irls_weights(fam, y, mu, w)[1] / vold(fam, mu[1], w[1]))
+        end
+        @test ratios[1] < 0.2                 # measured 0.132
+        @test ratios[5] > 0.99                # measured 0.999 — no-op limit
+        @test issorted(ratios)                # monotone toward 1
+
+        # Poisson / NegativeBinomial: identical, so those EDFs are untouched.
+        for f in (Poisson(), NegativeBinomial(3.0))
+            mu = [0.5, 2.0, 9.0]; y = [1.0, 2.0, 8.0]; w = ones(3)
+            @test irls_weights(f, y, mu, w) == [vold(f, mu[i], w[i]) for i in 1:3]
+        end
+
+        # CustomLikelihood: `_variance_function` evaluates the curvature at
+        # y = μ (an EXPECTED variance); `irls_weights` uses the observed yᵢ,
+        # which is what the IRLS loop actually does. Identical whenever the
+        # curvature is y-free, different exactly when it is not.
+        mu = [1.0, 2.0]; y = [1.6, 1.4]; w = ones(2)
+        cg = CustomLikelihood((yy, m) -> -0.5 * (yy - m)^2)
+        @test irls_weights(cg, y, mu, w) ≈ [vold(cg, mu[i], w[i]) for i in 1:2]
+        cs = CustomLikelihood((yy, m) -> -(yy - m) - exp(-(yy - m)))
+        @test maximum(irls_weights(cs, y, mu, w) ./
+                      [vold(cs, mu[i], w[i]) for i in 1:2]) > 1.5   # measured 1.82
+
+        # THE discriminator. The assertions above are about the two weight
+        # FORMULAS and would pass whichever one `_vi_edf` actually calls, so
+        # on their own they are decorative. Drive `_vi_edf` itself and pin
+        # which weighting it used, by rebuilding its Gauss-Newton EDF with
+        # the same finite-difference J under both weightings.
+        rng9 = StableRNG(9)
+        ts9 = collect(0.0:0.5:6.0)
+        mu9 = [1.0 + 0.4t for t in ts9]
+        y9 = [max(m + randn(rng9), 0.01) for m in mu9]
+        dyn9!(du, u, p, t) = (du[1] = p.g(u[1]))
+        uf9 = BSplineApproximator(:g, (0.0, 6.0), 5; initial=x -> 0.4)
+        fam9 = TruncatedNormal(sigma=1.0, lower=0.0)
+        prob9 = PSMProblem(dyn9!, [1.0], (0.0, 6.0), [uf9];
+            data_times=ts9, data_values=reshape(y9, :, 1), obs_to_state=[1],
+            known_params=NamedTuple(), likelihood=fam9, solver=Tsit5())
+        np9 = PSM.nparams(uf9)
+        mu_opt9 = PSM.initial_params(uf9)
+        Λ9 = Matrix(1.0I, np9, np9)
+        edf_pkg = PSM._vi_edf(prob9, mu_opt9, Λ9, 1.0, np9)
+
+        keep9 = [(i, 1) for i in eachindex(ts9) if PSM.usable_cell(prob9, i, 1)]
+        base9 = Float64.(PSM.simulate(prob9, mu_opt9))
+        J9 = zeros(length(keep9), np9)
+        for b in 1:np9                     # same FD recipe as `_vi_edf`
+            step = max(1e-6, abs(mu_opt9[b]) * 1e-6)
+            bp = copy(mu_opt9); bp[b] += step
+            pert = Float64.(PSM.simulate(prob9, bp))
+            for (r, (i, j)) in enumerate(keep9)
+                J9[r, b] = (pert[i, j] - base9[i, j]) / step
+            end
+        end
+        wv9 = [Float64(prob9.data_weights[i, j]) for (i, j) in keep9]
+        yv9 = [Float64(prob9.data_values[i, j]) for (i, j) in keep9]
+        mv9 = [base9[i, j] for (i, j) in keep9]
+        w_new9 = irls_weights(fam9, yv9, mv9, wv9)
+        w_old9 = [wv9[k] / max(PSM._variance_function(fam9, abs(mv9[k])), 1e-10)
+                  for k in eachindex(wv9)]
+        edf_of(W) = (H = J9' * Diagonal(W) * J9;
+                     clamp(tr((H .+ Λ9) \ H), 0.0, Float64(np9)))
+        # Measured: _vi_edf 1.90783747 == new-weight 1.90783747, versus
+        # old-weight 1.94493811 (1.9% away, 19× outside the rtol below).
+        @test edf_pkg ≈ edf_of(w_new9) rtol = 1e-12
+        @test !isapprox(edf_pkg, edf_of(w_old9); rtol = 1e-3)
+    end
+
+    @testset "C4: state-estimating solvers report a simulated loss" begin
+        # CollocationLAML, ODIN and RKHS report an ESTIMATED STATE as
+        # `fitted_values`, so `data_loss` measures the state's fit, not the
+        # model's. B7's fix (substituting a simulation) is deliberately NOT
+        # applied: in generalized profiling the state IS the estimand. The
+        # simulated loss is reported alongside instead.
+        rng = StableRNG(5)
+        ts = collect(0.0:0.5:10.0)
+        mu = [2.0 + 6.0 * exp(-((t - 5.0)^2) / 6.0) for t in ts]
+        y = mu .+ 0.2 .* randn(rng, length(ts))
+        # Humped data, but `du = -exp(r(u))` is strictly negative: no
+        # trajectory can rise, so the RHS is genuinely infeasible. (A free
+        # spline makes most "wrong" RHSs equally expressive — du=r(u) and
+        # du=r(u)*u fit alike — so infeasibility, not misspecification, is
+        # what exposes the gap.)
+        dyn!(du, u, p, t) = (du[1] = -exp(p.r(u[1])))
+        uf = BSplineApproximator(:r, (0.0, 12.0), 8)
+        prob = PSMProblem(dyn!, [y[1]], (0.0, 10.0), [uf];
+            data_times=ts, data_values=reshape(y, :, 1), obs_to_state=[1],
+            known_params=NamedTuple(), solver=Tsit5())
+        # Measured ratios: CollocationLAML 2.27×, ODIN 15.74×, RKHS 44.9×.
+        # Gate at 1.5 — 1.5× headroom on the tightest of the three.
+        for alg in (CollocationLAML(maxiters=40, verbose=false),
+                    ODINSolver(maxiters=40, verbose=false),
+                    RKHSSolver(maxiters=40, verbose=false))
+            sol = solve(prob, alg)
+            @test hasproperty(sol.convergence, :simulated_data_loss)
+            @test hasproperty(sol.convergence, :simulation_failed)
+            sl = sol.convergence.simulated_data_loss
+            @test sol.convergence.simulation_failed == false
+            @test isfinite(sl)
+            @test sl / sol.data_loss > 1.5
+        end
+    end
+
     @testset "B7: GradientMatching's discrete branch is unchanged" begin
         # Regression guard. The discrete branch ALREADY simulated (its own
         # comment names the same defect), so B7 must not perturb it.
