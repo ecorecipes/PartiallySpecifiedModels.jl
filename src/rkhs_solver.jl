@@ -435,10 +435,31 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
 
     edf = Float64(n_beta)   # number of θ parameters (trajectory dof excluded)
 
+    # `fitted_values` above are the ESTIMATED STATE, not a simulation of the
+    # fitted dynamics, so `data_loss` measures the STATE's fit. Report the
+    # simulated loss alongside it so the gap cannot hide — see
+    # `_simulated_companion` for why this is reported rather than substituted.
+    sim_loss, sim_failed, sim_ratio = _simulated_companion(prob, beta, data_loss)
+    if sim_failed
+        @warn "RKHSSolver: `fitted_values` are the estimated state, and " *
+              "integrating the FITTED dynamics from u0 failed outright, so " *
+              "`data_loss` ($(round(data_loss, sigdigits=5))) says nothing " *
+              "about how the model itself fits. See " *
+              "`convergence.simulated_data_loss`."
+    elseif isfinite(sim_ratio) && sim_ratio > 10
+        @warn "RKHSSolver: simulating the fitted dynamics gives a data loss " *
+              "$(round(sim_ratio, sigdigits=4))× the reported " *
+              "`data_loss`. `fitted_values` are the estimated STATE, which " *
+              "need not lie near any trajectory the dynamics admit, so the " *
+              "reported loss understates the model's error by that factor. " *
+              "See `convergence.simulated_data_loss`."
+    end
     PSMSolution(params, J_final, data_loss, edf, Float64[λ, ρ],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (converged=converged, iterations=final_iter,
+                (simulated_data_loss=sim_loss,
+                 simulation_failed=sim_failed,
+                 converged=converged, iterations=final_iter,
                  reason=conv_reason_rkhs, method=:rkhs,
                  n_dynamics_failures=n_dyn_fail,
                  kernel=alg.kernel, lengthscale=ℓ))

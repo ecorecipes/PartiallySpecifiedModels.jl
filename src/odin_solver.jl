@@ -337,10 +337,31 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
 
     edf = Float64(n_beta)
 
+    # `fitted_values` above are the ESTIMATED STATE, not a simulation of the
+    # fitted dynamics, so `data_loss` measures the STATE's fit. Report the
+    # simulated loss alongside it so the gap cannot hide — see
+    # `_simulated_companion` for why this is reported rather than substituted.
+    sim_loss, sim_failed, sim_ratio = _simulated_companion(prob, beta, data_loss)
+    if sim_failed
+        @warn "ODINSolver: `fitted_values` are the estimated state, and " *
+              "integrating the FITTED dynamics from u0 failed outright, so " *
+              "`data_loss` ($(round(data_loss, sigdigits=5))) says nothing " *
+              "about how the model itself fits. See " *
+              "`convergence.simulated_data_loss`."
+    elseif isfinite(sim_ratio) && sim_ratio > 10
+        @warn "ODINSolver: simulating the fitted dynamics gives a data loss " *
+              "$(round(sim_ratio, sigdigits=4))× the reported " *
+              "`data_loss`. `fitted_values` are the estimated STATE, which " *
+              "need not lie near any trajectory the dynamics admit, so the " *
+              "reported loss understates the model's error by that factor. " *
+              "See `convergence.simulated_data_loss`."
+    end
     PSMSolution(params, best_loss, data_loss, edf, Float64[ode_weight],
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (converged=conv_converged, iterations=conv_iters,
+                (simulated_data_loss=sim_loss,
+                 simulation_failed=sim_failed,
+                 converged=conv_converged, iterations=conv_iters,
                  reason=conv_reason, method=:odin,
                  n_dynamics_failures=n_dyn_fail,
                  gp_hyperparams=[hyper[k] for k in 1:n_vars]))

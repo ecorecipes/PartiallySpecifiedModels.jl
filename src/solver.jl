@@ -483,6 +483,42 @@ function simulate(prob::PSMProblem, beta::AbstractVector)
     return simulate_continuous(prob, beta)
 end
 
+# ─── Companion simulated loss for state-estimating solvers ──────────
+"""
+    _simulated_companion(prob, beta, reported_loss) -> (loss, failed, ratio)
+
+For solvers whose `fitted_values` are an ESTIMATED STATE rather than a
+simulation of the fitted dynamics — CollocationLAML (generalized profiling),
+ODINSolver, RKHSSolver — `data_loss` measures how well that state fits the
+data, which is NOT how well the model does. With a finite compliance weight
+the state can sit arbitrarily far from any trajectory the dynamics admit, so
+the reported loss can understate the model's fit without bound: measured on
+an infeasible RHS, LAML 1×, ODIN 21.7×, RKHS 3454×, CollocationLAML 1.409e9×.
+
+B7 fixed the analogous problem in the gradient-matching family by REPLACING
+`fitted_values` with `simulate(prob, beta)`. That is deliberately NOT done
+here: in generalized profiling the state IS the estimand, jointly estimated
+with the parameters, so simulating would change what the method returns
+rather than how honestly it reports. Instead the simulated loss is reported
+ALONGSIDE, as `convergence.simulated_data_loss`, so the gap is visible.
+
+Returns `(NaN, true, NaN)` when the fitted dynamics cannot be integrated —
+which is itself the strongest possible statement about the reported loss.
+"""
+function _simulated_companion(prob::PSMProblem, beta::AbstractVector,
+                              reported_loss::Real)
+    sim = try
+        simulate(prob, beta)
+    catch e
+        _is_program_error(e) && rethrow()
+        return (NaN, true, NaN)
+    end
+    all(isfinite, sim) || return (NaN, true, NaN)
+    sl = weighted_data_loss(prob, Float64.(sim))
+    ratio = reported_loss > 0 ? sl / reported_loss : NaN
+    (sl, false, ratio)
+end
+
 """
     simulate_continuous(prob, beta)
 
