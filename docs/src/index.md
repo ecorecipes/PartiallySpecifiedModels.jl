@@ -22,7 +22,7 @@ using Pkg
 Pkg.add(url="https://github.com/ecorecipes/PartiallySpecifiedModels.jl")
 ```
 
-Requires Julia ≥ 1.10.
+Requires Julia ≥ 1.12.
 
 ## Quick Start
 
