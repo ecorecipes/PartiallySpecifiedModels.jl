@@ -6,6 +6,10 @@ using MCMCChains
 using Random
 using OrdinaryDiffEq
 using StableRNGs
+# Top level, not inside the testset that uses it: `Symbolics.@variables` is a
+# MACRO, so the name must be bound at macro-expansion time, which happens
+# before any in-block `using` would run.
+using Symbolics
 
 # ─── Custom approximator for the "approximator extension protocol" testset ──
 # Struct and method definitions must live at top level; the tests themselves
@@ -12456,6 +12460,82 @@ end
                                     ftrue_d4.(grid_d4)) / length(grid_d4))
         @test rmse_d4(sol_d4s) ≈ 0.034201 rtol = 1e-3
         @test rmse_d4(sol_d4b) ≈ 0.034201 rtol = 1e-3
+    end
+
+    # ─── Gradient checks: Symbolics vs ForwardDiff vs finite differences ──
+    # The suite had 25 ForwardDiff-vs-finite-difference checks and NO
+    # symbolic leg. FD and AD can agree while both being wrong about what the
+    # code is supposed to compute; an independent symbolic derivation is the
+    # third opinion. Symbolics traces the package's OWN evaluators here — it
+    # is not a re-derivation of what they ought to do.
+    @testset "gradient checks: Symbolics vs ForwardDiff vs finite differences" begin
+        PSM = PartiallySpecifiedModels
+        # ForwardDiff reached through PSM: it is a package dep, not a test
+        # dep, and the suite's only `using ForwardDiff` sits inside an
+        # unrelated testset ~6000 lines up, so relying on that leaking here
+        # would make this testset order-dependent.
+        FD = PSM.ForwardDiff
+
+        # (a) B-spline evaluator. Linear in β, so ∂f/∂βⱼ is the j-th basis
+        # function at x — but nothing in the test assumes that; the symbolic
+        # gradient is taken of the ACTUAL `build_evaluator` closure.
+        # Measured: max|sym − ad| = 0.0 exactly, max|sym − fd| = 6.50e-11.
+        a_sym = BSplineApproximator(:f, (0.0, 5.0), 6)
+        np_sym = PSM.nparams(a_sym)
+        Symbolics.@variables bsym[1:6]
+        bv = collect(bsym)
+        bnum = [0.3, -0.2, 0.8, 1.1, -0.4, 0.6]
+        fsym = PSM.build_evaluator(a_sym, bv)(1.7)
+        gsym_e = [Symbolics.derivative(fsym, bv[j]) for j in 1:np_sym]
+        gfun = Symbolics.build_function(gsym_e, bv; expression=Val(false))[1]
+        g_sym = gfun(bnum)
+        g_ad = FD.gradient(bb -> PSM.build_evaluator(a_sym, bb)(1.7), bnum)
+        h_s = 1e-6
+        g_fd = [(PSM.build_evaluator(a_sym, bnum .+ h_s .* (1:np_sym .== j))(1.7) -
+                 PSM.build_evaluator(a_sym, bnum .- h_s .* (1:np_sym .== j))(1.7)) / (2h_s)
+                for j in 1:np_sym]
+        @test maximum(abs.(g_sym .- g_ad)) < 1e-12     # measured 0.0
+        @test maximum(abs.(g_sym .- g_fd)) < 1e-8      # measured 6.50e-11
+
+        # (b) the SPDE evaluator, same three-way check. Measured
+        # max|sym − ad| = 8.67e-19.
+        a_spde = SPDEApproximator(:f, (0.0, 5.0), 6)
+        np_sp = PSM.nparams(a_spde)
+        bsp = [0.3 * sin(1.7j) + 0.1j for j in 1:np_sp]
+        Symbolics.@variables bs2[1:20]
+        bv2 = collect(bs2)[1:np_sp]
+        fsp = PSM.build_evaluator(a_spde, bv2)(1.7)
+        gsp = [Symbolics.derivative(fsp, bv2[j]) for j in 1:np_sp]
+        gspf = Symbolics.build_function(gsp, bv2; expression=Val(false))[1]
+        @test maximum(abs.(gspf(bsp) .-
+              FD.gradient(bb -> PSM.build_evaluator(a_spde, bb)(1.7), bsp))) < 1e-12
+
+        # NOT COVERED, and deliberately so: the shape-constrained evaluators.
+        # SCOP's constraint logic branches on the sign of a coefficient, so
+        # tracing it symbolically raises `TypeError: non-boolean (Num) used in
+        # boolean context`. That is a property of the reparameterisation, not
+        # a defect; those paths keep their FD-vs-AD coverage elsewhere.
+
+        # (c) the identity `laml_gradient` is built on:
+        #        d/dρ log det(A + e^ρ S) = e^ρ · tr((A + e^ρ S)⁻¹ S)
+        # checked four ways — symbolic, AD, central FD, and the closed form
+        # the solver actually evaluates. Measured agreement to 10 d.p. at
+        # every ρ below.
+        Symbolics.@variables rho_s
+        A_s = [4.0 1.0 0.3; 1.0 3.0 0.5; 0.3 0.5 2.5]
+        S_s = [2.0 -1.0 0.0; -1.0 2.0 -1.0; 0.0 -1.0 1.0]
+        dsym = Symbolics.derivative(log(Symbolics.det(A_s .+ exp(rho_s) .* S_s)), rho_s)
+        dfun = Symbolics.build_function(dsym, rho_s; expression=Val(false))
+        for r0 in (-1.5, 0.0, 2.0)
+            f_ld(r) = log(det(A_s .+ exp(r) .* S_s))
+            v_sym = dfun(r0)
+            v_ad = FD.derivative(f_ld, r0)
+            v_fd = (f_ld(r0 + 1e-6) - f_ld(r0 - 1e-6)) / 2e-6
+            v_cf = exp(r0) * tr((A_s .+ exp(r0) .* S_s) \ S_s)
+            @test v_sym ≈ v_ad rtol = 1e-12
+            @test v_sym ≈ v_cf rtol = 1e-12      # the form the solver uses
+            @test v_sym ≈ v_fd rtol = 1e-6       # central FD, h = 1e-6
+        end
     end
 
 end
