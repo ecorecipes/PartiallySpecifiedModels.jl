@@ -1961,6 +1961,39 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         abs(theta[l] - theta_init[l]) >
             1e-10 * max(abs(theta_init[l]), 1e-300) for l in 1:m)
 
+    # SAY SO OUT LOUD. A solve that finishes with smooth terms present but
+    # λ̂ still sitting on its 1/tr(S) initialization has not done smoothing
+    # selection at all, and everything downstream that depends on λ̂ — the
+    # EDF, the posterior covariance `V_beta`, the intervals built from it —
+    # describes a model nobody chose. Until now that was visible only to a
+    # caller who went looking for `convergence.smoothing_advanced`.
+    #
+    # This is not hypothetical and it is not rare. On the package's own F6
+    # fixture under the DEFAULT `jac=:fd`, k = 8 knots lands here while
+    # k = 6, 7, 9, 10 do not: measured edf 4.074 against the correct 2.000
+    # and a sup error of 3.39e-3 against 1.31e-4 — 26x worse — on a problem
+    # whose truth lies in the penalty null space. Which knot counts trip is
+    # platform-dependent (macOS CI trips k = 8; this machine trips k = 8 too
+    # under --check-bounds=yes, and k = 9 without it), because the mechanism
+    # is Fellner-Schall proposals being rejected when the finite-difference
+    # Jacobian is noisy. Under `jac=:forwarddiff` every k in 6:12 succeeds.
+    #
+    # `:forwarddiff` is NOT recommended unconditionally in the message: it is
+    # ~2.5x faster than `:fd` at 8 parameters but ~25x SLOWER at 12 (measured
+    # 3.86 s vs 0.152 s), so it is the right escape hatch for a fit that has
+    # actually hit this, not a blanket default.
+    if m > 0 && !smoothing_advanced
+        @warn "LAML: smoothing selection never moved λ̂ off its " *
+              "initialization, so the reported λ̂, EDF and posterior " *
+              "covariance describe the INITIAL smoothing, not a selected " *
+              "one. Every Fellner–Schall proposal was rejected (or the " *
+              "iteration budget was spent before any ran). This happens " *
+              "when the working-model Jacobian is too noisy for the " *
+              "proposals to be accepted; try `jac=:forwarddiff`, more " *
+              "`maxiters`, or a different knot count. See " *
+              "`convergence.smoothing_advanced`." maxlog=1
+    end
+
     convergence_info = (V_beta=V_beta, sigma2=sigma2_hat,
                         converged=conv_converged, iterations=conv_iters,
                         reason=conv_reason, laml_failures=laml_failures,
