@@ -2589,8 +2589,10 @@ end
                  prior_scale=1.0, obs_sigma=nothing, sample_smoothing=false,
                  rng_seed=nothing, verbose=false)
 
-Full Bayesian inference via Hamiltonian Monte Carlo (NUTS).
-Uses LogDensityProblems.jl + AdvancedHMC.jl.
+Full Bayesian inference via Hamiltonian Monte Carlo, using the No-U-Turn
+Sampler (NUTS; Hoffman & Gelman 2014) with dual-averaging step-size
+adaptation, on the Hamiltonian dynamics of Neal (2011).
+Implemented over LogDensityProblems.jl + AdvancedHMC.jl.
 
 # Arguments
 - `n_samples`: number of posterior samples per chain (after warmup)

@@ -1,6 +1,6 @@
 # Vignettes
 
-The `vignettes/` directory contains 35 worked examples covering every solver, approximator, and likelihood type. Each vignette is a self-contained [Quarto](https://quarto.org/) document with rendered markdown available on GitHub.
+The `vignettes/` directory contains 40 worked examples covering every solver, approximator, and likelihood type. Each vignette is a self-contained [Quarto](https://quarto.org/) document with rendered markdown available on GitHub.
 
 ## Getting Started
 
@@ -53,6 +53,11 @@ The `vignettes/` directory contains 35 worked examples covering every solver, ap
 | 33 | [Ensemble Kalman](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/33_ensemble_kalman/33_ensemble_kalman.md) | Derivative-free estimation via ensemble Kalman inversion |
 | 34 | [ODIN](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/34_odin/34_odin.md) | ODE-informed Gaussian process regression |
 | 35 | [RKHS](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/35_rkhs/35_rkhs.md) | Reproducing kernel Hilbert space estimation |
+| 36 | [Tensor Smooths](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/36_tensor_smooths/36_tensor_smooths.md) | Bivariate interaction surfaces with `TensorBSplineApproximator` — predator interference |
+| 37 | [Single-Index](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/37_single_index/37_single_index.md) | Rank-1 multivariate responses with `SingleIndexApproximator`, and when the direction is identifiable |
+| 38 | [Transformed Covariates](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/38_transformed_covariates/38_transformed_covariates.md) | Lagged environmental drivers with `TransformedCovariateApproximator` |
+| 39 | [Shape-Constrained GP](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/39_shape_constrained_gp/39_shape_constrained_gp.md) | Monotone Gaussian processes with `ShapeConstrainedGPApproximator`, audited with `check_constraints` |
+| 40 | [FGPGM](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/40_fgpgm/40_fgpgm.md) | Bayesian gradient matching with `FGPGMSolver` (Wenk et al. 2019) |
 
 ## Uncertainty Quantification
 

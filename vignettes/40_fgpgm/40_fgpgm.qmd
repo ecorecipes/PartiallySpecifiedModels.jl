@@ -1,0 +1,117 @@
+---
+title: "Fast Gaussian Process Gradient Matching"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+`FGPGMSolver` implements **Fast Gaussian Process Gradient Matching** (Wenk et
+al. 2019). Like the other gradient-matching methods in this package it avoids
+integrating the ODE inside the fitting loop; unlike them it is **Bayesian**,
+sampling the joint posterior of the states and the unknown-function
+coefficients rather than optimizing a point estimate.
+
+The idea is a *product of experts*. A Gaussian process over the states gives
+one opinion about the derivative at each time; the model's right-hand side
+gives another; FGPGM multiplies the two densities and samples from the result.
+The parameter $\gamma$ controls how strictly the two must agree.
+
+The practical consequences are worth knowing before you reach for it:
+
+- It returns a **posterior**, so you get uncertainty without a bootstrap.
+- It is a **fixed-budget sampler**: it always reports
+  `converged = false` with `reason = :maxiters`, because a sampler has no
+  stopping criterion to satisfy. That is honest reporting, not a failure —
+  judge it by R̂ and ESS of `convergence.chains`, and by the acceptance rates.
+- It is **ODE-only**: DDE problems are rejected with an error.
+
+```{julia}
+using PartiallySpecifiedModels
+using OrdinaryDiffEq
+using Plots; default(fmt=:png)
+using Random
+Random.seed!(5)
+```
+
+## Logistic growth with an unknown per-capita rate
+
+```{julia}
+r_true(N) = 0.55 * (1 - N / 7.0)
+f_true!(du, u, p, t) = (du[1] = r_true(u[1]) * u[1])
+
+st = solve(ODEProblem(f_true!, [0.7], (0.0, 25.0)), Tsit5(); saveat=1.0)
+ts = collect(st.t)
+Y  = reshape([st(t)[1] for t in ts] .+ 0.06 .* randn(length(ts)), :, 1)
+scatter(ts, Y[:,1], label="observations", ms=4, xlabel="time", ylabel="N(t)")
+plot!(ts, [st(t)[1] for t in ts], lw=2, label="truth")
+```
+
+## Sampling
+
+```{julia}
+dyn!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+prob = PSMProblem(dyn!, [0.7], (0.0, 25.0),
+    [BSplineApproximator(:r, (0.0, 8.0), 6; initial = x -> 0.3)];
+    data_times=ts, data_values=Y, obs_to_state=[1],
+    known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+
+sol = solve(prob, FGPGMSolver(n_samples=400, n_warmup=200, rng_seed=2))
+(; data_loss = sol.data_loss,
+   converged = sol.convergence.converged,
+   reason    = sol.convergence.reason,
+   iterations = sol.convergence.iterations)
+```
+
+`converged = false` with `reason = :maxiters` is the expected and correct
+output. Read it as "the budget was spent", not "the fit failed" — and then go
+and look at the diagnostics that *do* carry information:
+
+```{julia}
+keys(sol.convergence)
+```
+
+## Recovered growth rate
+
+```{julia}
+gx = collect(range(0.7, 6.5, length=60))
+rhat = sol.unknown_functions[:r]
+plot(gx, r_true.(gx), lw=3, ls=:dash, c=:black, label="truth")
+plot!(gx, rhat.(gx), lw=2, label="FGPGM posterior mean")
+xlabel!("density N"); ylabel!("per-capita growth r(N)")
+```
+
+```{julia}
+(; max_abs_error = maximum(abs.(rhat.(gx) .- r_true.(gx))))
+```
+
+## Where FGPGM sits among the integration-free methods
+
+| Solver | Style | Returns | Cost |
+|---|---|---|---|
+| `GradientMatching` | penalized least squares on derivatives | point estimate | cheapest |
+| `TwoStageSolver` | smooth, then match | point estimate | cheap |
+| `AdaptiveGradientMatching` | GP + MCMC over states and parameters | posterior | expensive |
+| `FGPGMSolver` | GP product-of-experts, MCMC | posterior | expensive |
+
+Reach for FGPGM when you want gradient matching's avoidance of the ODE solve
+*and* honest uncertainty, and can afford a sampler. If a point estimate will
+do, `GradientMatching` or `TwoStageSolver` will get there far faster — see the
+gradient-matching vignette for those.
+
+## References
+
+- Wenk, P., Gotovos, A., Bauer, S., Gorbach, N., Krause, A. & Buhmann, J.M.
+  (2019). Fast Gaussian process based gradient matching for parameter
+  identification in systems of nonlinear ODEs. *AISTATS* 89:1351–1360.

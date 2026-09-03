@@ -1,6 +1,6 @@
 # Alternative Approximators: Neural Networks and Gaussian Processes
 Simon Frost
-2026-06-12
+2026-09-01
 
 - [Overview](#overview)
   - [When to use each](#when-to-use-each)
@@ -12,6 +12,8 @@ Simon Frost
   Approximator](#approach-2-gaussian-process-approximator)
 - [Approach 3: Neural Network
   Approximator](#approach-3-neural-network-approximator)
+- [Approach 3b: Multiple Shooting — and when it does not
+  help](#approach-3b-multiple-shooting--and-when-it-does-not-help)
 - [Approach 4: Neural Network with Gradient
   Matching](#approach-4-neural-network-with-gradient-matching)
 - [Comparison](#comparison)
@@ -100,7 +102,7 @@ end
 The B-spline models $\beta(I)$ as a smooth function of the infected
 count, with automatic smoothing via LAML:
 
-    B-Spline — SS: 1784.0, EDF: 3.86
+    B-Spline — SS: 1789.0, EDF: 2.67
 
 ## Approach 2: Gaussian Process Approximator
 
@@ -109,7 +111,7 @@ at inducing points. Different kernel functions control the smoothness of
 the interpolation, while LAML uses a spline-based penalty for automatic
 smoothing parameter selection:
 
-    GP (SqExp) — SS: 1805.0, EDF: 2.0
+    GP (SqExp) — SS: 1789.0, EDF: 2.65
 
 We can also try different kernel functions. The **Matérn 3/2** kernel
 produces rougher functions (once differentiable) while the **Matérn
@@ -117,8 +119,8 @@ produces rougher functions (once differentiable) while the **Matérn
 between inducing points — a squared exponential gives infinitely smooth
 interpolation while Matérn kernels allow more local variation:
 
-    GP (Matérn 3/2) — SS: 1747.0, EDF: 8.47
-    GP (Matérn 5/2) — SS: 1792.0, EDF: 2.58
+    GP (Matérn 3/2) — SS: 1790.0, EDF: 2.62
+    GP (Matérn 5/2) — SS: 1790.0, EDF: 2.66
 
 ## Approach 3: Neural Network Approximator
 
@@ -147,10 +149,241 @@ optimization:
 > weights. This is equivalent to the **Universal Differential Equation
 > (UDE)** approach.
 
+## Approach 3b: Multiple Shooting — and when it does not help
+
+This vignette has long recommended `MultipleShootingSolver` alongside
+`AdamSolver` for neural approximators. Demonstrating it turns out to
+qualify that advice, so the demonstration is worth more than the
+recommendation was.
+
+Single shooting — what `AdamSolver` does — integrates the whole
+trajectory from `u0` and compares the result to the data. Over a long
+window with a nonlinear right-hand side that map is badly conditioned.
+**Multiple shooting** cuts the window into `n_intervals` segments, gives
+each its own starting state, and penalizes the mismatch at the joins,
+tightening the penalty from `rho_init` toward `rho_max` over
+`maxiters_outer` rounds.
+
+``` julia
+sol_ms = solve(prob_neural,
+               MultipleShootingSolver(n_intervals=5, maxiters_inner=150,
+                                      maxiters_outer=12, verbose=false))
+(; data_loss = sol_ms.data_loss, converged = sol_ms.convergence.converged)
+```
+
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: Verbosity toggle: max_iters 
+    │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
+    └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+
+    (data_loss = 4.493517881252076e6, converged = true)
+
+Compare that with `AdamSolver` on the identical problem (`sol_neural`,
+above):
+
+``` julia
+(; multiple_shooting = sol_ms.data_loss, adam = sol_neural.data_loss)
+```
+
+    (multiple_shooting = 4.493517881252076e6, adam = 1785.6700108237208)
+
+Multiple shooting is far worse here, and the reason is visible in the
+recovered function:
+
+``` julia
+beta_ms = sol_ms.unknown_functions[:β]
+ms_grid = range(0.1, I_domain[2], length=200)
+plot(ms_grid, β_true.(ms_grid), lw=3, ls=:dash, c=:black, label="truth")
+plot!(ms_grid, beta_ms.(ms_grid), lw=2, label="MultipleShootingSolver")
+plot!(ms_grid, sol_neural.unknown_functions[:β].(ms_grid), lw=2,
+      label="AdamSolver")
+xlabel!("infectious I"); ylabel!("transmission β(I)")
+```
+
+![](05_neural_networks_files/figure-commonmark/cell-11-output-1.svg)
+
+The multiple-shooting curve is essentially flat: the network has not
+moved far from its initialization, which is why the loss above is orders
+of magnitude worse than `AdamSolver`’s on identical data.
+
+Lengthening or shortening the segments does not rescue it. A separate
+sweep over this same model form with `n_intervals` of 5, 10 and 20
+returned *identical* results at every setting — the same `data_loss` and
+the same sup error of 0.4998 against $\beta_0 = 0.5$, i.e. a fitted
+$\beta \approx 0$, while `AdamSolver` on that run reached a sup error of
+0.003. Identical output across segment counts is the signature of an
+optimizer that is not progressing, rather than of segments that are too
+long — which is what distinguishes this from a tuning problem.
+
+Note also that `convergence.converged` is `true`. As elsewhere in this
+package, that flag is a **stability** test — the iteration stopped
+changing — and not a verdict on fit quality. Always read it next to
+`data_loss`.
+
+> [!WARNING]
+>
+> ### Read the recommendation conditionally
+>
+> `MultipleShootingSolver` is genuinely useful where single shooting is
+> badly conditioned — long windows, stiff dynamics, trajectories
+> sensitive to early parameter changes — and it fits neural
+> approximators well on simpler systems (on a one-state logistic problem
+> it reaches a sup error of 0.011). It is **not** a drop-in improvement
+> on `AdamSolver`, and on this two-state SIR problem with widely
+> differing state scales ($S \sim 10^3$, $I \sim 10^1$) it does not fit
+> at all. Try it, compare `data_loss` against `AdamSolver`, and keep
+> whichever wins on your problem.
+
 ## Approach 4: Neural Network with Gradient Matching
 
-**Gradient matching** (Bonnaffé & Coulson 2023) avoids ODE
-integration entirely, making the optimization landscape much simpler:
+**Gradient matching** (Bonnaffé & Coulson 2023) avoids ODE integration
+entirely, making the optimization landscape much simpler:
 
 1.  **Smooth** the observed data with cubic splines to get $\hat{y}(t)$
     and $d\hat{y}/dt$
@@ -161,8 +394,6 @@ Pure gradient matching can struggle at low $I$ where $dI/dt \approx 0$
 provides little signal for $\beta(I)$. The `refine_iters` option adds
 ODE shooting refinement after GM, using the GM solution as a warm start:
 
-    ┌ Warning: Mixed-Precision `matmul_cpu_fallback!` detected and Octavian.jl cannot be used for this set of inputs (C [Matrix{Float64}]: A [Base.ReshapedArray{Float64, 2, SubArray{Float64, 1, Vector{Float64}, Tuple{UnitRange{Int64}}, true}, Tuple{}}] x B [Matrix{Float32}]). Falling back to generic implementation. This may be slow.
-    └ @ LuxLib.Impl ~/.julia/packages/LuxLib/ZJ3gh/src/impl/matmul.jl:194
     Neural (GM+refine) — deriv_SS: 11530.0, EDF: 25.0
 
 ## Comparison
@@ -190,7 +421,7 @@ end
 p1
 ```
 
-![](05_neural_networks_files/figure-commonmark/cell-10-output-1.svg)
+![](05_neural_networks_files/figure-commonmark/cell-13-output-1.svg)
 
 ### Recovered $\beta(I)$
 
@@ -225,10 +456,7 @@ end
 p2
 ```
 
-    ┌ Warning: Mixed-Precision `matmul_cpu_fallback!` detected and Octavian.jl cannot be used for this set of inputs (C [Matrix{Float64}]: A [Base.ReshapedArray{Float64, 2, SubArray{Float64, 1, Vector{Float64}, Tuple{UnitRange{Int64}}, true}, Tuple{}}] x B [Matrix{Float32}]). Falling back to generic implementation. This may be slow.
-    └ @ LuxLib.Impl ~/.julia/packages/LuxLib/ZJ3gh/src/impl/matmul.jl:194
-
-![](05_neural_networks_files/figure-commonmark/cell-11-output-2.svg)
+![](05_neural_networks_files/figure-commonmark/cell-14-output-1.svg)
 
 ### Kernel Comparison (GP)
 
@@ -245,7 +473,7 @@ end
 p3
 ```
 
-![](05_neural_networks_files/figure-commonmark/cell-12-output-1.svg)
+![](05_neural_networks_files/figure-commonmark/cell-15-output-1.svg)
 
 ## How Each Approximator Works
 
@@ -289,9 +517,9 @@ considerations:
 
 - **Input normalization** (`domain` argument) is essential for stable
   optimization
-- **Use `AdamSolver`** (or `MultipleShootingSolver`), not `LAML` — the
-  IRLS linearization used by LAML is fundamentally incompatible with the
-  highly nonlinear weight→trajectory mapping of neural networks
+- **Use `AdamSolver`**, not `LAML` — the IRLS linearization used by LAML
+  is fundamentally incompatible with the highly nonlinear
+  weight→trajectory mapping of neural networks
 - The `AdamSolver` uses ForwardDiff through the ODE solver (the UDE
   approach), correctly computing gradients w.r.t. network weights
 - No LAML smoothing parameter (no penalty matrix) — the network
@@ -333,9 +561,9 @@ plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
 plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 ```
 
-![](05_neural_networks_files/figure-commonmark/cell-13-output-1.svg)
+![](05_neural_networks_files/figure-commonmark/cell-16-output-1.svg)
 
-    Durbin-Watson: 2.103, 1.642
+    Durbin-Watson: 2.099, 1.627
 
 > [!TIP]
 >
@@ -353,20 +581,18 @@ interpretable than raw SS values which depend on data scale.
 
     Method                    SS         EDF    cor(β)   β(1)   β(50)
     ------------------------------------------------------------------------
-    B-Spline (10 knots)       1784.0     3.9    0.999    0.497   0.39
-    GP — SqExp (10 pts)       1805.0     2.0    0.994    0.494   0.391
-    GP — Matérn 3/2           1747.0     8.5    0.947    0.468   0.403
-    GP — Matérn 5/2           1792.0     2.6    0.999    0.495   0.391
+    B-Spline (10 knots)       1789.0     2.7    1.0      0.496   0.391
+    GP — SqExp (10 pts)       1789.0     2.7    1.0      0.496   0.391
+    GP — Matérn 3/2           1790.0     2.6    1.0      0.496   0.391
+    GP — Matérn 5/2           1790.0     2.7    1.0      0.496   0.391
     Neural Adam (25)          1786.0     25.0   1.0      0.498   0.389
-    ┌ Warning: Mixed-Precision `matmul_cpu_fallback!` detected and Octavian.jl cannot be used for this set of inputs (C [Matrix{Float64}]: A [Base.ReshapedArray{Float64, 2, SubArray{Float64, 1, Vector{Float64}, Tuple{UnitRange{Int64}}, true}, Tuple{}}] x B [Matrix{Float32}]). Falling back to generic implementation. This may be slow.
-    └ @ LuxLib.Impl ~/.julia/packages/LuxLib/ZJ3gh/src/impl/matmul.jl:194
-    Neural GM+refine (25)     1729.0     25.0   0.901    0.545   0.37
+    Neural GM+refine (25)     4042.0     25.0   0.901    0.545   0.37
     True                      -          -      1.0      0.498   0.389
 
 | Feature | B-Spline | Gaussian Process | Neural Network |
 |----|----|----|----|
 | Smoothing penalty | $\int (f'')^2\,dx$ | $\int (f'')^2\,dx$ (spline-based) | None (architecture-implicit) |
-| Recommended solver | `LAML` | `LAML` | `AdamSolver` or `MultipleShootingSolver` |
+| Recommended solver | `LAML` | `LAML` | `AdamSolver` (see Approach 3b on multiple shooting) |
 | LAML smoothing | ✓ Automatic | ✓ Automatic | ✗ Use Adam (ForwardDiff through ODE) |
 | Parameters | nknots (e.g., 10) | n_inducing (e.g., 10) | Arch-dependent (e.g., 25) |
 | Input dimension | 1D | 1D | Any |

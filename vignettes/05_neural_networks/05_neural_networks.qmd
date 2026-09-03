@@ -218,6 +218,77 @@ handling the nonlinear dependence on network weights. This is equivalent to the
 **Universal Differential Equation (UDE)** approach.
 :::
 
+## Approach 3b: Multiple Shooting — and when it does not help
+
+This vignette has long recommended `MultipleShootingSolver` alongside
+`AdamSolver` for neural approximators. Demonstrating it turns out to qualify
+that advice, so the demonstration is worth more than the recommendation was.
+
+Single shooting — what `AdamSolver` does — integrates the whole trajectory
+from `u0` and compares the result to the data. Over a long window with a
+nonlinear right-hand side that map is badly conditioned. **Multiple shooting**
+cuts the window into `n_intervals` segments, gives each its own starting
+state, and penalizes the mismatch at the joins, tightening the penalty from
+`rho_init` toward `rho_max` over `maxiters_outer` rounds.
+
+```{julia}
+#| warning: false
+sol_ms = solve(prob_neural,
+               MultipleShootingSolver(n_intervals=5, maxiters_inner=150,
+                                      maxiters_outer=12, verbose=false))
+(; data_loss = sol_ms.data_loss, converged = sol_ms.convergence.converged)
+```
+
+Compare that with `AdamSolver` on the identical problem (`sol_neural`, above):
+
+```{julia}
+(; multiple_shooting = sol_ms.data_loss, adam = sol_neural.data_loss)
+```
+
+Multiple shooting is far worse here, and the reason is visible in the
+recovered function:
+
+```{julia}
+#| warning: false
+beta_ms = sol_ms.unknown_functions[:β]
+ms_grid = range(0.1, I_domain[2], length=200)
+plot(ms_grid, β_true.(ms_grid), lw=3, ls=:dash, c=:black, label="truth")
+plot!(ms_grid, beta_ms.(ms_grid), lw=2, label="MultipleShootingSolver")
+plot!(ms_grid, sol_neural.unknown_functions[:β].(ms_grid), lw=2,
+      label="AdamSolver")
+xlabel!("infectious I"); ylabel!("transmission β(I)")
+```
+
+The multiple-shooting curve is essentially flat: the network has not moved
+far from its initialization, which is why the loss above is orders of
+magnitude worse than `AdamSolver`'s on identical data.
+
+Lengthening or shortening the segments does not rescue it. A separate sweep
+over this same model form with `n_intervals` of 5, 10 and 20 returned
+*identical* results at every setting — the same `data_loss` and the same sup
+error of 0.4998 against $\beta_0 = 0.5$, i.e. a fitted $\beta \approx 0$,
+while `AdamSolver` on that run reached a sup error of 0.003. Identical output
+across segment counts is the signature of an optimizer that is not
+progressing, rather than of segments that are too long — which is what
+distinguishes this from a tuning problem.
+
+Note also that `convergence.converged` is `true`. As elsewhere in this
+package, that flag is a **stability** test — the iteration stopped changing —
+and not a verdict on fit quality. Always read it next to `data_loss`.
+
+::: {.callout-warning}
+## Read the recommendation conditionally
+
+`MultipleShootingSolver` is genuinely useful where single shooting is badly
+conditioned — long windows, stiff dynamics, trajectories sensitive to early
+parameter changes — and it fits neural approximators well on simpler systems
+(on a one-state logistic problem it reaches a sup error of 0.011). It is
+**not** a drop-in improvement on `AdamSolver`, and on this two-state SIR
+problem with widely differing state scales ($S \sim 10^3$, $I \sim 10^1$) it
+does not fit at all. Try it, compare `data_loss` against `AdamSolver`, and
+keep whichever wins on your problem.
+:::
+
 ## Approach 4: Neural Network with Gradient Matching
 
 **Gradient matching** (Bonnaffé & Coulson 2023) avoids ODE integration entirely, making the optimization landscape much simpler:
@@ -352,7 +423,7 @@ Available kernels control the smoothness of the interpolation:
 Parameters are **weights and biases** of a Lux.jl model. There is no structural smoothing penalty — the network architecture itself provides implicit regularization (a small network cannot overfit). Key considerations:
 
 - **Input normalization** (`domain` argument) is essential for stable optimization
-- **Use `AdamSolver`** (or `MultipleShootingSolver`), not `LAML` — the IRLS linearization used by LAML is fundamentally incompatible with the highly nonlinear weight→trajectory mapping of neural networks
+- **Use `AdamSolver`**, not `LAML` — the IRLS linearization used by LAML is fundamentally incompatible with the highly nonlinear weight→trajectory mapping of neural networks
 - The `AdamSolver` uses ForwardDiff through the ODE solver (the UDE approach), correctly computing gradients w.r.t. network weights
 - No LAML smoothing parameter (no penalty matrix) — the network architecture provides implicit regularization
 - Best suited for multi-dimensional inputs where B-splines and GPs cannot be applied
@@ -442,7 +513,7 @@ println(rpad("True", 25), " ", rpad("-", 10), " ", rpad("-", 6),
 | Feature | B-Spline | Gaussian Process | Neural Network |
 |---------|----------|------------------|----------------|
 | Smoothing penalty | $\int (f'')^2\,dx$ | $\int (f'')^2\,dx$ (spline-based) | None (architecture-implicit) |
-| Recommended solver | `LAML` | `LAML` | `AdamSolver` or `MultipleShootingSolver` |
+| Recommended solver | `LAML` | `LAML` | `AdamSolver` (see Approach 3b on multiple shooting) |
 | LAML smoothing | ✓ Automatic | ✓ Automatic | ✗ Use Adam (ForwardDiff through ODE) |
 | Parameters | nknots (e.g., 10) | n_inducing (e.g., 10) | Arch-dependent (e.g., 25) |
 | Input dimension | 1D | 1D | Any |

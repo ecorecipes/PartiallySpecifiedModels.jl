@@ -847,6 +847,9 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
         pending_validate = false   # this iteration recomputes a grown step
         da_prev = da
         da_used = da         # the step of the last SUCCESSFUL central diff
+        # This column's own noise estimate — see the refinement block below.
+        eps_col = eps_noise
+        eps_refined = false
         while true
             # Forward perturbation
             p_pert[j] = beta[j] + da
@@ -908,12 +911,45 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
             # it and stop. This is the safety net that no base-point
             # noise/curvature statistic can provide, because the jitter is
             # measured once at beta and can misclassify a mid-fit column.
+            # ── per-column noise, at no extra cost ────────────────────
+            # The global `eps_noise` above nudges EVERY parameter at once, and
+            # the step-sequence perturbations that produces partially cancel,
+            # so it reads systematically LOW against the noise a
+            # single-parameter perturbation meets. Measured on the
+            # exact-reference quadrature fixture: global 4.70e-7 against
+            # per-column nudges of 5.60e-7 … 1.458e-6 — EVERY column
+            # under-reported, worst 3.10×. That gap is what left B1's KNOWN
+            # LIMITATION standing: a column whose true SNR is ~4 measures ~12,
+            # clears a trigger of 10, keeps the floor step, and keeps an error
+            # of 0.3–0.95 of column scale.
+            #
+            # At the FLOOR step the second difference is noise-dominated
+            # (truncation is O(h²) and h is at the floor) and carries the noise
+            # of BOTH perturbed solves, so `d2max/2` estimates this column's
+            # noise. `d2max` is already computed just above for the curvature
+            # guard, so this costs NOTHING — no extra solves, which is why the
+            # noise-free paths (discrete maps) are unaffected.
+            #
+            # It is a FLOOR under the global figure, never a replacement: on
+            # its own it is noisy in both directions (measured ratios to the
+            # per-column nudge of 0.31, 0.58, 0.59, 1.30, 1.79, 1.83). Taking
+            # `max(global, d2max/2)` cuts the worst UNDER-report — the only
+            # dangerous direction — from 3.10× to 1.71×, and `_FD_SNR_TRIGGER`
+            # is sized against that residual.
+            #
+            # First pass only: once the step grows, `d2max` picks up real
+            # curvature and would inflate the estimate.
+            if !eps_refined
+                eps_refined = true
+                eps_col = max(eps_col, 0.5 * d2max)
+            end
+
             if pending_validate
                 change = 0.0
                 for k2 in 1:n_data
                     change = max(change, abs(J[k2, j] - jprev[k2]))
                 end
-                if change > _FD_GROW_TOL * eps_noise / (2.0 * da_prev)
+                if change > _FD_GROW_TOL * eps_col / (2.0 * da_prev)
                     @inbounds for k2 in 1:n_data
                         J[k2, j] = jprev[k2]
                     end
@@ -950,8 +986,8 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
             # historical floor-step behavior. Once triggered, the column
             # grows all the way to the _FD_SNR_TARGET accuracy.
             snr_gate = grew ? _FD_SNR_TARGET : _FD_SNR_TRIGGER
-            (!grow || signal >= snr_gate * eps_noise || da >= da_cap ||
-             d2max > _FD_CURV_MAX * eps_noise) && break
+            (!grow || signal >= snr_gate * eps_col || da >= da_cap ||
+             d2max > _FD_CURV_MAX * eps_col) && break
             # Jump toward the step that reaches the target SNR (signal
             # scales linearly in da once above the noise), at least ×10.
             @inbounds for k2 in 1:n_data
@@ -961,7 +997,7 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
             pending_validate = true
             da = min(da_cap,
                      max(10.0 * da,
-                         da * _FD_SNR_TARGET * eps_noise / max(signal, 1e-300)))
+                         da * _FD_SNR_TARGET * eps_col / max(signal, 1e-300)))
             grew = true
         end
         # After a revert, fp/fb hold the REJECTED step's values, so the
@@ -1042,7 +1078,13 @@ const _FD_SNR_TARGET = 1.0e4
 # trigger with errors of 0.31 and 0.45 of column scale. Closing this
 # needs per-column noise estimation (e.g. a second nudge or the ±h pair
 # asymmetry) — see the review record before changing the constant alone.
-const _FD_SNR_TRIGGER = 10.0
+# RAISED 10 -> 20 with the per-column estimate. That estimate still
+# UNDER-reports by up to 1.71× on the measured fixture, and an under-report by
+# k inflates a column's apparent SNR by k, so a trigger of 10 against a 1.71×
+# under-report screens at only ~5.8 in true terms. 20 restores an effective
+# trigger of ~11.7 against the measured worst case, while columns that
+# genuinely resolve their signal are untouched.
+const _FD_SNR_TRIGGER = 20.0
 
 # Curvature guard for the growth loop: a column may only grow while its
 # max second difference is within _FD_CURV_MAX× the measured jitter — at
@@ -1960,6 +2002,39 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     smoothing_advanced = m > 0 && any(
         abs(theta[l] - theta_init[l]) >
             1e-10 * max(abs(theta_init[l]), 1e-300) for l in 1:m)
+
+    # SAY SO OUT LOUD. A solve that finishes with smooth terms present but
+    # λ̂ still sitting on its 1/tr(S) initialization has not done smoothing
+    # selection at all, and everything downstream that depends on λ̂ — the
+    # EDF, the posterior covariance `V_beta`, the intervals built from it —
+    # describes a model nobody chose. Until now that was visible only to a
+    # caller who went looking for `convergence.smoothing_advanced`.
+    #
+    # This is not hypothetical and it is not rare. On the package's own F6
+    # fixture under the DEFAULT `jac=:fd`, k = 8 knots lands here while
+    # k = 6, 7, 9, 10 do not: measured edf 4.074 against the correct 2.000
+    # and a sup error of 3.39e-3 against 1.31e-4 — 26x worse — on a problem
+    # whose truth lies in the penalty null space. Which knot counts trip is
+    # platform-dependent (macOS CI trips k = 8; this machine trips k = 8 too
+    # under --check-bounds=yes, and k = 9 without it), because the mechanism
+    # is Fellner-Schall proposals being rejected when the finite-difference
+    # Jacobian is noisy. Under `jac=:forwarddiff` every k in 6:12 succeeds.
+    #
+    # `:forwarddiff` is NOT recommended unconditionally in the message: it is
+    # ~2.5x faster than `:fd` at 8 parameters but ~25x SLOWER at 12 (measured
+    # 3.86 s vs 0.152 s), so it is the right escape hatch for a fit that has
+    # actually hit this, not a blanket default.
+    if m > 0 && !smoothing_advanced
+        @warn "LAML: smoothing selection never moved λ̂ off its " *
+              "initialization, so the reported λ̂, EDF and posterior " *
+              "covariance describe the INITIAL smoothing, not a selected " *
+              "one. Every Fellner–Schall proposal was rejected (or the " *
+              "iteration budget was spent before any ran). This happens " *
+              "when the working-model Jacobian is too noisy for the " *
+              "proposals to be accepted; try `jac=:forwarddiff`, more " *
+              "`maxiters`, or a different knot count. See " *
+              "`convergence.smoothing_advanced`." maxlog=1
+    end
 
     convergence_info = (V_beta=V_beta, sigma2=sigma2_hat,
                         converged=conv_converged, iterations=conv_iters,
