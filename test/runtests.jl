@@ -12651,8 +12651,16 @@ end
         # growth collapsed LAML fits to edf -> 0), so it is left alone here.
         let Jref = fdfix_J(9, :forwarddiff), Jfd = fdfix_J(9, :fd)
             rel9 = maximum(abs.(Jfd .- Jref)) / maximum(abs.(Jref))
-            @test rel9 < 5e-2      # pins it well below the 2.85 cliff …
-            @test rel9 > 1e-4      # … while recording that it is NOT yet fixed
+            # Only the upper bound is asserted. The lower one ("record that
+            # nk=9 is NOT fixed") was itself over-pinned, in the pessimistic
+            # direction, and ubuntu CI caught it: nk=9 measures 5.91e-3 on the
+            # authoring machine but 4.63e-5 there. So the outlier is
+            # PLATFORM-SPECIFIC, not a standing defect — which is consistent
+            # with its mechanism, since which columns sit near the noise floor
+            # depends on the integrator's step sequence, and that differs by
+            # platform. Asserting a defect's presence is only legitimate when
+            # the defect is deterministic; this one is not.
+            @test rel9 < 5e-2
         end
     end
 
