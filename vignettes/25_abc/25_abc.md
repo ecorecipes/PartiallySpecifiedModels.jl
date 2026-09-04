@@ -1,6 +1,6 @@
 # Likelihood-Free Inference with ABC-SMC
 Simon Frost
-2026-06-12
+2026-09-04
 
 - [Overview](#overview)
 - [Exponential Decay with Unknown
@@ -90,7 +90,28 @@ sol_abc = solve(prob, ABCSolver(n_particles=500, n_generations=10,
 sol_laml = solve(prob, LAML(maxiters=50, verbose=false))
 ```
 
-    PSMSolution((f = [-0.00836736583109984, 0.5405349500371419, 1.1120205335085238, 1.7090645032172862, 2.3183206291603407, 2.9297974239626074]), 0.047293354787519934, 0.0919434080378219, 2.5187068189569053, [0.014324814510001675], [5.0; 3.8428626852614487; … ; 0.06915856309886924; 0.05987317122363067;;], [5.078835560160429; 3.806018088128271; … ; 0.06894633070068673; 0.053785164971568336;;], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0], Dict{Symbol, Any}(:f => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([-0.00836736583109984, 0.5405349500371419, 1.1120205335085238, 1.7090645032172862, 2.3183206291603407, 2.9297974239626074], [0.01, 1.108, 2.206, 3.304, 4.402, 5.5], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 1.098, 1.0979999999999999, 1.0979999999999999, 1.0980000000000003, 1.0979999999999999], [0.0, 0.02209573988738384, 0.024008510301959423, 0.009068135819688353, 0.000495899221161383, 0.0], DataInterpolations.ExtrapolationType.Extension, DataInterpolations.ExtrapolationType.Extension, FindFirstFunctions.Guesser{Vector{Float64}}([0.01, 1.108, 2.206, 3.304, 4.402, 5.5], Base.RefValue{Int64}(1), true), false, false)), (V_beta = [0.04122102788938971 -0.013721922774739671 … 0.06202606745093546 0.10982717532994053; -0.013721922774739671 0.06094590886668673 … -0.09789676365438492 -0.17528244453129957; … ; 0.06202606745093546 -0.09789676365438492 … 0.9681800864521124 1.6653556886526626; 0.10982717532994053 -0.17528244453129957 … 1.6653556886526626 3.4364761696437442], sigma2 = 0.004974944509409733))
+    ┌ Warning: ABC-SMC gen 1: effective sample size 23.6 < N/2 = 250.0; importance weights are highly concentrated
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/abc_solver.jl:94
+    ┌ Warning: ABC-SMC gen 2: effective sample size 33.2 < N/2 = 250.0; importance weights are highly concentrated
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/abc_solver.jl:94
+    ┌ Warning: ABC-SMC gen 3: effective sample size 8.2 < N/2 = 250.0; importance weights are highly concentrated
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/abc_solver.jl:94
+    ┌ Warning: ABC-SMC gen 4: effective sample size 29.8 < N/2 = 250.0; importance weights are highly concentrated
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/abc_solver.jl:94
+    ┌ Warning: ABC-SMC gen 5: effective sample size 32.5 < N/2 = 250.0; importance weights are highly concentrated
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/abc_solver.jl:94
+    ┌ Warning: ABC-SMC gen 6: effective sample size 62.4 < N/2 = 250.0; importance weights are highly concentrated
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/abc_solver.jl:94
+    ┌ Warning: ABC-SMC gen 7: effective sample size 62.3 < N/2 = 250.0; importance weights are highly concentrated
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/abc_solver.jl:94
+    ┌ Warning: ABC-SMC gen 8: effective sample size 112.2 < N/2 = 250.0; importance weights are highly concentrated
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/abc_solver.jl:94
+    ┌ Warning: ABC-SMC gen 9: effective sample size 111.6 < N/2 = 250.0; importance weights are highly concentrated
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/abc_solver.jl:94
+    ┌ Warning: ABC-SMC gen 10: effective sample size 154.7 < N/2 = 250.0; importance weights are highly concentrated
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/abc_solver.jl:94
+
+    PSMSolution((f = [-0.007159068246233605, 0.5385691884496616, 1.1097360362084392, 1.710594267245719, 2.3258423947390248, 2.943764099504231]), 0.046907115499497096, 0.09121640421590996, 2.6255305543140093, [0.010661692650401958], [5.0; 3.8396649976797756; … ; 0.06789123220923896; 0.05842740902466895;;], [5.078835560160429; 3.806018088128271; … ; 0.06894633070068673; 0.053785164971568336;;], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0], Dict{Symbol, Any}(:f => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([-0.007159068246233605, 0.5385691884496616, 1.1097360362084392, 1.710594267245719, 2.3258423947390248, 2.943764099504231], [0.01, 1.108, 2.206, 3.304, 4.402, 5.5], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 1.098, 1.0979999999999999, 1.0979999999999999, 1.0980000000000003, 1.0979999999999999], [0.0, 0.02462367630476875, 0.028107020038384875, 0.010715088767001562, 0.0006476649367354296, 0.0], DataInterpolations.ExtrapolationType.Linear, DataInterpolations.ExtrapolationType.Linear, FindFirstFunctions.Guesser{Vector{Float64}}([0.01, 1.108, 2.206, 3.304, 4.402, 5.5], Base.RefValue{Int64}(1), true), false, false)), (V_beta = [0.06417440872524004 -0.021806873222363455 … 0.023351544292864873 0.053628070758673894; -0.021806873222363455 0.06790115097966348 … -0.09678112246329461 -0.17211995620126763; … ; 0.023351544292864873 -0.09678112246329461 … 0.9954497421024228 1.7437679919327813; 0.053628070758673894 -0.17211995620126763 … 1.7437679919327813 3.8060125349357232], sigma2 = 0.004964301390336253, converged = true, iterations = 9, reason = :converged_tol, laml_failures = 0, criterion = :working, laml = 48.57046341656602, stationarity = 0.02484953408431123, smoothing_advanced = true))
 
 ### Recovered Function
 
@@ -154,8 +175,8 @@ if haskey(sol_abc.convergence, :n_accepted)
 end
 ```
 
-    ABC:  loss=0.0195, f(3)=1.568
-    LAML: loss=0.0919, f(3)=1.542
+    ABC:  loss=1.4703, f(3)=1.648
+    LAML: loss=0.0912, f(3)=1.542
     True: f(3)=1.5
 
 ## Diagnostic Plots
@@ -197,7 +218,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](25_abc_files/figure-commonmark/cell-9-output-1.svg)
 
-    Durbin-Watson: 0.883
+    Durbin-Watson: 0.258
 
 ## When to Use ABC
 

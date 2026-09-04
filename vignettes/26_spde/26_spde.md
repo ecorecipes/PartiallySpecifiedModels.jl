@@ -1,6 +1,6 @@
 # Matérn SPDE Approximator
 Simon Frost
-2026-06-12
+2026-09-04
 
 - [Overview](#overview)
 - [Logistic Growth with Unknown Growth
@@ -273,17 +273,17 @@ Figure 7: Fitted Lotka-Volterra trajectories
 
 ## Comparison Table
 
-| Approximator            | Data Loss | Objective |
-|:------------------------|----------:|----------:|
-| SPDE (ν=1.5)            |    0.5442 |    0.3992 |
-| SPDE+decreasing         |    0.7013 |    0.5491 |
-| B-spline                |    0.6159 |    0.3215 |
-| SPDE (ν=0.5)            |    3.0169 |    1.9668 |
-| SPDE (ν=1.5)            |    0.5442 |    0.3992 |
-| SPDE (ν=2.5)            |    0.5716 |    0.4208 |
-| SPDE+inc_concave (LV)   |    0.6271 |    0.3306 |
-| SPDE unconstrained (LV) |   39.5411 |   20.8569 |
-| B-spline (LV)           |   14.8046 |    7.5439 |
+| Approximator            | Data Loss |             Objective |
+|:------------------------|----------:|----------------------:|
+| SPDE (ν=1.5)            |    0.5116 |                0.3504 |
+| SPDE+decreasing         |    0.5335 |                0.3479 |
+| B-spline                |    0.6663 |                0.3331 |
+| SPDE (ν=0.5)            |    0.5058 |                0.3506 |
+| SPDE (ν=1.5)            |    0.5116 |                0.3504 |
+| SPDE (ν=2.5)            |    0.5161 |                0.3508 |
+| SPDE+inc_concave (LV)   |   95.0989 |               47.7465 |
+| SPDE unconstrained (LV) |    0.5480 |                0.2848 |
+| B-spline (LV)           |   94.9691 | -579655649682011.0000 |
 
 ## Profile Range Optimization
 
@@ -297,17 +297,17 @@ result = optimize_spde_range(prob_spde, LAML(maxiters=100, verbose=false);
     n_grid=8, verbose=true)
 ```
 
-      range= 0.333 (×0.10): GCV=0.7178, loss=10.4074, edf=9.8
-      range= 0.644 (×0.19): GCV=5.3047, loss=104.9043, edf=6.2
-      range= 1.243 (×0.37): GCV=0.0402, loss=0.5770, edf=9.9
-      range= 2.399 (×0.72): GCV=0.3220, loss=4.9144, edf=9.2
-      range= 4.632 (×1.39): GCV=0.0389, loss=0.5759, edf=9.6
-      range= 8.942 (×2.68): GCV=0.0438, loss=0.6284, edf=9.9
-      range=17.265 (×5.18): GCV=0.0277, loss=0.5876, edf=5.4
-      range=33.333 (×10.00): GCV=0.0280, loss=0.5921, edf=5.4
-    Best range=17.265, GCV=0.0277
+      range= 0.333 (×0.10): GCV=0.0335, loss=0.4941, edf=9.6
+      range= 0.644 (×0.19): GCV=0.0334, loss=0.4943, edf=9.6
+      range= 1.243 (×0.37): GCV=0.0330, loss=0.4954, edf=9.4
+      range= 2.399 (×0.72): GCV=0.0318, loss=0.5010, edf=8.9
+      range= 4.632 (×1.39): GCV=0.0301, loss=0.5304, edf=7.6
+      range= 8.942 (×2.68): GCV=0.0281, loss=0.5673, edf=6.0
+      range=17.265 (×5.18): GCV=0.0266, loss=0.5836, edf=4.9
+      range=33.333 (×10.00): GCV=0.0262, loss=0.5901, edf=4.6
+    Best range=33.333, GCV=0.0262
 
-    (solution = PSMSolution((r = [0.4329249113296453, 0.4165806144920535, 0.38589235554332635, 0.3360729352253334, 0.26920213351244465, 0.2010294085158498, 0.13604961046208544, 0.0834491109514167, 0.030156816345978853, 0.003019551284145332]), 0.35327768447130853, 0.5876063073537875, 5.361806483547311, [21.207136126689708], [0.5; 0.6206177607654114; … ; 9.972747093866502; 10.035372867378907;;], [0.4454963777822334; 0.6707835637706556; … ; 10.011521386502283; 10.092491865779015;;], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  10.5, 11.0, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0], Dict{Symbol, Any}(:r => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([0.4329249113296453, 0.4165806144920535, 0.38589235554332635, 0.3360729352253334, 0.26920213351244465, 0.2010294085158498, 0.13604961046208544, 0.0834491109514167, 0.030156816345978853, 0.003019551284145332], [0.5, 1.6111111111111112, 2.7222222222222223, 3.8333333333333335, 4.944444444444445, 6.055555555555555, 7.166666666666667, 8.277777777777779, 9.38888888888889, 10.5], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 1.1111111111111112, 1.1111111111111112, 1.1111111111111112, 1.1111111111111112, 1.1111111111111107, 1.1111111111111116, 1.1111111111111116, 1.1111111111111107, 1.1111111111111107], [0.0, -0.013569615880673938, -0.015433192337422387, -0.01767505902426824, 0.003263714855301945, -0.001707147555751418, 0.01908250030986018, -0.014459462764244669, 0.03539322658654044, 0.0], DataInterpolations.ExtrapolationType.Extension, DataInterpolations.ExtrapolationType.Extension, FindFirstFunctions.Guesser{Vector{Float64}}([0.5, 1.6111111111111112, 2.7222222222222223, 3.8333333333333335, 4.944444444444445, 6.055555555555555, 7.166666666666667, 8.277777777777779, 9.38888888888889, 10.5], Base.RefValue{Int64}(1), true), false, false)), (V_beta = [0.01060517446469225 -0.0009677067285068982 … 0.00012782105526472972 0.00017152386049972354; -0.0009677067285068982 0.0038864767875104477 … -6.538036880987034e-5 -9.83781980390419e-5; … ; 0.00012782105526472972 -6.538036880987034e-5 … 0.0007845603950382624 -0.0014553679838912308; 0.00017152386049972354 -9.83781980390419e-5 … -0.0014553679838912308 0.010660840274917326], sigma2 = 0.022919177475460798)), range_param = 17.264915597437376, gcv_scores = [0.7177847116159232, 5.304685671444911, 0.04020424571563397, 0.3219618492051896, 0.038871507933077046, 0.04384018857155922, 0.027712346475711795, 0.027952285583038975], range_values = [0.3333333333333334, 0.6435659096277502, 1.2425312401049804, 2.398952243337174, 4.63165164791046, 8.942319317599088, 17.264915597437376, 33.33333333333334])
+    (solution = PSMSolution((r = [0.4310553489055179, 0.41714879270588767, 0.384991072893859, 0.3352030351117984, 0.2696584614846853, 0.20196155096589818, 0.13629226873238448, 0.08368554997848027, 0.030017328007111328, 0.004412626011826592]), 0.3460921957730508, 0.5900881374811003, 4.5724033767094125, [32.602978404711344], [0.5; 0.6200963602816946; … ; 9.97645911495859; 10.041196837825746;;], [0.4454963777822334; 0.6707835637706556; … ; 10.011521386502283; 10.092491865779015;;], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  10.5, 11.0, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0], Dict{Symbol, Any}(:r => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([0.4310553489055179, 0.41714879270588767, 0.384991072893859, 0.3352030351117984, 0.2696584614846853, 0.20196155096589818, 0.13629226873238448, 0.08368554997848027, 0.030017328007111328, 0.004412626011826592], [0.5, 1.6111111111111112, 2.7222222222222223, 3.8333333333333335, 4.944444444444445, 6.055555555555555, 7.166666666666667, 8.277777777777779, 9.38888888888889, 10.5], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 1.1111111111111112, 1.1111111111111112, 1.1111111111111112, 1.1111111111111112, 1.1111111111111107, 1.1111111111111116, 1.1111111111111116, 1.1111111111111107, 1.1111111111111107], [0.0, -0.01904848456405266, -0.01250671690004597, -0.016607993170118473, 0.0023619253735647793, -0.0033000656176766334, 0.020692610563570805, -0.015986318125704505, 0.038093756302368456, 0.0], DataInterpolations.ExtrapolationType.Linear, DataInterpolations.ExtrapolationType.Linear, FindFirstFunctions.Guesser{Vector{Float64}}([0.5, 1.6111111111111112, 2.7222222222222223, 3.8333333333333335, 4.944444444444445, 6.055555555555555, 7.166666666666667, 8.277777777777779, 9.38888888888889, 10.5], Base.RefValue{Int64}(1), true), false, false)), (V_beta = [0.009493588029902002 -0.0002158971438394344 … -9.759123603712354e-6 -5.3129104461644756e-6; -0.0002158971438394344 0.0031534195430302104 … 1.2506280393723698e-6 -5.513223828403602e-6; … ; -9.759123603712354e-6 1.2506280393723698e-6 … 0.00043513025447246566 -0.0007547910526052014; -5.3129104461644756e-6 -5.513223828403602e-6 … -0.0007547910526052014 0.007720898440337978], sigma2 = 0.022328482831505642, converged = true, iterations = 16, reason = :converged_tol, laml_failures = 0, criterion = :working, laml = 45.36904654739028, stationarity = 5.434752530408815e-6, smoothing_advanced = true)), range_param = 33.33333333333334, gcv_scores = [0.033519211762354124, 0.03340257370914121, 0.03302452797805888, 0.03183056352746019, 0.030115223412462165, 0.028079911641566348, 0.026614835571716785, 0.02619167295624058], range_values = [0.3333333333333334, 0.6435659096277502, 1.2425312401049804, 2.398952243337174, 4.63165164791046, 8.942319317599088, 17.264915597437376, 33.33333333333334])
 
 <div id="fig-profile-range">
 
@@ -317,8 +317,8 @@ Figure 8: Profile GCV over SPDE range parameter
 
 </div>
 
-The optimized range parameter is $\rho = 17\.26$ with data loss 0.5876
-(vs 0.5442 for the default range).
+The optimized range parameter is $\rho = 33\.33$ with data loss 0.5901
+(vs 0.5116 for the default range).
 
 ## Diagnostic Plots
 
@@ -359,7 +359,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](26_spde_files/figure-commonmark/cell-19-output-1.svg)
 
-    Durbin-Watson: 1.914
+    Durbin-Watson: 1.978
 
 ## When to Use SPDEApproximator
 
@@ -383,9 +383,9 @@ Holling Type II response is increasing), use
 `:increasing` or `:decreasing` tend to converge more reliably than
 combined constraints like `:inc_concave`, which can trap the optimizer.
 Constraints are enforced at mesh nodes, and they hold **at the nodes
-only**: the cubic-spline interpolant between nodes has cardinal functions
-that take negative values, so the fitted function can violate the
-constraint between nodes — and the violation is material rather than
+only**: the cubic-spline interpolant between nodes has cardinal
+functions that take negative values, so the fitted function can violate
+the constraint between nodes — and the violation is material rather than
 slight (a `:positive` fixture whose 10 node values are all positive,
 alternating ≈5 / ≈0.007, dips to −0.121). Adding mesh nodes does **not**
 cure this; more nodes help only indirectly, by letting the fitted node

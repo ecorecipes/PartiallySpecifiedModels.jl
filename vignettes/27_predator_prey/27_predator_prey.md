@@ -1,6 +1,6 @@
 # Predator-Prey Functional Response with Confidence Intervals
 Simon Frost
-2026-06-12
+2026-09-04
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -178,7 +178,7 @@ sol_free = solve(prob_free, CollocationLAML(
     n_continuation=6));
 ```
 
-    Unconstrained — data loss: 5.05, EDF: 2.53
+    Unconstrained — data loss: 5.05, EDF: 2.0
 
 ### Fitted trajectories
 
@@ -240,7 +240,7 @@ prob_sc = PSMProblem(rm_psm!, u0, tspan, [uf_sc];
 sol_sc = solve(prob_sc, LAML(maxiters=200, verbose=false));
 ```
 
-    Shape-constrained — data loss: 5.12, EDF: 2.06
+    Shape-constrained — data loss: 5.12, EDF: 2.11
 
 ### Comparison: unconstrained vs shape-constrained
 
@@ -412,7 +412,7 @@ Figure 8: Four-panel diagnostic plots for the unconstrained LAML fit
 
 </div>
 
-    Durbin-Watson: 1.588, 2.0
+    Durbin-Watson: 1.59, 1.999
 
 ## Summary
 

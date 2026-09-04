@@ -1,6 +1,6 @@
 # Bayesian Inference with PseudoMarginalSolver
 Simon Frost
-2026-06-12
+2026-09-04
 
 - [Overview](#overview)
 - [Logistic Growth Model](#logistic-growth-model)
@@ -204,7 +204,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](19_pseudo_marginal_files/figure-commonmark/cell-10-output-1.svg)
 
-    Durbin-Watson: 1.419
+    Durbin-Watson: 1.012
 
 ## Summary
 

@@ -1,6 +1,6 @@
 # Solver Comparison: Eleven Methods on One Problem
 Simon Frost
-2026-08-19
+2026-09-04
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -150,7 +150,9 @@ mixed models. For strongly nonlinear models like prevalence-dependent
 transmission, `initial_lambda` and `warmup` keep the early IRLS steps
 well-conditioned:
 
-    LAML: data_loss=1342.4, edf=3.0, time=6.9s
+    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). This happens when the working-model Jacobian is too noisy for the proposals to be accepted; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2028
+    LAML: data_loss=1342.4, edf=4.1, time=8.9s
 
 ### 2. CollocationLAML
 
@@ -159,7 +161,9 @@ collocation. A continuation schedule gradually increases the ODE
 penalty, starting from a pure data-fit and converging toward
 ODE-consistent solutions.
 
-    CollocationLAML: data_loss=771.1, edf=2.0, time=1.9s
+    ┌ Warning: CollocationLAML: simulating the fitted dynamics gives a data loss 8468.0× the reported `data_loss`. `fitted_values` are the estimated STATE, which need not lie near any trajectory the dynamics admit, so the reported loss understates the model's error by that factor. See `convergence.simulated_data_loss`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/collocation_solver.jl:1267
+    CollocationLAML: data_loss=771.1, edf=2.0, time=3.3s
 
 ### 3. GradientMatching
 
@@ -167,36 +171,31 @@ Estimates derivatives directly from a smooth interpolant of the data,
 then fits the ODE right-hand side to those derivatives. No ODE
 integration required — fast but relies on good derivative estimates.
 
-    GradientMatching: data_loss=1023.4, edf=8.0, time=1.9s
+    GradientMatching: data_loss=953677.0, edf=8.0, time=2.5s
 
 > [!NOTE]
 >
-> `data_loss` is comparable across every solver in this vignette: each one
-> reports the weighted residual sum of squares of its fitted model,
+> `data_loss` is comparable across every solver in this vignette: each
+> one reports the weighted residual sum of squares of its fitted model,
 > evaluated at the fitted parameters. Eight of the eleven obtain that
 > trajectory by integrating the dynamics from `u0`. `CollocationLAML`,
 > `ODINSolver` and `RKHSSolver` do not: they estimate the state
 > trajectory jointly with the coefficients and report that estimate,
-> which is coupled to the fitted parameters but does not start exactly at
-> `u0`. See the `fitted_values` docstring for the two conventions.
+> which is coupled to the fitted parameters but does not start exactly
+> at `u0`. See the `fitted_values` docstring for the two conventions.
 >
 > This was not always so. `GradientMatching`, `TwoStageSolver`,
 > `IntegralMatchingSolver` and `AdaptiveGradientMatching` (its default,
 > deterministic path) used to report the stage-1 data smoother as their
-> `fitted_values`, which made their `data_loss` a function of the
-> data alone — near zero simply because a smoothing spline nearly
+> `fitted_values`, which made their `data_loss` a function of the data
+> alone — near zero simply because a smoothing spline nearly
 > interpolates its own data, and identical for two problems with
 > completely different dynamics. An earlier version of this callout
-> attributed that near-zero value to these solvers "optimising derivative
-> match rather than data fit"; that explanation was wrong, and the number
-> is now a genuine model-vs-data fit statistic. Gradient matching still
-> never integrates the ODE *while fitting* — the simulation happens once,
-> at the end, purely for reporting.
->
-> The printed outputs below still show the pre-fix numbers: note that
-> GradientMatching, IntegralMatching and TwoStage all report exactly
-> `1023.4`, the same smoother SSE three times over. They will separate
-> when this vignette is next re-rendered.
+> attributed that near-zero value to these solvers “optimising
+> derivative match rather than data fit”; that explanation was wrong,
+> and the number is now a genuine model-vs-data fit statistic. Gradient
+> matching still never integrates the ODE *while fitting* — the
+> simulation happens once, at the end, purely for reporting.
 
 ### 4. AdamSolver
 
@@ -204,7 +203,7 @@ Direct optimisation of the B-spline coefficients using the Adam gradient
 descent algorithm. Integrates the ODE at each step and minimises the
 mean squared error to data.
 
-    AdamSolver: data_loss=1365.0, time=4.2s
+    AdamSolver: data_loss=1365.0, time=4.7s
 
 ### 5. AdaptiveGradientMatching (AGM)
 
@@ -213,7 +212,7 @@ parameters $\gamma_k$ that control how tightly the GP derivatives must
 satisfy the ODE. Uses pre-computed eigendecomposition for efficiency and
 a B-spline smoothing penalty.
 
-    AGM: data_loss=1167.2, time=5.1s
+    AGM: data_loss=1.2349747e6, time=6.7s
 
 ### 6. RodeoSolver
 
@@ -222,7 +221,7 @@ Kalman filter/smoother. The ODE is enforced as pseudo-observations in a
 state-space model; the marginal likelihood is maximised over B-spline
 coefficients.
 
-    RodeoSolver: data_loss=1505.9, time=11.5s
+    RodeoSolver: data_loss=1505.9, time=13.5s
 
 ### 7. IntegralMatchingSolver
 
@@ -231,7 +230,7 @@ rather than derivatives. This avoids both derivative estimation (noisy)
 and full ODE integration (expensive), providing robustness to
 measurement noise.
 
-    IntegralMatching: data_loss=1023.4, time=2.0s
+    IntegralMatching: data_loss=649160.4, time=2.3s
 
 ### 8. EnsembleKalmanSolver
 
@@ -239,7 +238,7 @@ Derivative-free ensemble method: maintains a population of parameter
 particles, propagates each through the ODE, and updates via the Kalman
 gain. Naturally handles non-smooth objectives and noisy forward models.
 
-    EnsembleKalman: data_loss=1328.8, time=1.9s
+    EnsembleKalman: data_loss=1328.8, time=2.2s
 
 ### 9. ODINSolver
 
@@ -248,7 +247,9 @@ process to the data and optimising unknown-function parameters against
 the GP’s derivative estimates. The ODE residual enters the GP marginal
 likelihood for tighter coupling.
 
-    ODIN: data_loss=1067.5, time=4.4s
+    ┌ Warning: ODINSolver: simulating the fitted dynamics gives a data loss 13520.0× the reported `data_loss`. `fitted_values` are the estimated STATE, which need not lie near any trajectory the dynamics admit, so the reported loss understates the model's error by that factor. See `convergence.simulated_data_loss`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/odin_solver.jl:352
+    ODIN: data_loss=1067.5, time=4.6s
 
 ### 10. RKHSSolver
 
@@ -258,7 +259,9 @@ analytic, and fitting alternates a linear Gauss–Newton solve for the
 trajectory coefficients with gradient steps on the unknown-function
 parameters. No ODE integration.
 
-    RKHS: data_loss=1033.7, time=4.3s
+    ┌ Warning: RKHSSolver: simulating the fitted dynamics gives a data loss 11310.0× the reported `data_loss`. `fitted_values` are the estimated STATE, which need not lie near any trajectory the dynamics admit, so the reported loss understates the model's error by that factor. See `convergence.simulated_data_loss`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/rkhs_solver.jl:450
+    RKHS: data_loss=1033.7, time=5.8s
 
 ### 11. TwoStageSolver
 
@@ -266,7 +269,7 @@ Simple baseline: smooth data with cubic splines, then match derivatives
 with Adam optimisation. Fast and transparent, but the quality of
 derivative estimation limits accuracy.
 
-    TwoStage: data_loss=1023.4, time=2.0s
+    TwoStage: data_loss=978159.2, time=2.4s
 
 ## Comparison
 
@@ -323,17 +326,17 @@ p_β
 
     Solver              | Data Loss | Time (s)
     --------------------------------------------------
-    LAML                | 1342.4    | 6.9
-    CollocationLAML     | 771.1     | 1.9
-    GradientMatching    | 1023.4    | 1.9
-    Adam                | 1365.0    | 4.2
-    AGM                 | 1167.2    | 5.1
-    Rodeo               | 1505.9    | 11.5
-    IntegralMatch       | 1023.4    | 2.0
-    EnsKalman           | 1328.8    | 1.9
-    ODIN                | 1067.5    | 4.4
-    RKHS                | 1033.7    | 4.3
-    TwoStage            | 1023.4    | 2.0
+    LAML                | 1342.4    | 8.9
+    CollocationLAML     | 771.1     | 3.3
+    GradientMatching    | 953677.0  | 2.5
+    Adam                | 1365.0    | 4.7
+    AGM                 | 1.2349747e6| 6.7
+    Rodeo               | 1505.9    | 13.5
+    IntegralMatch       | 649160.4  | 2.3
+    EnsKalman           | 1328.8    | 2.2
+    ODIN                | 1067.5    | 4.6
+    RKHS                | 1033.7    | 5.8
+    TwoStage            | 978159.2  | 2.4
 
 ## Diagnostic Plots
 

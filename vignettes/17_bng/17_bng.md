@@ -1,6 +1,6 @@
 # Fast Gradient Matching with BNGSolver
 Simon Frost
-2026-08-19
+2026-09-04
 
 - [Overview](#overview)
 - [Lotka-Volterra with Unknown
@@ -125,6 +125,8 @@ sol_bng = solve(prob, BNGSolver(maxiters=3000, lr=0.01, rng_seed=1, verbose=fals
     ┌ Warning: Verbosity toggle: max_iters 
     │  Interrupted. Larger maxiters is needed. If you are using an integrator for non-stiff ODEs or an automatic switching algorithm (the default), you may want to consider using a method for stiff equations. See the solver pages for more details (e.g. https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/#Stiff-Problems).
     └ @ SciMLBase ~/.julia/packages/SciMLBase/nJKQh/src/integrator_interface.jl:679
+    ┌ Warning: BNGSolver: integrating the fitted dynamics from u0 failed (retcode MaxIters). Reporting the base data smoother as `fitted_values`; `data_loss` therefore measures the SMOOTHER, not the model fit. See `convergence.simulation_failed`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/bng_solver.jl:388
 
 ### Compare with AdamSolver
 

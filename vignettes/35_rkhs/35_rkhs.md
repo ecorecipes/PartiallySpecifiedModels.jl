@@ -1,6 +1,6 @@
 # RKHS: Reproducing Kernel Hilbert Space Estimation
 Simon Frost
-2026-08-19
+2026-09-04
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -130,8 +130,10 @@ println("\nTime: $(round(t_rbf, digits=1))s")
       iter 50: J=470.568
       iter 75: J=469.205
       Converged at iter 87
+    ┌ Warning: RKHSSolver: `fitted_values` are the estimated state, and integrating the FITTED dynamics from u0 failed outright, so `data_loss` (314.95) says nothing about how the model itself fits. See `convergence.simulated_data_loss`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/rkhs_solver.jl:444
 
-    Time: 6.4s
+    Time: 8.8s
 
 ### Fit with RKHS (Matérn-5/2 kernel)
 
@@ -153,6 +155,8 @@ println("\nTime: $(round(t_mat, digits=1))s")
       iter 50: J=177.457
       iter 75: J=175.505
       Converged at iter 88
+    ┌ Warning: RKHSSolver: `fitted_values` are the estimated state, and integrating the FITTED dynamics from u0 failed outright, so `data_loss` (91.851) says nothing about how the model itself fits. See `convergence.simulated_data_loss`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/rkhs_solver.jl:444
 
     Time: 0.1s
 
@@ -168,7 +172,9 @@ t_ts = @elapsed sol_ts = solve(prob,
 println("TwoStage time: $(round(t_ts, digits=1))s")
 ```
 
-    TwoStage time: 3.1s
+    ┌ Warning: TwoStageSolver: integrating the fitted dynamics from u0 failed (ODE solve failed: Unstable). Reporting the stage-1 data smoother as `fitted_values`; `data_loss` therefore measures the SMOOTHER, not the model fit. See `convergence.simulation_failed`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/two_stage_solver.jl:313
+    TwoStage time: 2.7s
 
 ### Recovered Functional Response
 

@@ -1,6 +1,6 @@
 # Likelihood Families
 Simon Frost
-2026-06-12
+2026-09-04
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -184,7 +184,7 @@ parameter $\sigma^2$ in the REML objective:
 
 $$V_{\text{REML}}(\boldsymbol{\lambda}) = -\frac{n - M_p}{2}\log\hat\sigma^2 + \frac{1}{2}\log|S^\lambda|_+ - \frac{1}{2}\log|H|$$
 
-    Gaussian — SS: 46530.0, EDF: 5.25, λ: [0.223]
+    Gaussian — SS: 925.4, EDF: 3.22, λ: [6090.0]
 
 ## Fitting with Poisson Likelihood
 
@@ -200,7 +200,7 @@ For count data, the LAML solver uses Pearson-scaled Fellner-Schall
 updates and a Gaussian warm-start phase to ensure reliable convergence
 with identity-link IRLS weights.
 
-    Poisson — Loss: 4198.0, EDF: 4.18, λ: [20.2]
+    Poisson — Loss: 4382.0, EDF: 2.86, λ: [248.0]
 
 ## Fitting with Negative Binomial Likelihood
 
@@ -208,7 +208,7 @@ with identity-link IRLS weights.
 controlling the variance: $\text{Var}(Y) = \mu + \mu^2/\theta$. Smaller
 $\theta$ means more overdispersion.
 
-    NegBin — Loss: 270500.0, EDF: 4.94, λ: [3.66e-5]
+    NegBin — Loss: 114300.0, EDF: 2.0, λ: [2.34e9]
 
 ## Fitting with Truncated Normal Likelihood
 
@@ -225,7 +225,7 @@ $$\ell(y_i \mid \mu_i, \sigma) = -\frac{(y_i - \mu_i)^2}{2\sigma^2} - \log\sigma
 where $\Phi$ is the standard normal CDF. The IRLS weights use the Fisher
 information, which accounts for the truncation adjustment.
 
-    TruncNormal — Loss: 1411.0, EDF: 8.0, λ: [0.0379]
+    TruncNormal — Loss: 926.0, EDF: 3.17, λ: [280.0]
 
 ## Custom Likelihoods
 
@@ -239,7 +239,7 @@ Here we demonstrate with a **Laplace (double-exponential) likelihood**,
 which is more robust to outliers than the Gaussian. We create data with
 a few outlier observations:
 
-    Laplace — Loss: 10920.0, EDF: 1.96
+    Laplace — Loss: 573500.0, EDF: 0.0
 
 > [!NOTE]
 >
@@ -370,7 +370,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](02_likelihoods_files/figure-commonmark/cell-14-output-1.svg)
 
-    Durbin-Watson: 0.245
+    Durbin-Watson: 2.401
 
 > [!TIP]
 >

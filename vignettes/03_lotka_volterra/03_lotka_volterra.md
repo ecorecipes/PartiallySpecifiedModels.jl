@@ -1,6 +1,6 @@
 # Lotka–Volterra Predator–Prey with Real Data
 Simon Frost
-2026-06-12
+2026-09-04
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -155,9 +155,11 @@ variance $\hat\sigma^2$, which in turn drives the Fellner–Schall
 smoothing parameter update. We use `sigma2_init` to cap $\hat\sigma^2$
 at a plausible observation-noise level, preventing this feedback loop:
 
-    Data loss (SS):  148340.0
-    EDF:             9.3
-    Smoothing λ:     [0.256, 0.1044]
+    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). This happens when the working-model Jacobian is too noisy for the proposals to be accepted; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2028
+    Data loss (SS):  147590.0
+    EDF:             4.8
+    Smoothing λ:     [1.265e-5, 1.265e-5]
 
 The `sigma2_init=25.0` reflects a prior belief that observation noise
 has standard deviation $\sigma \approx 5$. As the fit improves and the
@@ -253,14 +255,14 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](03_lotka_volterra_files/figure-commonmark/cell-10-output-1.svg)
 
-    Durbin-Watson: 0.684, 0.452
+    Durbin-Watson: 0.683, 0.453
 
 Additional time-series diagnostics — the **Durbin–Watson statistic** (DW
 ≈ 2 for independent residuals, DW \< 2 for positive autocorrelation
 indicating oversmoothing) and the **empirical autocorrelation function
 (ACF)**:
 
-    Durbin–Watson: hare = 0.684  lynx = 0.452
+    Durbin–Watson: hare = 0.683  lynx = 0.453
 
 ``` julia
 resid = sol.data_values .- sol.fitted_values
@@ -300,10 +302,12 @@ appropriate than the linearization-based PSM approach.
 To illustrate the impact of the `sigma2_init` cap, we compare fits with
 different assumed noise levels:
 
-    σ²_init=auto: SS=149100.0  EDF=19.1  DW=[0.68, 0.45]
-    σ²_init=100.0: SS=143500.0  EDF=4.0  DW=[0.71, 0.46]
-    σ²_init=25.0: SS=148300.0  EDF=9.3  DW=[0.68, 0.45]
-    σ²_init=1.0: SS=143200.0  EDF=4.4  DW=[0.71, 0.47]
+    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). This happens when the working-model Jacobian is too noisy for the proposals to be accepted; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2028
+    σ²_init=auto: SS=147600.0  EDF=4.8  DW=[0.68, 0.45]
+    σ²_init=100.0: SS=147600.0  EDF=4.8  DW=[0.68, 0.45]
+    σ²_init=25.0: SS=147600.0  EDF=4.8  DW=[0.68, 0.45]
+    σ²_init=1.0: SS=348000.0  EDF=0.0  DW=[0.4, 0.1]
 
 ## Collocation-Based Estimation
 
@@ -322,10 +326,12 @@ and $\lambda_{\text{ode}}$ controls ODE compliance. A **continuation**
 schedule increases $\lambda_{\text{ode}}$ from small (data-driven) to
 large (ODE-constrained), avoiding local minima.
 
+    ┌ Warning: CollocationLAML: simulating the fitted dynamics gives a data loss 100.9× the reported `data_loss`. `fitted_values` are the estimated STATE, which need not lie near any trajectory the dynamics admit, so the reported loss understates the model's error by that factor. See `convergence.simulated_data_loss`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/collocation_solver.jl:1267
     CollocationLAML:
-      Data loss (SS):  2450.6
+      Data loss (SS):  2366.7
       EDF:             3.96
-      ODE compliance:  0.009632
+      ODE compliance:  0.01026
 
 ### Comparison: LAML vs CollocationLAML
 
@@ -349,8 +355,8 @@ plot(p1c, p2c, layout=(2, 1), size=(700, 500))
 
 ### Residual Diagnostics (Collocation)
 
-    Durbin–Watson (collocation): hare = 1.967  lynx = 1.656
-    Durbin–Watson (LAML):        hare = 0.684  lynx = 0.452
+    Durbin–Watson (collocation): hare = 1.864  lynx = 1.634
+    Durbin–Watson (LAML):        hare = 0.683  lynx = 0.453
 
 ``` julia
 resid_coll = sol_coll.data_values .- sol_coll.fitted_values

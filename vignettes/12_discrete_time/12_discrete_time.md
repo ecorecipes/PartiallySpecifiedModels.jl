@@ -1,6 +1,6 @@
 # Discrete-Time Population Models
 Simon Frost
-2026-06-12
+2026-09-04
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -111,7 +111,7 @@ scatter!(times, data, label="Observed", ms=4, color=:steelblue, alpha=0.7)
 
 ### Fit with LAML
 
-    LAML — Data loss: 286.0, EDF: 4.5
+    LAML — Data loss: 292.5, EDF: 4.2
 
 ### Fit with GradientMatching
 
@@ -121,7 +121,7 @@ The `refine_iters` option runs a short forward-simulation refinement to
 correct the function in regions where derivative matching alone is
 insufficient:
 
-    GradientMatching — Data loss: 284.2, EDF: 10.0
+    GradientMatching — Data loss: 301.4, EDF: 10.0
 
 ### Compare fitted trajectories
 
@@ -217,6 +217,8 @@ data_bh = max.(data_bh, 1.0)
 
 ### Fit with LAML
 
+    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). This happens when the working-model Jacobian is too noisy for the proposals to be accepted; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2028
     LAML — Data loss: 1113.0
 
 ### Compare stock-recruitment curves
@@ -295,11 +297,11 @@ p_data
 range of $N_2$, not the theoretical range. This avoids extrapolation
 artefacts at boundaries.
 
-    LAML — Data loss: 583.5, EDF: 2.6
+    LAML — Data loss: 587.9, EDF: 2.0
 
 ### Compare with GradientMatching
 
-    GradientMatching — Data loss: 576.5, EDF: 8.0
+    GradientMatching — Data loss: 580.3, EDF: 8.0
 
 ### Recovered competition effect
 
@@ -322,12 +324,12 @@ p3
 
 ![](12_discrete_time_files/figure-commonmark/cell-15-output-1.svg)
 
-Both solvers recover the **linear negative competition effect**
-$g(N_2)$ within the observed data range. Unlike the Ricker model, the
-competition dynamics have a longer transient, giving both solvers more
-information across the domain of $N_2$. The slope reveals the
-competition coefficient $\alpha_{12}$ without assuming any parametric
-functional form.
+Both solvers recover the **linear negative competition effect** $g(N_2)$
+within the observed data range. Unlike the Ricker model, the competition
+dynamics have a longer transient, giving both solvers more information
+across the domain of $N_2$. The slope reveals the competition
+coefficient $\alpha_{12}$ without assuming any parametric functional
+form.
 
 ## Diagnostic Plots
 
@@ -368,7 +370,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](12_discrete_time_files/figure-commonmark/cell-16-output-1.svg)
 
-    Durbin-Watson: 2.62, 1.847
+    Durbin-Watson: 2.61, 1.829
 
 ## Summary
 
@@ -381,20 +383,21 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 | Supported solvers | All 23 solvers | 15 of the 23 — see below |
 
 Fifteen of the 23 exported solvers accept a `DiscreteProblem`-derived
-`PSMProblem`: `LAML`, `GCVSolver`, `CollocationLAML`, `GradientMatching`,
-`AdaptiveGradientMatching` (MAP mode only — see below), `TwoStageSolver`,
-`BNGSolver`, `AdamSolver`, `MultipleShootingSolver`,
-`DerivativeFreeSolver`, `MCMCSolver`, `VariationalSolver`, `ABCSolver`,
-`EnsembleKalmanSolver` and `ProfileLikelihoodSolver`.
+`PSMProblem`: `LAML`, `GCVSolver`, `CollocationLAML`,
+`GradientMatching`, `AdaptiveGradientMatching` (MAP mode only — see
+below), `TwoStageSolver`, `BNGSolver`, `AdamSolver`,
+`MultipleShootingSolver`, `DerivativeFreeSolver`, `MCMCSolver`,
+`VariationalSolver`, `ABCSolver`, `EnsembleKalmanSolver` and
+`ProfileLikelihoodSolver`.
 
 Eight solvers reject a discrete problem up front, all through the same
 `_validate_problem(...; require_continuous=true)` guard: `RodeoSolver`,
 `DaltonSolver`, `PseudoMarginalSolver`, `MagiSolver`,
 `IntegralMatchingSolver`, `ODINSolver`, `RKHSSolver` and `FGPGMSolver`.
 These are the probabilistic-ODE and GP-gradient methods, which assume a
-continuous-time generative model — an integrated Brownian motion prior, a
-GP derivative operator, or a cumulative time integral — that a map does
-not have.
+continuous-time generative model — an integrated Brownian motion prior,
+a GP derivative operator, or a cumulative time integral — that a map
+does not have.
 
 `AdaptiveGradientMatching` is discrete-capable only in its MAP mode
 (`n_samples=0`, the default). Setting `n_samples > 0` selects the

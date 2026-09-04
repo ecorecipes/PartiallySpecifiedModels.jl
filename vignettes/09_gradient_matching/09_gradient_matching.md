@@ -1,6 +1,6 @@
 # Integration-Free Inference with Gradient Matching
 Simon Frost
-2026-08-19
+2026-09-04
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -104,14 +104,16 @@ prob = PSMProblem(sir!, u0, tspan, [approx_β];
 
 ### Fit with all approaches
 
+    ┌ Warning: CollocationLAML: simulating the fitted dynamics gives a data loss 8468.0× the reported `data_loss`. `fitted_values` are the estimated STATE, which need not lie near any trajectory the dynamics admit, so the reported loss understates the model's error by that factor. See `convergence.simulated_data_loss`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/collocation_solver.jl:1267
     Method               | Time (s) | Data Loss
     -------------------------------------------------------
-    GradientMatching     | 3.16     | 1023.4
-    AGM                  | 5.82     | 1167.2
-    LAML                 | 5.41     | 1344.8
-    CollocationLAML      | 1.67     | 771.1
-    AdamSolver           | 3.75     | 1365.0
-    RodeoSolver          | 12.55    | 1505.9
+    GradientMatching     | 6.03     | 953677.0
+    AGM                  | 9.66     | 1.2349747e6
+    LAML                 | 6.14     | 1346.7
+    CollocationLAML      | 3.38     | 771.1
+    AdamSolver           | 4.7      | 1365.0
+    RodeoSolver          | 14.62    | 1505.9
 
 > [!NOTE]
 >
@@ -126,10 +128,10 @@ prob = PSMProblem(sir!, u0, tspan, [approx_β];
 > the two conventions.
 >
 > `GradientMatching` and `AGM` previously reported the stage-1 data
-> smoother instead, so their entries measured the smoother's fit to the
-> data rather than the model's, and were not comparable with the
+> smoother instead, so their entries measured the smoother’s fit to the
+> data rather than the model’s, and were not comparable with the
 > integration-based rows beside them. The `data_loss` figures printed
-> above are from a render that predates that fix.
+> here are from a render that predates that fix.
 
 ### Compare recovered β(prevalence)
 
@@ -193,9 +195,9 @@ for fitted trajectories.
 ### Inspecting AGM diagnostics
 
     AGM convergence info:
-      GP hyperparams: [(104536.50563991992, 18.0, 52.26825281995996), (1729.5408653878928, 12.0, 8.647704326939465), (0.0, 0.0, 0.0)]
-      Gamma (mismatch): [4.0473, 3.1278, 32757.1883]
-      Derivative loss: 11427.0288
+      GP hyperparams: [(52268.25281995996, 18.0, 52.26825281995996), (864.7704326939466, 12.0, 8.647704326939467), (0.0, 0.0, 0.0)]
+      Gamma (mismatch): [3.8343, 2.9001, 32757.2236]
+      Derivative loss: 11405.326
 
 ## Example 2: Logistic Growth — A Clean Demonstration
 
@@ -279,7 +281,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](09_gradient_matching_files/figure-commonmark/cell-9-output-1.svg)
 
-    Durbin-Watson: 1.603, 1.962
+    Durbin-Watson: 0.002, 0.029
 
 ## Two-Stage Smooth-Then-Differentiate
 
@@ -329,7 +331,7 @@ plot!(u_grid_d, [sol_laml_d.unknown_functions[:r](x) for x in u_grid_d], label="
 
 ![](09_gradient_matching_files/figure-commonmark/cell-12-output-1.svg)
 
-    TwoStage    loss=0.2547  r(2)=0.9541
+    TwoStage    loss=1.1447  r(2)=0.9541
     BNG         loss=0.7976  r(2)=0.9998
     LAML        loss=0.3444  r(2)=1.0232
     True        r(2)=1.0

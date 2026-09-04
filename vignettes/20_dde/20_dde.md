@@ -1,6 +1,6 @@
 # Delay Differential Equations
 Simon Frost
-2026-06-12
+2026-09-04
 
 - [Overview](#overview)
 - [Example 1: Delayed Negative
@@ -176,10 +176,10 @@ model
 >
 > - **`AdamSolver`** — uses autodiff through the DDE solve (works if the
 >   dynamics are differentiable)
-> - **`GCVSolver`** — the same IRLS structure as `LAML`, but selects λ by
->   cross-validation
-> - **`VariationalSolver`** — approximate Bayesian inference, handling the
->   nonlinear coupling by sampling from q(β)
+> - **`GCVSolver`** — the same IRLS structure as `LAML`, but selects λ
+>   by cross-validation
+> - **`VariationalSolver`** — approximate Bayesian inference, handling
+>   the nonlinear coupling by sampling from q(β)
 >
 > See [Vignette 03:
 > Lotka–Volterra](../03_lotka_volterra/03_lotka_volterra.qmd) for a
@@ -196,10 +196,10 @@ model
 > - **`CollocationLAML`** rejects DDEs with an explicit, informative
 >   error: its collocation residual evaluates the dynamics with the
 >   4-argument ODE signature and cannot supply the delayed history.
-> - **`MCMCSolver`** and **`BNGSolver`** fail with a `MethodError` for the
->   same underlying reason — both build a 4-argument closure over the
->   dynamics, so the 5-argument DDE signature `f!(du, u, h, p, t)` does
->   not match. There is no up-front guard, so the failure surfaces
+> - **`MCMCSolver`** and **`BNGSolver`** fail with a `MethodError` for
+>   the same underlying reason — both build a 4-argument closure over
+>   the dynamics, so the 5-argument DDE signature `f!(du, u, h, p, t)`
+>   does not match. There is no up-front guard, so the failure surfaces
 >   mid-solve.
 >
 > Use `LAML`, `GCVSolver`, `AdamSolver` or `VariationalSolver` for delay
@@ -255,7 +255,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](20_dde_files/figure-commonmark/cell-9-output-1.svg)
 
-    Durbin-Watson: 2.127
+    Durbin-Watson: 2.172
 
 > [!TIP]
 >

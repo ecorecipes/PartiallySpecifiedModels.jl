@@ -1,6 +1,6 @@
 # Epidemiological Count Data: Non-Gaussian Likelihoods
 Simon Frost
-2026-06-12
+2026-09-04
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -168,15 +168,15 @@ Each likelihood gets a fresh approximator:
 
 ### Gaussian (standard, but wrong for counts)
 
-    Gaussian: data_loss = 1.5744947e6, edf = 2.1
+    Gaussian: data_loss = 1.5753497e6, edf = 2.0
 
 ### Poisson (correct variance structure for counts)
 
-    Poisson: data_loss = 1.5756104e6, edf = 2.0
+    Poisson: data_loss = 1.5755929e6, edf = 2.0
 
 ### Negative Binomial (accounts for overdispersion)
 
-    NegBin: data_loss = 1.5873241e6, edf = 2.0
+    NegBin: data_loss = 1.5873491e6, edf = 2.0
 
 ## Compare Results
 
@@ -228,7 +228,7 @@ plot!(prev_grid, [sol_nb.unknown_functions[:β](p) for p in prev_grid],
 
     Likelihood | β(0.01) est | β(0.06) est | EDF  | Cor(β̂, β_true)
     ----------------------------------------------------------------------
-    Gaussian   | 0.494 (0.490) | 0.462 (0.443) | 2.1  | 0.988
+    Gaussian   | 0.503 (0.490) | 0.459 (0.443) | 2.0  | 1.0
     Poisson    | 0.508 (0.490) | 0.459 (0.443) | 2.0  | 1.0
     NegBin     | 0.506 (0.490) | 0.451 (0.443) | 2.0  | 1.0
 
@@ -324,7 +324,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](11_count_data_sir_files/figure-commonmark/cell-15-output-1.svg)
 
-    Durbin-Watson: 2.522, 1.788
+    Durbin-Watson: 2.521, 1.783
 
 ## Key Takeaways
 
