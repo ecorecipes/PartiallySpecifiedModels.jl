@@ -1,6 +1,6 @@
 # Fisheries Stock-Recruitment with Poisson Counts
 Simon Frost
-2026-08-30
+2026-09-04
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -212,6 +212,8 @@ println("Unconstrained — Data loss: $(round(sol_unc.data_loss, sigdigits=4)), 
     "EDF: $(round(sol_unc.edf, digits=1))")
 ```
 
+    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). This happens when the working-model Jacobian is too noisy for the proposals to be accepted; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2028
     Unconstrained — Data loss: 213200.0, EDF: 6.9
 
 ## Shape-Constrained Fit
@@ -238,7 +240,7 @@ println("Inc+Concave — Data loss: $(round(sol_sc.data_loss, sigdigits=4)), " *
     "EDF: $(round(sol_sc.edf, digits=1))")
 ```
 
-    Inc+Concave — Data loss: 231000.0, EDF: 3.7
+    Inc+Concave — Data loss: 1.124e6, EDF: 4.3
 
 ### Compare recovered R(S) curves
 
@@ -282,7 +284,7 @@ p_fit
     Stock-Recruitment Model — Comparison
     ────────────────────────────────────────────────────────────
       Unconstrained:  data_loss=213200.0, EDF=6.9, cor(R̂,R)=0.982
-      Inc+Concave:    data_loss=231000.0, EDF=3.7, cor(R̂,R)=0.995
+      Inc+Concave:    data_loss=1.124e6, EDF=4.3, cor(R̂,R)=0.929
 
 The shape constraint produces a smoother, more biologically plausible
 curve at a slightly higher data loss and roughly half the effective
@@ -308,6 +310,8 @@ bs = bootstrap(sol_sc, prob_sc, LAML(maxiters=200, verbose=false);
 println("Bootstrap: $(bs.n_success)/50 replicates converged")
 ```
 
+    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). This happens when the working-model Jacobian is too noisy for the proposals to be accepted; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2028
     Bootstrap: 50/50 replicates converged
 
 ### Trajectory confidence bands
@@ -389,7 +393,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](28_fisheries_files/figure-commonmark/cell-17-output-1.svg)
 
-    Durbin-Watson: 2.064
+    Durbin-Watson: 0.6
 
 For well-specified Poisson models, the deviance residuals should be
 approximately standard normal. Patterns in “Residuals vs Fitted” would

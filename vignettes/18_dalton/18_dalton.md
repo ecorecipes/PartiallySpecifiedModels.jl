@@ -1,6 +1,6 @@
 # Probabilistic ODE Solving with DaltonSolver
 Simon Frost
-2026-06-12
+2026-09-04
 
 - [Overview](#overview)
 - [Logistic Growth with Unknown Per-Capita
@@ -125,9 +125,9 @@ sol_laml = solve(prob, LAML(maxiters=100, verbose=false));
 sol_rodeo = solve(prob, RodeoSolver(n_steps=200, method=:fenrir, maxiters=500, verbose=false));
 ```
 
-    DaltonSolver: SS=0.1546, r(5)=0.231
-    RodeoSolver:  SS=0.1588, r(5)=0.24
-    LAML:         SS=0.1995, EDF=2.0, r(5)=0.251
+    DaltonSolver: SS=1.46e11, r(5)=0.378
+    RodeoSolver:  SS=0.1636, r(5)=0.237
+    LAML:         SS=0.1998, EDF=2.0, r(5)=0.25
     True r(5) = 0.25
 
 ### Recovered Per-Capita Growth Rate
@@ -257,6 +257,9 @@ sol_lv_rodeo = solve(prob_lv, RodeoSolver(n_steps=300, method=:fenrir, maxiters=
 sol_lv_laml = solve(prob_lv, LAML(maxiters=60, verbose=false));
 ```
 
+    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). This happens when the working-model Jacobian is too noisy for the proposals to be accepted; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2028
+
 ### Functional Response Recovery (Oscillatory)
 
 <div id="fig-lv-growth-rate">
@@ -323,7 +326,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](18_dalton_files/figure-commonmark/cell-15-output-1.svg)
 
-    Durbin-Watson: 2.326
+    Durbin-Watson: 2.115
 
 ## Summary
 

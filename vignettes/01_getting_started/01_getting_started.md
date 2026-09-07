@@ -1,6 +1,6 @@
 # Getting Started with PartiallySpecifiedModels.jl
 Simon Frost
-2026-08-30
+2026-09-04
 
 - [Overview](#overview)
 - [Vignette Guide](#vignette-guide)
@@ -174,7 +174,7 @@ equivalent to **Restricted Maximum Likelihood (REML)**.
 
     Data loss (SS): 2.66
     EDF:            2.0
-    Smoothing λ:    [2.109e6]
+    Smoothing λ:    [2.012e6]
 
 ### Inspect the solution
 

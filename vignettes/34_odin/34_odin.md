@@ -1,6 +1,6 @@
 # ODIN: ODE-Informed Gaussian Process Regression
 Simon Frost
-2026-08-19
+2026-09-04
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -146,7 +146,7 @@ println("\nTime: $(round(t_odin, digits=1))s")
       step 1900: risk=53435.0
       step 2000: risk=53431.0
 
-    Time: 9.2s
+    Time: 10.8s
 
 ### Compare with Adaptive Gradient Matching and LAML
 

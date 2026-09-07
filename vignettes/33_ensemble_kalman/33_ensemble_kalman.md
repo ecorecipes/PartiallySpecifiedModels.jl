@@ -1,6 +1,6 @@
 # Ensemble Kalman Inversion: Derivative-Free Estimation
 Simon Frost
-2026-06-12
+2026-09-04
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -117,20 +117,20 @@ println("\nTime: $(round(t_ek, digits=1))s")
 
     EnsembleKalmanSolver: 100 particles, 50 iterations, 8 params
       iter 1: misfit=21830.0 spread=0.1713
-      iter 2: misfit=1351.0 spread=0.1397
-      iter 3: misfit=568.0 spread=0.1126
-      iter 5: misfit=152.2 spread=0.07548
-      iter 10: misfit=9.755 spread=0.04654
-      iter 15: misfit=9.675 spread=0.04168
-      iter 20: misfit=9.623 spread=0.03932
-      iter 25: misfit=9.597 spread=0.03827
-      iter 30: misfit=9.588 spread=0.03728
-      iter 35: misfit=9.58 spread=0.03642
-      iter 40: misfit=9.576 spread=0.03555
-      iter 45: misfit=9.573 spread=0.03525
-      iter 50: misfit=9.57 spread=0.03483
+      iter 2: misfit=1352.0 spread=0.1397
+      iter 3: misfit=471.1 spread=0.1134
+      iter 5: misfit=60.18 spread=0.07696
+      iter 10: misfit=13.39 spread=0.04951
+      iter 15: misfit=9.789 spread=0.0413
+      iter 20: misfit=9.57 spread=0.0384
+      iter 25: misfit=9.562 spread=0.03717
+      iter 30: misfit=9.56 spread=0.03631
+      iter 35: misfit=9.556 spread=0.03548
+      iter 40: misfit=9.554 spread=0.03483
+      iter 45: misfit=9.554 spread=0.03454
+      iter 50: misfit=9.553 spread=0.03413
 
-    Time: 3.6s
+    Time: 3.8s
 
 ### Recovered behavioural response
 
@@ -170,14 +170,14 @@ The final ensemble standard deviation provides a rough measure of
 parameter uncertainty:
 
     Ensemble parameter std (per coefficient):
-      β_1: std = 0.0198
-      β_2: std = 0.00263
-      β_3: std = 0.00225
-      β_4: std = 0.00154
-      β_5: std = 0.000727
-      β_6: std = 0.0272
-      β_7: std = 0.109
-      β_8: std = 0.116
+      β_1: std = 0.02
+      β_2: std = 0.00284
+      β_3: std = 0.0024
+      β_4: std = 0.00152
+      β_5: std = 0.0007
+      β_6: std = 0.0266
+      β_7: std = 0.106
+      β_8: std = 0.113
 
 ## Diagnostic Plots
 

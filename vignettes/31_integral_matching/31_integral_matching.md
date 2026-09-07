@@ -1,6 +1,6 @@
 # Integral Matching: Noise-Robust Integration-Free Estimation
 Simon Frost
-2026-06-12
+2026-09-04
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -181,8 +181,8 @@ println("IntegralMatching: loss=$(round(sol_im_lv.objective, sigdigits=4)), time
 println("GradientMatching: loss=$(round(sol_gm_lv.objective, sigdigits=4)), time=$(round(t_gm_lv, digits=1))s")
 ```
 
-    IntegralMatching: loss=172.6, time=2.3s
-    GradientMatching: loss=55.33, time=1.5s
+    IntegralMatching: loss=111.7, time=3.1s
+    GradientMatching: loss=9.477, time=1.6s
 
 ``` julia
 H_grid = range(0.0, H_max, length=100)
