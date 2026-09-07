@@ -83,7 +83,48 @@ Before reporting anything:
   noise level, and relaxing it hands the column to the validation guard,
   which reverts it to the same step. Both guards would have to move together,
   and the stiff fixture that motivated them is **not in the suite**.
-- **Nine vignettes** fit with λ̂ stuck at its initialization.
+- **Nine vignettes emit the smoothing warning** — 03_lotka_volterra,
+  04_copepod, 06_solver_comparison, 12_discrete_time, 13_shape_constraints,
+  18_dalton, 28_fisheries, 29_bootstrap, 38_transformed_covariates. Each
+  contains at least one fit finishing with λ̂ still on its initialization.
+  Partially investigated; here is exactly how far it got, so you neither
+  redo it nor over-trust it.
+
+  **Ruled out** on 38_transformed_covariates, the one fixture reconstructed
+  in full (all four runs under `--check-bounds=yes`):
+
+  | configuration           | advanced | edf    | λ | data_loss |
+  |-------------------------|----------|--------|---|-----------|
+  | jac=:fd, maxiters=40    | false    | 1.0000 | 1 | 183.75    |
+  | jac=:fd, maxiters=300   | false    | 1.0018 | 1 | 183.71    |
+  | jac=:forwarddiff, 40    | false    | 1.0000 | 1 | 183.78    |
+  | jac=:fd, 40, warmup=10  | false    | 1.0000 | 1 | 183.75    |
+
+  So it is NOT the `jac=:fd` noise cliff (forwarddiff does not help) and NOT
+  an iteration budget (300 does not help). The signature there is `λ = 1`
+  exactly with `edf = 1.0000`: the outer smooth has collapsed into the
+  penalty null space, so `βᵀSβ ≈ 0` and LAML's documented HOLD branch
+  correctly declines to move λ. The machinery is behaving as designed and
+  that particular fit is degenerate.
+
+  **Not established.** The nine are probably not one phenomenon: their
+  printed EDFs span 2.0 to 10.0, and only 38 shows the degenerate `edf ≈ 1`,
+  so the null-space explanation does NOT transfer to the other eight. Do not
+  assume it does — generalising from this single fixture is precisely the
+  error to avoid.
+
+  **Two traps** if you pick this up:
+   - The warning uses `maxlog=1`, so one warning means *at least one*
+     affected fit, not that the vignette's headline fit is affected. Several
+     of these documents run many solves, and the EDFs above may belong to
+     healthy ones.
+   - Identifying *which* solve warns needs the renders instrumented
+     individually; reading the rendered `.md` is not enough, because the
+     warning is not adjacent to the call that caused it.
+
+  The open question worth answering: for each of the remaining eight, which
+  fit warns, and is its cause the null-space hold (benign, correctly
+  reported) or something else.
 - **`_vi_edf`, Rodeo/Dalton FS, ABC/AGM/FGPGM convergence keys** were
   addressed in earlier campaigns; verify rather than assume.
 
