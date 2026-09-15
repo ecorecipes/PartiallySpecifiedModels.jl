@@ -20,12 +20,8 @@ _variance_function(::Gaussian, mu) = 1.0
 _variance_function(::Poisson, mu) = mu
 _variance_function(fam::NegativeBinomial, mu) = mu + mu^2 / fam.theta
 function _variance_function(fam::TruncatedNormal, mu)
-    # V(μ) = σ²(1 - δ) where δ = λ(ξ)(ξ + λ(ξ)), ξ = (μ-a)/σ, λ = φ/Φ
-    σ = fam.sigma; a = fam.lower
-    ξ = (mu - a) / σ
-    Φξ = max(_normcdf(ξ), 1e-15)
-    λξ = _normpdf(ξ) / Φξ
-    σ^2 * max(1.0 - λξ * (ξ + λξ), 0.01)
+    _, variance = _truncated_normal_moments(fam, mu)
+    fam.sigma^2 * variance
 end
 # Mean of the RESPONSE, E[Y | μ] — the centre the Pearson dispersion must
 # subtract.
@@ -50,10 +46,7 @@ _family_mean(::Poisson, mu) = mu
 _family_mean(::NegativeBinomial, mu) = mu
 _family_mean(::CustomLikelihood, mu) = mu
 function _family_mean(fam::TruncatedNormal, mu)
-    σ = fam.sigma; a = fam.lower
-    ξ = (mu - a) / σ
-    # Same Φ guard as `_variance_function`, so the two agree in the far tail.
-    mu + σ * (_normpdf(ξ) / max(_normcdf(ξ), 1e-15))
+    first(_truncated_normal_moments(fam, mu))
 end
 
 function _variance_function(fam::CustomLikelihood, mu)
@@ -65,6 +58,11 @@ function _variance_function(fam::CustomLikelihood, mu)
         μ -> ForwardDiff.derivative(μ2 -> fam.loglik_scalar(mu, μ2), μ), mu)
     clamp(1.0 / max(neg_d2l, 1e-20), 1e-10, 1e10)
 end
+
+# A truncated-normal location can legitimately be negative; reflecting it
+# changes the distribution rather than regularizing an invalid count mean.
+_pearson_variance(fam::AbstractLikelihood, mu) = _variance_function(fam, abs(mu))
+_pearson_variance(fam::TruncatedNormal, mu) = _variance_function(fam, mu)
 
 # ─── Penalty matrix assembly ──────────────────────────────────────
 
@@ -479,7 +477,7 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
                 # MEAN. Identity for every family but `TruncatedNormal`
                 # (see `_family_mean`), where μ is the latent location.
                 pearson += w_data[i] * (y[i] - _family_mean(family, mu[i]))^2 /
-                           max(_variance_function(family, abs(mu[i])), 1e-10)
+                           max(_pearson_variance(family, mu[i]), 1e-10)
             end
             phi = max(pearson / max(n - sum(ranks), 1), 1.0)
             min(phi, sigma2_max)

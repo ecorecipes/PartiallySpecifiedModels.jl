@@ -347,9 +347,9 @@ end
 function _agm_population_mcmc(prob::PSMProblem, alg::AdaptiveGradientMatching)
     prob.discrete && error("AdaptiveGradientMatching: population MCMC " *
                            "(n_samples > 0) requires a continuous-time problem")
-    any(a -> a isa NeuralApproximator, prob.approximators) &&
+    any(a -> a isa Union{NeuralApproximator,KANApproximator}, prob.approximators) &&
         error("AdaptiveGradientMatching population MCMC does not support " *
-              "NeuralApproximator; use the MAP mode or AdamSolver.")
+              "NeuralApproximator or KANApproximator; use the MAP mode or AdamSolver.")
     alg.n_chains >= 2 ||
         throw(ArgumentError("AdaptiveGradientMatching: population MCMC needs " *
                             "n_chains ≥ 2 (got $(alg.n_chains))"))

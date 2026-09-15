@@ -11,9 +11,9 @@ This approach is particularly valuable in **ecology**, where the form of key bio
 PartiallySpecifiedModels.jl provides a unified interface for specifying and fitting PSMs using two complementary approximation strategies:
 
 - **Basis function approximators** (B-splines, shape-constrained splines, Gaussian processes): fewer parameters, automatic smoothing via LAML/GCV, interpretable, and easy to constrain (monotonicity, convexity, positivity).
-- **Neural network approximators** (Lux.jl networks, COMONet): more flexible for high-dimensional or complex functional forms, compatible with gradient-based UDE-style training.
+- **Neural network approximators** (Lux.jl networks, fixed-grid KANs, COMONet): more flexible for high-dimensional or complex functional forms, compatible with gradient-based UDE-style training.
 
-The package supports 23 fitting algorithms, 11 approximator types, 5 likelihood families, and 14 shape constraint types.
+The package supports 23 fitting algorithms, 12 approximator types (including an optional FluxKAN backend), 5 likelihood families, and 14 shape constraint types.
 
 ## Installation
 

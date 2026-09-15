@@ -20,15 +20,19 @@ using Statistics: quantile, mean, std
 Result of bootstrap resampling for a PSM solution.
 
 # Fields
-- `coefs::Matrix{Float64}`: B × p matrix of bootstrap coefficient vectors
-- `fitted_values::Array{Float64,3}`: n_times × n_obs × B array of fitted trajectories
-- `uf_values::Dict{Symbol, Matrix{Float64}}`: unknown function evaluations on a grid,
-   each n_grid × B matrix
+- `coefs::Matrix{Float64}`: n_success × p matrix of bootstrap coefficient vectors
+- `fitted_values::Array{Float64,3}`: n_times × n_obs × n_success array of fitted trajectories
+- `uf_values::Dict{Symbol, Matrix{Float64}}`: unknown function evaluations,
+   each n_points × n_success matrix (point counts can differ by function)
 - `uf_grid::Dict{Symbol, Vector{Float64}}`: evaluation grid for each UF
 - `ci_fitted::NamedTuple`: `(lower, upper)` matrices (n_times × n_obs) at given level
 - `ci_uf::Dict{Symbol, NamedTuple}`: `(lower, upper)` vectors for each UF
 - `level::Float64`: confidence level (e.g., 0.95)
 - `n_success::Int`: number of successful bootstrap replicates (out of B attempted)
+- `uf_points::Dict{Symbol, Matrix{Float64}}`: explicit physical query points;
+  rows align with the corresponding `uf_values` and `ci_uf` entries
+- `uf_success::Dict{Symbol, Vector{Int}}`: finite replicate count at each
+  unknown-function query/grid point
 """
 struct BootstrapResult
     coefs::Matrix{Float64}
@@ -39,13 +43,32 @@ struct BootstrapResult
     ci_uf::Dict{Symbol, NamedTuple{(:lower, :upper), Tuple{Vector{Float64}, Vector{Float64}}}}
     level::Float64
     n_success::Int
+    uf_points::Dict{Symbol, Matrix{Float64}}
+    uf_success::Dict{Symbol, Vector{Int}}
+end
+
+BootstrapResult(coefs, fitted, uf_values, uf_grid, ci_fitted, ci_uf, level, n_success) =
+    BootstrapResult(coefs, fitted, uf_values, uf_grid, ci_fitted, ci_uf, level, n_success,
+        Dict{Symbol, Matrix{Float64}}(),
+        Dict(name => [count(isfinite, @view(values[i, :])) for i in axes(values, 1)]
+             for (name, values) in uf_values))
+
+function _bootstrap_function_value(f, args...)
+    value = try
+        f(args...)
+    catch e
+        (e isa DomainError || e isa OverflowError || e isa DivideError ||
+         (e isa InexactError && !_is_program_error(e))) || rethrow()
+        NaN
+    end
+    isfinite(value) ? Float64(value) : NaN
 end
 
 # ─── Bootstrap methods ────────────────────────────────────────────
 
 """
     bootstrap(sol, prob, alg; nboot=200, method=:parametric, level=0.95,
-              uf_ngrid=100, rng=default_rng(), verbose=false)
+              uf_ngrid=100, uf_points=nothing, rng=default_rng(), verbose=false)
 
 Compute bootstrap confidence intervals for a PSM solution.
 
@@ -89,11 +112,19 @@ scales the latent σ, which is the only reading under which the family's own
 families take the other branch (replicate count) because there `V(μ)/w`
 is reachable inside the family.
 
-Each replicate is refit from scratch with `alg`, so smoothing parameters are
-re-estimated per replicate; the intervals therefore include smoothing-
-selection variability (unlike a fixed-λ conditional bootstrap).
+Each replicate is refit from scratch with `alg`. Smoothing parameters are
+re-estimated only when that algorithm selects them (for example, LAML).
+Fixed-penalty Adam keeps its supplied penalty weight. For KANs the
+architecture, grids and cached initialization are held fixed; this does
+not sample initialization or architecture-selection uncertainty.
 - `level::Float64=0.95`: confidence level for CIs
-- `uf_ngrid::Int=100`: number of grid points for unknown function CIs
+- `uf_ngrid::Int=100`: number of grid points for unknown function CIs;
+  one evaluates the domain midpoint
+- `uf_points`: optional dictionary of physical query coordinates, with one
+  sample per row and one input per column (or a vector for unary inputs).
+  Explicit points override a function's automatic grid, support multivariate
+  KAN/tensor functions, and evaluate the full function for single-index or
+  transformed-covariate approximators. Returned coordinates are owned copies.
 - `rng`: random number generator
 - `parallel::Bool=false`: use multi-threading (`Threads.@threads`) for replicates.
   Requires Julia started with `JULIA_NUM_THREADS > 1`.
@@ -101,7 +132,10 @@ selection variability (unlike a fixed-λ conditional bootstrap).
 
 # Returns
 A `BootstrapResult` with coefficient samples, fitted value CIs, and
-unknown function CIs.
+unknown function CIs. `uf_success` counts finite evaluations per point;
+points with fewer than three usable replicates return NaN interval endpoints
+and a warning. These are pointwise intervals with fixed architecture/grids,
+not simultaneous coverage or identifiability guarantees.
 
 # Example
 ```julia
@@ -123,6 +157,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                    method::Symbol=:parametric,
                    level::Float64=0.95,
                    uf_ngrid::Int=100,
+                   uf_points=nothing,
                    rng=default_rng(),
                    parallel::Bool=false,
                    verbose::Bool=false)
@@ -142,6 +177,9 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
               "bound). Use method=:parametric, which samples from the " *
               "fitted distribution.")
     0.0 < level < 1.0 || error("bootstrap: level must be in (0, 1)")
+    nboot >= 3 || throw(ArgumentError("bootstrap: nboot must be at least three"))
+    uf_ngrid >= 1 || throw(ArgumentError("bootstrap: uf_ngrid must be positive"))
+    queries = _function_query_points(prob, uf_points)
 
     n_times = length(sol.data_times)
     n_obs = size(sol.data_values, 2)
@@ -193,16 +231,16 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
     for approx in prob.approximators
         _uf_range = (_uf_offset + 1):(_uf_offset + nparams(approx))
         _uf_offset = last(_uf_range)
+        haskey(queries, approx.name) && continue
         (approx isa SingleIndexApproximator ||
          approx isa TransformedCovariateApproximator) &&
             (uf_special[approx.name] = (approx, _uf_range))
-        if approx isa TensorBSplineApproximator
-            # Bivariate surface: the UF band machinery grids one variable
-            # and calls the evaluator with one argument. Skip its band
-            # (parameter/trajectory bootstrap still covers it).
-            @warn "bootstrap: approximator :$(approx.name) is bivariate; " *
+        if approx isa TensorBSplineApproximator ||
+           (approx isa KANApproximator && approx.input_dim > 1)
+            # Without query points there is no univariate evaluation grid.
+            @warn "bootstrap: approximator :$(approx.name) is multivariate; " *
                   "skipping its unknown-function confidence band " *
-                  "(only univariate functions can be gridded)"
+                  "(supply uf_points for physical query coordinates)"
             continue
         end
         # `band_domain`, NOT `approx.domain`: a `domain` field is NOT part of
@@ -221,10 +259,11 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                   "skipping its unknown-function confidence band"
             continue
         end
-        lo, hi = dom
-        uf_grids[approx.name] = collect(range(lo, hi, length=uf_ngrid))
+        uf_grids[approx.name] = _function_band_grid(dom, uf_ngrid)
     end
-    uf_names = collect(keys(uf_grids))
+    uf_names = union(collect(keys(uf_grids)), collect(keys(queries)))
+    uf_sizes = Dict(name => haskey(queries, name) ? size(queries[name], 1) : length(uf_grids[name])
+                    for name in uf_names)
 
     # One-argument band curve for `name` in a bootstrap replicate.
     _boot_uf_curve(name, sol_b) =
@@ -233,6 +272,16 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                                   Float64.(sol_b.parameters[uf_special[name][2]]),
                                   x)) :
             sol_b.unknown_functions[name]
+
+    function _boot_uf_values(name, sol_b)
+        if haskey(queries, name)
+            f = sol_b.unknown_functions[name]
+            [_bootstrap_function_value(f, point...) for point in eachrow(queries[name])]
+        else
+            f = _boot_uf_curve(name, sol_b)
+            [_bootstrap_function_value(f, x) for x in uf_grids[name]]
+        end
+    end
 
     n_p = length(sol.parameters)
 
@@ -270,18 +319,18 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
 
             sol_boot = try
                 solve(prob_boot, alg)
-            catch
+            catch e
+                (_is_program_error(e) || e isa ArgumentError) && rethrow()
                 nothing
             end
 
-            if sol_boot !== nothing && all(isfinite, sol_boot.fitted_values)
+            if sol_boot !== nothing && all(isfinite, sol_boot.parameters) &&
+                    all(isfinite, sol_boot.fitted_values)
                 # Evaluate UFs on grid
                 uf_vals = Dict{Symbol, Vector{Float64}}()
                 for name in uf_names
-                    grid = uf_grids[name]
                     if haskey(sol_boot.unknown_functions, name)
-                        f = _boot_uf_curve(name, sol_boot)
-                        uf_vals[name] = Float64[(try; f(x); catch; NaN; end) for x in grid]
+                        uf_vals[name] = _boot_uf_values(name, sol_boot)
                     end
                 end
                 results[b] = (coefs=collect(sol_boot.parameters),
@@ -305,7 +354,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
         # the quantile step below skips NaN columns instead of treating
         # them as zeros.
         uf_samples = Dict{Symbol, Matrix{Float64}}(
-            name => fill(NaN, uf_ngrid, n_success) for name in uf_names)
+            name => fill(NaN, uf_sizes[name], n_success) for name in uf_names)
 
         for (k, r) in enumerate(successful)
             coef_samples[k, :] .= r.coefs
@@ -326,7 +375,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
         fitted_samples = zeros(n_times, n_obs, nboot)
         # NaN marks absent/failed UF evaluations (see threaded path)
         uf_samples = Dict{Symbol, Matrix{Float64}}(
-            name => fill(NaN, uf_ngrid, nboot) for name in uf_names)
+            name => fill(NaN, uf_sizes[name], nboot) for name in uf_names)
         n_success = 0
 
         for b in 1:nboot
@@ -355,12 +404,13 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
             sol_boot = try
                 solve(prob_boot, alg)
             catch e
+                (_is_program_error(e) || e isa ArgumentError) && rethrow()
                 if verbose; println("  Replicate $b failed: $e"); end
                 continue
             end
 
-            if !all(isfinite, sol_boot.fitted_values)
-                if verbose; println("  Replicate $b: non-finite fitted values"); end
+            if !all(isfinite, sol_boot.parameters) || !all(isfinite, sol_boot.fitted_values)
+                if verbose; println("  Replicate $b: non-finite parameters or fitted values"); end
                 continue
             end
 
@@ -368,13 +418,9 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
             coef_samples[n_success, :] .= sol_boot.parameters
             fitted_samples[:, :, n_success] .= sol_boot.fitted_values
 
-            for (name, grid) in uf_grids
+            for name in uf_names
                 if haskey(sol_boot.unknown_functions, name)
-                    f = _boot_uf_curve(name, sol_boot)
-                    for (k, x) in enumerate(grid)
-                        val = try; f(x); catch; NaN; end
-                        uf_samples[name][k, n_success] = val
-                    end
+                    uf_samples[name][:, n_success] .= _boot_uf_values(name, sol_boot)
                 end
             end
         end
@@ -412,17 +458,26 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
     # pointwise evaluation) — quantile() throws on NaN, which previously
     # killed an entire completed bootstrap run at this final step.
     ci_uf = Dict{Symbol, NamedTuple{(:lower, :upper), Tuple{Vector{Float64}, Vector{Float64}}}}()
+    uf_success = Dict{Symbol, Vector{Int}}()
     for (name, mat) in uf_samples
-        lo = Vector{Float64}(undef, uf_ngrid)
-        hi = Vector{Float64}(undef, uf_ngrid)
-        for k in 1:uf_ngrid
-            vals = filter(!isnan, view(mat, k, :))
-            if isempty(vals)
+        lo = Vector{Float64}(undef, size(mat, 1))
+        hi = similar(lo)
+        counts = zeros(Int, size(mat, 1))
+        for k in axes(mat, 1)
+            vals = filter(isfinite, view(mat, k, :))
+            counts[k] = length(vals)
+            if length(vals) < 3
                 lo[k] = NaN; hi[k] = NaN
             else
                 lo[k] = quantile(vals, α_lo)
                 hi[k] = quantile(vals, α_hi)
             end
+        end
+        uf_success[name] = counts
+        if any(<(n_success), counts)
+            @warn "bootstrap: approximator :$name has unavailable/non-finite function evaluations; " *
+                  "pointwise bands use $(minimum(counts)) to $(maximum(counts)) of $n_success " *
+                  "successful fits. Points with fewer than three values have NaN endpoints."
         end
         ci_uf[name] = (lower=lo, upper=hi)
     end
@@ -431,7 +486,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
         coef_samples, fitted_samples,
         uf_samples, uf_grids,
         (lower=ci_lower, upper=ci_upper), ci_uf,
-        level, n_success)
+        level, n_success, queries, uf_success)
 end
 
 # ─── Resampling methods ──────────────────────────────────────────

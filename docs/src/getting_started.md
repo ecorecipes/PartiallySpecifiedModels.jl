@@ -151,6 +151,20 @@ A [`PSMProblem`](@ref) combines:
 | `likelihood`    | Error distribution ([`Gaussian`](@ref), [`Poisson`](@ref), etc.) |
 | `solver`        | ODE solver from OrdinaryDiffEq.jl                       |
 
+### Observation times
+
+ODE and DDE simulations return predictions at `data_times`, not at the first
+saved solver states. Extra saved points from `save_start=true`,
+`save_everystep=true`, or callbacks do not shift the observations. A saved
+trajectory that does not cover the requested times raises an error.
+
+Discrete simulations advance in unit steps from `tspan[1]`, which need not be
+an integer. For example, `tspan=(0.5, 5.5)` uses the grid
+`0.5, 1.5, ..., 5.5`. Observation times are rounded to the nearest step on
+that grid; gaps still require all intervening model steps, and duplicate
+observations share a prediction. An observation that rounds outside the
+available grid raises an error instead of receiving a zero prediction.
+
 ### Missing observations
 
 Incomplete data does not need reshaping. Mark a missing cell in `data_values`

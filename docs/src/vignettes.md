@@ -1,6 +1,6 @@
 # Vignettes
 
-The `vignettes/` directory contains 40 worked examples covering every solver, approximator, and likelihood type. Each vignette is a self-contained [Quarto](https://quarto.org/) document with rendered markdown available on GitHub.
+The `vignettes/` directory contains 41 worked examples covering every solver, approximator, and likelihood type. Each vignette is a self-contained [Quarto](https://quarto.org/) document with rendered markdown available on GitHub.
 
 ## Getting Started
 
@@ -31,6 +31,7 @@ The `vignettes/` directory contains 40 worked examples covering every solver, ap
 | 13 | [Shape Constraints](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/13_shape_constraints/13_shape_constraints.md) | Monotonicity, convexity, and zero-at-endpoint constraints |
 | 16 | [COMONet](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/16_comonet/16_comonet.md) | Shape-constrained neural network approximators |
 | 26 | [SPDE](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/26_spde/26_spde.md) | Matérn SPDE approximator with shape constraints and profile range optimization |
+| 41 | [Kolmogorov-Arnold Networks](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/41_kan/41_kan.md) | Fixed-grid KAN responses, spline comparison, edge diagnostics and pointwise uncertainty |
 
 ## Solvers
 

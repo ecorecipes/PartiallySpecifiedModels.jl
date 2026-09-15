@@ -33,32 +33,39 @@ function partition_intervals(data_times::Vector{Float64}, n_intervals::Int;
 
     # Create evenly spaced interval boundaries
     boundaries = collect(range(t_start, t_end, length=n_intervals + 1))
+    partition_times = data_times
+    partition_bounds = boundaries
 
     if discrete
-        # Discrete maps advance on integer steps; fractional boundaries made
-        # the step grid miss both the data times (zero data loss) and the
-        # segment ends (continuity constraints silently dropped).
-        boundaries = unique(round.(boundaries) .+ 0.0)   # .+ 0.0 folds -0.0 into 0.0
+        # Use the global step indices for boundaries AND observations.
+        # Absolute integer rounding loses a fractional model time origin;
+        # local rounding can also disagree at half-step ties.
+        partition_times = [_discrete_step_index(t, t0) for t in data_times]
+        all(>=(0), partition_times) ||
+            throw(ArgumentError("discrete observations precede the time origin"))
+        partition_bounds = unique(round.(Int, range(
+            0, partition_times[end], length=n_intervals + 1)))
+        boundaries = t0 .+ partition_bounds
         if length(boundaries) - 1 < n_intervals
             @warn "MultipleShooting: reduced n_intervals from $n_intervals " *
                   "to $(length(boundaries) - 1) after snapping interval " *
-                  "boundaries to integer time steps"
+                  "boundaries to unit steps from t0=$t0"
             n_intervals = length(boundaries) - 1
         end
         n_intervals >= 1 ||
             error("MultipleShooting: fewer than one interval after snapping " *
-                  "boundaries to integer steps; use single shooting instead")
+                  "boundaries to unit steps; use single shooting instead")
     end
 
     # Assign data points to intervals
     intervals = Vector{Vector{Int}}(undef, n_intervals)
     for k in 1:n_intervals
-        t_lo = boundaries[k]
-        t_hi = boundaries[k + 1]
+        t_lo = partition_bounds[k]
+        t_hi = partition_bounds[k + 1]
         if k < n_intervals
-            intervals[k] = findall(t -> t_lo <= t < t_hi, data_times)
+            intervals[k] = findall(t -> t_lo <= t < t_hi, partition_times)
         else
-            intervals[k] = findall(t -> t_lo <= t <= t_hi, data_times)
+            intervals[k] = findall(t -> t_lo <= t <= t_hi, partition_times)
         end
     end
 
@@ -178,14 +185,13 @@ function _ms_loss_inner(prob::PSMProblem, z, n_theta::Int, K::Int,
 
         if prob.discrete
             # Discrete-time: iterate from t_lo to t_hi. Boundaries are
-            # snapped to integers in partition_intervals, so the unit-step
-            # grid lands exactly on t_hi and on rounded data times.
+            # snapped to the model's step grid in partition_intervals.
             u = copy(u0_k)
             u_next = similar(u)
             all_steps = collect(t_lo:1.0:t_hi)
 
-            time_states = Dict{Float64, Vector{T}}()
-            time_states[t_lo] = copy(u)
+            time_states = Dict{Int, Vector{T}}()
+            time_states[0] = copy(u)
 
             for si in 1:(length(all_steps)-1)
                 t_cur = all_steps[si]
@@ -195,8 +201,7 @@ function _ms_loss_inner(prob::PSMProblem, z, n_theta::Int, K::Int,
                 # the spline evaluators (which cannot bracket a NaN knot
                 # position) deep inside the AD-driven line search.
                 all(_all_finite, u) || return T(1e10)
-                t_now = all_steps[si + 1]
-                time_states[t_now] = copy(u)
+                time_states[si] = copy(u)
             end
 
             # Data fit loss. A missing entry indicates an internal
@@ -204,11 +209,12 @@ function _ms_loss_inner(prob::PSMProblem, z, n_theta::Int, K::Int,
             # fail loudly rather than silently dropping observations.
             for gi in idx
                 t_data = prob.data_times[gi]
-                t_nearest = round(t_data)
-                u_at_t = get(time_states, t_nearest, nothing)
+                local_step = _discrete_step_index(t_data, prob.tspan[1]) -
+                             _discrete_step_index(t_lo, prob.tspan[1])
+                u_at_t = get(time_states, local_step, nothing)
                 u_at_t === nothing &&
                     error("MultipleShooting internal error: no state " *
-                          "recorded at t=$t_nearest for observation at " *
+                          "recorded at local step $local_step for observation at " *
                           "t=$t_data in interval [$t_lo, $t_hi]")
                 for j in 1:size(prob.data_values, 2)
                     # Masked cells contribute nothing. `0 * NaN = NaN`,
@@ -232,7 +238,7 @@ function _ms_loss_inner(prob::PSMProblem, z, n_theta::Int, K::Int,
 
             # Shooting constraint: t_hi is always on the step grid.
             if k < n_intervals
-                u_end = time_states[t_hi]
+                u_end = time_states[length(all_steps) - 1]
                 for s in 1:K
                     gap = u_end[s] - shooting_vars[k, s]
                     lagrangian_term += lagrange_mult[k, s] * gap
@@ -316,8 +322,8 @@ divided into intervals, each with its own initial condition; a combined
 objective penalises data misfit and continuity gaps between intervals.
 
 # Algorithm
-1. Partition the time span into `n_intervals` sub-intervals (integer
-   boundaries for discrete-time models).
+1. Partition the time span into `n_intervals` sub-intervals (boundaries on
+   the unit-step grid anchored at `tspan[1]` for discrete-time models).
 2. Introduce free initial conditions at each interval boundary, optimized
    jointly with the model parameters.
 3. Form the augmented Lagrangian: data-fit loss + v'h + (ρ/2)‖h‖²

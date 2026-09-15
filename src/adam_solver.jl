@@ -67,15 +67,7 @@ function adam_simulate_discrete(prob::PSMProblem, p, ::Type{T}) where {T}
     t_end = prob.tspan[2]
     all_times = collect(t_start:1.0:t_end)
 
-    # Map data_times to step indices
-    data_time_set = Dict{Float64, Vector{Int}}()
-    for (di, dt) in enumerate(prob.data_times)
-        t_nearest = round(dt)
-        if !haskey(data_time_set, t_nearest)
-            data_time_set[t_nearest] = Int[]
-        end
-        push!(data_time_set[t_nearest], di)
-    end
+    data_time_set = _discrete_observation_steps(prob)
 
     # Allocate prediction matrix in the caller-supplied element type
     pred = zeros(T, n_times, n_obs)
@@ -84,9 +76,8 @@ function adam_simulate_discrete(prob::PSMProblem, p, ::Type{T}) where {T}
     u_next = zeros(T, n_vars)
 
     # Record initial condition
-    t = t_start
-    if haskey(data_time_set, t)
-        for di in data_time_set[t]
+    if haskey(data_time_set, 0)
+        for di in data_time_set[0]
             for j in 1:n_obs
                 pred[di, j] = u[prob.obs_to_state[j]]
             end
@@ -97,10 +88,8 @@ function adam_simulate_discrete(prob::PSMProblem, p, ::Type{T}) where {T}
         t = all_times[step]
         prob.dynamics!(u_next, u, p, t)
         u = copy(u_next)
-        t_now = all_times[step + 1]
-
-        if haskey(data_time_set, t_now)
-            for di in data_time_set[t_now]
+        if haskey(data_time_set, step)
+            for di in data_time_set[step]
                 for j in 1:n_obs
                     pred[di, j] = u[prob.obs_to_state[j]]
                 end
@@ -349,6 +338,13 @@ end
 
 # ─── Main Adam solver ────────────────────────────────────────────
 
+function _adam_plateau(loss_window, iter, best_loss, lr_t, alg::AdamSolver)
+    alg.early_stopping && iter > max(60, alg.plateau_window) &&
+        best_loss < 1e9 && lr_t > 0.05 * alg.lr || return false
+    recent_min, recent_max = extrema(loss_window)
+    (recent_max-recent_min)/max(abs(recent_min), 1.0) < alg.plateau_tol
+end
+
 """
     solve(prob::PSMProblem, alg::AdamSolver)
 
@@ -441,7 +437,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
     v_adam = zeros(n_beta)
     best_beta = copy(beta)
     best_loss = Inf
-    loss_window = fill(Inf, 30)
+    loss_window = fill(Inf, alg.plateau_window)
 
     # Honest convergence reporting: defaults describe loop exhaustion.
     conv_converged = false
@@ -485,7 +481,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
             best_loss = loss_val
             best_beta .= beta
         end
-        loss_window[mod1(iter, 30)] = loss_val
+        loss_window[mod1(iter, alg.plateau_window)] = loss_val
 
         # Cosine learning rate annealing
         lr_t = lr * 0.5 * (1 + cos(π * iter / alg.maxiters))
@@ -508,15 +504,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
         # schedule: near maxiters lr_t → 0, so the loss stops moving no matter
         # how far from an optimum we are. Only declare plateau-convergence
         # while the step size is still meaningful (lr_t > 5% of the base lr).
-        if iter > 60 && best_loss < 1e9 && lr_t > 0.05 * lr
-            recent_min = minimum(loss_window)
-            recent_max = maximum(loss_window)
-            if (recent_max - recent_min) / max(abs(recent_min), 1.0) < 1e-4
-                if verbose; println("  Converged at iter $iter (loss plateau)"); end
-                conv_converged = true
-                conv_reason = :plateau
-                break
-            end
+        if _adam_plateau(loss_window, iter, best_loss, lr_t, alg)
+            if verbose; println("  Converged at iter $iter (loss plateau)"); end
+            conv_converged = true
+            conv_reason = :plateau
+            break
         end
     end
     beta .= best_beta

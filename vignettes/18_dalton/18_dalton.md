@@ -1,6 +1,6 @@
 # Probabilistic ODE Solving with DaltonSolver
 Simon Frost
-2026-09-04
+2026-09-15
 
 - [Overview](#overview)
 - [Logistic Growth with Unknown Per-Capita
@@ -256,9 +256,6 @@ sol_lv_dalton = solve(prob_lv, DaltonSolver(n_steps=300, maxiters=500, verbose=f
 sol_lv_rodeo = solve(prob_lv, RodeoSolver(n_steps=300, method=:fenrir, maxiters=500, verbose=false));
 sol_lv_laml = solve(prob_lv, LAML(maxiters=60, verbose=false));
 ```
-
-    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). This happens when the working-model Jacobian is too noisy for the proposals to be accepted; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
-    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2028
 
 ### Functional Response Recovery (Oscillatory)
 

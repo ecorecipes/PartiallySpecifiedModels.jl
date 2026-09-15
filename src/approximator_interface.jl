@@ -9,7 +9,7 @@
 # docs/src/extending.md ("Custom approximators") for the contracts and a
 # worked example.
 
-# The eleven built-in approximator types. Six solvers (TwoStage,
+# The historical built-in penalty-dispatch set. Six solvers (TwoStage,
 # IntegralMatching, MAGI, AGM, Rodeo, Dalton) assemble their smoothing
 # penalties through per-type whitelists whose built-in treatment is
 # historical and deliberately NOT unified (the lists differ — e.g.
@@ -18,7 +18,8 @@
 # knots, a different scale; changing either would change existing fits).
 # Each of those sites uses this Union to give any NON-built-in type the
 # generic `penalty_matrix(approx)` treatment instead of silently leaving
-# it unpenalized.
+# it unpenalized. KANApproximator is deliberately outside this set so it
+# receives the generic penalty treatment in every one of those solvers.
 const _BUILTIN_APPROX_TYPES = Union{
     BSplineApproximator, ShapeConstrainedBSplineApproximator,
     SPDEApproximator, ShapeConstrainedSPDEApproximator,
@@ -58,7 +59,8 @@ vector of `ForwardDiff.Dual` numbers, so the evaluator must be eltype-generic
 (`AdamSolver`, `MultipleShootingSolver`, `TwoStageSolver`, `BNGSolver`,
 `IntegralMatchingSolver`, …).
 
-Methods are provided for the eleven built-in types:
+Methods are provided for the twelve shipped types (KAN construction requires
+the optional FluxKAN backend):
 
 | Approximator | Evaluator |
 |:---|:---|
@@ -67,6 +69,7 @@ Methods are provided for the eleven built-in types:
 | `SingleIndexApproximator` | `build_single_index_evaluator` (learned direction composed with a univariate outer smooth; the callable takes `p` arguments, `f(u₁, …, u_p)`) |
 | `TransformedCovariateApproximator` | `build_transformed_covariate_evaluator` (learned transform of an exogenous covariate composed with a univariate outer smooth; the callable takes TIME, `f(t)`) |
 | `NeuralApproximator` | `build_neural_evaluator` (Dual-safe MLP path + Lux fallback) |
+| `KANApproximator` | Fixed-grid scalar spline network with one or several scalar inputs, using FluxKAN-compatible parameters |
 | `GPApproximator` | `build_gp_evaluator` (kernel interpolation) |
 | `ShapeConstrainedGPApproximator` | `build_constrained_gp_evaluator` (SCOP reparameterization + kernel interpolation) |
 | `ShapeConstrainedBSplineApproximator` | `build_constrained_bspline_evaluator` (SCOP reparameterization) |
@@ -201,8 +204,9 @@ or computes it — opts into a band by defining this method:
 PartiallySpecifiedModels.band_domain(a::MyApproximator) = (a.lo, a.hi)
 ```
 
-Types that return `nothing` are skipped with a warning; the rest of the
-bootstrap (coefficient and fitted-value intervals) still runs.
+Types that return `nothing` are skipped with a warning when no explicit
+`uf_points` are supplied; the rest of the bootstrap (coefficient and
+fitted-value intervals) still runs.
 """
 band_domain(approx::AbstractApproximator) =
     hasproperty(approx, :domain) ? approx.domain : nothing

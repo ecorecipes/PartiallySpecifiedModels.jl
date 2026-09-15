@@ -33,6 +33,22 @@ function _normcdf(x::Real)
 end
 
 """
+For t >= 1, return the inverse Mills correction r = phi(t)/Phi(-t) - t
+and the standardized truncated variance -dr/dt. Differentiating the
+continued fraction avoids subtracting nearly equal O(t^2) terms.
+"""
+function _norm_tail_moments(t::Real)
+    r = zero(t)
+    variance = zero(t)
+    for k in 400:-1:1
+        denom = t + r
+        r = k / denom
+        variance = (r / denom) * (1 - variance)
+    end
+    r, variance
+end
+
+"""
 Standard normal log-CDF log Φ(x), stable and accurate in BOTH tails.
 
 Replaces a truncated asymptotic expansion that dropped the Mills-series
@@ -76,12 +92,36 @@ function _normlogcdf(x::Real)
         # evaluated by backward recurrence (depth 400: machine precision
         # for t ≥ 1, and trivially cheap).
         t = -x
-        r = zero(t)
-        for k in 400:-1:1
-            r = k / (t + r)
-        end
+        r, _ = _norm_tail_moments(t)
         -0.5 * x^2 - 0.5 * log(2π) - log(t + r)
     end
+end
+
+"""Return (response mean, variance / sigma^2) for a truncated normal."""
+function _truncated_normal_moments(fam::TruncatedNormal, mu::Real)
+    σ, a = fam.sigma, fam.lower
+    ξ = (mu - a) / σ
+    if ξ <= -1
+        r, variance = _norm_tail_moments(-ξ)
+        # mu + sigma * (-xi + r) = a + sigma*r, without tail cancellation.
+        return a + σ * r, variance
+    end
+    λ = exp(-0.5 * ξ^2 - 0.5 * log(2π) - _normlogcdf(ξ))
+    mu + σ * λ, 1 - λ * (ξ + λ)
+end
+
+function _truncated_normal_loglik(fam::TruncatedNormal, y::Real, mu::Real)
+    σ, a = fam.sigma, fam.lower
+    ξ = (mu - a) / σ
+    if ξ <= -1
+        t = -ξ
+        r, _ = _norm_tail_moments(t)
+        d = (y - a) / σ
+        # Cancel the shared t^2/2 terms algebraically, not in floating point.
+        return log(t + r) - log(σ) - d * (t + 0.5 * d)
+    end
+    z = (y - mu) / σ
+    -0.5 * z^2 - log(σ) - 0.5 * log(2π) - _normlogcdf(ξ)
 end
 
 # ─── log Γ (Lanczos; avoids a SpecialFunctions dependency) ──────────
@@ -208,15 +248,10 @@ end
 
 function log_likelihood(fam::TruncatedNormal, y::AbstractVector,
                         mu::AbstractVector, w::AbstractVector)
-    σ = fam.sigma
-    a = fam.lower
     ll = 0.0
     for i in eachindex(y)
         _usable(y[i], w[i]) || continue
-        z = (y[i] - mu[i]) / σ
-        # log f(y|μ,σ,a) = -½z² - log(σ) - ½log(2π) - log Φ((μ-a)/σ)
-        ll += w[i] * (-0.5 * z^2 - log(σ) - 0.5 * log(2π) -
-                       _normlogcdf((mu[i] - a) / σ))
+        ll += w[i] * _truncated_normal_loglik(fam, y[i], mu[i])
     end
     ll
 end
@@ -273,10 +308,7 @@ end
 
 function loglik_pointwise(fam::TruncatedNormal, y::Real, mu::Real)
     !isfinite(y) && return zero(y * mu)
-    σ = fam.sigma
-    a = fam.lower
-    z = (y - mu) / σ
-    -0.5 * z^2 - log(σ) - 0.5 * log(2π) - _normlogcdf((mu - a) / σ)
+    _truncated_normal_loglik(fam, y, mu)
 end
 
 loglik_pointwise(fam::CustomLikelihood, y::Real, mu::Real) =
@@ -360,19 +392,16 @@ function irls_weights(fam::TruncatedNormal, y::AbstractVector,
     #   I(μ) = (1/σ²)(1 - ξ·λ(ξ) - λ(ξ)²)
     # where ξ = (μ-a)/σ, λ(ξ) = φ(ξ)/Φ(ξ) (inverse Mills ratio), from
     # -∂²ℓ/∂μ² = (1 + λ'(ξ))/σ² with λ'(ξ) = -ξλ - λ².
-    # Analytically I(μ) ∈ (0, 1/σ²); the floor guards roundoff at ξ ≪ 0.
+    # Analytically I(μ) ∈ (0, 1/σ²); the floor regularizes vanishing information.
     # Working weight: W̃ = w × I(μ)
     σ = fam.sigma
-    a = fam.lower
     wt = similar(w)
     for i in eachindex(w)
         if !_usable(y[i], w[i])
             wt[i] = zero(eltype(wt)); continue
         end
-        ξ = (mu[i] - a) / σ
-        Φξ = max(_normcdf(ξ), 1e-15)
-        λξ = _normpdf(ξ) / Φξ          # inverse Mills ratio
-        info = (1.0 - ξ * λξ - λξ^2) / σ^2
+        _, variance = _truncated_normal_moments(fam, mu[i])
+        info = variance / σ^2
         wt[i] = w[i] * max(info, 1e-10)
     end
     wt
@@ -473,20 +502,18 @@ this is a no-op on weakly truncated fits and only bites where the bound
 actually bites — the same "only bites where it bites" property
 `_family_mean` has.
 
-The `Φ` and information floors are the SAME guards `irls_weights` applies
-(`max(Φ(ξ), 1e-15)`, `max(I, 1e-10)`). They have to be, or (★) would fail
-in the far tail where one side is clamped and the other is not.
+The moments and information floor are shared with `irls_weights`. In the
+lower tail the mean and information come directly from the normal
+log-CDF's continued fraction, without flooring Φ or subtracting large,
+nearly equal Mills-ratio terms.
 """
 function _working_residual_scalar(fam::TruncatedNormal, y::Real, mu::Real)
     σ = fam.sigma
-    a = fam.lower
-    ξ = (mu - a) / σ
-    Φξ = max(_normcdf(ξ), 1e-15)
-    λξ = _normpdf(ξ) / Φξ
+    mean_y, variance = _truncated_normal_moments(fam, mu)
     # Same guarded information as `irls_weights`, so W̃·(z−η) = w·score holds
     # even where the floor is active.
-    info = max((1.0 - ξ * λξ - λξ^2) / σ^2, 1e-10)
-    score = (y - mu) / σ^2 - λξ / σ            # = (y − E[Y|μ])/σ²
+    info = max(variance / σ^2, 1e-10)
+    score = (y - mean_y) / σ^2
     score / info
 end
 

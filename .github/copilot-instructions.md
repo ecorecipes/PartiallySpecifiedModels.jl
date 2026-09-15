@@ -9,8 +9,11 @@ rather than assumed to have a fixed parametric form. The application domain is
 ecology and epidemiology, where density dependence, functional responses and
 transmission rates are often of uncertain shape.
 
-Scale: ~25k lines of source, ~12.7k lines of tests (2760 assertions), 23
-solvers, 11 approximators, 5 likelihoods, 40 vignettes.
+Scale: ~25k lines of source, 23 solvers, 12 approximators (including
+`KANApproximator`, backed by FluxKAN.jl through a package extension), 5
+likelihoods, 41 vignettes. The test suite is `test/runtests.jl` plus
+topic files it includes; `Pkg.test(test_args=["kan"])` runs one group
+(see README for the group names).
 
 ## Architecture — four composable abstractions
 

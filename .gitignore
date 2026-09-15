@@ -13,3 +13,10 @@ vignettes/*_files/
 Manifest.toml
 proofs/
 .claude/worktrees/
+
+# Benchmark campaign OUTPUTS (measured 2026-09-15: kan/results 441M,
+# calibration/campaigns 1.6G, calibration/runs 1.3G — 3.4G, 215k files).
+# Scripts, plans and assessment notes under benchmarks/ stay tracked.
+benchmarks/**/results/
+benchmarks/calibration/campaigns/
+benchmarks/calibration/runs/

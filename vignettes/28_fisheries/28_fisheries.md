@@ -1,6 +1,6 @@
 # Fisheries Stock-Recruitment with Poisson Counts
 Simon Frost
-2026-09-04
+2026-09-15
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -212,9 +212,7 @@ println("Unconstrained — Data loss: $(round(sol_unc.data_loss, sigdigits=4)), 
     "EDF: $(round(sol_unc.edf, digits=1))")
 ```
 
-    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). This happens when the working-model Jacobian is too noisy for the proposals to be accepted; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
-    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2028
-    Unconstrained — Data loss: 213200.0, EDF: 6.9
+    Unconstrained — Data loss: 223100.0, EDF: 4.8
 
 ## Shape-Constrained Fit
 
@@ -283,7 +281,7 @@ p_fit
 
     Stock-Recruitment Model — Comparison
     ────────────────────────────────────────────────────────────
-      Unconstrained:  data_loss=213200.0, EDF=6.9, cor(R̂,R)=0.982
+      Unconstrained:  data_loss=223100.0, EDF=4.8, cor(R̂,R)=0.996
       Inc+Concave:    data_loss=1.124e6, EDF=4.3, cor(R̂,R)=0.929
 
 The shape constraint produces a smoother, more biologically plausible
@@ -310,8 +308,8 @@ bs = bootstrap(sol_sc, prob_sc, LAML(maxiters=200, verbose=false);
 println("Bootstrap: $(bs.n_success)/50 replicates converged")
 ```
 
-    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). This happens when the working-model Jacobian is too noisy for the proposals to be accepted; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
-    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2028
+    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). A noisy working-model Jacobian or a stalled nonlinear search can prevent acceptance; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2070
     Bootstrap: 50/50 replicates converged
 
 ### Trajectory confidence bands

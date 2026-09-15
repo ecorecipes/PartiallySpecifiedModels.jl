@@ -1,6 +1,6 @@
 # Custom approximators
 
-PartiallySpecifiedModels.jl ships with eleven approximator types, but the set is open: every solver constructs and consumes unknown functions through four generic functions, so adding your own approximator requires no changes to any solver file. Define a struct, implement the four methods, and pass it to `PSMProblem` like any built-in type.
+PartiallySpecifiedModels.jl ships with twelve approximator types, including the optional FluxKAN-backed KAN, but the set is open: every solver constructs and consumes unknown functions through four generic functions, so adding your own approximator requires no changes to any solver file. Define a struct, implement the four methods, and pass it to `PSMProblem` like any built-in type.
 
 ## The interface
 
@@ -97,12 +97,13 @@ All 23 solvers use `nparams` (parameter layout), `initial_params` (starting valu
 
 Returning `nothing` from `penalty_matrix` is always safe: the approximator is then simply unpenalized (as `NeuralApproximator` is, relying on implicit regularization).
 
-Three caveats for custom types:
+Caveats for custom types:
 
+- `KANApproximator` deliberately uses the generic penalty route even though its type is shipped by this package. The historical `_BUILTIN_APPROX_TYPES` union controls six per-type penalty branches; adding a new type to that union without implementing every branch can silently remove its penalty.
 - A handful of solver capabilities are gated on the built-in types (e.g. `AdaptiveGradientMatching`'s population-MCMC mode rejects `NeuralApproximator`; `optimize_spde_range` only operates on SPDE approximators). Custom types pass these gates like any non-listed type.
 - Six solvers (`TwoStageSolver`, `IntegralMatchingSolver`, `MagiSolver`, `AdaptiveGradientMatching`, `RodeoSolver`, `DaltonSolver`) assemble their smoothing penalty through per-type code whose built-in treatment is historical and deliberately preserved (the lists differ between solvers, and some build spline penalties on domain rather than unit knots). Custom types are **not** affected by those quirks: every one of these sites falls back to the generic `penalty_matrix(approx)` for any non-built-in type, so a custom penalty flows in everywhere — as it always did in the penalized-likelihood, through-the-solver, and MCMC/VI/ABC families.
 - The adaptive GP hyperparameter refitting inside `LAML`/`GCVSolver` is specific to `GPApproximator`; custom types keep whatever structure their four methods define.
-- `confidence_band` (diagnostics) evaluates approximators through its own restricted mechanism and supports only the built-in basis-expansion types — custom types (like `NeuralApproximator`/`COMONetApproximator`) are not supported there and will error. `bootstrap`'s unknown-function band is **not** subject to that limitation: it grids whatever [`band_domain`](@ref PartiallySpecifiedModels.band_domain) returns, and simply skips the band (with a warning, keeping the rest of the bootstrap) when that is `nothing`.
+- `confidence_band`'s automatic grids support the built-in basis expansions and KANs. Explicit unary `uf_points` instead uses `build_evaluator` for parameter sensitivities, so custom unary types can use that path when the fit provides a covariance. Automatic bootstrap bands grid whatever [`band_domain`](@ref PartiallySpecifiedModels.band_domain) returns, skipping only the band with a warning when that is `nothing`; explicit unary points do not require a domain.
 
 One further subtlety: the default penalty enumeration only includes a term
 when the approximator has at least 3 parameters (the gate lives in the
@@ -130,7 +131,7 @@ under another name, or computes it, opts into a band with one line:
 PartiallySpecifiedModels.band_domain(a::MyApproximator) = (a.lo, a.hi)
 ```
 
-Without such a method `bootstrap` warns and skips **only that band**; the
+Without such a method or explicit `uf_points`, `bootstrap` warns and skips **only that band**; the
 coefficient and fitted-value intervals are still produced. (Previously the
 field was read directly, so a protocol-conforming type with no `domain`
 raised a `FieldError` in the grid loop — before any replicate was fitted —

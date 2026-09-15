@@ -1,6 +1,6 @@
 # Solver Comparison: Eleven Methods on One Problem
 Simon Frost
-2026-09-04
+2026-09-15
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -150,9 +150,7 @@ mixed models. For strongly nonlinear models like prevalence-dependent
 transmission, `initial_lambda` and `warmup` keep the early IRLS steps
 well-conditioned:
 
-    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). This happens when the working-model Jacobian is too noisy for the proposals to be accepted; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
-    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2028
-    LAML: data_loss=1342.4, edf=4.1, time=8.9s
+    LAML: data_loss=1347.2, edf=3.0, time=8.2s
 
 ### 2. CollocationLAML
 
@@ -162,7 +160,7 @@ penalty, starting from a pure data-fit and converging toward
 ODE-consistent solutions.
 
     ┌ Warning: CollocationLAML: simulating the fitted dynamics gives a data loss 8468.0× the reported `data_loss`. `fitted_values` are the estimated STATE, which need not lie near any trajectory the dynamics admit, so the reported loss understates the model's error by that factor. See `convergence.simulated_data_loss`.
-    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/collocation_solver.jl:1267
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/collocation_solver.jl:1269
     CollocationLAML: data_loss=771.1, edf=2.0, time=3.3s
 
 ### 3. GradientMatching
@@ -171,7 +169,7 @@ Estimates derivatives directly from a smooth interpolant of the data,
 then fits the ODE right-hand side to those derivatives. No ODE
 integration required — fast but relies on good derivative estimates.
 
-    GradientMatching: data_loss=953677.0, edf=8.0, time=2.5s
+    GradientMatching: data_loss=953677.0, edf=8.0, time=2.1s
 
 > [!NOTE]
 >
@@ -203,7 +201,7 @@ Direct optimisation of the B-spline coefficients using the Adam gradient
 descent algorithm. Integrates the ODE at each step and minimises the
 mean squared error to data.
 
-    AdamSolver: data_loss=1365.0, time=4.7s
+    AdamSolver: data_loss=1365.0, time=4.1s
 
 ### 5. AdaptiveGradientMatching (AGM)
 
@@ -212,7 +210,7 @@ parameters $\gamma_k$ that control how tightly the GP derivatives must
 satisfy the ODE. Uses pre-computed eigendecomposition for efficiency and
 a B-spline smoothing penalty.
 
-    AGM: data_loss=1.2349747e6, time=6.7s
+    AGM: data_loss=1.2387482e6, time=6.0s
 
 ### 6. RodeoSolver
 
@@ -221,7 +219,7 @@ Kalman filter/smoother. The ODE is enforced as pseudo-observations in a
 state-space model; the marginal likelihood is maximised over B-spline
 coefficients.
 
-    RodeoSolver: data_loss=1505.9, time=13.5s
+    RodeoSolver: data_loss=1505.9, time=13.4s
 
 ### 7. IntegralMatchingSolver
 
@@ -238,7 +236,7 @@ Derivative-free ensemble method: maintains a population of parameter
 particles, propagates each through the ODE, and updates via the Kalman
 gain. Naturally handles non-smooth objectives and noisy forward models.
 
-    EnsembleKalman: data_loss=1328.8, time=2.2s
+    EnsembleKalman: data_loss=1328.8, time=2.1s
 
 ### 9. ODINSolver
 
@@ -249,7 +247,7 @@ likelihood for tighter coupling.
 
     ┌ Warning: ODINSolver: simulating the fitted dynamics gives a data loss 13520.0× the reported `data_loss`. `fitted_values` are the estimated STATE, which need not lie near any trajectory the dynamics admit, so the reported loss understates the model's error by that factor. See `convergence.simulated_data_loss`.
     └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/odin_solver.jl:352
-    ODIN: data_loss=1067.5, time=4.6s
+    ODIN: data_loss=1067.5, time=4.7s
 
 ### 10. RKHSSolver
 
@@ -261,7 +259,7 @@ parameters. No ODE integration.
 
     ┌ Warning: RKHSSolver: simulating the fitted dynamics gives a data loss 11310.0× the reported `data_loss`. `fitted_values` are the estimated STATE, which need not lie near any trajectory the dynamics admit, so the reported loss understates the model's error by that factor. See `convergence.simulated_data_loss`.
     └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/rkhs_solver.jl:450
-    RKHS: data_loss=1033.7, time=5.8s
+    RKHS: data_loss=1033.7, time=4.9s
 
 ### 11. TwoStageSolver
 
@@ -269,7 +267,7 @@ Simple baseline: smooth data with cubic splines, then match derivatives
 with Adam optimisation. Fast and transparent, but the quality of
 derivative estimation limits accuracy.
 
-    TwoStage: data_loss=978159.2, time=2.4s
+    TwoStage: data_loss=978159.2, time=2.2s
 
 ## Comparison
 
@@ -326,17 +324,17 @@ p_β
 
     Solver              | Data Loss | Time (s)
     --------------------------------------------------
-    LAML                | 1342.4    | 8.9
+    LAML                | 1347.2    | 8.2
     CollocationLAML     | 771.1     | 3.3
-    GradientMatching    | 953677.0  | 2.5
-    Adam                | 1365.0    | 4.7
-    AGM                 | 1.2349747e6| 6.7
-    Rodeo               | 1505.9    | 13.5
+    GradientMatching    | 953677.0  | 2.1
+    Adam                | 1365.0    | 4.1
+    AGM                 | 1.2387482e6| 6.0
+    Rodeo               | 1505.9    | 13.4
     IntegralMatch       | 649160.4  | 2.3
-    EnsKalman           | 1328.8    | 2.2
-    ODIN                | 1067.5    | 4.6
-    RKHS                | 1033.7    | 5.8
-    TwoStage            | 978159.2  | 2.4
+    EnsKalman           | 1328.8    | 2.1
+    ODIN                | 1067.5    | 4.7
+    RKHS                | 1033.7    | 4.9
+    TwoStage            | 978159.2  | 2.2
 
 ## Diagnostic Plots
 
@@ -374,7 +372,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](06_solver_comparison_files/figure-commonmark/cell-19-output-1.svg)
 
-    Durbin-Watson: 1.4, 1.82
+    Durbin-Watson: 1.387, 1.862
 
 > [!TIP]
 >

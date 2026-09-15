@@ -359,23 +359,122 @@ end
 
 # ─── Bayesian confidence bands from LAML posterior ────────────────
 
+_band_input_dimension(a::KANApproximator) = a.input_dim
+_band_input_dimension(::TensorBSplineApproximator) = 2
+_band_input_dimension(a::SingleIndexApproximator) = a.p
+_band_input_dimension(::AbstractApproximator) = 1
+
+_function_band_grid(dom, n) = n == 1 ? [dom[1]/2 + dom[2]/2] :
+    collect(range(dom[1], dom[2], length=n))
+
+function _function_query_points(prob::PSMProblem, supplied)
+    points = Dict{Symbol, Matrix{Float64}}()
+    supplied === nothing && return points
+    supplied isa AbstractDict || throw(ArgumentError("uf_points must be a dictionary keyed by approximator name"))
+    approximators = Dict(a.name => a for a in prob.approximators)
+    for (name, values) in supplied
+        name isa Symbol && haskey(approximators, name) ||
+            throw(ArgumentError("uf_points contains an unknown approximator name: $name"))
+        dim = _band_input_dimension(approximators[name])
+        matrix = if values isa AbstractVector{<:Real}
+            dim == 1 || throw(DimensionMismatch("uf_points[:$name] requires $dim columns, one sample per row"))
+            reshape(Vector{Float64}(values), :, 1)
+        elseif values isa AbstractMatrix{<:Real}
+            Matrix{Float64}(values)
+        else
+            throw(ArgumentError("uf_points[:$name] must contain real query coordinates"))
+        end
+        size(matrix, 2) == dim ||
+            throw(DimensionMismatch("uf_points[:$name] requires $dim columns, got $(size(matrix, 2))"))
+        size(matrix, 1) > 0 || throw(ArgumentError("uf_points[:$name] must not be empty"))
+        all(isfinite, matrix) || throw(DomainError(matrix, "uf_points[:$name] must be finite"))
+        points[name] = matrix
+    end
+    points
+end
+
+function _band_parameter_gradient(approx, params, evaluate)
+    if approx isa KANApproximator
+        return ForwardDiff.gradient(evaluate, params)
+    end
+    jac = zeros(length(params))
+    for j in eachindex(params)
+        step = max(abs(params[j])*1e-4, 1e-5)
+        plus, minus = copy(params), copy(params)
+        plus[j] += step
+        minus[j] -= step
+        jac[j] = (evaluate(plus)-evaluate(minus))/(2step)
+    end
+    jac
+end
+
+function _band_standard_error(jac, covariance)
+    all(isfinite, jac) || throw(DomainError(jac, "confidence_band: non-finite parameter sensitivity"))
+    variance = dot(jac, covariance*jac)
+    magnitude = dot(abs.(jac), abs.(covariance)*abs.(jac))
+    isfinite(variance) && isfinite(magnitude) ||
+        throw(DomainError(variance, "confidence_band: non-finite projected variance"))
+    # Only accumulation-scale negative roundoff can be clamped. A genuinely
+    # negative variance must not become a success-shaped zero-width band.
+    allowance = 8length(jac)*eps(Float64)*magnitude
+    variance >= -allowance ||
+        throw(DomainError(variance, "confidence_band: covariance gives a negative projected variance"))
+    sqrt(max(variance, 0.0))
+end
+
 """
     confidence_band(sol::PSMSolution, prob::PSMProblem;
-                    level=0.95, uf_ngrid=100)
+                    level=0.95, uf_ngrid=100, uf_points=nothing,
+                    interval=:pointwise, nsim=10000, rng=Random.default_rng(),
+                    unconditional=false, rho_covariance=nothing, rho_regularization=0.0)
 
-Compute Bayesian confidence/credible bands for the unknown functions
-using the posterior covariance from the LAML fit.
+Compute pointwise approximate posterior intervals for the unknown functions
+using the fitted parameter covariance (available from LAML).
 
-The posterior covariance is `V_β = σ̂² (J'WJ + S^λ)⁻¹`, and the
-pointwise standard error of `f(x)` is `se(x) = √(b(x)' V_β b(x))`,
-where `b(x)` is the basis vector mapping coefficients to function value.
+The stored `V_beta` is the unscaled inverse penalized information matrix.
+With `C = sigma2 * V_beta`, the pointwise standard error is
+`se(x) = sqrt(j(x)' * C * j(x))`, where `j(x)` is the parameter gradient
+of the function. For a linear spline this reduces to its basis vector;
+for nonlinear approximators this is a local delta-method approximation.
+By default the intervals condition on the selected smoothing parameters and do not
+automatically correct bias, integrate model selection, or guarantee coverage.
 
-These "across-the-function" intervals (Nychka 1988, Wood 2006 §4.8)
-account for smoothing bias and typically achieve near-nominal coverage,
-unlike bootstrap CIs which only capture sampling variability.
+By default returns a Dict mapping each unknown function name to
+`(grid, fitted, lower, upper, se)` on a univariate domain grid. A unary
+KAN requires an explicit input domain or explicit query points.
+`uf_ngrid=1` evaluates the domain midpoint.
 
-Returns a Dict mapping each unknown function name to a NamedTuple
-`(grid, fitted, lower, upper, se)`.
+`uf_points=Dict(:g => X)` supplies physical query coordinates as one sample
+per row and one input per column. Unary coordinates can also be a vector.
+The corresponding result is `(points, fitted, lower, upper, se)`, with an
+owned coordinate matrix. This supports multivariate KAN/tensor functions
+without inventing a rectangular evaluation region. For a single-index or
+transformed-covariate approximator, explicit points evaluate the FULL
+function and include inner-parameter sensitivities; the default grid still
+describes the outer standardized curve.
+
+KAN sensitivities use ForwardDiff through the fixed-grid evaluator.
+`interval=:simultaneous` instead simulates Gaussian parameter deviations
+and calibrates their maximum standardized function deviation over the
+returned query/grid points. It returns the additional fields
+`interval`, `method`, `critical`, `level`, `scope`, `conditioning` and
+`n_draws`. `nsim` controls Monte Carlo precision and `rng` reproducibility.
+The band is simultaneous for each function's finite query set separately,
+not jointly across different functions and not over a continuum.
+
+`unconditional=true` uses [`smoothing_covariance_correction`](@ref) in
+EITHER mode. This includes both coefficient-mean and covariance-root
+corrections for a Gaussian LAML local working model, holding the fitted
+dispersion fixed. `rho_covariance` and `rho_regularization` are forwarded
+to that helper and require `unconditional=true`. Unsupported or
+unidentified corrections raise an error, never silently revert to
+conditional bands. Corrected pointwise results also carry band metadata;
+`conditioning=:smoothing_corrected` and `covariance_method=:wps_local_gaussian`
+distinguish them from conditional bands. The fitted curve is unchanged.
+
+Both modes still condition on architecture, grids, other hyperparameters
+and the local Gaussian approximation. They do not guarantee frequentist coverage.
+Extrapolating query points does not make the function informed by data.
 
 ## Example
 
@@ -388,40 +487,74 @@ plot(bands[:λ].grid, bands[:λ].fitted, lw=2, label="Estimated λ")
 plot!(bands[:λ].grid, bands[:λ].lower,
       fillrange=bands[:λ].upper, fillalpha=0.2, label="95% CI")
 ```
+
+# References
+- Ruppert, D., Wand, M.P. & Carroll, R.J. (2003). *Semiparametric Regression*,
+  §6.5 — the simulation-based simultaneous band: the (1−α) quantile of the
+  maximum standardized deviation over the query grid, under the Gaussian
+  approximation to the parameter posterior.
+- Marra, G. & Wood, S.N. (2012). Coverage properties of confidence intervals
+  for generalized additive model components. *Scandinavian Journal of
+  Statistics* 39(1):53–74.
+- Wood, S.N., Pya, N. & Säfken, B. (2016). Smoothing parameter and model
+  selection for general smooth models. *JASA* 111(516):1548–1563 — the
+  smoothing-uncertainty correction applied by `smoothing_covariance_correction`.
 """
 function confidence_band(sol::PSMSolution, prob::PSMProblem;
-                         level::Float64=0.95, uf_ngrid::Int=100)
+                         level::Float64=0.95, uf_ngrid::Int=100,
+                         uf_points=nothing, interval::Symbol=:pointwise,
+                         nsim::Int=10000, rng=Random.default_rng(),
+                         unconditional::Bool=false, rho_covariance=nothing,
+                         rho_regularization::Real=0.0)
+    0 < level < 1 || throw(ArgumentError("confidence_band: level must be in (0,1)"))
+    _band_interval(interval)
+    interval === :simultaneous && nsim < 2 &&
+        throw(ArgumentError("confidence_band: nsim must be at least two"))
+    uf_ngrid >= 1 || throw(ArgumentError("confidence_band: uf_ngrid must be positive"))
+    unconditional || (rho_covariance === nothing && iszero(rho_regularization)) ||
+        throw(ArgumentError("confidence_band: smoothing covariance options require unconditional=true"))
+    queries = _function_query_points(prob, uf_points)
     # Check that V_beta is available
     conv = sol.convergence
-    if conv === nothing || !hasproperty(conv, :V_beta) || conv.V_beta === nothing
-        error("confidence_band: posterior covariance V_β not available. " *
-              "Only LAML-fitted solutions support this. Refit with LAML().")
+    if conv === nothing || !hasproperty(conv, :V_beta) || conv.V_beta === nothing ||
+            !hasproperty(conv, :sigma2) || conv.sigma2 === nothing
+        error("confidence_band: posterior covariance V_beta and scale sigma2 are required. " *
+              "Use a covariance-producing fit such as LAML().")
     end
     V_beta = conv.V_beta
     σ² = conv.sigma2
+    size(V_beta) == (length(sol.parameters), length(sol.parameters)) &&
+        length(sol.parameters) == n_total_params(prob) ||
+        throw(DimensionMismatch("confidence_band: covariance/parameter dimensions do not match the problem"))
+    all(isfinite, V_beta) && isfinite(σ²) && σ² >= 0 ||
+        throw(DomainError(σ², "confidence_band: covariance and scale must be finite, with nonnegative scale"))
+    correction = unconditional ?
+        smoothing_covariance_correction(sol, prob; rho_covariance, rho_regularization) : nothing
 
     z = _qnorm(1.0 - (1.0 - level) / 2.0)
 
-    result = Dict{Symbol, NamedTuple{(:grid, :fitted, :lower, :upper, :se),
-                  Tuple{Vector{Float64}, Vector{Float64}, Vector{Float64},
-                        Vector{Float64}, Vector{Float64}}}}()
+    result = Dict{Symbol, NamedTuple}()
 
     offset = 0
     for approx in prob.approximators
-        # The band machinery grids a SINGLE input variable and evaluates the
-        # unknown function with one argument; a bivariate tensor surface has
-        # no univariate band. Reject loudly rather than erroring obscurely
-        # on the missing `.domain` field below.
-        approx isa TensorBSplineApproximator && throw(ArgumentError(
+        approx isa TensorBSplineApproximator && !haskey(queries, approx.name) && throw(ArgumentError(
             "confidence_band: TensorBSplineApproximator (:$(approx.name)) " *
-            "is a bivariate surface; univariate confidence bands are not " *
-            "defined for it. Evaluate sol.unknown_functions[:" *
-            "$(approx.name)](x, y) directly for point estimates."))
+            "requires explicit uf_points with two columns."))
         np = nparams(approx)
         idx = (offset+1):(offset+np)
-        V_k = σ² .* V_beta[idx, idx]
+        V_k = unconditional ? correction.covariance[idx, idx] : σ² .* V_beta[idx, idx]
+        all(isfinite, V_k) || throw(DomainError(V_k, "confidence_band: scaled covariance is non-finite"))
+        params_k = Float64.(sol.parameters[idx])
 
-        grid = collect(range(approx.domain[1], approx.domain[2], length=uf_ngrid))
+        explicit = haskey(queries, approx.name)
+        grid = if explicit
+            queries[approx.name]
+        else
+            dom = band_domain(approx)
+            dom === nothing && throw(ArgumentError(
+                "confidence_band: approximator :$(approx.name) requires explicit uf_points or a univariate band domain"))
+            _function_band_grid(dom, uf_ngrid)
+        end
         # A single-index approximator's fitted callable takes p arguments, so
         # its band is the band of the OUTER curve s(z) over the STANDARDIZED
         # index z ∈ [−xi, xi] — the univariate payoff a tensor surface cannot
@@ -430,35 +563,66 @@ function confidence_band(sol::PSMSolution, prob::PSMProblem;
         # is the standardized covariate range, so calling it on the grid would
         # evaluate f at times −xi…xi. Everything else is evaluated through its
         # own callable.
-        f_est = if approx isa SingleIndexApproximator ||
+        f_est = if explicit
+            f = sol.unknown_functions[approx.name]
+            Float64[f(point...) for point in eachrow(grid)]
+        elseif approx isa SingleIndexApproximator ||
                    approx isa TransformedCovariateApproximator
-            Float64[_eval_approx_at(approx, Float64.(sol.parameters[idx]), x)
+            Float64[_eval_approx_at(approx, params_k, x)
                     for x in grid]
         else
             Float64[sol.unknown_functions[approx.name](x) for x in grid]
         end
-        se = zeros(uf_ngrid)
+        all(isfinite, f_est) ||
+            throw(DomainError(f_est, "confidence_band: non-finite function values at query points"))
+        se = zeros(length(f_est))
+        jacobian = interval === :simultaneous ? zeros(length(f_est),np) : nothing
 
-        # Compute ∂f(x)/∂β via central finite differences for all approximator types.
-        # This handles B-splines, shape-constrained, SPDE, GP uniformly.
-        params_k = Float64.(sol.parameters[idx])
-        for (k, x) in enumerate(grid)
-            jac = zeros(np)
-            for j in 1:np
-                eps_fd = max(abs(params_k[j]) * 1e-4, 1e-5)
-                p_plus = copy(params_k); p_plus[j] += eps_fd
-                p_minus = copy(params_k); p_minus[j] -= eps_fd
-                f_plus = _eval_approx_at(approx, p_plus, x)
-                f_minus = _eval_approx_at(approx, p_minus, x)
-                jac[j] = (f_plus - f_minus) / (2 * eps_fd)
+        # Keep the existing finite-difference path for legacy approximators;
+        # KAN uses its qualified parameter-AD evaluator.
+        for k in eachindex(f_est)
+            evaluate = if explicit
+                point = Tuple(@view grid[k, :])
+                p -> build_evaluator(approx, p)(point...)
+            else
+                x = grid[k]
+                approx isa KANApproximator ? (p -> build_evaluator(approx, p)(x)) :
+                                            (p -> _eval_approx_at(approx, p, x))
             end
-            se[k] = sqrt(max(dot(jac, V_k * jac), 0.0))
+            jac = _band_parameter_gradient(approx, params_k, evaluate)
+            if interval === :pointwise
+                se[k] = _band_standard_error(jac, V_k)
+            else
+                jacobian[k,:] .= jac
+            end
         end
 
-        lower = f_est .- z .* se
-        upper = f_est .+ z .* se
+        critical = z
+        draws = 0
+        if interval === :simultaneous
+            calibrated = _gaussian_grid_band(jacobian,V_k;level,nsim,rng)
+            se,critical,draws = calibrated.se,calibrated.critical,calibrated.n_draws
+        end
+        lower = f_est .- critical .* se
+        upper = f_est .+ critical .* se
+        if interval === :simultaneous && !(all(isfinite,lower) && all(isfinite,upper))
+            throw(DomainError((lower,upper),"confidence_band: non-finite simultaneous endpoints"))
+        end
 
-        result[approx.name] = (grid=grid, fitted=f_est, lower=lower, upper=upper, se=se)
+        band = explicit ?
+            (points=grid, fitted=f_est, lower=lower, upper=upper, se=se) :
+            (grid=grid, fitted=f_est, lower=lower, upper=upper, se=se)
+        if unconditional
+            result[approx.name] = merge(band, (; interval, method=:gaussian_delta, critical, level,
+                scope=interval === :pointwise ? :pointwise : :function_grid,
+                conditioning=:smoothing_corrected, n_draws=draws,
+                covariance_method=correction.method, rho_source=correction.rho_source,
+                rho_regularization=correction.rho_regularization))
+        else
+            result[approx.name] = interval === :pointwise ? band :
+                merge(band,(;interval,method=:gaussian_delta,critical,level,
+                    scope=:function_grid,conditioning=:fixed_smoothing,n_draws=draws))
+        end
         offset += np
     end
 
@@ -690,4 +854,3 @@ function check_constraints(sol::PSMSolution, prob::PSMProblem;
     end
     results
 end
-

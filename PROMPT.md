@@ -55,9 +55,10 @@ Before reporting anything:
 5. **Faithfulness to the cited literature.** Docstrings cite Wood, Ramsay,
    Wenk, Hoffman & Gelman and others. Check the implemented formula against
    the citation.
-6. **Vignettes and docs.** All 40 vignettes render; nine currently emit a
-   warning that λ̂ never left its initialization, which is honest output whose
-   surrounding prose has not been updated.
+6. **Vignettes and docs.** All 41 vignettes render (41_kan is new). Four
+   fits across 04, 28, 29 and 38 still emit the warning that λ̂ never left
+   its initialization — honest output; see the known-open entry below for
+   which causes are diagnosed and which are not.
 
 ## Already checked — do not re-report without new evidence
 
@@ -83,7 +84,26 @@ Before reporting anything:
   noise level, and relaxing it hands the column to the validation guard,
   which reverts it to the same step. Both guards would have to move together,
   and the stiff fixture that motivated them is **not in the suite**.
-- **Nine vignettes emit the smoothing warning** — 03_lotka_volterra,
+- **Nine vignettes emit the smoothing warning — UPDATED 2026-09-15.** The
+  dominant cause was found and fixed: LAML's accept block let a
+  sub-tolerance old-θ improvement (measured 5.74e-13) veto a new-θ step
+  that descended its own penalized objective, so λ̂ never advanced.
+  `_laml_prefer_old_step` in `src/solver.jl` now requires the old-θ gain to
+  be material (above `tol`). Re-rendering all nine, warnings went
+  **12 → 4**: 03, 06, 12, 13, 18 cleared entirely; 28 and 29 each dropped
+  from 2 to 1; 04 and 38 unchanged. So the veto explained 8 of 12.
+
+  STILL OPEN (4 warnings): 04_copepod, 28_fisheries (one fit),
+  29_bootstrap (one fit), 38_transformed_covariates. 38's cause is known
+  and benign — null-space collapse, `λ = 1`, `edf = 1.0000`, the documented
+  HOLD branch (table below). The other three are NOT diagnosed; do not
+  assume they share either cause. The instrumentation trap below still
+  applies: `maxlog=1` means one warning per document, so first find WHICH
+  solve warns.
+
+  The original entry follows, kept for the ruled-out table.
+
+- **(original) Nine vignettes emit the smoothing warning** — 03_lotka_volterra,
   04_copepod, 06_solver_comparison, 12_discrete_time, 13_shape_constraints,
   18_dalton, 28_fisheries, 29_bootstrap, 38_transformed_covariates. Each
   contains at least one fit finishing with λ̂ still on its initialization.
@@ -127,6 +147,14 @@ Before reporting anything:
   reported) or something else.
 - **`_vi_edf`, Rodeo/Dalton FS, ABC/AGM/FGPGM convergence keys** were
   addressed in earlier campaigns; verify rather than assume.
+
+- **Context-dependent optimum on the LV2 consistency fixture.** After the
+  accept-block fix, the "λ̂ and β̂ are mutually consistent" fixture (hard-coded
+  data) converges to a penalty/data-loss ratio of 1.18 under `Pkg.test` and
+  0.002 under `--project=.`, both converged with the pairing invariant
+  intact. The consistency test now gates the ratio at 100× (the F1 defect it
+  guards sits at 8e7). Worth knowing before trusting any single-run λ̂ on a
+  multi-smooth fixture; not itself a defect.
 
 ## Output format
 

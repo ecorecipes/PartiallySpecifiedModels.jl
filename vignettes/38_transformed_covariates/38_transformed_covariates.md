@@ -1,6 +1,6 @@
 # Transformed Environmental Covariates
 Simon Frost
-2026-09-01
+2026-09-15
 
 - [Overview](#overview)
 - [A temperature-driven epidemic](#a-temperature-driven-epidemic)
@@ -106,10 +106,10 @@ sol = solve(prob, LAML(maxiters=40, verbose=false))
    converged = sol.convergence.converged)
 ```
 
-    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). This happens when the working-model Jacobian is too noisy for the proposals to be accepted; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
-    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:1986
+    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). A noisy working-model Jacobian or a stalled nonlinear search can prevent acceptance; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2070
 
-    (data_loss = 183.73113354062474, edf = 1.0000450865620618, converged = false)
+    (data_loss = 183.73112978055053, edf = 1.0000450942048313, converged = false)
 
 With 61 observations at noise $\sigma = 2$, the noise floor is about
 $61 \times 2^2 = 244$, so a `data_loss` below that is a good fit rather
@@ -139,7 +139,7 @@ phi_hat = smoothing_inertia(prob.approximators[1], sol.parameters.beta)
 (; phi_min = minimum(phi_hat), phi_max = maximum(phi_hat), phi_true = phi_true)
 ```
 
-    (phi_min = 0.9443920250836104, phi_max = 0.9443920250836104, phi_true = 0.75)
+    (phi_min = 0.9443965752946735, phi_max = 0.9443965752946735, phi_true = 0.75)
 
 The recovered inertia is in the right regime — strongly smoothed rather
 than responsive to daily fluctuations — but it is not exact, and it
