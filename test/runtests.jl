@@ -11703,6 +11703,25 @@ end
         else
             @test isfinite(pcls_refit_move(prob_lv2, sol_lv2))
         end
+        # RIDGE FLAG. The solver now reports the refit move itself: one
+        # UNCONTRACTED PCLS step from the reported (λ̂, β̂) with the solver's
+        # final Jacobian (`convergence.final_parameter_step`), and
+        # `convergence.ridge = converged && step > 1e-3`. The last ACCEPTED
+        # step is not usable for this — trust-region contraction masks it
+        # (measured 2.2e-4 on the 1.13 ridge, i.e. under the tolerance).
+        # Calibrated on this fixture: 1.12 step 7.4e-6 -> ridge=false;
+        # 1.13 step 1.78 -> ridge=true. Assert agreement with the test's own
+        # instrument on WHICH SIDE of the tolerance the fit lands (the two
+        # normalise slightly differently and use different Jacobian
+        # backends, so the values are compared as a classification, not
+        # to a relative tolerance), and the flag's defining identity.
+        let c = sol_lv2.convergence
+            @test haskey(c, :ridge) && haskey(c, :final_parameter_step)
+            @test isfinite(c.final_parameter_step)
+            @test (c.final_parameter_step > 1e-3) ==
+                  (pcls_refit_move(prob_lv2, sol_lv2) > 1e-3)
+            @test c.ridge == (c.converged && c.final_parameter_step > 1e-3)
+        end
         # TOLERANCE, 1e-8 -> 1e-5, and why that is not hiding anything.
         # `objective` is literally `0.5 * (data_loss + dot(p_opt, B_final *
         # p_opt))` in solver.jl, so the only difference from the line below is
@@ -11762,6 +11781,9 @@ end
                        LAML(maxiters=30, verbose=false, jac=:forwarddiff))
             sol_eg = solve(prob_eg, alg_f1)
             @test pcls_refit_move(prob_eg, sol_eg) < 1e-4
+            # A pinned optimum is NOT a ridge, on either Jacobian backend.
+            @test sol_eg.convergence.final_parameter_step < 1e-3
+            @test sol_eg.convergence.ridge == false
             @test sol_eg.objective ≈
                   0.5 * (sol_eg.data_loss +
                          reported_penalty(prob_eg, sol_eg)) rtol=1e-8
@@ -12616,6 +12638,11 @@ end
         end
         @test isempty(s_nn_w.smoothing_params)
         @test !s_nn_w.convergence.smoothing_advanced
+        # ... and neither is the ridge flag: an unpenalized approximator has
+        # no pinned coefficients by construction. The probe step is still
+        # reported (measured 5230x here — the network's normal state).
+        @test s_nn_w.convergence.ridge == false
+        @test isfinite(s_nn_w.convergence.final_parameter_step)
     end
 
     @testset "jac=:fd per-column noise removes the large-p cliff" begin
@@ -12651,37 +12678,102 @@ end
                                   dam=fill(1e-8, nk), jac=mode)
             J
         end
-        for nk in (6, 8, 10)
+        # The nk=9 column that this loop used to exclude is now included. It
+        # was the last FD outlier: at nk=9 every column sits near the noise
+        # floor (SNR 0.57-1.35), growth triggers on all nine, and column 4 was
+        # REVERTED to its small-step value by the growth-validation guard,
+        # which compared against a previous column that was itself still
+        # noise-limited. Two changes in `compute_jacobian!` fix that without
+        # touching the guard's purpose (B1: unrestricted growth collapsed LAML
+        # fits to edf -> 0):
+        #   * the curvature stop only fires once the column has a SIGNAL above
+        #     the noise (`signal > _FD_SNR_TRIGGER * eps`) AND the curvature
+        #     is a real fraction of that signal (`d2max > _FD_CURV_FRAC *
+        #     signal`), so a noise-shaped second difference no longer halts
+        #     growth early;
+        #   * the validation revert compares only against a RESOLVED previous
+        #     column (`signal_prev >= _FD_SNR_TRIGGER * eps`), so a noisy
+        #     predecessor cannot veto a good step;
+        #   * the per-column noise estimate is refined at every GROWN step
+        #     whose second difference is still below the curvature fraction
+        #     (it is noise, not curvature). The re-solve jitter is
+        #     step-dependent: under the package stack `Pkg.test` resolves
+        #     (OrdinaryDiffEq 6.111, vs 6.108 in a stale local Manifest),
+        #     column 4 met a second difference 34x the floor estimate at
+        #     h=8.6e-3, read SNR 5383 with a true error of 4.29e-3, and the
+        #     next step's honest 4.3e-3 correction was reverted by a
+        #     tolerance sized from the floor. Refining eps re-sizes both the
+        #     SNR target and that tolerance (1.0e-3 -> 1.7e-2).
+        # Measured (relative to max|J|, this fixture), old guard -> new,
+        # under BOTH package stacks (they now agree except at nk=10):
+        #   nk=5   6.94e-5 -> 6.94e-5     nk=9   5.91e-3 -> 4.63e-5
+        #   nk=6   1.89e-5 -> 1.89e-5     nk=10  8.37e-5 -> 6.2e-5 / 1.33e-4
+        #   nk=7   1.23e-4 -> 7.56e-5     nk=12  3.80e-5 -> 3.80e-5
+        #   nk=8   1.14e-4 -> 5.90e-5
+        # and the truncation-limited stiff probe is unchanged at 1.5e-5 in
+        # both. Before the third change the first two alone fixed nk=9 under
+        # one stack and not the other — the same "platform-specific" pattern
+        # the old outlier note recorded (ubuntu 4.63e-5, macOS 5.91e-3) —
+        # which is why the loop asserts one bound for every size rather than
+        # pinning any value.
+        for nk in (5, 6, 7, 8, 9, 10, 12)
             Jref = fdfix_J(nk, :forwarddiff)
             Jfd  = fdfix_J(nk, :fd)
             rel = maximum(abs.(Jfd .- Jref)) / maximum(abs.(Jref))
-            # 1e-3 excludes the pre-fix nk=10 value (2.85) by ~2850x and
-            # leaves ~12x headroom over the measured 8.37e-5.
+            # 1e-3 excludes the pre-fix nk=10 value (2.85) by ~2850x and the
+            # pre-fix nk=9 value (5.91e-3) by ~6x, and leaves ~7x headroom
+            # over the largest measured post-fix value (1.33e-4 at nk=10).
             @test rel < 1e-3
         end
+    end
 
-        # KNOWN REMAINING OUTLIER, characterised rather than hidden: nk=9 sits
-        # at 5.91e-3 and is UNCHANGED by this fix. Diagnosed — at nk=9 every
-        # column's d2max/2 (4.8e-7 … 1.3e-6) falls BELOW the global estimate
-        # (2.17e-6), so the per-column floor never binds, and all nine columns
-        # are already deeply noise-limited (SNR 0.57–1.35) and do trigger
-        # growth. Eight reach ~1e-5; column 4 alone ends at 4.29e-3, which
-        # points at the growth VALIDATION guard reverting it to its
-        # small-step value. That guard is load-bearing (B1: unrestricted
-        # growth collapsed LAML fits to edf -> 0), so it is left alone here.
-        let Jref = fdfix_J(9, :forwarddiff), Jfd = fdfix_J(9, :fd)
-            rel9 = maximum(abs.(Jfd .- Jref)) / maximum(abs.(Jref))
-            # Only the upper bound is asserted. The lower one ("record that
-            # nk=9 is NOT fixed") was itself over-pinned, in the pessimistic
-            # direction, and ubuntu CI caught it: nk=9 measures 5.91e-3 on the
-            # authoring machine but 4.63e-5 there. So the outlier is
-            # PLATFORM-SPECIFIC, not a standing defect — which is consistent
-            # with its mechanism, since which columns sit near the noise floor
-            # depends on the integrator's step sequence, and that differs by
-            # platform. Asserting a defect's presence is only legitimate when
-            # the defect is deterministic; this one is not.
-            @test rel9 < 5e-2
+    @testset "bootstrap aggregates stalled and ridge replicate fits" begin
+        # Per-fit LAML diagnostics are NOISE inside a bootstrap: with
+        # `maxlog=1` a single replicate out of many trips a whole-document
+        # warning (measured in vignettes 28 and 29, where the surviving warning
+        # came from inside `bootstrap`). The replicate fits now run under a
+        # logger that drops those two warnings by id, and the result carries
+        # the counts instead.
+        gh_b!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
+        t_b = collect(0.0:0.5:10.0)
+        noi_b = [0.01 * (sin(3.1i) + 0.5cos(7.7i)) for i in 1:length(t_b)]
+        prob_b = PSMProblem(gh_b!, [1.0], (0.0, 10.0),
+            [BSplineApproximator(:r, (0.0, 5.0), 6; initial=x -> 0.05)];
+            data_times=t_b, data_values=reshape(exp.(0.1 .* t_b) .+ noi_b, :, 1),
+            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+
+        # DETERMINISTIC stall: maxiters <= warmup means Fellner-Schall never
+        # runs, so EVERY replicate fit reports smoothing_advanced == false,
+        # whatever the resample. That makes the aggregate count exact.
+        alg_stall = LAML(maxiters=2, warmup=3)
+        sol_b = @test_logs (:warn, r"never moved") match_mode=:any solve(prob_b, alg_stall)
+        tl = Test.TestLogger(min_level=Base.CoreLogging.Warn)
+        bs = Base.CoreLogging.with_logger(tl) do
+            bootstrap(sol_b, prob_b, alg_stall; nboot=4)
         end
+        msgs = [string(r.message) for r in tl.logs]
+        @test !any(occursin("never moved", m) for m in msgs)      # per-fit warning suppressed
+        @test any(occursin("bootstrap: of", m) for m in msgs)     # ONE aggregate warning instead
+        @test bs.n_success >= 1
+        @test bs.n_smoothing_stalled == bs.n_success               # every replicate stalled
+        @test 0 <= bs.n_ridge <= bs.n_success
+
+        # A converged bootstrap: the aggregate warning appears IFF a count is
+        # non-zero. Not asserted to be zero — on this fixture the spline
+        # domain (0, 5) extends past the data's support (N in 1 .. e^1), so a
+        # resample can legitimately leave the outer coefficients on a ridge
+        # (measured under Pkg.test: 1 of 3 replicates). Asserting zero here
+        # would pin a resample-dependent count, the single-draw trap.
+        sol_ok = solve(prob_b, LAML(maxiters=30))
+        tl2 = Test.TestLogger(min_level=Base.CoreLogging.Warn)
+        bs_ok = Base.CoreLogging.with_logger(tl2) do
+            bootstrap(sol_ok, prob_b, LAML(maxiters=30); nboot=3)
+        end
+        agg_ok = any(occursin("bootstrap: of", string(r.message)) for r in tl2.logs)
+        @test agg_ok == (bs_ok.n_smoothing_stalled + bs_ok.n_ridge > 0)
+        @test !any(occursin("never moved", string(r.message)) for r in tl2.logs)
+        @test 0 <= bs_ok.n_smoothing_stalled <= bs_ok.n_success
+        @test 0 <= bs_ok.n_ridge <= bs_ok.n_success
     end
 
     # ─── Gradient checks: Symbolics vs ForwardDiff vs finite differences ──

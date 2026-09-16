@@ -1,6 +1,6 @@
 # Copepod Stage-Structured Population Model
 Simon Frost
-2026-09-15
+2026-09-16
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -16,6 +16,8 @@ Simon Frost
 - [Diagnostic Plots](#diagnostic-plots)
 - [Discussion](#discussion)
   - [Model complexity](#model-complexity)
+  - [What LAML chose, and why the fit needs 300
+    iterations](#what-laml-chose-and-why-the-fit-needs-300-iterations)
   - [Dependent initial conditions](#dependent-initial-conditions)
   - [Smoothing parameter
     interpretation](#smoothing-parameter-interpretation)
@@ -168,12 +170,10 @@ prob = PSMProblem(copepod!, compute_u0, (0.0, 90.0),
 
     PSMProblem{typeof(copepod!), typeof(compute_u0), Gaussian, BS3{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(copepod!, compute_u0, (0.0, 90.0), BSplineApproximator[BSplineApproximator(:R, (0.0, 90.0), 15, var"#2#3"()), BSplineApproximator(:mu_j, (0.0, 90.0), 15, var"#5#6"()), BSplineApproximator(:mu_a, (0.0, 90.0), 15, var"#8#9"())], [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0], [2853.9353 0.0 … 6893.1885 7983.0894; 10981.5 5793.3442 … 0.0 1473.7781; … ; 0.0 0.0 … 5107.6265 0.0; 1660.5525 15433.848 … 12018.808 0.0], [1.0 1.0 … 1.0 1.0; 1.0 1.0 … 1.0 1.0; … ; 1.0 1.0 … 1.0 1.0; 1.0 1.0 … 1.0 1.0], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], NamedTuple(), Gaussian(), BS3{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(:maxiters => 10000, :reltol => 1.0e-6, :abstol => 1.0e-6), false, Float64[], nothing)
 
-    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). A noisy working-model Jacobian or a stalled nonlinear search can prevent acceptance; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
-    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2070
-    Data loss (SS):  1.5226e+09
-    Penalized obj:   7.6130e+08
-    EDF:             41.29
-    Smoothing λ:     [2.023e-6, 2.023e-6, 2.023e-6]
+    Data loss (SS):  3.7990e+09
+    Penalized obj:   1.8398e+09
+    EDF:             2.27
+    Smoothing λ:     [2.167e17, 2.353e17, 2.354e17]
 
 ## Results
 
@@ -259,7 +259,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](04_copepod_files/figure-commonmark/cell-12-output-1.svg)
 
-    Durbin-Watson: 2.089, 1.01, 1.741, 1.855, 1.416, 2.805, 2.173, 2.366, 1.874, 1.027, 1.395
+    Durbin-Watson: 1.944, 1.707, 0.982, 1.412, 2.233, 2.099, 0.992, 1.716, 2.188, 1.409, 1.505
 
 ## Discussion
 
@@ -276,9 +276,30 @@ This model illustrates several features of complex PSMs:
 | Data points        | 110 (10 times × 11 stages)            |
 
 The ratio of data to parameters (110:45 ≈ 2.4:1) is low, making the
-smoothing penalty critical. Without it, the model could overfit easily.
-The LAML-estimated smoothing parameters ensure that the effective model
-complexity matches what the data can support.
+smoothing penalty critical. Without it, the model could overfit easily —
+and the fit reported above shows LAML making exactly that call.
+
+### What LAML chose, and why the fit needs 300 iterations
+
+Read the numbers printed after the fit. All three smoothing parameters
+are driven to very large values, the effective degrees of freedom fall
+to about 2.3 *in total* across the three functions — essentially their
+penalty null spaces — and the data loss is roughly two and a half times
+what the unpenalized starting point achieves (1.5 × 10⁹). With ten
+sampling times per stage and residual standard deviations in the
+thousands of individuals, the marginal likelihood finds no support for
+time-varying recruitment or mortality beyond what a near-linear trend in
+each can explain: the flexible fit is fitting noise. That is a statement
+about this data set, not about the model; it is what an honest
+smoothing-parameter criterion should say when the data are this thin.
+
+Getting there is not quick. Each Fellner–Schall proposal from the
+initial smoothing is a very large jump, the first proposals are rejected
+on their own objective, and the fit only leaves the initial smoothing
+after roughly 130 IRLS iterations. With the default `maxiters=100` the
+solver runs out of budget first and reports `smoothing_advanced = false`
+(with a warning) — the reported EDF of 41 is then the *initial*
+smoothing, not a selected one. `maxiters=300` lets selection complete.
 
 ### Dependent initial conditions
 
@@ -291,12 +312,13 @@ $R(0)$, $\mu_j(0)$, and $\mu_a(0)$.
 ### Smoothing parameter interpretation
 
 The three smoothing parameters $\lambda_k$ control the trade-off between
-data fit and smoothness independently for each unknown function:
-
-- **$\lambda_R$**: typically small (recruitment is complex, needs
-  flexibility)
-- **$\lambda_{\mu_j}$, $\lambda_{\mu_a}$**: often larger (death rates
-  are smoother)
+data fit and smoothness independently for each unknown function, so in
+principle recruitment could be left more flexible than the two
+mortalities. On this data set all three end up large and the three
+functions are smoothed to near-linear trends (see above). If a more
+flexible fit is wanted for exploratory plotting, pass fixed smoothing
+parameters instead of letting LAML select them — but the marginal
+likelihood is telling you the data do not support that flexibility.
 
 The LAML/REML criterion provides an automatic, principled way to set
 these parameters, avoiding the need for cross-validation on such a small

@@ -78,12 +78,24 @@ Before reporting anything:
 
 ## Known open — describe better, do not rediscover
 
-- **`jac=:fd` at nk=9** on the quadrature fixture sits at 5.9e-3 relative
-  where the best achievable step reaches 8.3e-6. Diagnosed: the curvature
-  stop fires at SNR 5383 because `d2max ≈ h²f''` is compared against a fixed
-  noise level, and relaxing it hands the column to the validation guard,
-  which reverts it to the same step. Both guards would have to move together,
-  and the stiff fixture that motivated them is **not in the suite**.
+- **`jac=:fd` at nk=9 — RESOLVED 2026-09-16.** Three changes in
+  `compute_jacobian!`, moved together: the curvature stop requires a signal
+  above the noise AND curvature that is a real fraction of it
+  (`_FD_CURV_FRAC`); the growth-validation revert compares only against a
+  RESOLVED previous column; and the per-column noise estimate is refined at
+  every grown step that the relative test classifies as noise (the re-solve
+  jitter is step-dependent — 34x the floor on the offending column). nk=9
+  went 5.91e-3 -> 4.63e-5 under BOTH package stacks; all sizes <= 1.33e-4;
+  the stiff probe is unchanged at 1.5e-5. The suite asserts `rel < 1e-3`
+  for nk in 5,6,7,8,9,10,12.
+
+  **Trap found on the way:** the local `Manifest.toml` (gitignored) was
+  stale — `Pkg.test` and CI resolve a fresh environment (OrdinaryDiffEq
+  6.111 vs 6.108 locally), and the FD noise structure differs between the
+  two. A fix measured only under `--project=.` passed locally and failed
+  under `Pkg.test`. Measure FD claims under `Pkg.test`, or refresh the
+  Manifest first.
+
 - **Nine vignettes emit the smoothing warning — UPDATED 2026-09-15.** The
   dominant cause was found and fixed: LAML's accept block let a
   sub-tolerance old-θ improvement (measured 5.74e-13) veto a new-θ step

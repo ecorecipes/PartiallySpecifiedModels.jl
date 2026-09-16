@@ -28,7 +28,7 @@
 #
 # Reference: Wenk et al. (2019), AISTATS 89:1351-1360
 
-using LinearAlgebra: dot, Symmetric, cholesky, I
+using LinearAlgebra: dot, Symmetric, cholesky, I, tr
 
 """
     _fgpgm_state_matrices(times, σ², ℓ, σn², γ_user) -> (Cinv, L, D, Λinv)
@@ -289,6 +289,24 @@ function SciMLBase.solve(prob::PSMProblem, alg::FGPGMSolver)
     n_total = alg.n_warmup + alg.n_samples
     sx = fill(0.1, n_vars)                    # per-state proposal scales
     st = 0.05                                 # θ proposal scale
+    # θ proposal SHAPE: adaptive Metropolis (Haario, Saksman & Tamminen
+    # 2001) — the proposal covariance is the sample covariance of the
+    # warmup draws, refreshed every 10 sweeps once enough draws exist,
+    # and frozen with everything else at the end of warmup. An isotropic
+    # random walk over B-spline coefficients mixes badly: neighbouring
+    # coefficients are strongly correlated through the penalty prior and
+    # the ODE expert, and coefficients outside the data support are
+    # prior-dominated and far wider than the rest, so no single scalar
+    # scale suits all directions (measured on the logistic vignette
+    # fixture: ESS 3-9 of 3000 draws, split-R̂ 1.3 at 0.27 acceptance).
+    # The learned covariance proposes along the posterior's own axes.
+    # Accumulation starts after the first fifth of warmup so the initial
+    # transient does not inflate the covariance along the drift direction.
+    th_mean = zeros(n_beta); th_m2 = zeros(n_beta, n_beta); n_th = 0
+    Lt = Matrix{Float64}(I, n_beta, n_beta)
+    cov_start = alg.n_warmup ÷ 5
+    cov_min_draws = max(10, 2 * n_beta)
+    cov_active = false
     # Robbins–Monro-style multiplicative tuning toward target_accept:
     # E[Δ log s] = 0 exactly when the acceptance probability equals the
     # target. Adaptation runs during WARMUP ONLY — adapting after warmup
@@ -323,8 +341,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::FGPGMSolver)
             end
             adapting || (tot_x[k] += 1)
         end
-        # θ block: joint random walk
-        bp = beta .+ st .* randn(rng, n_beta)
+        # θ block: joint random walk with the (warmup-learned) covariance
+        bp = beta .+ st .* (Lt * randn(rng, n_beta))
         lp_p = fgpgm_logdens(X, bp)
         if log(rand(rng)) < lp_p - lp_cur
             beta = bp; lp_cur = lp_p
@@ -334,6 +352,32 @@ function SciMLBase.solve(prob::PSMProblem, alg::FGPGMSolver)
             adapting && (st *= exp(-adapt_rate * alg.target_accept))
         end
         adapting || (tot_t += 1)
+        if adapting && sweep > cov_start
+            # Welford running mean / scatter of the warmup θ draws
+            n_th += 1
+            d_old = beta .- th_mean
+            th_mean .+= d_old ./ n_th
+            th_m2 .+= d_old * (beta .- th_mean)'
+            if n_th >= cov_min_draws && n_th % 10 == 0
+                Σθ = th_m2 ./ (n_th - 1)
+                ridge = 1e-6 * tr(Σθ) / n_beta + 1e-12          # relative ridge
+                for i in 1:n_beta
+                    Σθ[i, i] += ridge
+                end
+                try
+                    Lt = Matrix(cholesky(Symmetric(Σθ)).L)
+                    if !cov_active
+                        # Switching from the identity shape: restart the
+                        # scalar at the Roberts-Rosenthal 2.38/√d optimum
+                        # and let Robbins-Monro tune from there.
+                        st = 2.38 / sqrt(n_beta)
+                        cov_active = true
+                    end
+                catch e
+                    _is_program_error(e) && rethrow()   # keep the previous Lt
+                end
+            end
+        end
         if !adapting
             s_idx = sweep - alg.n_warmup
             beta_samples[s_idx, :] = beta

@@ -1,6 +1,6 @@
 # Fisheries Stock-Recruitment with Poisson Counts
 Simon Frost
-2026-09-15
+2026-09-16
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -238,7 +238,24 @@ println("Inc+Concave — Data loss: $(round(sol_sc.data_loss, sigdigits=4)), " *
     "EDF: $(round(sol_sc.edf, digits=1))")
 ```
 
-    Inc+Concave — Data loss: 1.124e6, EDF: 4.3
+    ┌ Warning: LAML: the objective converged but the parameters did not — one more PCLS step from the reported fit moves β by 0.582 (relative), above 0.001. The fit stopped on a flat ridge of the penalized objective: the fitted FUNCTIONS are usable, but individual coefficients and their covariance are not pinned. See `convergence.ridge` and `convergence.final_parameter_step`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2174
+    Inc+Concave — Data loss: 227600.0, EDF: 4.1
+
+The constrained fit also reports `convergence.ridge = true` (the warning
+above): the penalized objective has converged, but one more penalized
+least-squares step from the reported coefficients would still move them
+appreciably. For a shape-constrained spline that is the expected
+geometry, not a failed fit. The constraints are imposed by
+reparameterising differences of the coefficients through an exponential,
+and wherever the fitted curve is nearly flat (for a saturating
+stock–recruitment curve, its high-stock asymptote) the corresponding
+transformed coefficients are driven towards $-\infty$, where the
+exponential is flat and the objective no longer pins them. The
+*function* is determined — that is what the recovery correlation
+measures — but individual coefficients and their covariance are not,
+which is why the bootstrap below, and not a coefficient-level
+covariance, is the right uncertainty statement for this fit.
 
 ### Compare recovered R(S) curves
 
@@ -282,10 +299,10 @@ p_fit
     Stock-Recruitment Model — Comparison
     ────────────────────────────────────────────────────────────
       Unconstrained:  data_loss=223100.0, EDF=4.8, cor(R̂,R)=0.996
-      Inc+Concave:    data_loss=1.124e6, EDF=4.3, cor(R̂,R)=0.929
+      Inc+Concave:    data_loss=227600.0, EDF=4.1, cor(R̂,R)=0.997
 
 The shape constraint produces a smoother, more biologically plausible
-curve at a slightly higher data loss and roughly half the effective
+curve at a slightly higher data loss and slightly fewer effective
 degrees of freedom. Note what it buys: despite fitting the observations
 less closely, the constrained curve correlates *more* strongly with the
 true recruitment function than the unconstrained one does. That is the
@@ -306,11 +323,28 @@ $N(\hat\mu_t, \hat\sigma)$ and refits the model.
 bs = bootstrap(sol_sc, prob_sc, LAML(maxiters=200, verbose=false);
     nboot=50, method=:parametric, level=0.95, verbose=false)
 println("Bootstrap: $(bs.n_success)/50 replicates converged")
+println("  of which $(bs.n_smoothing_stalled) never advanced smoothing selection " *
+        "and $(bs.n_ridge) stopped on a flat ridge")
 ```
 
-    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). A noisy working-model Jacobian or a stalled nonlinear search can prevent acceptance; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
-    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2070
+    ┌ Warning: bootstrap: of 50 successful replicate fits, 0 never advanced smoothing selection (λ̂ left at its initialization) and 27 converged on a flat ridge (parameters unpinned). Their intervals inherit that. See `n_smoothing_stalled` / `n_ridge` on the result.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/bootstrap.jl:542
     Bootstrap: 50/50 replicates converged
+      of which 0 never advanced smoothing selection and 27 stopped on a flat ridge
+
+Two more counts are worth reading alongside `n_success`. A replicate can
+*converge* — the penalized objective stops changing — without the
+smoothing parameter ever moving off its initial value
+(`n_smoothing_stalled`), or with the coefficients still free to slide
+along a flat ridge of the objective (`n_ridge`; see `convergence.ridge`
+on a single fit). Neither makes the replicate unusable: its fitted
+*function* is a legitimate draw, which is what the confidence bands
+below are built from. But a large fraction of stalled replicates would
+mean the bands mostly reflect the initial smoothing, and a large
+fraction of ridge exits would mean coefficient-level summaries (as
+opposed to function-level ones) are not to be trusted. The package
+reports both in one aggregate warning rather than one warning per
+replicate — that is the warning printed above.
 
 ### Trajectory confidence bands
 
@@ -391,7 +425,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](28_fisheries_files/figure-commonmark/cell-17-output-1.svg)
 
-    Durbin-Watson: 0.6
+    Durbin-Watson: 2.083
 
 For well-specified Poisson models, the deviance residuals should be
 approximately standard normal. Patterns in “Residuals vs Fitted” would

@@ -29,6 +29,10 @@ Result of bootstrap resampling for a PSM solution.
 - `ci_uf::Dict{Symbol, NamedTuple}`: `(lower, upper)` vectors for each UF
 - `level::Float64`: confidence level (e.g., 0.95)
 - `n_success::Int`: number of successful bootstrap replicates (out of B attempted)
+- `n_smoothing_stalled::Int`: successful replicates whose smoothing selection never
+  advanced (`smoothing_advanced == false`); the per-fit warning is suppressed inside
+  the bootstrap and reported here in aggregate
+- `n_ridge::Int`: successful replicates that converged on a flat ridge (`ridge == true`)
 - `uf_points::Dict{Symbol, Matrix{Float64}}`: explicit physical query points;
   rows align with the corresponding `uf_values` and `ci_uf` entries
 - `uf_success::Dict{Symbol, Vector{Int}}`: finite replicate count at each
@@ -45,13 +49,28 @@ struct BootstrapResult
     n_success::Int
     uf_points::Dict{Symbol, Matrix{Float64}}
     uf_success::Dict{Symbol, Vector{Int}}
+    # Replicate fits whose smoothing selection never advanced (LAML-family
+    # `smoothing_advanced == false`) and whose objective converged on a flat
+    # ridge (`ridge == true`). The per-fit warnings are SUPPRESSED inside a
+    # bootstrap — one replicate out of many tripping a whole-document warning
+    # is noise — and reported here in aggregate instead.
+    n_smoothing_stalled::Int
+    n_ridge::Int
 end
 
 BootstrapResult(coefs, fitted, uf_values, uf_grid, ci_fitted, ci_uf, level, n_success) =
     BootstrapResult(coefs, fitted, uf_values, uf_grid, ci_fitted, ci_uf, level, n_success,
         Dict{Symbol, Matrix{Float64}}(),
         Dict(name => [count(isfinite, @view(values[i, :])) for i in axes(values, 1)]
-             for (name, values) in uf_values))
+             for (name, values) in uf_values), 0, 0)
+
+# The pre-2026-09 full positional arity (through `uf_success`), kept so
+# external constructions of a result — the simultaneous-band tests build one
+# by hand — keep working; the two diagnostic counters default to 0.
+BootstrapResult(coefs, fitted, uf_values, uf_grid, ci_fitted, ci_uf, level, n_success,
+                uf_points, uf_success) =
+    BootstrapResult(coefs, fitted, uf_values, uf_grid, ci_fitted, ci_uf, level, n_success,
+                    uf_points, uf_success, 0, 0)
 
 function _bootstrap_function_value(f, args...)
     value = try
@@ -152,6 +171,33 @@ plot(bs.uf_grid[:λ], bs.ci_uf[:λ].lower, fillrange=bs.ci_uf[:λ].upper,
      alpha=0.2, label="95% CI")
 ```
 """
+# Per-replicate convergence flags read defensively: only the LAML family
+# carries `smoothing_advanced`/`ridge`; other solvers are neither.
+_bs_stalled(sol) = hasproperty(sol.convergence, :smoothing_advanced) &&
+                   !sol.convergence.smoothing_advanced
+_bs_ridge(sol)   = hasproperty(sol.convergence, :ridge) && sol.convergence.ridge
+
+# A logger that drops the two per-fit LAML diagnostics by id and forwards
+# everything else to the enclosing logger. Inside a bootstrap those warnings
+# are aggregated into `n_smoothing_stalled` / `n_ridge` instead.
+struct _ReplicateLogger{L} <: Base.CoreLogging.AbstractLogger
+    parent::L
+end
+const _BS_SUPPRESSED_IDS = (:laml_smoothing_never_moved, :laml_ridge)
+Base.CoreLogging.shouldlog(l::_ReplicateLogger, level, _module, group, id) =
+    !(id in _BS_SUPPRESSED_IDS) &&
+    Base.CoreLogging.shouldlog(l.parent, level, _module, group, id)
+Base.CoreLogging.min_enabled_level(l::_ReplicateLogger) =
+    Base.CoreLogging.min_enabled_level(l.parent)
+Base.CoreLogging.catch_exceptions(l::_ReplicateLogger) =
+    Base.CoreLogging.catch_exceptions(l.parent)
+Base.CoreLogging.handle_message(l::_ReplicateLogger, args...; kwargs...) =
+    Base.CoreLogging.handle_message(l.parent, args...; kwargs...)
+_replicate_solve(prob, alg) =
+    Base.CoreLogging.with_logger(_ReplicateLogger(Base.CoreLogging.current_logger())) do
+        solve(prob, alg)
+    end
+
 function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                    nboot::Int=200,
                    method::Symbol=:parametric,
@@ -318,7 +364,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                 prob.ode_kwargs...)
 
             sol_boot = try
-                solve(prob_boot, alg)
+                _replicate_solve(prob_boot, alg)
             catch e
                 (_is_program_error(e) || e isa ArgumentError) && rethrow()
                 nothing
@@ -335,13 +381,17 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                 end
                 results[b] = (coefs=collect(sol_boot.parameters),
                               fitted=copy(sol_boot.fitted_values),
-                              uf_vals=uf_vals)
+                              uf_vals=uf_vals,
+                              stalled=_bs_stalled(sol_boot),
+                              ridge=_bs_ridge(sol_boot))
             end
         end
 
         # Collect successful results
         successful = filter(!isnothing, results)
         n_success = length(successful)
+        n_smoothing_stalled = count(r -> r.stalled, successful)
+        n_ridge = count(r -> r.ridge, successful)
 
         if n_success < 3
             error("bootstrap: only $n_success / $nboot replicates succeeded. " *
@@ -377,6 +427,8 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
         uf_samples = Dict{Symbol, Matrix{Float64}}(
             name => fill(NaN, uf_sizes[name], nboot) for name in uf_names)
         n_success = 0
+        n_smoothing_stalled = 0
+        n_ridge = 0
 
         for b in 1:nboot
             if verbose && (b <= 3 || b % 50 == 0 || b == nboot)
@@ -402,7 +454,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                 prob.ode_kwargs...)
 
             sol_boot = try
-                solve(prob_boot, alg)
+                _replicate_solve(prob_boot, alg)
             catch e
                 (_is_program_error(e) || e isa ArgumentError) && rethrow()
                 if verbose; println("  Replicate $b failed: $e"); end
@@ -415,6 +467,8 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
             end
 
             n_success += 1
+            n_smoothing_stalled += _bs_stalled(sol_boot)
+            n_ridge += _bs_ridge(sol_boot)
             coef_samples[n_success, :] .= sol_boot.parameters
             fitted_samples[:, :, n_success] .= sol_boot.fitted_values
 
@@ -482,11 +536,21 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
         ci_uf[name] = (lower=lo, upper=hi)
     end
 
+    # ONE aggregate diagnostic for the replicate fits, in place of the per-fit
+    # LAML warnings suppressed by `_replicate_solve`.
+    if n_smoothing_stalled > 0 || n_ridge > 0
+        @warn "bootstrap: of $n_success successful replicate fits, " *
+              "$n_smoothing_stalled never advanced smoothing selection " *
+              "(λ̂ left at its initialization) and $n_ridge converged on a " *
+              "flat ridge (parameters unpinned). Their intervals inherit " *
+              "that. See `n_smoothing_stalled` / `n_ridge` on the result." maxlog=1
+    end
     BootstrapResult(
         coef_samples, fitted_samples,
         uf_samples, uf_grids,
         (lower=ci_lower, upper=ci_upper), ci_uf,
-        level, n_success, queries, uf_success)
+        level, n_success, queries, uf_success,
+        n_smoothing_stalled, n_ridge)
 end
 
 # ─── Resampling methods ──────────────────────────────────────────

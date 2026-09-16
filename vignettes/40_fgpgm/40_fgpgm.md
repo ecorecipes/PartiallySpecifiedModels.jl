@@ -1,11 +1,12 @@
 # Fast Gaussian Process Gradient Matching
 Simon Frost
-2026-09-01
+2026-09-16
 
 - [Overview](#overview)
 - [Logistic growth with an unknown per-capita
   rate](#logistic-growth-with-an-unknown-per-capita-rate)
 - [Sampling](#sampling)
+- [Did the chain converge?](#did-the-chain-converge)
 - [Recovered growth rate](#recovered-growth-rate)
 - [Where FGPGM sits among the integration-free
   methods](#where-fgpgm-sits-among-the-integration-free-methods)
@@ -71,14 +72,14 @@ prob = PSMProblem(dyn!, [0.7], (0.0, 25.0),
     data_times=ts, data_values=Y, obs_to_state=[1],
     known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
 
-sol = solve(prob, FGPGMSolver(n_samples=400, n_warmup=200, rng_seed=2))
+sol = solve(prob, FGPGMSolver(n_samples=3000, n_warmup=1500, rng_seed=2))
 (; data_loss = sol.data_loss,
    converged = sol.convergence.converged,
    reason    = sol.convergence.reason,
    iterations = sol.convergence.iterations)
 ```
 
-    (data_loss = 0.07431727268042508, converged = false, reason = :maxiters, iterations = 600)
+    (data_loss = 0.07259211901848119, converged = false, reason = :maxiters, iterations = 4500)
 
 `converged = false` with `reason = :maxiters` is the expected and
 correct output. Read it as “the budget was spent”, not “the fit failed”
@@ -90,6 +91,53 @@ keys(sol.convergence)
 
     (:method, :sampler, :chains, :beta_samples, :state_mean, :gp_hyperparams, :accept_rates, :converged, :reason, :iterations)
 
+## Did the chain converge?
+
+`convergence.chains` is an `MCMCChains.Chains` object over the spline
+coefficients, so the standard sampler diagnostics apply directly.
+Split-R̂ near 1 (below about 1.05) and an effective sample size in the
+hundreds are what a usable posterior looks like; the accept rates should
+sit near the `target_accept` of 0.234 the warmup adaptation aimed for.
+
+``` julia
+using MCMCChains
+es = ess_rhat(sol.convergence.chains)
+(; rhat_max = maximum(es[:, :rhat]),
+   ess_min  = minimum(es[:, :ess]),
+   accept   = sol.convergence.accept_rates)
+```
+
+    (rhat_max = 1.0074001747169865, ess_min = 106.32308253290334, accept = (x = [0.25233333333333335], theta = 0.21333333333333335))
+
+``` julia
+es
+```
+
+    ESS/R-hat
+
+      parameters        ess      rhat   ess_per_sec 
+          Symbol    Float64   Float64       Missing 
+
+            r[1]   118.9785    1.0027       missing
+            r[2]   106.3231    1.0013       missing
+            r[3]   116.7805    1.0005       missing
+            r[4]   109.4677    1.0074       missing
+            r[5]   140.7774    1.0051       missing
+            r[6]   127.0320    1.0018       missing
+
+The budget matters here more than for the point-estimate solvers. The θ
+block is a joint random walk over six correlated coefficients whose
+proposal covariance is *learned during warmup* (adaptive Metropolis;
+Haario et al. 2001) and frozen afterwards. With too little warmup that
+covariance has not settled and the chain crawls: at
+`n_samples=400, n_warmup=200` this same fixture gives R̂ ≈ 1.2 and an ESS
+of a few draws, while `n_samples=3000, n_warmup=1500` gives R̂ ≈ 1.01 and
+ESS above 100 — at a cost of well under a second, because nothing here
+integrates the ODE. The coefficients at the edges of the spline domain
+(where there are few or no data) mix slowest, which is why the minimum
+ESS, not the average, is the number to watch. If you see R̂ above 1.05,
+raise `n_warmup` before raising `n_samples`.
+
 ## Recovered growth rate
 
 ``` julia
@@ -100,13 +148,13 @@ plot!(gx, rhat.(gx), lw=2, label="FGPGM posterior mean")
 xlabel!("density N"); ylabel!("per-capita growth r(N)")
 ```
 
-![](40_fgpgm_files/figure-commonmark/cell-6-output-1.svg)
+![](40_fgpgm_files/figure-commonmark/cell-8-output-1.svg)
 
 ``` julia
 (; max_abs_error = maximum(abs.(rhat.(gx) .- r_true.(gx))))
 ```
 
-    (max_abs_error = 0.15554948138210606,)
+    (max_abs_error = 0.01788881290597255,)
 
 ## Where FGPGM sits among the integration-free methods
 
@@ -128,3 +176,5 @@ far faster — see the gradient-matching vignette for those.
   J.M. (2019). Fast Gaussian process based gradient matching for
   parameter identification in systems of nonlinear ODEs. *AISTATS*
   89:1351–1360.
+- Haario, H., Saksman, E. & Tamminen, J. (2001). An adaptive Metropolis
+  algorithm. *Bernoulli* 7(2):223–242.
