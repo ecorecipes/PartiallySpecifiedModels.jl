@@ -98,7 +98,7 @@ fit, the state initialization and the data term, mirroring
 `ODINSolver`/`AdaptiveGradientMatching`; per-cell `data_weights`
 MAGNITUDES are not applied (FGPGM weights by state through σ_{n,k}²) —
 only the zero/NaN mask is honored. Continuous-time problems only;
-`NeuralApproximator` is rejected (as in AGM's population MCMC) — use
+`NeuralApproximator` and `KANApproximator` are rejected (as in AGM's population MCMC) — use
 `AdamSolver` for neural unknowns.
 
 # Returns
@@ -125,8 +125,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::FGPGMSolver)
               "product-of-experts density assumes Gaussian observation " *
               "noise); got $(typeof(prob.likelihood)). " *
               "Use MCMCSolver or LAML for other likelihood families.")
-    any(a -> a isa NeuralApproximator, prob.approximators) &&
-        error("FGPGMSolver does not support NeuralApproximator (random-walk " *
+    any(a -> a isa Union{NeuralApproximator,KANApproximator}, prob.approximators) &&
+        error("FGPGMSolver does not support NeuralApproximator or KANApproximator (random-walk " *
               "Metropolis over network weights does not mix); use " *
               "AdamSolver or MultipleShootingSolver.")
     verbose = alg.verbose

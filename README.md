@@ -17,7 +17,7 @@ PartiallySpecifiedModels.jl provides a unified interface for specifying and fitt
 - **Basis function approximators** (B-splines, shape-constrained splines, Gaussian processes): fewer parameters, automatic smoothing via LAML/GCV, interpretable, and easy to constrain (monotonicity, convexity, positivity).
 - **Neural network approximators** (Lux.jl networks, COMONet): more flexible for high-dimensional or complex functional forms, compatible with gradient-based UDE-style training.
 
-The package builds on the [SciML ecosystem](https://sciml.ai/) and supports 23 fitting algorithms, 11 approximator types, 5 likelihood families, and 14 shape constraint types.
+The package builds on the [SciML ecosystem](https://sciml.ai/) and supports 23 fitting algorithms, 12 approximator types (including an optional KAN backend), 5 likelihood families, and 14 shape constraint types.
 
 ## Installation
 
@@ -122,9 +122,38 @@ PartiallySpecifiedModels.jl provides 23 solvers spanning penalized likelihood, g
 | `SPDEApproximator` | Matérn SPDE penalty (Lindgren et al. 2011) | Mesh node values |
 | `ShapeConstrainedSPDEApproximator` | SPDE + shape constraints | Constrained mesh values |
 | `NeuralApproximator` | Lux.jl neural network | Network weights |
+| `KANApproximator` | Fixed-grid cubic KAN; load FluxKAN.jl | Edge spline and residual weights |
 | `GPApproximator` | Gaussian process | GP hyperparameters |
 | `ShapeConstrainedGPApproximator` | GP + SCOP shape constraints | Constrained inducing values |
 | `COMONetApproximator` | Constrained monotone network | exp(W) weights |
+
+`KANApproximator` uses the optional [FluxKAN.jl](https://github.com/cometscome/FluxKAN.jl)
+v0.9 backend. It supports scalar responses of one or several inputs, fixed
+Float64 grids, and optional ridge or per-layer edge-curvature penalties. Grids are never updated inside
+the differential-equation solve. See the
+[KAN documentation](docs/src/approximators.md#kanapproximator) for setup and scope.
+`kan_edge_curves` and `kan_activation_diagnostics` expose effective edges
+and fixed-grid coverage without adapting the model.
+The [KAN vignette](vignettes/41_kan/41_kan.md) demonstrates fitting and
+pointwise covariance/bootstrap intervals, including explicit query coordinates.
+The [KAN assessment harness](benchmarks/kan/README.md) compares it with
+splines, SPDE/GP approximators and an MLP under a documented ODE-fitting protocol.
+The [multitrajectory assessment](benchmarks/kan/MULTIVARIATE-ASSESSMENT.md)
+extends this to two-input predator-prey responses, tensor/single-index
+baselines, ten fresh seeds and separately reported native solver tracks.
+The [local follow-on](benchmarks/kan/LOCAL-ASSESSMENT.md) evaluates
+near-training-trajectory recovery and validation-selected native starts.
+The [reaction-diffusion assessment](benchmarks/kan/REACTION-DIFFUSION-ASSESSMENT.md)
+adds an independent spatial example while separating fitting error from
+finite-mesh discretization error.
+Its [optimizer and mesh-transfer refinements](benchmarks/kan/REACTION-DIFFUSION-REFINEMENTS.md)
+keep validation selection, optimizer sensitivity and no-refit spatial transfer separate.
+The [uncertainty-calibration study](benchmarks/kan/UNCERTAINTY-CALIBRATION.md)
+assesses pointwise interval coverage, widths and failures under repeated
+datasets rather than treating interval computation as a coverage guarantee.
+The [fresh-data confirmation and seven-model screen](benchmarks/kan/FRESH-COVERAGE.md)
+recompute bootstrap refits under explicit priors, with larger confirmation
+cohorts kept separate from exploratory family comparisons.
 
 ## Features
 
@@ -180,7 +209,7 @@ Following Pya & Wood (2015), the monotone and monotone-plus-curvature constraint
 
 ## Vignettes
 
-The `vignettes/` directory contains 40 worked examples:
+The `vignettes/` directory contains 41 worked examples:
 
 | # | Vignette | Description |
 |---|----------|-------------|
@@ -224,6 +253,19 @@ The `vignettes/` directory contains 40 worked examples:
 | 38 | [Transformed Covariates](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/38_transformed_covariates/38_transformed_covariates.md) | Lagged environmental drivers with `TransformedCovariateApproximator` — smoothed temperature driving transmission |
 | 39 | [Shape-Constrained GP](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/39_shape_constrained_gp/39_shape_constrained_gp.md) | Monotone Gaussian processes with `ShapeConstrainedGPApproximator`, audited with `check_constraints` |
 | 40 | [FGPGM](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/40_fgpgm/40_fgpgm.md) | Bayesian gradient matching with `FGPGMSolver` (Wenk et al. 2019) |
+| 41 | [Kolmogorov-Arnold Networks](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/41_kan/41_kan.md) | Fixed-grid KAN responses, spline baseline, diagnostics and pointwise uncertainty |
+
+## Testing
+
+```bash
+julia --project=. --check-bounds=yes -e 'using Pkg; Pkg.test()'
+julia --project=. --check-bounds=yes -e 'using Pkg; Pkg.test(test_args=["laml-stalls"])'
+julia --project=. --check-bounds=yes -e 'using Pkg; Pkg.test(test_args=["--testset=LAML|Fellner|PCLS|Laplace"])'
+```
+
+The regex selector runs complete matching legacy testsets, retaining shared
+fixtures and rejecting empty selections. Focused file groups remain available
+separately. Use `--check-bounds=yes` for numerical reproduction scripts too.
 
 ## References
 

@@ -69,21 +69,7 @@ function simulate_dde(prob::PSMProblem, beta::AbstractVector)
         error("DDE solve failed: $(sol.retcode)")
     end
 
-    n_times = length(prob.data_times)
-    n_obs = length(prob.obs_to_state)
-    pred = zeros(eltype(beta), n_times, n_obs)
-
-    length(sol.u) >= n_times ||
-        error("solve terminated after $(length(sol.u)) of $n_times save " *
-              "points (retcode $(sol.retcode)); cannot form predictions " *
-              "at all data times")
-    for i in 1:n_times
-        u_i = sol.u[i]
-        for j in 1:n_obs
-            pred[i, j] = u_i[prob.obs_to_state[j]]
-        end
-    end
-    pred
+    _observation_predictions(prob, sol, eltype(beta))
 end
 
 """

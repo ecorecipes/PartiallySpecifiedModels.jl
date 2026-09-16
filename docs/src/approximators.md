@@ -1,6 +1,6 @@
 # Approximators
 
-PartiallySpecifiedModels.jl provides eleven approximator types for representing unknown functions in dynamical systems. Each approximator is a callable object that maps scalar inputs to scalar outputs and is fitted as part of the model (the tensor-product approximator takes two scalar inputs; the single-index approximator takes `p`; the transformed-covariate approximator takes time).
+PartiallySpecifiedModels.jl provides twelve approximator types for representing unknown functions in dynamical systems, including an optional FluxKAN backend. Each approximator is a callable object that maps scalar inputs to scalar outputs and is fitted as part of the model (tensor-product and KAN approximators can take multiple inputs; the single-index approximator takes `p`; the transformed-covariate approximator takes time).
 
 ## BSplineApproximator
 
@@ -53,7 +53,7 @@ sol = solve(prob, AdamSolver(maxiters=400, lr=0.05))
 sol.unknown_functions[:g](1.5, 2.0)   # fitted surface at (N, P)
 ```
 
-Works with the through-the-solver and penalized-likelihood solvers (`AdamSolver`, `LAML`, `GCVSolver`, `DerivativeFreeSolver`, `MultipleShootingSolver`, …); for strongly nonlinear oscillatory systems, start `LAML` from a light penalty (e.g. `LAML(warmup=10, initial_lambda=0.01)`). A 1-D trajectory only visits a curve through the `(x, y)` plane, so the surface is identified near the visited region — evaluate it there. `confidence_band` and the bootstrap unknown-function bands are univariate and do not cover tensor surfaces.
+Works with the through-the-solver and penalized-likelihood solvers (`AdamSolver`, `LAML`, `GCVSolver`, `DerivativeFreeSolver`, `MultipleShootingSolver`, …); for strongly nonlinear oscillatory systems, start `LAML` from a light penalty (e.g. `LAML(warmup=10, initial_lambda=0.01)`). A 1-D trajectory only visits a curve through the `(x, y)` plane, so the surface is identified near the visited region — evaluate it there. Supply `uf_points=Dict(:g => points)` to `confidence_band` or `bootstrap` for pointwise intervals, with an `n_points` by two matrix of physical coordinates. Without explicit points there is no univariate surface band.
 
 ```@docs
 TensorBSplineApproximator
@@ -113,8 +113,10 @@ changing its tangent direction. Second, ``\xi = 2`` covers ±2 standard deviatio
 index; a strongly skewed orbit needs a larger `xi` (outside the knots the outer smooth
 extrapolates linearly, as everywhere else in the package).
 
-`confidence_band` works, and returns the band of the **outer curve** over the standardized
-index — the univariate payoff a tensor surface cannot offer.
+By default `confidence_band` returns the band of the **outer curve** over the
+standardized index. Supply `uf_points=Dict(:g => points)` to evaluate the full
+response at physical `p`-column state coordinates, including the sensitivity
+to the inner loadings. Bootstrap follows the same distinction.
 
 ```@docs
 SingleIndexApproximator
@@ -164,7 +166,9 @@ end
   curve the SCOP construction — e.g. a response guaranteed monotone in smoothed temperature.
 - **`xi`** (keyword, default 2.0): the outer smooth spans ``[-\xi, \xi]`` in **standardized**
   covariate units. So `domain` is *not* time, and [`confidence_band`](@ref) accordingly
-  reports the band of the **response curve** ``s(z)``, not of ``f(t)``.
+  reports the band of the **response curve** ``s(z)``, not of ``f(t)``, by
+  default. Explicit `uf_points` instead supplies times and includes the
+  full response's inner-parameter uncertainty.
 
 **Why this is the easy half of the nested construction.** The single index standardizes
 against the fitted *trajectory*, which moves during the fit, so it must freeze reference
@@ -289,6 +293,236 @@ The network weights are fitted as part of the optimization. Network architecture
 NeuralApproximator
 ```
 
+## KANApproximator
+
+A fixed-grid Kolmogorov-Arnold network represents an unknown scalar response
+using learned univariate edge splines and residual/base functions. It is an
+approximator inside the existing dynamics, not a separate ODE solver or PINN.
+The first implementation supports cubic `FluxKAN.LuxKANLinear` layers,
+either alone or in a flat `Lux.Chain`, with one final output.
+
+FluxKAN is optional: install it in the application environment and load it
+alongside this package. Existing users do not acquire a Flux dependency
+unless they opt into this backend.
+
+```julia
+using Pkg
+Pkg.add("FluxKAN")  # v0.9
+
+using PartiallySpecifiedModels, Lux, FluxKAN
+
+model = Lux.Chain(
+    LuxKANLinear(2, 4; grid_size=5, spline_order=3,
+                 standalone_spline_scale=false),
+    LuxKANLinear(4, 1; grid_size=5, spline_order=3,
+                 standalone_spline_scale=false),
+)
+approx_g = KANApproximator(:g, model;
+    input_domains=((0.0, 50.0), (0.0, 20.0)),
+    penalty=:ridge, rng_seed=42)
+
+# Add approx_g to the PSMProblem's approximators, then use p.g(N, P)
+# in its dynamics. For a fixed ridge strength:
+# sol = solve(prob, AdamSolver(penalty_weight=1e-3))
+```
+
+`input_domains` contains one `(lo, hi)` pair per input and maps physical
+inputs onto the first layer's logical grid interval. Without it, inputs
+are passed in raw coordinates. Hidden layers retain their own fixed grids.
+Inputs are not clamped: outside spline support, the residual/base branch
+still contributes. Choosing appropriate scales remains important.
+
+Initialization, ComponentArray layout and grids are captured once. The
+Float64 evaluator uses the same parameterization as FluxKAN, with local
+cubic support and numerically stable SiLU evaluation. It computes at most
+four active spline bases per input and accumulates their edge contributions
+without constructing full basis arrays or temporary weight matrices. Scalar
+inputs stay in tuples, and the final layer returns a scalar directly.
+Hidden layers allocate their own output vectors, not shared scratch buffers.
+This avoids the fused
+Boolean-mask broadcast that prevents the upstream Lux path from working
+with the package's default ReverseDiff adjoint. Parameters and state inputs
+can carry ForwardDiff Duals, including nested differentiation for stiff
+ODE solvers. No random initialization or grid adaptation occurs in the RHS.
+Non-finite parameter blocks are rejected when building the evaluator,
+rather than being hidden in unused basis coefficients.
+
+### Edge and activation diagnostics
+
+[`kan_edge_curves`](@ref) returns owned plotting data for each effective
+edge, separating its base, spline and total contributions. It uses logical
+layer coordinates and also supplies physical coordinates for first-layer
+edges when `input_domains` is available. Hidden coordinates are learned
+activations, not ecological state variables.
+
+[`kan_activation_diagnostics`](@ref) traces a matrix with one sample per row
+and one physical input per column. It reports each layer's input/output
+values, occupancy of the actual central knot intervals, and samples where
+every spline basis is zero:
+
+```julia
+beta = initial_params(approx_g)  # Use sol.parameters.g after fitting.
+samples = [10.0 2.0; 25.0 5.0; 40.0 10.0]
+exposure = kan_activation_diagnostics(approx_g, beta, samples)
+exposure.layers[2].coverage  # Hidden-layer coordinates, not rescaled inputs
+exposure.predictions
+
+edges = kan_edge_curves(approx_g, beta; npoints=101, extent=:support)
+edge = first(edges)
+# Plot edge.physical_x against edge.base, edge.spline and edge.total.
+```
+
+Leaving the central grid is not the same as losing spline support: cubic
+bases continue through the padded intervals. Where all bases vanish, the
+base branch can still contribute. Central-grid endpoints are included in
+occupancy counts; the outer support endpoints have zero spline basis.
+Actual knot limits can differ slightly from declared logical limits due
+to upstream rounding.
+
+These are CPU Float64 snapshots, not AD evaluators or uncertainty bands.
+They neither change grids/weights nor adapt the model. Marginal coordinate
+coverage does not establish joint-trajectory support or identifiability.
+Unoccupied intervals do not imply unused coefficients, since bases overlap
+intervals. Edge functions are non-unique decompositions, not automatically
+identified scientific laws or pruning targets.
+
+### Penalties and current scope
+
+`penalty=:none` is unpenalized; `:ridge` exposes an identity penalty on the
+raw network weights. The solver supplies or estimates its strength, as for
+other approximators. Ridge shrinkage is **not** an edge-curvature penalty,
+and FluxKAN's magnitude/entropy regularizer is not a quadratic PSM penalty.
+Separate spline scalers are rejected rather than silently dropped.
+
+`penalty=:edge_curvature` penalizes the complete edge functions, including
+the residual activation and its cross terms with the spline coefficients:
+
+```math
+\sum_e \int_0^1
+\left[\frac{d^2}{dz^2}\phi_e(a_e+(b_e-a_e)z)\right]^2 dz
+= \boldsymbol{\beta}^{T}S\boldsymbol{\beta}.
+```
+
+The matrices use the actual de Boor coefficient layout and are cached on
+the fixed grids. Each KAN layer contributes one contiguous, disjoint
+`penalty_blocks` entry; LAML/GCV can select one smoothing parameter per
+layer. Fixed-penalty solvers use the merged matrix. The supported base
+activations for this penalty are the default SiLU, `tanh`, and `identity`.
+
+An optional `nullspace_penalty` adds a declared coefficient-space penalty
+on each edge's affine null space. It defaults to zero and is only valid
+with `:edge_curvature`. For example:
+
+```julia
+approx_g = KANApproximator(:g, model;
+    input_domains=((0.0, 50.0), (0.0, 20.0)),
+    penalty=:edge_curvature, nullspace_penalty=1e-6, rng_seed=42)
+```
+
+This is a penalty on the **edge representation**, not the curvature of the
+entire composed response. It does not remove hidden-unit permutations or
+establish a uniquely identifiable scientific decomposition. Dense
+penalty/Jacobian algebra also makes large KANs expensive for LAML/GCV.
+
+The initial path covers small CPU Float64 models with Adam (including its
+adjoint option), LAML/GCV, and existing ODE/DDE/map simulation. The generic
+approximator protocol also carries its parameters and penalties through
+other solvers, but is not a blanket performance or mixing guarantee.
+FGPGM and AGM population MCMC reject KANs under their existing restriction
+on neural-network weights.
+
+`confidence_band` supports KANs when the fit supplies a parameter covariance
+(for example, LAML), using ForwardDiff parameter sensitivities. The default
+is pointwise conditional delta-method intervals; `interval=:simultaneous`
+instead calibrates a Gaussian maximum-deviation band over the returned
+finite grid. Neither mode establishes identifiability or continuum coverage.
+For a Gaussian LAML fit, `unconditional=true` adds analytic smoothing
+uncertainty in either mode, using both mean and covariance-root corrections
+of the final local working model. It retains the fitted dispersion and
+does not integrate architecture, grid or other hyperparameter choices.
+See [Function Uncertainty](@ref) for assumptions, explicit regularization,
+and how to propagate a selection-stage log-smoothing covariance to a
+fixed-smoothing refit. Unsupported/unidentified corrections raise an error
+rather than silently returning conditional bands.
+Unary KANs with an input domain have an automatic
+grid. For multiple inputs, or a unary KAN without a domain, supply physical
+coordinates explicitly:
+
+```julia
+points = [10.0 2.0; 25.0 5.0; 40.0 10.0]  # one query per row
+band = confidence_band(sol, prob; uf_points=Dict(:g => points))[:g]
+resampled = bootstrap(sol, prob, LAML();
+    nboot=200, uf_points=Dict(:g => points))
+```
+
+Explicit results carry `.points` (`confidence_band`) or `.uf_points`
+(`BootstrapResult`), not an automatic `.grid`/`.uf_grid` entry. Bootstrap
+supports serial and threaded queries and records finite replicate counts
+in `uf_success`; fewer than three usable values produces NaN endpoints and
+a warning. LAML reselects smoothing in each replicate, but fixed-penalty Adam
+does not. Architecture, grids and initialization remain fixed in both cases.
+Without explicit multivariate points, bootstrap skips only that function
+band with a warning and retains coefficient/trajectory output.
+`confidence_band(resampled, sol, prob; interval=:simultaneous)` constructs
+a per-function grid-wise band from coherent complete bootstrap curves.
+It preserves the uncertainty actually included by the refitter, not an
+analytic smoothing-parameter covariance correction.
+
+The [coverage assessment](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/benchmarks/kan/UNCERTAINTY-CALIBRATION.md)
+assesses calibration of a specified small unary KAN procedure against repeated synthetic
+datasets. Its scope is not a coverage guarantee for composed or multivariate
+networks, different initialization schemes, or real-data misspecification.
+It found near-nominal coverage on a logistic control but marked nonlinear
+undercoverage: nominal 95% intervals achieved about 69% in-range coverage
+for covariance and 55% for percentile bootstrap. Stable fitting and
+advanced smoothing did not eliminate response bias.
+The [follow-on investigation](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/benchmarks/kan/UNCERTAINTY-METHODS.md)
+qualifies that result: the nondefault `nullspace_penalty=1e-6` is a
+statistical prior, not numerical jitter. Under LAML the same estimated
+lambda scales both curvature and the affine penalty, changing the penalty
+rank and evidence normalization. With the default zero affine penalty,
+an exploratory replay gave about 91% covariance coverage. That is not a
+new general coverage guarantee or a recalibrated bootstrap.
+An [independent-data confirmation](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/benchmarks/kan/FRESH-COVERAGE.md)
+subsequently found 91.8% covariance and 77.5% percentile-bootstrap coverage
+for that free-affine KAN on the nonlinear truth. Its separate, lower-budget
+family screen also found the composed-KAN fitting procedure poorly
+qualified, with stalled smoothing and extremely uneven interval widths.
+
+Adaptive grids, shape constraints, pruning,
+symbolic extraction and GPU qualification remain separate work. A learned
+edge decomposition is not guaranteed to be uniquely interpretable.
+
+A reproducible ODE assessment against splines, SPDE/GP approximators and an
+MLP is provided in `benchmarks/kan`. Its shared-optimizer protocol reports
+held-out trajectories, on-support response recovery, failures and fitting
+cost rather than assuming KANs are superior.
+`benchmarks/kan/PERFORMANCE.md` records a frozen-weight before/after replay
+and an unchanged-protocol rerun for the local-support optimization.
+`benchmarks/kan/MULTIVARIATE-ASSESSMENT.md` adds a ten-seed, two-input
+predator-prey comparison against tensor splines, single-index splines and
+an MLP. It reports paired-seed variability, limited joint-state support
+and separate native LAML/GCV initialization diagnostics. Composed KAN
+and tensor splines win different fixtures; no universal advantage is claimed.
+The separate `benchmarks/kan/LOCAL-ASSESSMENT.md` evaluates response recovery
+near the training trajectories and native single-index multistart selection.
+Its changed rankings and initialization effects reinforce that qualification.
+`benchmarks/kan/DIAGNOSTICS.md` reports edge and activation exposure for
+the retained fits, with separate fitting/diagnostic source provenance.
+`benchmarks/kan/REACTION-DIFFUSION-ASSESSMENT.md` adds a known-diffusion
+Fisher-KPP example using the existing ODE solvers on a conservative spatial
+discretization. Its same-mesh reaction-recovery results are kept distinct
+from continuum-PDE accuracy.
+`benchmarks/kan/REACTION-DIFFUSION-REFINEMENTS.md` adds a controlled
+stopping/learning-rate comparison and no-refit transfer of the saved
+reaction functions to finer meshes.
+The runnable [KAN vignette](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/41_kan/41_kan.md)
+combines fitting, a spline baseline, edge diagnostics and both uncertainty workflows.
+
+```@docs
+KANApproximator
+```
+
 ## GPApproximator
 
 Gaussian process approximator. Uses a GP prior over the unknown function with learnable hyperparameters (lengthscale, signal variance). Particularly useful with gradient matching solvers.
@@ -360,5 +594,6 @@ COMONetApproximator
 - Use [`SPDEApproximator`](@ref) for an interpretable correlation-length parameter and Matérn-based smoothing.
 - Use [`ShapeConstrainedBSplineApproximator`](@ref) or [`ShapeConstrainedSPDEApproximator`](@ref) when you have prior knowledge about monotonicity or convexity.
 - Use [`NeuralApproximator`](@ref) when the unknown function may be complex or when using UDE-style solvers.
+- Use [`KANApproximator`](@ref) to explore fixed-grid edge-spline networks, comparing them against ordinary splines and MLPs rather than assuming an accuracy or speed advantage.
 - Use [`GPApproximator`](@ref) with gradient matching or MAGI solvers.
 - Use [`COMONetApproximator`](@ref) for neural network flexibility with monotonicity guarantees.

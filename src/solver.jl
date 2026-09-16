@@ -74,6 +74,7 @@ function _validate_problem(prob::PSMProblem, solver_name::String;
     n_obs = size(prob.data_values, 2)
 
     n_times == 0 && error("$solver_name: data_times is empty")
+    prob.discrete && _discrete_observation_steps(prob)
     issorted(prob.data_times) ||
         error("$solver_name: data_times must be sorted increasing (the " *
               "Kalman-filter and profiling paths assume monotone " *
@@ -519,6 +520,33 @@ function _simulated_companion(prob::PSMProblem, beta::AbstractVector,
     (sl, false, ratio)
 end
 
+"""Extract observations by time, rejecting incomplete saved trajectories."""
+function _observation_predictions(prob::PSMProblem, sol, ::Type{T}) where {T}
+    pred = zeros(T, length(prob.data_times), length(prob.obs_to_state))
+    isempty(prob.data_times) && return pred
+    isempty(sol.t) &&
+        error("solve saved no trajectory (retcode $(sol.retcode)); " *
+              "cannot form predictions at data times")
+    lo, hi = minmax(first(sol.t), last(sol.t))
+    all(t -> lo <= t <= hi, prob.data_times) ||
+        error("saved trajectory [$lo, $hi] does not cover all data times " *
+              "(retcode $(sol.retcode)); cannot form predictions")
+
+    # Preserve the ordinary saveat path exactly; extra saved points (initial
+    # states, solver steps or callbacks) must not shift observation indices.
+    direct = sol.t == prob.data_times
+    reverse_times = first(sol.t) > last(sol.t)
+    for i in eachindex(prob.data_times)
+        t = prob.data_times[i]
+        idx = direct ? i : searchsortedlast(sol.t, t; rev=reverse_times)
+        u_i = idx > 0 && sol.t[idx] == t ? sol.u[idx] : sol(t)
+        for j in eachindex(prob.obs_to_state)
+            pred[i, j] = u_i[prob.obs_to_state[j]]
+        end
+    end
+    pred
+end
+
 """
     simulate_continuous(prob, beta)
 
@@ -559,21 +587,28 @@ function simulate_continuous(prob::PSMProblem, beta::AbstractVector)
         error("ODE solve failed: $(sol.retcode)")
     end
 
-    n_times = length(prob.data_times)
-    n_obs = length(prob.obs_to_state)
-    pred = zeros(eltype(beta), n_times, n_obs)
+    _observation_predictions(prob, sol, eltype(beta))
+end
 
-    length(sol.u) >= n_times ||
-        error("solve terminated after $(length(sol.u)) of $n_times save " *
-              "points (retcode $(sol.retcode)); cannot form predictions " *
-              "at all data times")
-    for i in 1:n_times
-        u_i = sol.u[i]
-        for j in 1:n_obs
-            pred[i, j] = u_i[prob.obs_to_state[j]]
-        end
+function _discrete_step_index(t::Real, t0::Real)
+    isfinite(t) && isfinite(t0) ||
+        throw(ArgumentError("discrete observation times and time origin must be finite"))
+    round(Int, t - t0)
+end
+
+"""Group observation rows by zero-based unit step from the model's origin."""
+function _discrete_observation_steps(prob::PSMProblem)
+    t_start, t_end = prob.tspan
+    n_steps = length(t_start:1.0:t_end) - 1
+    rows_by_step = Dict{Int, Vector{Int}}()
+    for (di, dt) in enumerate(prob.data_times)
+        step = _discrete_step_index(dt, t_start)
+        0 <= step <= n_steps ||
+            throw(ArgumentError("observation time $dt rounds to step $step " *
+                                "outside the discrete trajectory (0:$n_steps)"))
+        push!(get!(rows_by_step, step, Int[]), di)
     end
-    pred
+    rows_by_step
 end
 
 """
@@ -582,8 +617,10 @@ end
 Simulate a discrete-time model by explicit iteration.
 The dynamics function `f!(u_next, u, p, t)` computes `u(t+1)` from `u(t)`.
 
-Iterates through all integer time steps from `tspan[1]` to `tspan[2]`,
-recording state at `data_times`.
+Iterates in unit time steps from `tspan[1]` to `tspan[2]`. Observation
+times are rounded to the nearest step relative to `tspan[1]`, including
+when the time origin is fractional. Times rounding outside the trajectory
+raise an error rather than leaving zero predictions.
 """
 function simulate_discrete(prob::PSMProblem, beta::AbstractVector)
     p = build_param_struct(prob, beta)
@@ -598,29 +635,17 @@ function simulate_discrete(prob::PSMProblem, beta::AbstractVector)
     t_start = prob.tspan[1]
     t_end = prob.tspan[2]
 
-    # Build sorted set of all times we need to visit
-    # (integer steps from tspan[1] to tspan[2])
+    # Unit steps on the grid anchored at tspan[1].
     all_times = collect(t_start:1.0:t_end)
 
-    # Map data_times to indices in all_times (allow non-integer data_times
-    # by finding nearest time step)
-    data_time_set = Dict{Float64, Vector{Int}}()
-    for (di, dt) in enumerate(prob.data_times)
-        # Round to nearest time step
-        t_nearest = round(dt)
-        if !haskey(data_time_set, t_nearest)
-            data_time_set[t_nearest] = Int[]
-        end
-        push!(data_time_set[t_nearest], di)
-    end
+    data_time_set = _discrete_observation_steps(prob)
 
     u = T.(u0)
     u_next = similar(u)
 
     # Record initial condition if it's a data time
-    t = t_start
-    if haskey(data_time_set, t)
-        for di in data_time_set[t]
+    if haskey(data_time_set, 0)
+        for di in data_time_set[0]
             for j in 1:n_obs
                 pred[di, j] = u[prob.obs_to_state[j]]
             end
@@ -632,10 +657,8 @@ function simulate_discrete(prob::PSMProblem, beta::AbstractVector)
         t = all_times[step]
         prob.dynamics!(u_next, u, p, t)
         u = copy(u_next)
-        t_now = all_times[step + 1]
-
-        if haskey(data_time_set, t_now)
-            for di in data_time_set[t_now]
+        if haskey(data_time_set, step)
+            for di in data_time_set[step]
                 for j in 1:n_obs
                     pred[di, j] = u[prob.obs_to_state[j]]
                 end
@@ -1236,6 +1259,13 @@ end
 
 # ─── Main solve function ─────────────────────────────────────────
 
+function _laml_prefer_old_step(old_value, old_candidate, new_value, new_candidate, tol)
+    old_candidate < old_value || return false
+    isfinite(new_candidate) && new_candidate < new_value || return true
+    isfinite(old_value) && isfinite(old_candidate) || return true
+    old_value - old_candidate > tol * max(abs(old_value), 1.0)
+end
+
 """
     SciMLBase.solve(prob::PSMProblem, alg::LAML)
 
@@ -1251,12 +1281,15 @@ For each IRLS iteration:
 5. Re-estimate smoothing parameters via Fellner-Schall + Newton
 
 Returns a `PSMSolution`. `sol.convergence` is a NamedTuple
-`(V_beta, sigma2, converged, iterations, reason, laml_failures, criterion,
-laml, stationarity, smoothing_advanced)` — see the `LAML` and `PSMSolution`
+with covariance, convergence and smoothing diagnostics — see the `LAML` and `PSMSolution`
 docstrings for the key taxonomy. Note in particular that `converged` is a
 stability test, and that `stationarity`/`smoothing_advanced` are the additive
 diagnostics that say whether the fit stopped at a smoothing optimum or merely
 stopped moving.
+
+Gaussian penalized fits also retain `smoothing_state`, final working
+information for opt-in [`smoothing_covariance_correction`](@ref).
+This does not change the fitted parameters, smoothing or conditional covariance.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     _validate_problem(prob, "LAML")
@@ -1293,6 +1326,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     # multi-block type contributes one entry — and hence one λ — per block)
     S_list, uf_offsets, uf_nk = build_penalty_matrices(prob)
     m = length(S_list)
+    smoothing_fixed = alg.fixed_lambda !== nothing
+    smoothing_fixed && m == 0 &&
+        throw(ArgumentError("LAML: fixed_lambda requires at least one penalty block"))
 
     # Mixed-approximator dof advisory: parameters without a penalty block
     # (e.g. NeuralApproximator weights with penalty_weight = 0) are REML
@@ -1321,7 +1357,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     # Default: θ = 1/tr(S) ≈ 3.7e-5 (light initial smoothing).  LAML will
     # quickly adjust this once the warmup phase is complete.  For strongly
     # nonlinear problems, use initial_lambda=10.0 + warmup=5 or higher.
-    if alg.initial_lambda !== nothing
+    if smoothing_fixed
+        theta = fill(alg.fixed_lambda, m)
+    elseif alg.initial_lambda !== nothing
         theta = fill(alg.initial_lambda, m)
     else
         theta = Float64[1.0 / max(tr(S_list[l]), 1e-10) for l in 1:m]
@@ -1442,7 +1480,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             a0, f01 = step_contract(beta, a0_pcls, B0, fac0)
 
             # After warmup iters, also estimate θ via Gaussian LAML
-            if gw_iter > 3
+            if !smoothing_fixed && gw_iter > 3
                 theta_new, _ = try
                     rho0 = log.(max.(gw_otheta, 1e-20))
                     estimate_smoothing_params(J, w_gauss, w_vec,
@@ -1536,7 +1574,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         conv_iters = iter + 1
         # Adapt GP kernel hyperparameters to the evolving fit (before the
         # model evaluation so f/J/W below are consistent with the new kernel)
-        if iter >= alg.warmup
+        if !smoothing_fixed && iter >= alg.warmup
             _adapt_gp_approximators!(prob, beta)
         end
         # Re-evaluate model + Jacobian
@@ -1573,10 +1611,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
 
             f10 = penalized_objective(beta, B_new)
 
-            # Compare old-θ step vs new-θ step using DATA LOSS (not penalized
-            # objective).  Penalized objective is biased: lower θ → lower
-            # penalty → lower objective even if the fit is worse.  Data loss
-            # is θ-independent and gives an unbiased comparison.
+            # Compare likelihoods while the old-θ fit is making material
+            # progress. Likelihood alone can reject legitimate smoothing
+            # increases, so a sub-tolerance old step must not veto a new-θ
+            # step that descends its OWN penalized objective.
             dl_a0 = -log_likelihood(prob.likelihood, y_vec,
                         (try; first(eval_model(a0)); catch; f_vec; end), w_vec)
             dl_a1 = -log_likelihood(prob.likelihood, y_vec,
@@ -1592,8 +1630,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                                   jac=alg.jac, fd_cfg=fd_cfg)
                 otheta .= theta
                 theta_fit .= theta      # β was fitted under B(theta)
-            elseif f01 < obj_prev
-                # Old theta step improved at old theta
+            elseif _laml_prefer_old_step(obj_prev, f01, f10, f11, alg.tol)
+                # Keep a materially improving old-θ step, or any improving
+                # old step when the new proposal has no finite descent.
                 f0_vec, _ = try; eval_model(a0); catch; (f_vec, nothing); end
                 beta .= a0
                 f_vec .= f0_vec
@@ -1607,7 +1646,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                     otheta .= theta
                 end
             elseif f11 < f10
-                # New theta step improved within new theta's metric
+                # New theta step improved within new theta's metric. This
+                # includes an old-θ step already below convergence precision.
+                # Tensor probes previously kept old gains of 5.74e-13 /
+                # 6.74e-14 over new gains of 0.00683 / 0.00420, then stopped
+                # before smoothing advanced. Do not compare the absolute
+                # objectives across penalties; only their own-step descent.
                 f1_vec, _ = try; eval_model(a1); catch; (f_vec, nothing); end
                 beta .= a1
                 f_vec .= f1_vec
@@ -1679,7 +1723,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         # change in data loss.
         # Don't converge before warmup is complete — the smoothing parameters
         # haven't been optimised yet and the objective may improve further.
-        min_conv_iter = max(3, alg.warmup + 3)
+        min_conv_iter = smoothing_fixed ? 3 : max(3, alg.warmup + 3)
         curr_data_loss = sum((y_vec[i] - f_vec[i])^2 * w_vec[i] for i in 1:n_data)
         # alg.tol governs the penalized-objective test (as documented); the
         # data-loss test uses a proportionally looser threshold.
@@ -1747,20 +1791,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         # (the θ at which β̂ is the penalized MLE); `otheta` is the search
         # STATE.
         #
-        # NOT changed, deliberately: the `dl_a1 <= dl_a0` / `dl_a1 < dl_curr`
-        # vetoes above. Data loss is monotone decreasing in model flexibility,
-        # so ANY λ increase raises it and those vetoes are a one-way ratchet
-        # that can only ever accept λ DECREASES — measured `dl_a1/dl_curr` at
-        # the first rejected iteration of the three fixtures below: 1.0086,
-        # 1.0163, 1.00078. (The comment above them says data loss is unbiased
-        # because it is θ-independent; the FUNCTION is, but its argmin over β
-        # moves toward λ → 0, so it is biased against λ increases exactly as
-        # the penalized objective is biased for them.) The correct arbiter of
-        # λ is the LAML criterion Fellner–Schall already ascends — but the
-        # loop does not need one here, because the `f11 < f10` branch accepts
-        # a new θ on its own penalized objective once β is exhausted at the
-        # old θ. Restoring a live proposal is what lets that branch be
-        # reached; widening the veto is a larger change with no measured need.
+        # The likelihood preferences above can reject legitimate λ increases:
+        # at a penalized optimum, increasing smoothing can raise data loss
+        # while improving LAML. The first rejected dl_a1/dl_curr ratios on
+        # the historical fixtures below were 1.0086, 1.0163 and 1.00078.
+        # A live proposal is necessary but not sufficient: tiny positive
+        # old-θ improvements can still monopolize the accept block until the
+        # stopping test fires. `_laml_prefer_old_step` now treats old progress
+        # below alg.tol as exhausted when a finite new-θ descent is available.
+        # The existing fallback then fits β at the proposed θ. This changes
+        # neither the smoothing formula nor the stopping/reporting semantics.
         #
         # Measured effect (λ̂ / EDF / `stationarity` / sup|f̂ − truth|, before →
         # after). All three reported `converged = true` with λ̂ frozen bit-
@@ -1777,7 +1817,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         # In all three the truth lies in null(S), so EDF 2 is the correct
         # answer: the frozen fits were UNDERSMOOTHED, not merely mislabelled.
         w_irls_for_laml = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
-        if m > 0 && iter >= alg.warmup
+        if !smoothing_fixed && m > 0 && iter >= alg.warmup
             # sigma2_init caps the FS dispersion during early iterations to
             # prevent runaway smoothing while the fit is still poor; as
             # documented, the cap relaxes (×10 per iteration past warmup)
@@ -1848,8 +1888,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     JWJ = J' * Diagonal(W_irls) * J
     H_final = JWJ + B_final
     maxd = maximum(abs.(diag(H_final)))
+    covariance_ridge = 1e-12 * maxd + 1e-15
     for i in 1:n_p
-        H_final[i,i] += 1e-12 * maxd + 1e-15
+        H_final[i,i] += covariance_ridge
     end
     edf = try
         tr(cholesky(Symmetric(H_final)) \ JWJ)
@@ -1888,9 +1929,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         println("Final θ: ", [round(t, sigdigits=4) for t in theta])
     end
 
-    # Compute Bayesian posterior covariance V_β = (J'WJ + S^λ)⁻¹
-    # This gives "across-the-function" CIs with near-nominal coverage
-    # (Nychka 1988, Wood 2006 §4.8)
+    # Unscaled inverse penalized information, conditional on selected smoothing.
+    # confidence_band uses this covariance by default; analytic smoothing
+    # uncertainty is a separate opt-in postprocessing step.
+    # Nominal coverage, bias correction and identifiability are not guaranteed.
     V_beta = try
         inv(cholesky(Symmetric(H_final)))
     catch
@@ -2024,24 +2066,35 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     # ~2.5x faster than `:fd` at 8 parameters but ~25x SLOWER at 12 (measured
     # 3.86 s vs 0.152 s), so it is the right escape hatch for a fit that has
     # actually hit this, not a blanket default.
-    if m > 0 && !smoothing_advanced
+    if m > 0 && !smoothing_advanced && !smoothing_fixed
         @warn "LAML: smoothing selection never moved λ̂ off its " *
               "initialization, so the reported λ̂, EDF and posterior " *
               "covariance describe the INITIAL smoothing, not a selected " *
               "one. Every Fellner–Schall proposal was rejected (or the " *
-              "iteration budget was spent before any ran). This happens " *
-              "when the working-model Jacobian is too noisy for the " *
-              "proposals to be accepted; try `jac=:forwarddiff`, more " *
+              "iteration budget was spent before any ran). A noisy " *
+              "working-model Jacobian or a stalled nonlinear search can " *
+              "prevent acceptance; try `jac=:forwarddiff`, more " *
               "`maxiters`, or a different knot count. See " *
               "`convergence.smoothing_advanced`." maxlog=1
     end
 
+    # Retain the final working model, not a new Jacobian evaluation with
+    # different FD step history, for opt-in smoothing covariance correction.
+    smoothing_state = if prob.likelihood isa Gaussian && m > 0 &&
+                         V_beta !== nothing && all(isfinite, J)
+        _laml_smoothing_state(prob, p_opt, theta, S_list, uf_offsets, uf_nk,
+            J, W_irls, y_vec, f_vec, JWJ, data_loss, covariance_ridge; jac=alg.jac)
+    else
+        nothing
+    end
     convergence_info = (V_beta=V_beta, sigma2=sigma2_hat,
                         converged=conv_converged, iterations=conv_iters,
                         reason=conv_reason, laml_failures=laml_failures,
                         criterion=alg.criterion, laml=laml_value,
                         stationarity=stationarity,
-                        smoothing_advanced=smoothing_advanced)
+                        smoothing_advanced=smoothing_advanced,
+                        smoothing_fixed=smoothing_fixed,
+                        solver=:LAML, smoothing_state=smoothing_state)
 
     PSMSolution(params, obj_val, data_loss, edf, copy(theta),
                 Float64.(pred), Float64.(prob.data_values),

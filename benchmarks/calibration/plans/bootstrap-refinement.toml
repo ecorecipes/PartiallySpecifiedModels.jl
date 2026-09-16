@@ -1,0 +1,522 @@
+"schema" = "calibration-execution-plan-v1"
+"phase" = "bootstrap-refinement"
+"stage" = "develop"
+"code_sha256" = "566d17b66810aecf04355c85f446d9bc4f4434d6619268d5d14ce40a18acda2d"
+"source_root" = "/Users/sdwfrost/Projects/psm/PartiallySpecifiedModels.jl/benchmarks/calibration/runs/develop-full-20260910-0906/source"
+"parent_results" = "/Users/sdwfrost/Projects/psm/PartiallySpecifiedModels.jl/benchmarks/calibration/runs/develop-full-20260910-0906/results"
+"parent_metadata_sha256" = "87a1450343400632f0b78e599056e0b90f50bc80f7ed5132d2869eaa5de51fab"
+"nboot" = 99
+"nsim" = 10000
+"seeds" = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+"shard" = [1, 1]
+"target" = "density_simultaneous"
+"selection_secondary_target" = "density_pointwise"
+"shortlist_size_per_family" = 1
+"selection_rule" = "conditional estimator: primary worst-stratum deficit, secondary deficit, availability, width, model ID"
+"confirmation_not_started" = true
+
+["options"]
+"designs" = "baseline"
+"iterations" = "40"
+"level" = "0.95"
+"methods" = "bootstrap_percentile,bootstrap_t,bootstrap_t_pilot"
+"models" = "gp12,gp12_long,gp12_short,gp20,kan12,mlp13,spde12_long,spde20,spline12,spline8"
+"ngrid" = "31"
+"noise-modes" = "known,estimated"
+"noises" = "iid"
+"operators" = "growth,integral"
+"pilot-fraction" = "0.25"
+"rhos" = "-16.0,-12.0,-10.0,-8.0,-6.0,-4.0,-2.0,2.0,8.0"
+"sigmas" = "0.015,0.03"
+"tol" = "1.0e-8"
+
+["lineage"]
+"screen_analysis" = "/Users/sdwfrost/Projects/psm/PartiallySpecifiedModels.jl/benchmarks/calibration/runs/develop-full-20260910-0906/analysis"
+"screen_analysis_sha256" = "7c1b9649d41402896e04d3fb25e3722676aac32f5e0603cd379881c4b957234a"
+"screen_design_sha256" = "c6ac79ae733addafeb3ce7a86b0577b0fc60ef2a8231eeb6f716f70a1b124ea5"
+"screen_methods" = "conditional,split_bias_bank,split_bias_ellipsoid"
+"selection_stage" = "development only; not a confirmed calibration claim"
+
+["cases"]
+"growth" = ["affine", "sine2_plus", "bump2_minus", "weak_a", "weak_b"]
+"integral" = ["poly_a", "poly_b", "sine2_plus"]
+
+[[participants]]
+"operator" = "growth"
+"family" = "gp"
+"noise_mode" = "estimated"
+"model" = "gp12_long"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "gp"
+"noise_mode" = "estimated"
+"model" = "gp12_long"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "gp"
+"noise_mode" = "estimated"
+"model" = "gp12_long"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "gp"
+"noise_mode" = "known"
+"model" = "gp20"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "gp"
+"noise_mode" = "known"
+"model" = "gp20"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "gp"
+"noise_mode" = "known"
+"model" = "gp20"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "kan"
+"noise_mode" = "estimated"
+"model" = "kan12"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "kan"
+"noise_mode" = "estimated"
+"model" = "kan12"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "kan"
+"noise_mode" = "estimated"
+"model" = "kan12"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "kan"
+"noise_mode" = "known"
+"model" = "kan12"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "kan"
+"noise_mode" = "known"
+"model" = "kan12"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "kan"
+"noise_mode" = "known"
+"model" = "kan12"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "mlp"
+"noise_mode" = "estimated"
+"model" = "mlp13"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "mlp"
+"noise_mode" = "estimated"
+"model" = "mlp13"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "mlp"
+"noise_mode" = "estimated"
+"model" = "mlp13"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "mlp"
+"noise_mode" = "known"
+"model" = "mlp13"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "mlp"
+"noise_mode" = "known"
+"model" = "mlp13"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "mlp"
+"noise_mode" = "known"
+"model" = "mlp13"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "spde"
+"noise_mode" = "estimated"
+"model" = "spde20"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "spde"
+"noise_mode" = "estimated"
+"model" = "spde20"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "spde"
+"noise_mode" = "estimated"
+"model" = "spde20"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "spde"
+"noise_mode" = "known"
+"model" = "spde12_long"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "spde"
+"noise_mode" = "known"
+"model" = "spde12_long"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "spde"
+"noise_mode" = "known"
+"model" = "spde12_long"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "spline"
+"noise_mode" = "estimated"
+"model" = "spline12"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "spline"
+"noise_mode" = "estimated"
+"model" = "spline12"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "spline"
+"noise_mode" = "estimated"
+"model" = "spline12"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "spline"
+"noise_mode" = "known"
+"model" = "spline8"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "spline"
+"noise_mode" = "known"
+"model" = "spline8"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "growth"
+"family" = "spline"
+"noise_mode" = "known"
+"model" = "spline8"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "gp"
+"noise_mode" = "estimated"
+"model" = "gp12"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "gp"
+"noise_mode" = "estimated"
+"model" = "gp12"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "gp"
+"noise_mode" = "estimated"
+"model" = "gp12"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "gp"
+"noise_mode" = "known"
+"model" = "gp12_short"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "gp"
+"noise_mode" = "known"
+"model" = "gp12_short"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "gp"
+"noise_mode" = "known"
+"model" = "gp12_short"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "kan"
+"noise_mode" = "estimated"
+"model" = "kan12"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "kan"
+"noise_mode" = "estimated"
+"model" = "kan12"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "kan"
+"noise_mode" = "estimated"
+"model" = "kan12"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "kan"
+"noise_mode" = "known"
+"model" = "kan12"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "kan"
+"noise_mode" = "known"
+"model" = "kan12"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "kan"
+"noise_mode" = "known"
+"model" = "kan12"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "mlp"
+"noise_mode" = "estimated"
+"model" = "mlp13"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "mlp"
+"noise_mode" = "estimated"
+"model" = "mlp13"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "mlp"
+"noise_mode" = "estimated"
+"model" = "mlp13"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "mlp"
+"noise_mode" = "known"
+"model" = "mlp13"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "mlp"
+"noise_mode" = "known"
+"model" = "mlp13"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "mlp"
+"noise_mode" = "known"
+"model" = "mlp13"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "spde"
+"noise_mode" = "estimated"
+"model" = "spde12_long"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "spde"
+"noise_mode" = "estimated"
+"model" = "spde12_long"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "spde"
+"noise_mode" = "estimated"
+"model" = "spde12_long"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "spde"
+"noise_mode" = "known"
+"model" = "spde12_long"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "spde"
+"noise_mode" = "known"
+"model" = "spde12_long"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "spde"
+"noise_mode" = "known"
+"model" = "spde12_long"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "spline"
+"noise_mode" = "estimated"
+"model" = "spline8"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "spline"
+"noise_mode" = "estimated"
+"model" = "spline8"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "spline"
+"noise_mode" = "estimated"
+"model" = "spline8"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "spline"
+"noise_mode" = "known"
+"model" = "spline8"
+"method" = "bootstrap_percentile"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "spline"
+"noise_mode" = "known"
+"model" = "spline8"
+"method" = "bootstrap_t"
+"target" = "density_simultaneous"
+
+[[participants]]
+"operator" = "integral"
+"family" = "spline"
+"noise_mode" = "known"
+"model" = "spline8"
+"method" = "bootstrap_t_pilot"
+"target" = "density_simultaneous"

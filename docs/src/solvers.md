@@ -25,11 +25,41 @@ println("Data loss: ", round(sol.data_loss, digits=4), ", EDF: ", round(sol.edf,
 
 Penalized Iteratively Reweighted Least Squares (P-IRLS) with **Laplace Approximate Marginal Likelihood** for automatic smoothing parameter selection. The default and recommended solver for B-spline approximators. For Gaussian data, LAML is equivalent to REML.
 
+For deliberate coefficient refitting at a specified smoothing weight, use
+`LAML(fixed_lambda=0.1)`. The scalar applies to every penalty block and
+cannot be combined with `initial_lambda`. This mode skips smoothing
+selection and automatic GP kernel updates while retaining coefficient
+stability, EDF and covariance reporting. It requires a penalized term.
+Unlike an artificially long warmup, it can stop when the coefficients
+stabilize.
+
+`convergence.smoothing_fixed=true` marks this intentional mode:
+`smoothing_advanced=false` is expected, no stalled-selection warning is
+emitted, and smoothing stationarity need not be small. These statements
+do not say that the supplied weight is statistically appropriate or that
+its intervals are calibrated. Defaults and automatic selection are unchanged.
+
+Gaussian LAML fits retain final working information for
+[`smoothing_covariance_correction`](@ref). Use
+`confidence_band(sol, prob; unconditional=true)` to include analytic
+log-smoothing uncertainty in pointwise or simultaneous covariance bands.
+This local-Gaussian correction includes mean and covariance-root terms,
+holds coefficient dispersion fixed, and leaves the fitted mean and default
+conditional covariance unchanged. Fixed-lambda fits need an explicitly
+supplied selection-stage `rho_covariance`; non-Gaussian and other-solver
+fits cannot reuse this Gaussian profiled-REML curvature.
+
 For non-Gaussian likelihoods the default smoothing criterion (`criterion=:working`) is PQL-flavored: smoothing parameters are calibrated on the Gaussian working model of the IRLS loop via a Pearson-dispersion-scaled Fellner–Schall update. The opt-in `criterion=:laplace` instead maximizes the actual family's full Laplace-approximate marginal likelihood, `ℓ(β̂) − ½β̂ᵀS_λβ̂ + ½log|S_λ|₊ − ½log|JᵀW̃J + S_λ| + (Mp/2)log 2π` (Wood 2011; Wood, Pya & Säfken 2016), using the generalized Fellner–Schall update of Wood & Fasiolo (2017) plus Newton refinement. Prefer `:laplace` for count data with low means (Poisson μ ≲ 10), where the working-model approximation is most biased. It supports `Poisson`, `NegativeBinomial` (dispersion fixed at the supplied `theta`), and `TruncatedNormal` (fixed `lower`/`sigma`); `CustomLikelihood` is rejected because it declares no normalized density or dispersion. For `Gaussian` data `:laplace` reduces exactly to the profiled-REML criterion, so results are identical to the default. `sol.convergence.criterion` records which criterion ran and `sol.convergence.laml` the criterion value at the fit.
+
+For `TruncatedNormal`, the model predicts the latent normal location, which
+can lie below `lower`; it is not the mean of the observed truncated response.
+The log-density, IRLS score and information, and Pearson dispersion use
+consistent, stable tail calculations. Negative latent locations are not
+reflected to positive values when estimating the truncated variance.
 
 `sol.convergence.converged` is a **stability** test — it fires when the penalized objective and the data loss stop changing — and a fit stops changing for several distinct reasons that it cannot tell apart: a genuine optimum, a search that stalled because a non-smooth model made the finite-difference Jacobian too noisy to build an accepted step from, and a fit whose smoothing parameters never moved off their initialization at all. LAML therefore also reports two **additive** diagnostics that separate those cases, present on every solution whether converged or not:
 
-- `smoothing_advanced::Bool` — whether λ̂ ever moved off `initial_lambda`/the `1/tr(S)` default. `false` means smoothing selection never took effect and the reported λ̂ carries no information from the data. It compares λ̂ against its initialization with a 1e-10 relative tolerance (guarding against pure round-off, not a calibrated cutoff); it is `false` for 17 of the 163 LAML solves in this package's test suite, 8 of which nonetheless report `converged == true`.
+- `smoothing_advanced::Bool` — whether λ̂ ever moved off `initial_lambda`/the `1/tr(S)` default. Under automatic selection, `false` means selection never took effect. With `fixed_lambda`, it is intentionally false and the supplied weight may have been chosen externally. It compares λ̂ against its initialization with a 1e-10 relative tolerance (guarding against pure round-off, not a calibrated cutoff); it is `false` for 17 of the 163 automatic LAML solves in this package's test suite, 8 of which nonetheless report `converged == true`.
 - `stationarity::Float64` — the LAML criterion's gradient w.r.t. `ρ = log λ` at the returned fit, normalized to `maxₖ |∂V/∂ρₖ| / (½·rank(Sₖ))` so that it is dimensionless and `0` means exactly stationary. It is not bounded above (largest observed on this suite: 8.7).
 
 There is deliberately **no `stationary::Bool`**: measured across all 163 LAML solves in the test suite the residual is an unbroken continuum, not two clusters — quantiles p25 = 1.6e-7, p50 = 8.5e-6, p75 = 1.6e-2, p90 = 0.29, and across the whole decision-relevant region (1e-3 to 3) the largest ratio between consecutive sorted values is 1.52 below 1 and 2.98 across the whole region — nothing resembling the orders-of-magnitude separation a threshold would need, so there is no gap anywhere a threshold could sit. A cutoff at 0.1 would have flagged 23 of 163 (14.1%). Read `stationarity` as a magnitude calibrated against your own problem class: a value orders of magnitude larger than comparable fits of yours is the signal. The two keys are complementary rather than redundant — of the 17 `smoothing_advanced == false` fits, one is an unpenalized model whose residual is `0.0` by convention and the other 16 span residuals from 0.016 to 8.7, so a fit can sit at an ordinary residual and still never have moved its λ̂. See the [`LAML`](@ref) docstring for the precise definitions, what each key does *not* mean, and the one regime — near-interpolating Gaussian fits, where the profiled σ̂² underflows and the residual becomes a ratio of two near-zero quantities — in which `stationarity` must not be read at all.
@@ -111,6 +141,15 @@ BNGSolver
 ### AdamSolver
 
 Gradient-based optimization through the ODE solver using the **Adam** optimizer. This is the standard approach for Universal Differential Equations (UDEs). Works with all approximator types including neural networks.
+
+The plateau rule is configurable with `plateau_tol=1e-4`,
+`plateau_window=30` and `early_stopping=true`; these defaults preserve the
+original policy. Its spread statistic is absolute for losses below one,
+so assess stopping sensitivity when fitting small normalized losses.
+Use a smaller tolerance for a flatter required window, or
+`early_stopping=false` for the full budget (`reason=:maxiters`, not
+convergence). Keep `maxiters` fixed when comparing stopping rules: changing
+it also changes the cosine learning-rate schedule.
 
 By default, gradients are computed with ForwardDiff through the ODE solve, whose cost grows with the number of parameters. For continuous ODE problems you can opt into **adjoint sensitivities** instead by loading SciMLSensitivity and setting `sensealg`:
 

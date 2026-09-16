@@ -101,8 +101,10 @@ predprey!(du, u, p, t) = begin
 end
 ```
 
-Note: `confidence_band` and the bootstrap unknown-function bands are
-univariate and do not support tensor surfaces.
+For pointwise function intervals, supply physical query coordinates to
+`confidence_band` or `bootstrap` with `uf_points=Dict(:g => points)`,
+where `points` has one sample per row and two columns. There is no
+automatic univariate grid for a tensor surface.
 """
 struct TensorBSplineApproximator <: AbstractApproximator
     name::Symbol
@@ -196,6 +198,79 @@ function NeuralApproximator(name::Union{Symbol,String}, model;
     d = domain === nothing ? nothing : (Float64(domain[1]), Float64(domain[2]))
     d === nothing || _validate_domain("NeuralApproximator", d)
     NeuralApproximator(Symbol(name), model, penalty_weight, d, rng_seed)
+end
+
+"""
+    KANApproximator(name, model; input_domains=nothing, penalty=:none,
+                   nullspace_penalty=0.0, rng_seed=42)
+
+Fixed-grid Kolmogorov-Arnold network for a scalar unknown response, called
+as `p.f(x)` or `p.g(x, y, ...)` inside the dynamics.
+
+Load `FluxKAN` to enable its optional backend. Supported models are a
+`FluxKAN.LuxKANLinear` or a flat `Lux.Chain` of those layers, with cubic
+splines, `standalone_spline_scale=false`, and one final output. Parameters
+and grids are initialized once and stored as Float64 snapshots. Evaluation
+uses the same edge functions and coefficient layout through a PSM-native
+scalar spline path compatible with differentiation through the RHS.
+
+`input_domains` is a tuple/vector containing one finite `(lo, hi)` pair per
+input. It maps each physical input affinely onto the first layer's logical
+grid range. `nothing` leaves inputs in the backend's raw coordinates.
+Inputs are not clamped: outside spline support, the residual/base branch
+still applies. Grids never adapt during a solve.
+
+`penalty=:none` returns no quadratic penalty; `:ridge` returns an identity
+matrix in raw coefficient coordinates. `:edge_curvature` integrates the
+squared second derivative of each COMPLETE edge function (base activation
+plus spline, including cross terms), in its layer's normalized logical
+coordinate. It supplies one disjoint smoothing block per layer.
+Curvature currently supports the default SiLU, `tanh`, and `identity`
+base activations. It regularizes the edge representation, not the
+curvature of the entire composed response.
+
+For `:edge_curvature`, `nullspace_penalty >= 0` optionally adds a declared
+quadratic penalty on each edge's affine coefficient null space. The default
+is zero. The solver supplies or estimates the overall block weights:
+`AdamSolver(penalty_weight=...)` uses a fixed weight, whereas LAML/GCV
+select one per layer. Grids remain fixed; adaptive grids are not implemented.
+
+`initial_params` returns a copy of the stored initialization, even when
+`rng_seed=nothing`. `confidence_band` supports pointwise covariance
+projection through the fixed-grid parameter gradient; a fit must supply
+`V_beta` and `sigma2` (for example, LAML). Both it and `bootstrap` accept
+physical `uf_points`, with one query per row and one column per input.
+A unary input domain also permits an automatic grid. These intervals
+condition on the architecture and grids, not on their identification.
+Bootstrap keeps the cached KAN initialization and reselects smoothing
+only when its fitting algorithm does.
+
+[`kan_edge_curves`](@ref) extracts base/spline/total edge curves.
+[`kan_activation_diagnostics`](@ref) reports fixed-grid exposure on supplied
+samples without adapting grids. Neither establishes unique edge
+interpretability, joint-state support, or uncertainty coverage.
+
+# References
+- Liu, Z., Wang, Y., Vaidya, S., Ruehle, F., Halverson, J., Soljačić, M.,
+  Hou, T.Y. & Tegmark, M. (2024). KAN: Kolmogorov-Arnold Networks.
+  arXiv:2404.19756.
+- Backend: FluxKAN.jl (`LuxKANLinear`), https://github.com/cometscome/FluxKAN.jl —
+  loaded through the `PartiallySpecifiedModelsFluxKANExt` package extension.
+"""
+struct KANApproximator{M,S,A,L,D} <: AbstractApproximator
+    name::Symbol
+    model::M
+    state::S
+    param_axes::A
+    layers::L
+    input_domains::D
+    logical_domain::Tuple{Float64,Float64}
+    input_dim::Int
+    initial_parameters::Vector{Float64}
+    penalty::Symbol
+    nullspace_penalty::Float64
+    curvature_blocks::Vector{Tuple{Matrix{Float64},UnitRange{Int}}}
+    rng_seed::Union{Nothing,Int}
 end
 
 """
@@ -1111,7 +1186,8 @@ A single index needs variation only ALONG the learned direction, which
 orbit data supply. The loadings are directly interpretable and the outer
 smooth is univariate, so [`confidence_band`](@ref) serves it (evaluating
 the OUTER curve over the standardized index) where the tensor surface has
-no univariate band at all.
+no univariate band at all. Explicit `uf_points` instead evaluates the
+full function at physical state coordinates, including loading sensitivity.
 
 # The standardization statistics are FIXED
 
@@ -1649,7 +1725,8 @@ Its inner penalty is a plain ridge, which shrinks the inertia toward
   (default 2.0), with linear extrapolation outside. **`domain` is
   therefore standardized-covariate units, NOT time** — which is what makes
   [`confidence_band`](@ref) report the band of the RESPONSE CURVE `s(z)`
-  rather than of `f(t)`
+  rather than of `f(t)` by default. Explicit `uf_points` supplies times
+  and evaluates the full `f(t)`, including inner-parameter sensitivity
 - `inner_ridge`: fixed weight of the inner penalty in the merged
   [`penalty_matrix`](@ref) read by the single-λ consumers (default 1e-4).
   Under `LAML`/`GCVSolver` the inner penalty is a block with its own
@@ -1878,6 +1955,10 @@ Truncated Normal likelihood for non-negative continuous data.  The distribution
 is a Normal(μ, σ²) truncated to `[lower, ∞)`.  Scale parameter σ is fixed
 (not profiled like the Gaussian σ²).
 
+The model predicts the latent location μ, which may lie below `lower` and
+is not the truncated response mean. The likelihood, score, information
+and Pearson variance use shared stable normal-tail calculations.
+
 Useful for continuous measurements that are bounded below (e.g., population
 densities, concentrations).
 
@@ -1906,7 +1987,8 @@ end
 
 """
     LAML(; maxiters=100, tol=1e-6, verbose=false, initial_lambda=nothing,
-           warmup=3, sigma2_init=nothing, criterion=:working, jac=:fd)
+           warmup=3, sigma2_init=nothing, criterion=:working, jac=:fd,
+           fixed_lambda=nothing)
 
 Laplace Approximate Marginal Likelihood algorithm.
 Equivalent to REML for Gaussian data.
@@ -1914,7 +1996,9 @@ Uses Fellner-Schall + Newton for smoothing parameter estimation.
 
 # Keyword arguments
 - `maxiters::Int=100`: maximum IRLS+LAML iterations
-- `tol::Float64=1e-6`: convergence tolerance on penalized objective
+- `tol::Float64=1e-6`: convergence tolerance on penalized objective. An
+  old-smoothing step below this precision no longer blocks an available
+  finite step that descends the proposed smoothing's own objective.
 - `verbose::Bool=false`: print iteration diagnostics
 - `initial_lambda::Union{Nothing,Float64}=nothing`: initial smoothing parameter
   for all terms.  Default (`nothing`) uses the data-driven `θ = 1/tr(S)` per
@@ -1926,6 +2010,16 @@ Uses Fellner-Schall + Newton for smoothing parameter estimation.
   engaging LAML estimation.  Allows the coefficient estimates to stabilise
   before the smoothing parameters are adapted.  Increase for strongly
   nonlinear models (e.g. `warmup=10`).
+- `fixed_lambda::Union{Nothing,Float64}=nothing`: opt-in coefficient fitting
+  at a supplied positive, finite smoothing weight, shared by every penalty
+  block. This disables smoothing selection and automatic GP kernel updates,
+  but retains coefficient convergence and covariance/EDF reporting. It
+  requires at least one penalty block and cannot be combined with
+  `initial_lambda`. The returned `smoothing_fixed=true` distinguishes this
+  intentional choice from stalled selection; `smoothing_advanced=false`
+  is expected and does not issue the stalled-selection warning. The reported
+  LAML `stationarity` need not be small because lambda is intentionally fixed.
+  This is not a coverage correction by itself.
 - `sigma2_init::Union{Nothing,Float64}=nothing`: cap on the profiled σ² used in
   the Fellner-Schall smoothing update during the warmup phase.  When provided,
   σ² is clamped to `min(profiled_σ², sigma2_init)`, preventing the large
@@ -2016,7 +2110,7 @@ converged or not.**
   `converged == true` is the strongest available signal that the reported λ̂
   carries no information from the data. It does NOT mean the fit is wrong —
   the initialization can happen to be reasonable — only that nothing chose
-  it. Across the package's own test suite this is `false` for 17 of 163 LAML
+  it. In an earlier test-suite characterization this was `false` for 17 of 163 LAML
   solves, 8 of which nonetheless report `converged == true`. It is genuinely
   complementary to `stationarity` rather than a proxy for it: one of those 17
   is an unpenalized model whose residual is `0.0` by convention, and the
@@ -2055,9 +2149,8 @@ converged or not.**
 
 ### How to read `stationarity`
 
-**There is deliberately no `stationary::Bool`, because the observed
-distribution does not support one.** Measured on all 163 LAML solves the test
-suite performs, the residual is an unbroken continuum rather than two
+**There is deliberately no universal `stationary::Bool`.** An earlier
+characterization of 163 LAML solves found an unbroken continuum rather than two
 clusters. Its quantiles are p25 = 1.6e-7, p50 = 8.5e-6, p75 = 1.6e-2,
 p90 = 0.29, max = 8.7, and across the whole decision-relevant region (1e-3
 to 3) the largest ratio between consecutive sorted values is 1.52 below 1
@@ -2067,17 +2160,19 @@ no gap anywhere a threshold could sit. A cutoff at 0.1 would have flagged 23
 of those 163 solves (14.1%), splitting a continuum of otherwise ordinary
 `:converged_tol` fits.
 
-So treat it as a magnitude, calibrated against your own problem class rather
-than an absolute scale. For orientation, on this suite 95 of 163 solves sit
-below 1e-4; a deliberately non-smooth fixture (a discrete map applying `floor`
-to a coefficient-dependent quantity, which makes the default `jac=:fd`
-Jacobian noise) reads 0.29, against 9.3e-7 for the identical map, basis and
-data with the `floor` removed — a factor of 3.2e5 between two fits that
-`converged` describes identically. A residual orders of magnitude larger than
-comparable fits of yours is the signal; a particular number is not. The usual
-causes of a large value are a non-smooth dynamics function
-(`floor`/`clamp`/`round` on a coefficient-dependent quantity) — for which
-`jac=:forwarddiff` is the fix — or too few `maxiters`.
+Treat it as a magnitude, calibrated against your own problem class rather
+than an absolute scale. In that characterization, 95 of 163 solves were
+below 1e-4. These are historical observations, not bounds or promises for
+current solver versions. In particular, a formerly stalled `floor`-based
+map improves when sub-tolerance old-smoothing steps no longer veto a new
+proposal. A non-smooth evaluator need not produce a large smoothing
+residual, and a small residual does not establish a good nonlinear fit.
+
+A residual orders of magnitude larger than comparable fits of yours is a
+signal to investigate. Causes can include a noisy working-model Jacobian,
+a stalled nonlinear search, or too few iterations. `jac=:forwarddiff` can
+help when the dynamics are Dual-compatible; it is neither a guarantee for
+non-smooth problems nor an unconditional performance recommendation.
 
 **One regime where it is ill-conditioned, and must not be read at all:** for
 `Gaussian` data the gradient contains `−½λₖβ̂'Sₖβ̂/σ̂²` with `σ̂²` the profiled
@@ -2097,6 +2192,15 @@ residual variance.
 `converged && smoothing_advanced`, plus a `stationarity` in line with
 comparable fits, is the combination that means what users generally read
 `converged` alone to mean.
+
+Gaussian penalized fits save final working information in
+`convergence.smoothing_state` for [`smoothing_covariance_correction`](@ref).
+`confidence_band(sol, prob; unconditional=true)` uses that opt-in analytic
+correction, including mean and covariance-root terms. The ordinary stored
+`V_beta` and the default conditional bands are unchanged. This correction
+is local-Gaussian, holds coefficient dispersion fixed, and requires
+identifiable coefficient and log-smoothing curvature (or an explicitly
+supplied log-smoothing covariance for fixed/external smoothing).
 """
 struct LAML
     maxiters::Int
@@ -2107,6 +2211,7 @@ struct LAML
     sigma2_init::Union{Nothing,Float64}
     criterion::Symbol
     jac::Symbol
+    fixed_lambda::Union{Nothing,Float64}
 end
 
 function LAML(; maxiters::Int=100, tol::Float64=1e-6, verbose::Bool=false,
@@ -2114,16 +2219,27 @@ function LAML(; maxiters::Int=100, tol::Float64=1e-6, verbose::Bool=false,
                 warmup::Int=3,
                 sigma2_init::Union{Nothing,Float64}=nothing,
                 criterion::Symbol=:working,
-                jac::Symbol=:fd)
+                jac::Symbol=:fd,
+                fixed_lambda::Union{Nothing,Float64}=nothing)
     criterion in (:working, :laplace) ||
         throw(ArgumentError("LAML: criterion must be :working or :laplace " *
                             "(got $(repr(criterion)))"))
     jac in (:fd, :forwarddiff) ||
         throw(ArgumentError("LAML: jac must be :fd or :forwarddiff " *
                             "(got $(repr(jac)))"))
+    fixed_lambda === nothing || (isfinite(fixed_lambda) && fixed_lambda > 0) ||
+        throw(ArgumentError("LAML: fixed_lambda must be positive and finite"))
+    fixed_lambda === nothing || initial_lambda === nothing ||
+        throw(ArgumentError("LAML: use fixed_lambda or initial_lambda, not both"))
     LAML(maxiters, tol, verbose, initial_lambda, warmup, sigma2_init,
-         criterion, jac)
+         criterion, jac, fixed_lambda)
 end
+
+# Backward-compatible positional constructor (before fixed smoothing).
+LAML(maxiters::Int, tol::Float64, verbose::Bool,
+     initial_lambda::Union{Nothing,Float64}, warmup::Int,
+     sigma2_init::Union{Nothing,Float64}, criterion::Symbol, jac::Symbol) =
+    LAML(maxiters,tol,verbose,initial_lambda,warmup,sigma2_init,criterion,jac,nothing)
 
 # Backward-compatible positional constructor (pre-jac arity).
 LAML(maxiters::Int, tol::Float64, verbose::Bool,
@@ -2300,7 +2416,8 @@ GradientMatching(; maxiters::Int=500, tol::Float64=1e-6, verbose::Bool=false,
 
 """
     AdamSolver(; maxiters=300, lr=0.01, verbose=false, loss=:auto,
-                 penalty_weight=0.0, autodiff=true, sensealg=nothing)
+                 penalty_weight=0.0, autodiff=true, sensealg=nothing,
+                 plateau_tol=1e-4, plateau_window=30, early_stopping=true)
 
 Adam optimizer that trains unknown function parameters through ODE integration.
 
@@ -2345,6 +2462,17 @@ quadratic roughness penalty `penalty_weight · Σₖ βₖ' Sₖ βₖ` to the l
   Only continuous ODE problems are supported (no discrete maps, no DDEs);
   the loss families are the same as the ForwardDiff path (`:mse`,
   `:poisson`).
+- `plateau_tol::Float64=1e-4`: stopping threshold for
+  `(maximum(window)-minimum(window))/max(abs(minimum(window)),1)`.
+  This is an absolute threshold for losses below one and a relative
+  threshold above one. A smaller value requires a flatter loss window;
+  zero disables this criterion.
+- `plateau_window::Int=30`: number of recent losses used by the plateau
+  criterion (at least two). Stopping is considered only after both 60
+  iterations and a full window.
+- `early_stopping::Bool=true`: enable the guarded plateau criterion.
+  `false` uses the complete iteration budget; it does not turn budget
+  exhaustion into convergence.
 
 # Convergence info
 `sol.convergence` is a NamedTuple `(optimizer, method, converged, iterations,
@@ -2364,12 +2492,28 @@ struct AdamSolver
     penalty_weight::Float64
     autodiff::Bool
     sensealg::Any
+    plateau_tol::Float64
+    plateau_window::Int
+    early_stopping::Bool
 end
 
-AdamSolver(; maxiters::Int=300, lr::Float64=0.01, verbose::Bool=false,
+function AdamSolver(; maxiters::Int=300, lr::Float64=0.01, verbose::Bool=false,
              loss::Symbol=:auto, penalty_weight::Float64=0.0,
-             autodiff::Bool=true, sensealg=nothing) =
-    AdamSolver(maxiters, lr, verbose, loss, penalty_weight, autodiff, sensealg)
+             autodiff::Bool=true, sensealg=nothing, plateau_tol::Float64=1e-4,
+             plateau_window::Int=30, early_stopping::Bool=true)
+    isfinite(plateau_tol) && plateau_tol >= 0 ||
+        throw(ArgumentError("AdamSolver: plateau_tol must be finite and nonnegative"))
+    plateau_window >= 2 ||
+        throw(ArgumentError("AdamSolver: plateau_window must be at least two"))
+    AdamSolver(maxiters, lr, verbose, loss, penalty_weight, autodiff, sensealg,
+               plateau_tol, plateau_window, early_stopping)
+end
+
+# Backward-compatible positional constructor (before plateau controls).
+AdamSolver(maxiters::Int, lr::Float64, verbose::Bool, loss::Symbol,
+           penalty_weight::Float64, autodiff::Bool, sensealg) =
+    AdamSolver(maxiters, lr, verbose, loss, penalty_weight, autodiff, sensealg,
+               1e-4, 30, true)
 
 # Backward-compatible positional constructor (pre-sensealg arity).
 AdamSolver(maxiters::Int, lr::Float64, verbose::Bool, loss::Symbol,
@@ -3405,8 +3549,8 @@ initial value, reported as `converged = true, reason =
 honestly as `converged = false, reason = :maxiters`.
 
 Discrete problems are propagated with `simulate_discrete` (unit steps
-over `tspan`, data times snapped to the nearest integer step), so EKI
-sees the same trajectory as every other solver.
+over `tspan`, data times snapped to the nearest unit step from `tspan[1]`),
+so EKI sees the same trajectory as every other simulation-based solver.
 
 # Fields
 - `n_ensemble`: ensemble size (default 50)
@@ -3562,7 +3706,7 @@ uncertainty rather than a point estimate; over [`MagiSolver`](@ref)
 when the observation times are dense enough to carry the latent states
 (MAGI discretizes on a finer grid and uses NUTS — heavier per sweep).
 Gaussian likelihoods only; continuous-time problems only;
-`NeuralApproximator` is rejected (use [`AdamSolver`](@ref)).
+`NeuralApproximator` and `KANApproximator` are rejected (use [`AdamSolver`](@ref)).
 
 # Fields
 - `n_samples`: retained posterior draws after warmup (default 1000)
@@ -3791,6 +3935,12 @@ Construct a PSM fitting problem.
 - `delays=Float64[]`: delay values for DDE problems
 - `history=nothing`: history function `h(p, t)` for DDE problems
 - `solver_kwargs...`: passed to the ODE/discrete solver
+
+ODE/DDE predictions are extracted at `data_times` even when solver options
+save additional initial, internal-step or callback states. Incomplete
+saved trajectories raise an error. Discrete simulations use unit steps
+anchored at `tspan[1]` (including fractional origins), with observations
+rounded to the nearest step on that grid.
 """
 function PSMProblem(dynamics!, u0, tspan,
                     approximators::Vector{<:AbstractApproximator};

@@ -1,6 +1,6 @@
 # Copepod Stage-Structured Population Model
 Simon Frost
-2026-09-04
+2026-09-15
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -168,8 +168,8 @@ prob = PSMProblem(copepod!, compute_u0, (0.0, 90.0),
 
     PSMProblem{typeof(copepod!), typeof(compute_u0), Gaussian, BS3{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(copepod!, compute_u0, (0.0, 90.0), BSplineApproximator[BSplineApproximator(:R, (0.0, 90.0), 15, var"#2#3"()), BSplineApproximator(:mu_j, (0.0, 90.0), 15, var"#5#6"()), BSplineApproximator(:mu_a, (0.0, 90.0), 15, var"#8#9"())], [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0], [2853.9353 0.0 … 6893.1885 7983.0894; 10981.5 5793.3442 … 0.0 1473.7781; … ; 0.0 0.0 … 5107.6265 0.0; 1660.5525 15433.848 … 12018.808 0.0], [1.0 1.0 … 1.0 1.0; 1.0 1.0 … 1.0 1.0; … ; 1.0 1.0 … 1.0 1.0; 1.0 1.0 … 1.0 1.0], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], NamedTuple(), Gaussian(), BS3{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(:maxiters => 10000, :reltol => 1.0e-6, :abstol => 1.0e-6), false, Float64[], nothing)
 
-    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). This happens when the working-model Jacobian is too noisy for the proposals to be accepted; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
-    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2028
+    ┌ Warning: LAML: smoothing selection never moved λ̂ off its initialization, so the reported λ̂, EDF and posterior covariance describe the INITIAL smoothing, not a selected one. Every Fellner–Schall proposal was rejected (or the iteration budget was spent before any ran). A noisy working-model Jacobian or a stalled nonlinear search can prevent acceptance; try `jac=:forwarddiff`, more `maxiters`, or a different knot count. See `convergence.smoothing_advanced`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2070
     Data loss (SS):  1.5226e+09
     Penalized obj:   7.6130e+08
     EDF:             41.29

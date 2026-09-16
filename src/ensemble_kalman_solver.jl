@@ -41,7 +41,8 @@ values `NaN` and `data_loss` `Inf` — reports
 
 Note the discrete-time convention: discrete problems are propagated with
 `simulate_discrete` (unit steps over `tspan`, data times snapped to the
-nearest integer step), the same trajectory every other solver sees.
+nearest unit step from `tspan[1]`), the same trajectory every other
+simulation-based solver sees.
 
 # Masked data
 
@@ -90,7 +91,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
         try
             if prob.discrete
                 # Use the package-canonical discrete simulation (unit steps
-                # over tspan, data times snapped to the nearest integer step)
+                # over tspan, data times snapped relative to tspan[1])
                 # so EKI sees the same trajectory as every other solver even
                 # when data times have gaps.
                 pred = simulate_discrete(prob, theta)
@@ -104,12 +105,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
                 if ode_sol.retcode != :Success && ode_sol.retcode != SciMLBase.ReturnCode.Success
                     return nothing
                 end
-                for i in 1:length(prob.data_times)
-                    for j in 1:size(prob.data_values, 2)
-                        sk = prob.obs_to_state[j]
-                        pred[i, j] = ode_sol.u[i][sk]
-                    end
-                end
+                pred = _observation_predictions(prob, ode_sol, Float64)
             end
         catch e
             _is_program_error(e) && rethrow()

@@ -10,10 +10,10 @@ shooting, adaptive gradient matching, rodeo, MCMC/HMC, MAGI, BNG, DALTON,
 pseudo-marginal, GCV, two-stage, derivative-free, variational, ABC-SMC,
 integral matching, profile likelihood, ensemble Kalman, ODIN, FGPGM, and
 RKHS)
-and 11 approximator types (B-spline, shape-constrained B-spline, tensor-product
+and 12 approximator types (B-spline, shape-constrained B-spline, tensor-product
 B-spline, single index, transformed covariate, SPDE, shape-constrained SPDE,
 neural network, Gaussian process, shape-constrained Gaussian process, and
-COMONet).
+COMONet, plus fixed-grid KANs through the optional FluxKAN backend).
 
 Uses Laplace Approximate Marginal Likelihood (LAML) for automatic smoothing
 parameter estimation, following:
@@ -54,6 +54,11 @@ include("neural_evaluator.jl")
 # Generic evaluator construction (the approximator extension interface);
 # must precede the solver files, which all call build_evaluator
 include("approximator_interface.jl")
+
+# Optional-backend, fixed-grid KAN evaluator and protocol methods.
+include("kan_evaluator.jl")
+include("kan_penalties.jl")
+include("kan_diagnostics.jl")
 
 # Likelihood families
 include("likelihoods.jl")
@@ -148,8 +153,15 @@ include("diagnostics.jl")
 # Bootstrap confidence intervals
 include("bootstrap.jl")
 
+# Grid-wise simultaneous bands and post-bootstrap band construction
+include("simultaneous_bands.jl")
+
+# Opt-in Gaussian LAML smoothing-parameter covariance correction
+include("smoothing_uncertainty.jl")
+
 # Exports — types
 export AbstractApproximator, BSplineApproximator, NeuralApproximator, GPApproximator, SPDEApproximator
+export KANApproximator
 export TensorBSplineApproximator
 export SingleIndexApproximator, index_loadings
 export TransformedCovariateApproximator, lag_weights, smoothing_inertia,
@@ -176,9 +188,10 @@ export nparams, initial_params, build_evaluator
 export optimize_spde_range, with_range_param
 export residual_diagnostics, durbin_watson, residual_acf, semivariogram
 export check_constraints
+export kan_edge_curves, kan_activation_diagnostics
 export appraise, deviance_residuals
 export bootstrap, BootstrapResult
-export confidence_band
+export confidence_band, smoothing_covariance_correction
 
 # Re-export common ODE solvers and problem types
 using OrdinaryDiffEq: Tsit5, BS3, Vern7, Vern9, TRBDF2

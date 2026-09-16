@@ -87,7 +87,8 @@ Evaluate the dynamics right-hand side at all collocation points, also
 returning a per-point failure mask.
 
 For continuous models: returns `f(x(t), p, t)` (derivatives).
-For discrete models: returns `f(x(t), p, t)` (next-state map).
+For discrete models: returns `f(x(t), p, t)` (next-state map); the unused
+terminal row is zero and its dynamics are not evaluated.
 
 Returns `(F, failed)` where `F` is a (T × K) matrix with entry
 [i,k] = f_k(x(t_i), p, t_i) and `failed[i]` is `true` when the dynamics
@@ -102,7 +103,8 @@ function eval_ode_rhs_masked(prob::PSMProblem, times::Vector{Float64},
     p = build_param_struct(prob, beta)
     du = zeros(K)
 
-    for i in 1:T
+    n_rhs = prob.discrete ? T - 1 : T
+    for i in 1:n_rhs
         u = alpha[i, :]
         try
             prob.dynamics!(du, u, p, times[i])
@@ -244,6 +246,7 @@ function _colloc_beta_jac_ad!(J::AbstractMatrix, prob::PSMProblem,
                               n_data::Int, n_alpha::Int, cfg)
     T, K = size(alpha)
     n_beta = length(beta)
+    n_rhs = prob.discrete ? T - 1 : T
     # Per-point failure mask for the Dual sweep. ForwardDiff may call the
     # map several times (one pass per chunk); the dynamics are
     # deterministic, so the same points fail on every pass and |= just
@@ -253,7 +256,7 @@ function _colloc_beta_jac_ad!(J::AbstractMatrix, prob::PSMProblem,
         pd = build_param_struct(prob, bd)
         Fd = zeros(eltype(bd), T * K)
         dud = zeros(eltype(bd), K)
-        for i in 1:T
+        for i in 1:n_rhs
             # Sentinel points: skipped entirely — rows stay identically
             # zero and the sentinel never touches a Dual.
             F_failed[i] && continue
@@ -287,7 +290,7 @@ function _colloc_beta_jac_ad!(J::AbstractMatrix, prob::PSMProblem,
         for k in 1:K, i in 1:T
             row_ode = n_data + (k - 1) * T + i
             # Zero Jacobian at failed points (see sentinel convention).
-            J[row_ode, col] = (F_failed[i] || ad_failed[i]) ? 0.0 :
+            J[row_ode, col] = (i > n_rhs || F_failed[i] || ad_failed[i]) ? 0.0 :
                 -sqrt_lode * JF[(k - 1) * T + i, b]
         end
     end
@@ -326,6 +329,7 @@ function collocation_residual_jacobian(
     n_alpha = T * K
     n_beta = length(beta)
     n_params = n_alpha + n_beta
+    n_rhs = prob.discrete ? T - 1 : T
 
     sqrt_lode = sqrt(lambda_ode)
 
@@ -493,7 +497,7 @@ function collocation_residual_jacobian(
             beta_p[b] += step
             F_p, Fp_failed = eval_ode_rhs_masked(prob, times, alpha, beta_p)
             for k in 1:K
-                for i in 1:T
+                for i in 1:n_rhs
                     row_ode = n_data + (k - 1) * T + i
                     # Zero Jacobian at failed points (see sentinel convention):
                     # differencing a real value against the sentinel — in either
@@ -1108,9 +1112,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                         # latent normal location.
                         pearson += w_vec2[c] *
                                    (y_vec2[c] - _family_mean(lik, mu_base[c]))^2 /
-                                   max(_variance_function(lik,
-                                                          abs(mu_base[c])),
-                                       1e-10)
+                                   max(_pearson_variance(lik, mu_base[c]), 1e-10)
                     end
                     max(pearson / max(n_eff_cells - edf_total, 1.0), 1.0)
                 end
