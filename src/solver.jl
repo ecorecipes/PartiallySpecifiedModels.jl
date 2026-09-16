@@ -248,6 +248,9 @@ function _reject_masked_data(prob::PSMProblem, solver_name::String)
           "the masked rows from data_times/data_values before calling.")
 end
 
+# Relative size of a parameter step, for the ridge diagnostic.
+_rel_step(new, old) = sqrt(sum(abs2, new .- old)) / max(sqrt(sum(abs2, old)), 1.0)
+
 """
     _is_program_error(e)
 
@@ -869,6 +872,7 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
         reverted = false     # a grown step was computed and rejected
         pending_validate = false   # this iteration recomputes a grown step
         da_prev = da
+        signal_prev = 0.0    # signal at da_prev, for the validation gate
         da_used = da         # the step of the last SUCCESSFUL central diff
         # This column's own noise estimate — see the refinement block below.
         eps_col = eps_noise
@@ -965,6 +969,23 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
             if !eps_refined
                 eps_refined = true
                 eps_col = max(eps_col, 0.5 * d2max)
+            elseif d2max < _FD_CURV_FRAC * signal
+                # GROWN step, second difference still not a real fraction of
+                # the signal: it is the noise this column meets at THIS step,
+                # not curvature — and it can sit far above the floor
+                # estimate, because the re-solve jitter is step-dependent.
+                # Measured on the quadrature fixture at nk=9 under the CI
+                # package stack (OrdinaryDiffEq 6.111): column 4 at
+                # h=8.6e-3 had d2max = 7.4e-5 against a floor eps of
+                # 2.2e-6 (34x), an SNR that read 5383 but a true error of
+                # 4.29e-3, and the next step's honest correction (4.3e-3)
+                # was then REVERTED by the validation guard, whose
+                # tolerance was sized from the floor. Refining eps here
+                # re-sizes both the SNR target and that tolerance to the
+                # noise actually present (tol 1.0e-3 -> 1.7e-2), so the
+                # correction is kept. Curvature-dominated steps are
+                # excluded by the same relative test the stop uses.
+                eps_col = max(eps_col, 0.5 * d2max)
             end
 
             if pending_validate
@@ -972,7 +993,14 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
                 for k2 in 1:n_data
                     change = max(change, abs(J[k2, j] - jprev[k2]))
                 end
-                if change > _FD_GROW_TOL * eps_col / (2.0 * da_prev)
+                # Validate only against a RESOLVED previous column. The revert
+                # exists to stop growth from a good estimate INTO truncation;
+                # when the previous column was still noise-dominated a large
+                # change is the expected correction, and reverting keeps the
+                # noise. (This is what silently re-pinned nk=9 column 4 after
+                # the curvature stop above was relaxed.)
+                if signal_prev >= _FD_SNR_TRIGGER * eps_col &&
+                   change > _FD_GROW_TOL * eps_col / (2.0 * da_prev)
                     @inbounds for k2 in 1:n_data
                         J[k2, j] = jprev[k2]
                     end
@@ -1009,14 +1037,28 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
             # historical floor-step behavior. Once triggered, the column
             # grows all the way to the _FD_SNR_TARGET accuracy.
             snr_gate = grew ? _FD_SNR_TARGET : _FD_SNR_TRIGGER
+            # Curvature stop, gated TWICE. The absolute test alone
+            # (`d2max > _FD_CURV_MAX*eps`) grows with h² by construction and so
+            # always trips eventually; on nk=9 column 4 of the quadrature
+            # fixture it stopped growth at SNR 5383 (target 1e4) with only 0.6%
+            # nonlinearity across the step, leaving 4.29e-3 where h=0.1 reaches
+            # 8.27e-6. A purely relative test is WRONG at the floor, where the
+            # signal is itself noise (d2max/signal ≈ 0.6 → nothing ever grows;
+            # every size collapsed to 54–285% of scale). So: the stop fires only
+            # once the signal has cleared the noise AND both the absolute and
+            # the relative curvature tests agree.
+            curv_stop = signal > _FD_SNR_TRIGGER * eps_col &&
+                        d2max > _FD_CURV_MAX * eps_col &&
+                        d2max > _FD_CURV_FRAC * signal
             (!grow || signal >= snr_gate * eps_col || da >= da_cap ||
-             d2max > _FD_CURV_MAX * eps_col) && break
+             curv_stop) && break
             # Jump toward the step that reaches the target SNR (signal
             # scales linearly in da once above the noise), at least ×10.
             @inbounds for k2 in 1:n_data
                 jprev[k2] = J[k2, j]
             end
             da_prev = da
+            signal_prev = signal
             pending_validate = true
             da = min(da_cap,
                      max(10.0 * da,
@@ -1139,6 +1181,19 @@ const _FD_CURV_MAX = 25.0
 # error on column scale 1.08. Same root cause and same fix direction as
 # the _FD_SNR_TRIGGER limitation above.
 const _FD_GROW_TOL = 8.0
+
+# Relative parameter movement of the LAST ACCEPTED step above which a fit
+# that exited on the objective tolerance is reported as a RIDGE: the
+# objective stopped changing while the parameters did not. Near a proper
+# optimum a step that changes the objective by < tol moves the parameters
+# by O(sqrt(tol)); a flat direction lets them slide arbitrarily far at no
+# objective cost. Calibrated on the LV2 consistency fixture (see its test):
+# Julia 1.12 exits at an optimum, 1.13 on a ridge with refit move 1.78.
+const _RIDGE_PARAM_TOL = 1e-3
+
+# Relative nonlinearity across an FD step, required IN ADDITION to the
+# absolute curvature test before step growth stops. See `compute_jacobian!`.
+const _FD_CURV_FRAC = 0.1
 
 # ─── Penalty matrix assembly ─────────────────────────────────────
 
@@ -1565,6 +1620,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
 
     # Honest convergence reporting (see PSMSolution docs): defaults describe
     # loop exhaustion; the breaks below overwrite them with the actual outcome.
+    final_parameter_step = NaN   # relative size of one PCLS step from the reported pair (set at exit)
     conv_converged = false
     conv_reason = :maxiters
     conv_iters = 0
@@ -1858,6 +1914,29 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     # says so — but the λ/β PAIRING is now honest in every case.
     theta .= theta_fit
 
+    # RIDGE PROBE: one full, UNCONTRACTED PCLS step from the reported
+    # (λ̂, β̂), using the solver's own final Jacobian — the refit-move
+    # quantity the honesty tests compute, at the cost of one linear solve.
+    # The size of the last ACCEPTED step is NOT usable here: on a flat
+    # surface the trust region contracts it before the objective test fires,
+    # so it reads small on the known Julia 1.13 ridge (2.2e-4) where this
+    # probe reads 1.78 and the 1.12 optimum reads 7e-6.
+    # The step is measured for every fit (it is informative on its own);
+    # the FLAG and its warning apply to penalized approximators only. An
+    # unpenalized approximator (m == 0 — a NeuralApproximator, a KAN) has no
+    # pinned coefficients by construction, so "converged but the parameters
+    # did not" is its normal state, not a diagnostic (measured: a 4-unit
+    # network at a stable objective moves 5230x under the probe).
+    try
+        w_r = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
+        z_r = _working_residual(prob.likelihood, y_vec, f_vec, w_vec) .+ J * beta
+        a_r, _, _ = pcls_step(J, z_r, theta, w_r)
+        final_parameter_step = all(isfinite, a_r) ? _rel_step(a_r, beta) : NaN
+    catch e
+        _is_program_error(e) && rethrow()
+        final_parameter_step = NaN
+    end
+
     # Build solution
     p_opt = copy(beta)
     pred = simulate(prob, p_opt)
@@ -2075,7 +2154,28 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
               "working-model Jacobian or a stalled nonlinear search can " *
               "prevent acceptance; try `jac=:forwarddiff`, more " *
               "`maxiters`, or a different knot count. See " *
-              "`convergence.smoothing_advanced`." maxlog=1
+              "`convergence.smoothing_advanced`." maxlog=1 _id=:laml_smoothing_never_moved
+    end
+
+    # RIDGE: the objective converged but the parameters did not. `converged`
+    # is a STABILITY test on the objective (documented) and says nothing
+    # about whether the parameters are pinned. When one uncontracted PCLS
+    # step from the reported pair still moves them by more than
+    # `_RIDGE_PARAM_TOL` relative, the fit stopped on a flat direction of the
+    # penalized objective and the reported β̂ is one of a family of
+    # near-equivalent points. Measured: the LV2
+    # consistency fixture exits with a refit move of 7.4e-6 on Julia 1.12 (an
+    # optimum) and 1.78 on Julia 1.13 (a ridge), identical data.
+    ridge = m > 0 && conv_converged && isfinite(final_parameter_step) &&
+            final_parameter_step > _RIDGE_PARAM_TOL
+    if ridge
+        @warn "LAML: the objective converged but the parameters did not — " *
+              "one more PCLS step from the reported fit moves β by " *
+              "$(round(final_parameter_step, sigdigits=3)) (relative), above " *
+              "$(_RIDGE_PARAM_TOL). The fit stopped on a flat ridge of the " *
+              "penalized objective: the fitted FUNCTIONS are usable, but " *
+              "individual coefficients and their covariance are not pinned. " *
+              "See `convergence.ridge` and `convergence.final_parameter_step`." maxlog=1 _id=:laml_ridge
     end
 
     # Retain the final working model, not a new Jacobian evaluation with
@@ -2094,7 +2194,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                         stationarity=stationarity,
                         smoothing_advanced=smoothing_advanced,
                         smoothing_fixed=smoothing_fixed,
-                        solver=:LAML, smoothing_state=smoothing_state)
+                        solver=:LAML, smoothing_state=smoothing_state,
+                        ridge=ridge, final_parameter_step=final_parameter_step)
 
     PSMSolution(params, obj_val, data_loss, edf, copy(theta),
                 Float64.(pred), Float64.(prob.data_values),

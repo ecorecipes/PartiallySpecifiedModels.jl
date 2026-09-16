@@ -2098,6 +2098,14 @@ cases. **They are additive diagnostics; they do not change `converged`,
 converged or not.**
 
 - `smoothing_advanced::Bool`: whether λ̂ ever moved off its initialization
+- `ridge::Bool`: the objective converged but one more PCLS step from the reported
+  fit would still move the parameters by more than `1e-3` relative — the fit stopped on a flat
+  direction. The fitted functions are usable; individual coefficients and
+  their covariance are not pinned
+- `final_parameter_step::Float64`: relative size of that probe step. Reported for every
+  fit; `ridge` itself is evaluated only for penalized approximators — an
+  unpenalized one (`NeuralApproximator`, `KANApproximator`) has no pinned
+  coefficients by construction, so it is never flagged
   (`initial_lambda`, or the data-driven `1/tr(S)` default). `false` means the
   reported λ̂ **is** the initial value — smoothing selection never took
   effect, because every Fellner-Schall proposal was rejected by the step
@@ -3694,7 +3702,10 @@ parameters `θ` are sampled JOINTLY from one product-of-experts density
 
 with `D_k = 'C_k C_k⁻¹` and `A_k = ''C_k − 'C_k C_k⁻¹ 'C_kᵀ` (the GP
 conditional derivative map and covariance), by single-chain adaptive
-Metropolis-within-Gibbs. GP hyperparameters are fixed beforehand by
+Metropolis-within-Gibbs: one GP-correlated random-walk block per state
+and one joint random-walk block for θ whose proposal covariance is the
+sample covariance of the warmup draws (adaptive Metropolis; Haario,
+Saksman & Tamminen 2001). GP hyperparameters are fixed beforehand by
 per-state marginal likelihood — the paper's key simplification.
 
 **When to prefer FGPGM**: over [`AdaptiveGradientMatching`](@ref)'s
@@ -3710,8 +3721,14 @@ Gaussian likelihoods only; continuous-time problems only;
 
 # Fields
 - `n_samples`: retained posterior draws after warmup (default 1000)
-- `n_warmup`: warmup sweeps; proposal-scale adaptation happens here ONLY
-  and the scales are frozen afterwards (default 500)
+- `n_warmup`: warmup sweeps; proposal adaptation happens here ONLY and
+  the kernel is frozen afterwards (default 500). Two things adapt: the
+  per-block scalar scales (Robbins-Monro toward `target_accept`) and,
+  from the first fifth of warmup on, the θ proposal covariance (the
+  running covariance of the warmup draws, so proposals follow the
+  posterior's own axes — an isotropic walk over correlated B-spline
+  coefficients mixes an order of magnitude worse). A few hundred warmup
+  sweeps are needed for the covariance to settle; judge by ESS
 - `gamma`: the paper's model-mismatch variance γ added to the ODE
   expert's covariance `A_k + γI` (default 0.1). The effective slack also
   includes `σ_n²/ℓ²`, the derivative-scale observation noise, as in
@@ -3743,6 +3760,8 @@ run by the R̂/ESS of `convergence.chains`.
 - Wenk, Gotovos, Bauer, Gorbach, Krause & Buhmann (2019), "Fast
   Gaussian process based gradient matching for parameter identification
   in systems of nonlinear ODEs", AISTATS 89:1351-1360.
+- Haario, Saksman & Tamminen (2001), "An adaptive Metropolis algorithm",
+  Bernoulli 7(2):223-242 — the warmup covariance adaptation of the θ block.
 
 !!! note "ODE problems only"
     DDE problems are REJECTED with an error. The objective evaluates the dynamics

@@ -162,7 +162,7 @@ prob = PSMProblem(copepod!, compute_u0, (0.0, 90.0),
 
 ```{julia}
 #| echo: false
-sol = solve(prob, LAML(maxiters=100, verbose=false))
+sol = solve(prob, LAML(maxiters=300, verbose=false))
 
 println("Data loss (SS):  ", @sprintf("%.4e", sol.data_loss))
 println("Penalized obj:   ", @sprintf("%.4e", sol.objective))
@@ -266,7 +266,29 @@ This model illustrates several features of complex PSMs:
 | Total parameters | 45 |
 | Data points | 110 (10 times × 11 stages) |
 
-The ratio of data to parameters (110:45 ≈ 2.4:1) is low, making the smoothing penalty critical. Without it, the model could overfit easily. The LAML-estimated smoothing parameters ensure that the effective model complexity matches what the data can support.
+The ratio of data to parameters (110:45 ≈ 2.4:1) is low, making the smoothing penalty critical. Without it, the model could overfit easily — and the fit reported above shows LAML making exactly that call.
+
+### What LAML chose, and why the fit needs 300 iterations
+
+Read the numbers printed after the fit. All three smoothing parameters are
+driven to very large values, the effective degrees of freedom fall to about
+2.3 *in total* across the three functions — essentially their penalty null
+spaces — and the data loss is roughly two and a half times what the
+unpenalized starting point achieves (1.5 × 10⁹). With ten sampling times per
+stage and residual standard deviations in the thousands of individuals, the
+marginal likelihood finds no support for time-varying recruitment or
+mortality beyond what a near-linear trend in each can explain: the flexible
+fit is fitting noise. That is a statement about this data set, not about the
+model; it is what an honest smoothing-parameter criterion should say when the
+data are this thin.
+
+Getting there is not quick. Each Fellner–Schall proposal from the initial
+smoothing is a very large jump, the first proposals are rejected on their own
+objective, and the fit only leaves the initial smoothing after roughly 130
+IRLS iterations. With the default `maxiters=100` the solver runs out of budget
+first and reports `smoothing_advanced = false` (with a warning) — the reported
+EDF of 41 is then the *initial* smoothing, not a selected one. `maxiters=300`
+lets selection complete.
 
 ### Dependent initial conditions
 
@@ -274,10 +296,7 @@ The `compute_u0(p)` function demonstrates an important feature: the initial cond
 
 ### Smoothing parameter interpretation
 
-The three smoothing parameters $\lambda_k$ control the trade-off between data fit and smoothness independently for each unknown function:
-
-- **$\lambda_R$**: typically small (recruitment is complex, needs flexibility)
-- **$\lambda_{\mu_j}$, $\lambda_{\mu_a}$**: often larger (death rates are smoother)
+The three smoothing parameters $\lambda_k$ control the trade-off between data fit and smoothness independently for each unknown function, so in principle recruitment could be left more flexible than the two mortalities. On this data set all three end up large and the three functions are smoothed to near-linear trends (see above). If a more flexible fit is wanted for exploratory plotting, pass fixed smoothing parameters instead of letting LAML select them — but the marginal likelihood is telling you the data do not support that flexibility.
 
 The LAML/REML criterion provides an automatic, principled way to set these parameters, avoiding the need for cross-validation on such a small dataset.
 

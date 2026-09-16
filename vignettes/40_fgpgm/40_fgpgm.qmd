@@ -67,7 +67,7 @@ prob = PSMProblem(dyn!, [0.7], (0.0, 25.0),
     data_times=ts, data_values=Y, obs_to_state=[1],
     known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
 
-sol = solve(prob, FGPGMSolver(n_samples=400, n_warmup=200, rng_seed=2))
+sol = solve(prob, FGPGMSolver(n_samples=3000, n_warmup=1500, rng_seed=2))
 (; data_loss = sol.data_loss,
    converged = sol.convergence.converged,
    reason    = sol.convergence.reason,
@@ -81,6 +81,38 @@ and look at the diagnostics that *do* carry information:
 ```{julia}
 keys(sol.convergence)
 ```
+
+## Did the chain converge?
+
+`convergence.chains` is an `MCMCChains.Chains` object over the spline
+coefficients, so the standard sampler diagnostics apply directly. Split-R̂
+near 1 (below about 1.05) and an effective sample size in the hundreds are
+what a usable posterior looks like; the accept rates should sit near the
+`target_accept` of 0.234 the warmup adaptation aimed for.
+
+```{julia}
+using MCMCChains
+es = ess_rhat(sol.convergence.chains)
+(; rhat_max = maximum(es[:, :rhat]),
+   ess_min  = minimum(es[:, :ess]),
+   accept   = sol.convergence.accept_rates)
+```
+
+```{julia}
+es
+```
+
+The budget matters here more than for the point-estimate solvers. The θ
+block is a joint random walk over six correlated coefficients whose proposal
+covariance is *learned during warmup* (adaptive Metropolis; Haario et al.
+2001) and frozen afterwards. With too little warmup that covariance has not
+settled and the chain crawls: at `n_samples=400, n_warmup=200` this same
+fixture gives R̂ ≈ 1.2 and an ESS of a few draws, while `n_samples=3000,
+n_warmup=1500` gives R̂ ≈ 1.01 and ESS above 100 — at a cost of well under a
+second, because nothing here integrates the ODE. The coefficients at the
+edges of the spline domain (where there are few or no data) mix slowest,
+which is why the minimum ESS, not the average, is the number to watch. If
+you see R̂ above 1.05, raise `n_warmup` before raising `n_samples`.
 
 ## Recovered growth rate
 
@@ -115,3 +147,5 @@ gradient-matching vignette for those.
 - Wenk, P., Gotovos, A., Bauer, S., Gorbach, N., Krause, A. & Buhmann, J.M.
   (2019). Fast Gaussian process based gradient matching for parameter
   identification in systems of nonlinear ODEs. *AISTATS* 89:1351–1360.
+- Haario, H., Saksman, E. & Tamminen, J. (2001). An adaptive Metropolis
+  algorithm. *Bernoulli* 7(2):223–242.

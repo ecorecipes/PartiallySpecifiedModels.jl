@@ -201,7 +201,18 @@ plot!(prev_grid, λ_est, label="Estimated λ(I/N)", lw=2, color=:red)
 ```{julia}
 #| echo: false
 println("Parametric bootstrap: $(bs_param.n_success) / 50 replicates succeeded")
+println("  stalled smoothing selection: $(bs_param.n_smoothing_stalled), " *
+        "flat-ridge exits: $(bs_param.n_ridge)")
 ```
+
+The two extra counts come from the per-replicate convergence diagnostics.
+`n_smoothing_stalled` is the number of successful replicates whose smoothing
+parameter never left its initial value (the fit converged before
+Fellner–Schall could act on it); `n_ridge` is the number whose objective
+converged while the coefficients could still move along a flat ridge
+(`convergence.ridge`). Both are usable draws at the level of the fitted
+*function* — which is all the bands here use — and the package summarises
+them in one aggregate warning instead of a warning per replicate.
 
 ## Section 3: Nonparametric Bootstrap
 
@@ -495,5 +506,6 @@ The `:case` bootstrap (resampling entire rows) has been **removed** because it s
 
 - **Start with `nboot=50–100`** to check the method works, then increase to 200+ for publication-quality CIs.
 - **Check `bs.n_success`**: if many replicates fail (< 80% success), the model may be unstable. Try increasing `maxiters` or simplifying the approximator (fewer knots).
+- **Then check `bs.n_smoothing_stalled` and `bs.n_ridge`**: replicates that converged without ever moving the smoothing parameter, or that stopped on a flat ridge. A few of either is normal on resampled data; if most replicates stall, raise `maxiters` or lower `warmup`, and if most exit on a ridge, trust the function-level bands but not coefficient-level summaries.
 - **Set `rng=Random.Xoshiro(seed)`** for reproducibility.
 - The parametric bootstrap is the default for good reason: it is fast, well-calibrated, and adapts to the likelihood family. Use the nonparametric bootstrap when you have reason to doubt the error model (Gaussian likelihood only).
