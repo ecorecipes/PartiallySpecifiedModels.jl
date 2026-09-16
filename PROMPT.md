@@ -148,6 +148,14 @@ Before reporting anything:
 - **`_vi_edf`, Rodeo/Dalton FS, ABC/AGM/FGPGM convergence keys** were
   addressed in earlier campaigns; verify rather than assume.
 
+- **The same LV2 fixture is Julia-VERSION sensitive.** On Julia 1.13.0 (what
+  the CI matrix's `'1'` now resolves to) the fit exits on a non-stationary
+  ridge — stationarity 0.392, `converged = true` by the stability semantics,
+  λ̂ = [0.012, 1.43e7] — where 1.12 reaches stationarity 3.4e-3. Honestly
+  reported, not a defect in the reporting; but a design question for the
+  accept-block change: should a step be accepted that exits on a ridge?
+  The refit-move proxy is now asserted only when stationarity < 1e-2.
+
 - **Context-dependent optimum on the LV2 consistency fixture.** After the
   accept-block fix, the "λ̂ and β̂ are mutually consistent" fixture (hard-coded
   data) converges to a penalty/data-loss ratio of 1.18 under `Pkg.test` and
