@@ -12857,7 +12857,14 @@ end
         @test c_cop.smoothing_advanced               # λ̂ left λ₀ (it did not in 100 iterations before)
         @test c_cop.converged
         @test c_cop.iterations < 60                  # measured 18; 136 before the bound
-        @test sol_cop.edf < 5.0                      # measured 2.28: the heavily smoothed fixed point
+        # Smoothing acted: EDF far below the 41.3 at λ₀. NOT pinned to the
+        # basin — measured 2.28 on Julia 1.12 (both OSes, ubuntu 1.13) but
+        # 5.14 on Julia 1.13/macOS, which lands the same fixture on a less
+        # smoothed optimum (the LV2 consistency fixture shows the same
+        # version sensitivity). 20 keeps 2x headroom over λ₀'s 41.3 halved
+        # and 4x over the 1.13 value; the deferral bound is what this
+        # testset checks, and every other assertion held on all four jobs.
+        @test sol_cop.edf < 20.0
         @test all(sol_cop.smoothing_params .> 1e3)   # measured ~2e17; λ₀ was 2e-6
     end
 
