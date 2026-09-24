@@ -11805,6 +11805,23 @@ end
                   0.5 * (sol_eg.data_loss +
                          reported_penalty(prob_eg, sol_eg)) rtol=1e-8
         end
+
+        # ── Sibling parity: GCVSolver and CollocationLAML carry the same two
+        #    keys with the same semantics (one uncontracted step from the
+        #    reported fit — PCLS for GCV, Gauss–Newton on (α, β) measured on
+        #    β for collocation). Measured on this fixture: GCV 1.6e-5,
+        #    collocation 7.6e-9 (LAML 3.7e-8) — 60x and 1e5x under the
+        #    tolerance, so a pinned optimum is asserted, not just the keys.
+        for alg_sib in (GCVSolver(maxiters=40, verbose=false),
+                        CollocationLAML(maxiters=40, verbose=false))
+            sol_sib = solve(prob_eg, alg_sib)
+            c_sib = sol_sib.convergence
+            @test haskey(c_sib, :ridge) && haskey(c_sib, :final_parameter_step)
+            @test isfinite(c_sib.final_parameter_step)
+            @test c_sib.final_parameter_step < 1e-3
+            @test c_sib.ridge == false
+            @test c_sib.ridge == (c_sib.converged && c_sib.final_parameter_step > 1e-3)
+        end
     end
 
     @testset "CollocationLAML — reported λ̂ and β̂ are mutually consistent" begin
@@ -12791,6 +12808,57 @@ end
         @test !any(occursin("never moved", string(r.message)) for r in tl2.logs)
         @test 0 <= bs_ok.n_smoothing_stalled <= bs_ok.n_success
         @test 0 <= bs_ok.n_ridge <= bs_ok.n_success
+    end
+
+    @testset "LAML bounded proposal deferral (copepod)" begin
+        # The copepod vignette fixture (Wood 2001; 11 stages, three 15-knot
+        # smooths, 110 noisy counts, λ₀ = 1/tr(S) so EDF starts at 41). At
+        # that λ₀ the coefficients keep improving the penalized objective by
+        # more than `tol` for ~130 iterations, and before the bound each of
+        # them re-proposed the same Fellner–Schall λ̂ and deferred it:
+        # measured 136 iterations / 428 s to converge, and `maxiters=100`
+        # ran out with λ̂ still at λ₀ (`smoothing_advanced == false`). With
+        # `_LAML_MAX_DEFER = 5`: 18 iterations / 25 s, the SAME fixed point
+        # (EDF 2.28, λ̂/λ₀ 1.16e23, data loss 3.7996e9 vs 3.7990e9).
+        cop_raw = [parse.(Float64, split(l)) for l in readlines(joinpath(@__DIR__, "..", "data", "cop.dat")) if !isempty(strip(l))]
+        cop_t = [r[1] for r in cop_raw]
+        cop_y = reduce(vcat, [permutedims(r[2:12]) for r in cop_raw])
+        cop_dur = [0.75, 1.4, 4.55, 2.8, 2.5, 1.7, 3.5, 3.1, 3.2, 3.7, 4.7]
+        function copepod_d!(du, u, p, t)
+            inflow = p.R(t) * 1000.0
+            for i in 1:11
+                death = i <= 6 ? p.mu_j(t) : p.mu_a(t)
+                du[i] = inflow - u[i] / cop_dur[i] - death * u[i]
+                inflow = u[i] / cop_dur[i]
+            end
+        end
+        function copepod_u0(p)
+            R0 = p.R(0.0) * 1000.0; mj = p.mu_j(0.0); ma = p.mu_a(0.0)
+            u0 = zeros(promote_type(typeof(R0), typeof(mj), typeof(ma)), 11)
+            inflow = R0
+            for i in 1:11
+                death = i <= 6 ? mj : ma
+                u0[i] = inflow / (1.0 / cop_dur[i] + death)
+                inflow = u0[i] / cop_dur[i]
+            end
+            u0
+        end
+        prob_cop = PSMProblem(copepod_d!, copepod_u0, (0.0, 90.0),
+            [BSplineApproximator(:R, (0.0, 90.0), 15;
+                 initial=t -> (0.01 + 0.39894228 / 20.0 * exp(-(t - 30.0)^2 / 20.0^2)) * 400.0),
+             BSplineApproximator(:mu_j, (0.0, 90.0), 15; initial=t -> 0.1 * exp(-0.02t)),
+             BSplineApproximator(:mu_a, (0.0, 90.0), 15; initial=t -> 0.1)];
+            data_times=cop_t, data_values=cop_y, obs_to_state=collect(1:11),
+            known_params=NamedTuple(), likelihood=Gaussian(), solver=BS3(),
+            abstol=1e-6, reltol=1e-6, maxiters=10000)
+        sol_cop = solve(prob_cop, LAML(maxiters=60, verbose=false))
+        c_cop = sol_cop.convergence
+        @test c_cop.deferral_cap_hits >= 1          # the bound decided at least once
+        @test c_cop.smoothing_advanced               # λ̂ left λ₀ (it did not in 100 iterations before)
+        @test c_cop.converged
+        @test c_cop.iterations < 60                  # measured 18; 136 before the bound
+        @test sol_cop.edf < 5.0                      # measured 2.28: the heavily smoothed fixed point
+        @test all(sol_cop.smoothing_params .> 1e3)   # measured ~2e17; λ₀ was 2e-6
     end
 
     # ─── Gradient checks: Symbolics vs ForwardDiff vs finite differences ──

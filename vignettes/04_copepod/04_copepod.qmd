@@ -162,7 +162,7 @@ prob = PSMProblem(copepod!, compute_u0, (0.0, 90.0),
 
 ```{julia}
 #| echo: false
-sol = solve(prob, LAML(maxiters=300, verbose=false))
+sol = solve(prob, LAML(maxiters=100, verbose=false))
 
 println("Data loss (SS):  ", @sprintf("%.4e", sol.data_loss))
 println("Penalized obj:   ", @sprintf("%.4e", sol.objective))
@@ -268,7 +268,7 @@ This model illustrates several features of complex PSMs:
 
 The ratio of data to parameters (110:45 ≈ 2.4:1) is low, making the smoothing penalty critical. Without it, the model could overfit easily — and the fit reported above shows LAML making exactly that call.
 
-### What LAML chose, and why the fit needs 300 iterations
+### What LAML chose
 
 Read the numbers printed after the fit. All three smoothing parameters are
 driven to very large values, the effective degrees of freedom fall to about
@@ -282,13 +282,22 @@ fit is fitting noise. That is a statement about this data set, not about the
 model; it is what an honest smoothing-parameter criterion should say when the
 data are this thin.
 
-Getting there is not quick. Each Fellner–Schall proposal from the initial
-smoothing is a very large jump, the first proposals are rejected on their own
-objective, and the fit only leaves the initial smoothing after roughly 130
-IRLS iterations. With the default `maxiters=100` the solver runs out of budget
-first and reports `smoothing_advanced = false` (with a warning) — the reported
-EDF of 41 is then the *initial* smoothing, not a selected one. `maxiters=300`
-lets selection complete.
+The fit also reports `convergence.ridge = true`. With λ this large the
+penalized directions are pinned to zero, and what remains — the null-space
+components of three functions sharing 2.3 degrees of freedom — is only weakly
+determined by 110 noisy counts, so one more penalized least-squares step from
+the reported coefficients would still move them. The fitted *functions* (the
+near-linear trends above) are usable; individual spline coefficients and
+their covariance are not, which is the flag's meaning.
+
+This fit used to need ~130 iterations. At the initial smoothing the 45
+coefficients keep improving the penalized objective slowly, and the solver
+prefers that progress over a smoothing proposal that would change the fit
+sharply — reasonable for a few iterations, but with no natural end it kept
+re-proposing and deferring the same λ̂. Proposal deferral is now bounded (five
+consecutive iterations), after which the proposal is taken; the same fixed
+point is reached in under twenty iterations, well within the default
+`maxiters=100`.
 
 ### Dependent initial conditions
 

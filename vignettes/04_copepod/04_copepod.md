@@ -1,6 +1,6 @@
 # Copepod Stage-Structured Population Model
 Simon Frost
-2026-09-16
+2026-09-24
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -16,8 +16,7 @@ Simon Frost
 - [Diagnostic Plots](#diagnostic-plots)
 - [Discussion](#discussion)
   - [Model complexity](#model-complexity)
-  - [What LAML chose, and why the fit needs 300
-    iterations](#what-laml-chose-and-why-the-fit-needs-300-iterations)
+  - [What LAML chose](#what-laml-chose)
   - [Dependent initial conditions](#dependent-initial-conditions)
   - [Smoothing parameter
     interpretation](#smoothing-parameter-interpretation)
@@ -170,10 +169,12 @@ prob = PSMProblem(copepod!, compute_u0, (0.0, 90.0),
 
     PSMProblem{typeof(copepod!), typeof(compute_u0), Gaussian, BS3{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(copepod!, compute_u0, (0.0, 90.0), BSplineApproximator[BSplineApproximator(:R, (0.0, 90.0), 15, var"#2#3"()), BSplineApproximator(:mu_j, (0.0, 90.0), 15, var"#5#6"()), BSplineApproximator(:mu_a, (0.0, 90.0), 15, var"#8#9"())], [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0], [2853.9353 0.0 … 6893.1885 7983.0894; 10981.5 5793.3442 … 0.0 1473.7781; … ; 0.0 0.0 … 5107.6265 0.0; 1660.5525 15433.848 … 12018.808 0.0], [1.0 1.0 … 1.0 1.0; 1.0 1.0 … 1.0 1.0; … ; 1.0 1.0 … 1.0 1.0; 1.0 1.0 … 1.0 1.0], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], NamedTuple(), Gaussian(), BS3{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(:maxiters => 10000, :reltol => 1.0e-6, :abstol => 1.0e-6), false, Float64[], nothing)
 
-    Data loss (SS):  3.7990e+09
-    Penalized obj:   1.8398e+09
-    EDF:             2.27
-    Smoothing λ:     [2.167e17, 2.353e17, 2.354e17]
+    ┌ Warning: LAML: the objective converged but the parameters did not — one more PCLS step from the reported fit moves β by 0.0367 (relative), above 0.001. The fit stopped on a flat ridge of the penalized objective: the fitted FUNCTIONS are usable, but individual coefficients and their covariance are not pinned. See `convergence.ridge` and `convergence.final_parameter_step`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2204
+    Data loss (SS):  3.8067e+09
+    Penalized obj:   1.9286e+09
+    EDF:             2.29
+    Smoothing λ:     [2.354e17, 2.354e17, 2.354e17]
 
 ## Results
 
@@ -259,7 +260,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](04_copepod_files/figure-commonmark/cell-12-output-1.svg)
 
-    Durbin-Watson: 1.944, 1.707, 0.982, 1.412, 2.233, 2.099, 0.992, 1.716, 2.188, 1.409, 1.505
+    Durbin-Watson: 1.935, 1.753, 0.957, 1.382, 2.369, 2.034, 0.997, 1.711, 2.037, 1.449, 1.526
 
 ## Discussion
 
@@ -279,7 +280,7 @@ The ratio of data to parameters (110:45 ≈ 2.4:1) is low, making the
 smoothing penalty critical. Without it, the model could overfit easily —
 and the fit reported above shows LAML making exactly that call.
 
-### What LAML chose, and why the fit needs 300 iterations
+### What LAML chose
 
 Read the numbers printed after the fit. All three smoothing parameters
 are driven to very large values, the effective degrees of freedom fall
@@ -293,13 +294,23 @@ each can explain: the flexible fit is fitting noise. That is a statement
 about this data set, not about the model; it is what an honest
 smoothing-parameter criterion should say when the data are this thin.
 
-Getting there is not quick. Each Fellner–Schall proposal from the
-initial smoothing is a very large jump, the first proposals are rejected
-on their own objective, and the fit only leaves the initial smoothing
-after roughly 130 IRLS iterations. With the default `maxiters=100` the
-solver runs out of budget first and reports `smoothing_advanced = false`
-(with a warning) — the reported EDF of 41 is then the *initial*
-smoothing, not a selected one. `maxiters=300` lets selection complete.
+The fit also reports `convergence.ridge = true`. With λ this large the
+penalized directions are pinned to zero, and what remains — the
+null-space components of three functions sharing 2.3 degrees of freedom
+— is only weakly determined by 110 noisy counts, so one more penalized
+least-squares step from the reported coefficients would still move them.
+The fitted *functions* (the near-linear trends above) are usable;
+individual spline coefficients and their covariance are not, which is
+the flag’s meaning.
+
+This fit used to need ~130 iterations. At the initial smoothing the 45
+coefficients keep improving the penalized objective slowly, and the
+solver prefers that progress over a smoothing proposal that would change
+the fit sharply — reasonable for a few iterations, but with no natural
+end it kept re-proposing and deferring the same λ̂. Proposal deferral is
+now bounded (five consecutive iterations), after which the proposal is
+taken; the same fixed point is reached in under twenty iterations, well
+within the default `maxiters=100`.
 
 ### Dependent initial conditions
 
