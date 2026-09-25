@@ -2125,6 +2125,15 @@ converged or not.**
   other 16 span residuals from 0.016 to 8.7, so a fit can sit at a perfectly
   ordinary residual and still never have moved its λ̂.
 
+- Proposal deferral is BOUNDED: while the step at the previous λ̂ still
+  improves the penalized objective by more than `tol`, a live Fellner–Schall
+  proposal is deferred in its favour — but for at most 5 consecutive
+  iterations, after which the proposal is taken. Without the bound a fit
+  whose coefficients converge slowly at the initial λ (the copepod vignette:
+  45 coefficients, EDF 41 at λ₀) re-proposed and deferred the same λ̂ for
+  ~130 iterations (18 with the bound, same fixed point). `verbose=true`
+  prints which branch each iteration took, and
+  `convergence.deferral_cap_hits` counts how often the bound decided.
 - `stationarity::Float64`: how far the returned λ̂ is from a stationary point
   of the LAML criterion, as
   `maxₖ |∂V/∂ρₖ| / (½·rank(Sₖ))` with `ρ = log λ`, evaluated at the returned
@@ -2324,10 +2333,18 @@ least squares.)
 
 # Convergence info
 `sol.convergence` is a NamedTuple `(ode_compliance, lambda_ode_final,
-converged, iterations, reason, iterations_total)`. `converged`/`reason`
+converged, iterations, reason, iterations_total, ridge,
+final_parameter_step)`. `converged`/`reason`
 describe the final continuation level's inner loop, `iterations` counts its
 inner iterations, and `iterations_total` accumulates inner iterations across
 all continuation levels (see [`PSMSolution`](@ref) for the key taxonomy).
+`ridge` and `final_parameter_step` have the [`LAML`](@ref) semantics — one
+more UNCONTRACTED Gauss–Newton step on (α, β) from the reported fit, at the
+final `lambda_ode_final`, weights and λ̂, measured on the coefficient part β:
+`ridge` is `true` when the objective converged but that step would still move
+β by more than 1e-3 relative (the fitted functions are usable; individual
+coefficients and their covariance are not pinned). Penalized approximators
+only; the step is reported for every fit.
 `lambda_ode_final` is the ENDPOINT THE CONTINUATION SCHEDULE WAS BUILT TO —
 the discrete cap above means it is `min(lambda_ode_end, 100.0)` for
 `prob.discrete`, not necessarily the setting you passed. (The schedule's last
@@ -3182,13 +3199,19 @@ residual autocorrelation is suspected (check `residual_diagnostics`).
 
 # Convergence info
 `sol.convergence` is a NamedTuple
-`(converged, iterations, reason, criterion, gcv, ncv)` with the standard
+`(converged, iterations, reason, criterion, gcv, ncv, ridge,
+final_parameter_step)` with the standard
 honest-convergence keys (see [`PSMSolution`](@ref)) plus:
 - `criterion::Symbol`: which selection criterion ran (`:gcv` or `:ncv`)
 - `gcv::Float64`: the final GCV score when `criterion=:gcv`; `NaN`
   otherwise (also NaN when no smooth terms are present)
 - `ncv::Float64`: the final NCV score when `criterion=:ncv`; `NaN`
   otherwise
+- `ridge::Bool`, `final_parameter_step::Float64`: the [`LAML`](@ref) ridge
+  probe — one more uncontracted PCLS step from the reported (λ̂, β̂) with the
+  final Jacobian and weights; `ridge` is `true` when the objective converged
+  but that step would still move β by more than 1e-3 relative. Penalized
+  approximators only; the step is reported for every fit.
 """
 struct GCVSolver
     n_grid::Int

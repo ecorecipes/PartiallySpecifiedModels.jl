@@ -927,6 +927,29 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     pen_ss  = dot(p_opt, B_final * p_opt)
     obj_val = 0.5 * (data_loss + pen_ss)
 
+    # RIDGE PROBE (LAML parity): one full, uncontracted PCLS step from the
+    # reported (λ̂, β̂) with the final Jacobian and weights. Same semantics
+    # as `solve(::LAML)`: the objective converged but the parameters did not.
+    final_parameter_step = try
+        z_r = _working_residual(prob.likelihood, y_vec, f_vec, w_vec) .+ J * p_opt
+        a_r, _, _ = pcls_step(J, z_r, theta, W_irls)
+        all(isfinite, a_r) ? _rel_step(a_r, p_opt) : NaN
+    catch e
+        _is_program_error(e) && rethrow()
+        NaN
+    end
+    ridge = length(theta) > 0 && conv_converged && isfinite(final_parameter_step) &&
+            final_parameter_step > _RIDGE_PARAM_TOL
+    if ridge
+        @warn "$crit_name: the objective converged but the parameters did not — " *
+              "one more PCLS step from the reported fit moves β by " *
+              "$(round(final_parameter_step, sigdigits=3)) (relative), above " *
+              "$(_RIDGE_PARAM_TOL). The fit stopped on a flat ridge of the " *
+              "penalized objective: the fitted FUNCTIONS are usable, but " *
+              "individual coefficients and their covariance are not pinned. " *
+              "See `convergence.ridge` and `convergence.final_parameter_step`." maxlog=1 _id=:gcv_ridge
+    end
+
     # Build ComponentArray for parameter access
     uf_syms = Symbol[a.name for a in prob.approximators]
     uf_vals = Vector{Float64}[]
@@ -964,5 +987,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
                 (converged=conv_converged, iterations=conv_iters,
                  reason=conv_reason, criterion=criterion,
                  gcv=(criterion === :gcv ? gcv_val : NaN),
-                 ncv=(criterion === :ncv ? gcv_val : NaN)))
+                 ncv=(criterion === :ncv ? gcv_val : NaN),
+                 ridge=ridge, final_parameter_step=final_parameter_step))
 end

@@ -105,13 +105,20 @@ Before reporting anything:
   **12 → 4**: 03, 06, 12, 13, 18 cleared entirely; 28 and 29 each dropped
   from 2 to 1; 04 and 38 unchanged. So the veto explained 8 of 12.
 
-  STILL OPEN (4 warnings): 04_copepod, 28_fisheries (one fit),
-  29_bootstrap (one fit), 38_transformed_covariates. 38's cause is known
-  and benign — null-space collapse, `λ = 1`, `edf = 1.0000`, the documented
-  HOLD branch (table below). The other three are NOT diagnosed; do not
-  assume they share either cause. The instrumentation trap below still
-  applies: `maxlog=1` means one warning per document, so first find WHICH
-  solve warns.
+  RESOLVED 2026-09-16 for three of the four. 28 and 29: the warning came
+  from inside `bootstrap` (one replicate of 50); replicate fits are now run
+  under a logger that drops the per-fit warnings, and `BootstrapResult`
+  carries `n_smoothing_stalled` / `n_ridge` with one aggregate warning.
+  04_copepod: neither cause — at λ₀ = 1/tr(S) (EDF 41) the 45 coefficients
+  kept improving by more than `tol` for ~130 iterations and the accept block
+  preferred that progress over the (identical, re-proposed) Fellner–Schall
+  λ̂ every time; `maxiters=100` ran out first. Proposal deferral is now
+  bounded (`_LAML_MAX_DEFER = 5`): 136 → 18 iterations, same fixed point
+  (EDF 2.28, λ̂/λ₀ 1e23 — LAML says these counts support only near-linear
+  trends; the fit reports `ridge = true` for the weakly determined
+  null-space components, explained in the vignette).
+  STILL OPEN (benign): 38_transformed_covariates — null-space collapse,
+  `λ = 1`, `edf = 1.0000`, the documented HOLD branch (table below).
 
   The original entry follows, kept for the ruled-out table.
 

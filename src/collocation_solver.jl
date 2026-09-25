@@ -1223,6 +1223,49 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     end
 
     # Build unknown function evaluators
+    # RIDGE PROBE (LAML parity): one full, UNCONTRACTED Gauss–Newton step on
+    # (α, β) from the reported fit — the same linear system the iteration
+    # solves, at the final λ_ode, weights and θ — reported on the β part
+    # (the states α are always pinned by the data and ODE terms). Same
+    # semantics as `solve(::LAML)`: the objective converged but the
+    # coefficients did not. One collocation Jacobian, no ODE solves.
+    final_parameter_step = try
+        w_end = if is_gauss
+            w_vec
+        else
+            fill_mu!(mu_flat, alpha)
+            irls_weights(lik, y_flat, mu_flat, w_vec)
+        end
+        resid_r, J_r = collocation_residual_jacobian(
+            prob, times, alpha, beta, D, lode_end, w_end;
+            jac=alg.jac, fd_cfg=fd_cfg)
+        n_total = n_alpha + n_beta
+        B_r = zeros(n_total, n_total)
+        for l in 1:m
+            off = n_alpha + uf_offsets[l]
+            nk = uf_nk[l]
+            B_r[off+1:off+nk, off+1:off+nk] .+= theta[l] .* S_list[l]
+        end
+        params_r = vcat(vec(alpha), beta)
+        delta_r = (J_r' * J_r + B_r) \ (-(J_r' * resid_r .+ B_r * params_r))
+        beta_r = beta .+ delta_r[n_alpha+1:end]
+        all(isfinite, beta_r) ? _rel_step(beta_r, beta) : NaN
+    catch e
+        _is_program_error(e) && rethrow()
+        NaN
+    end
+    ridge = m > 0 && conv_converged && isfinite(final_parameter_step) &&
+            final_parameter_step > _RIDGE_PARAM_TOL
+    if ridge
+        @warn "CollocationLAML: the objective converged but the coefficients did " *
+              "not — one more Gauss–Newton step from the reported fit moves β by " *
+              "$(round(final_parameter_step, sigdigits=3)) (relative), above " *
+              "$(_RIDGE_PARAM_TOL). The fit stopped on a flat ridge of the " *
+              "penalized objective: the fitted FUNCTIONS are usable, but " *
+              "individual coefficients and their covariance are not pinned. " *
+              "See `convergence.ridge` and `convergence.final_parameter_step`." maxlog=1 _id=:collocation_ridge
+    end
+
     p_opt = build_param_struct(prob, beta)
     uf_evals = Dict{Symbol, Any}()
     for approx in prob.approximators
@@ -1295,5 +1338,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                  simulation_failed=sim_failed,
                  ode_compliance=ode_loss, lambda_ode_final=lode_end,
                  converged=conv_converged, iterations=conv_iters,
-                 reason=conv_reason, iterations_total=conv_iters_total))
+                 reason=conv_reason, iterations_total=conv_iters_total,
+                 ridge=ridge, final_parameter_step=final_parameter_step))
 end

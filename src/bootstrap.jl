@@ -183,7 +183,8 @@ _bs_ridge(sol)   = hasproperty(sol.convergence, :ridge) && sol.convergence.ridge
 struct _ReplicateLogger{L} <: Base.CoreLogging.AbstractLogger
     parent::L
 end
-const _BS_SUPPRESSED_IDS = (:laml_smoothing_never_moved, :laml_ridge)
+const _BS_SUPPRESSED_IDS = (:laml_smoothing_never_moved, :laml_ridge,
+                            :gcv_ridge, :collocation_ridge)
 Base.CoreLogging.shouldlog(l::_ReplicateLogger, level, _module, group, id) =
     !(id in _BS_SUPPRESSED_IDS) &&
     Base.CoreLogging.shouldlog(l.parent, level, _module, group, id)

@@ -1190,6 +1190,10 @@ const _FD_GROW_TOL = 8.0
 # objective cost. Calibrated on the LV2 consistency fixture (see its test):
 # Julia 1.12 exits at an optimum, 1.13 on a ridge with refit move 1.78.
 const _RIDGE_PARAM_TOL = 1e-3
+# Consecutive iterations a live Fellner–Schall proposal may be deferred in
+# favour of continued progress at the old θ before it is taken; see the
+# accept block in `solve(::PSMProblem, ::LAML)`.
+const _LAML_MAX_DEFER = 5
 
 # Relative nonlinearity across an FD step, required IN ADDITION to the
 # absolute curvature test before step growth stops. See `compute_jacobian!`.
@@ -1621,6 +1625,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     # Honest convergence reporting (see PSMSolution docs): defaults describe
     # loop exhaustion; the breaks below overwrite them with the actual outcome.
     final_parameter_step = NaN   # relative size of one PCLS step from the reported pair (set at exit)
+    n_defer = 0                  # consecutive deferrals of a live smoothing proposal
+    deferral_cap_hits = 0        # proposals taken because the deferral bound was reached
+    last_branch = :init          # accept-block branch taken last (verbose log)
     conv_converged = false
     conv_reason = :maxiters
     conv_iters = 0
@@ -1678,6 +1685,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             dl_curr = -log_likelihood(prob.likelihood, y_vec, f_vec, w_vec)
 
             if f11 < f10 && dl_a1 <= dl_a0
+                n_defer = 0
+                last_branch = :accept_new
                 # New theta + step is best (data loss confirms)
                 f1_vec, _ = try; eval_model(a1); catch; (f_vec, nothing); end
                 beta .= a1
@@ -1686,7 +1695,24 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                                   jac=alg.jac, fd_cfg=fd_cfg)
                 otheta .= theta
                 theta_fit .= theta      # β was fitted under B(theta)
-            elseif _laml_prefer_old_step(obj_prev, f01, f10, f11, alg.tol)
+            elseif _laml_prefer_old_step(obj_prev, f01, f10, f11, alg.tol) &&
+                   n_defer < _LAML_MAX_DEFER
+                # DEFERRAL, BOUNDED. Preferring the old-θ step while it still
+                # makes material progress is right for a few iterations — β
+                # should settle before λ moves — but it has no natural end:
+                # on the copepod vignette (45 coefficients, λ₀ = 1/tr(S),
+                # EDF 41, noisy counts) β at the INITIAL λ kept improving by
+                # more than `tol` for ~130 iterations, and every one of them
+                # regenerated the same Fellner–Schall proposal from the same
+                # `otheta`, checked it against the same veto, and deferred
+                # it again (428 s to reach the fixed point). The proposal is
+                # FS's answer for the current working model, not a stale
+                # guess, so after `_LAML_MAX_DEFER` consecutive deferrals of
+                # a LIVE proposal (one that descends its own objective) the
+                # next branch takes it. `n_defer` counts only live proposals
+                # and resets whenever a proposal is accepted.
+                n_defer += (isfinite(f11) && f11 < f10) ? 1 : 0
+                last_branch = :prefer_old
                 # Keep a materially improving old-θ step, or any improving
                 # old step when the new proposal has no finite descent.
                 f0_vec, _ = try; eval_model(a0); catch; (f_vec, nothing); end
@@ -1702,6 +1728,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                     otheta .= theta
                 end
             elseif f11 < f10
+                last_branch = n_defer >= _LAML_MAX_DEFER ? :accept_new_deferral_cap :
+                                                          :accept_new_old_exhausted
+                n_defer >= _LAML_MAX_DEFER && (deferral_cap_hits += 1)
+                n_defer = 0
                 # New theta step improved within new theta's metric. This
                 # includes an old-θ step already below convergence precision.
                 # Tensor probes previously kept old gains of 5.74e-13 /
@@ -1718,6 +1748,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             else
                 # No improvement from either: β is unchanged, so theta_fit
                 # stays on whatever θ produced it.
+                last_branch = :reject
                 if iter >= 10
                     stop = true
                 end
@@ -1769,7 +1800,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             curr_data_ss = sum((y_vec[i] - f_vec[i])^2 * w_vec[i] for i in 1:n_data)
             println("Iter $iter: obj=$(round(curr_obj, sigdigits=6)), " *
                     "SS=$(round(curr_data_ss, sigdigits=6)), " *
-                    "θ=$(round.(theta, sigdigits=3))")
+                    "θ=$(round.(theta, sigdigits=3)), step=$(last_branch)" *
+                    (n_defer > 0 ? " (deferred $(n_defer))" : ""))
         end
 
         # Check convergence: relative change in penalized objective AND data fit.
@@ -2195,7 +2227,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                         smoothing_advanced=smoothing_advanced,
                         smoothing_fixed=smoothing_fixed,
                         solver=:LAML, smoothing_state=smoothing_state,
-                        ridge=ridge, final_parameter_step=final_parameter_step)
+                        ridge=ridge, final_parameter_step=final_parameter_step,
+                 deferral_cap_hits=deferral_cap_hits)
 
     PSMSolution(params, obj_val, data_loss, edf, copy(theta),
                 Float64.(pred), Float64.(prob.data_values),
