@@ -117,6 +117,13 @@ Before reporting anything:
   (EDF 2.28, λ̂/λ₀ 1e23 — LAML says these counts support only near-linear
   trends; the fit reports `ridge = true` for the weakly determined
   null-space components, explained in the vignette).
+  Deferral bound VALIDATED 2026-09-25: the same six-fixture script under
+  `_LAML_MAX_DEFER = 5` and under an unbounded copy (1e9) — exp-growth
+  (fd, forwarddiff), logistic Poisson, LV2 at both suite settings, Poisson
+  SIR warm-start, copepod: bit-identical iterations/λ̂/EDF/data loss on five
+  (`cap = 0`, 7–17 iterations); copepod 132 → 19 iterations, same fixed
+  point (EDF 2.269 vs 2.275, loss 3.799e9 vs 3.7991e9). The bound changes
+  nothing that did not defer past five iterations.
   STILL OPEN (benign): 38_transformed_covariates — null-space collapse,
   `λ = 1`, `edf = 1.0000`, the documented HOLD branch (table below).
 

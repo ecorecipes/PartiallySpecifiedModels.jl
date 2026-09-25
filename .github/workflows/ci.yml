@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ['**']      # every branch — a plain push used to run nothing
   pull_request:
     branches: [main]
   workflow_dispatch:
