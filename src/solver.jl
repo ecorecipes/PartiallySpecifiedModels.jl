@@ -1640,6 +1640,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     # loop exhaustion; the breaks below overwrite them with the actual outcome.
     final_parameter_step = NaN   # relative size of one PCLS step from the reported pair (set at exit)
     n_defer = 0                  # consecutive deferrals of a live smoothing proposal
+    rho_step_clamped = false     # last FS proposal was cut by the trust region
     data_loss_init = Inf         # data loss at iteration 0 (divergence guard at exit)
     V_best = -Inf; have_incumbent = false; n_worse = 0
     theta_best = copy(theta); beta_best = copy(beta); fvec_best = copy(f_vec); J_best = copy(J)
@@ -1892,7 +1893,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         dl_stable = prev_data_loss < Inf &&
                     abs(curr_data_loss - prev_data_loss) <
                         100 * alg.tol * max(prev_data_loss, 1.0)
-        if iter >= min_conv_iter && obj_stable && dl_stable
+        if iter >= min_conv_iter && obj_stable && dl_stable && !rho_step_clamped
             if verbose; println("Converged at iter $iter (objective stable)"); end
             conv_converged = true
             conv_reason = :converged_tol
@@ -1978,6 +1979,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         # In all three the truth lies in null(S), so EDF 2 is the correct
         # answer: the frozen fits were UNDERSMOOTHED, not merely mislabelled.
         w_irls_for_laml = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
+        rho_step_clamped = false
         if !smoothing_fixed && !smoothing_frozen && m > 0 && iter >= alg.warmup
             # sigma2_init caps the FS dispersion during early iterations to
             # prevent runaway smoothing while the fit is still poor; as
@@ -2003,9 +2005,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                 laml_failures += 1
                 (copy(theta), NaN)
             end
-            # Trust region on the proposal (see `_LAML_MAX_RHO_STEP`).
-            theta_new = otheta .* exp.(clamp.(log.(max.(theta_new, 1e-300) ./ max.(otheta, 1e-300)),
-                                              -_LAML_MAX_RHO_STEP, _LAML_MAX_RHO_STEP))
+            # Trust region on the proposal (see `_LAML_MAX_RHO_STEP`). A
+            # clamped proposal means smoothing selection has NOT finished —
+            # the convergence test below must not fire on the next iteration,
+            # or two smooths that both saturate the cap from a common λ₀ are
+            # reported tied at λ₀·e^{k·cap} (measured on CI: both λ̂ exactly
+            # 9.999999999999998 on Julia 1.13/macOS, and a suite assertion
+            # that they differ failed).
+            d_rho_prop = log.(max.(theta_new, 1e-300) ./ max.(otheta, 1e-300))
+            rho_step_clamped = any(abs.(d_rho_prop) .> _LAML_MAX_RHO_STEP)
+            theta_new = otheta .* exp.(clamp.(d_rho_prop, -_LAML_MAX_RHO_STEP, _LAML_MAX_RHO_STEP))
             theta .= theta_new
         end
     end

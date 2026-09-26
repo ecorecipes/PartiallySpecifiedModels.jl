@@ -664,7 +664,21 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     times = Float64.(prob.data_times)
     T_pts = length(times)
     n_obs = size(prob.data_values, 2)
-    K = length(prob.u0)  # Number of state variables
+    # A callable u0 (a parameter-dependent initial state, as the copepod
+    # vignette uses) is evaluated at the INITIAL coefficients. Collocation
+    # estimates the whole state trajectory, so u0 only fixes the state count
+    # and seeds states with no usable observations; it is not a boundary
+    # condition of the fit. (Used to fail with `length(::Function)`.)
+    u0_vec = if prob.u0 isa Function
+        beta_u0 = Float64[]
+        for approx in prob.approximators
+            append!(beta_u0, initial_params(approx))
+        end
+        Float64.(prob.u0(build_param_struct(prob, beta_u0)))
+    else
+        prob.u0
+    end
+    K = length(u0_vec)  # Number of state variables
 
     # Build differentiation matrix
     D = build_diff_matrix(times)
@@ -689,7 +703,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
             # `alpha`, making the whole state block NaN from step one.
             keep = usable_rows(prob, obs_idx)
             if isempty(keep)
-                alpha[:, k] .= prob.u0[k]
+                alpha[:, k] .= u0_vec[k]
             else
                 col = Float64.(prob.data_values[keep, obs_idx])
                 floor_k = all(>=(0.0), col) ? 0.01 : -Inf
@@ -718,7 +732,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                 end
             end
         else
-            alpha[:, k] .= prob.u0[k]
+            alpha[:, k] .= u0_vec[k]
         end
     end
 

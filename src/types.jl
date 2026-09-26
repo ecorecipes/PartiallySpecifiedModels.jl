@@ -2140,7 +2140,11 @@ converged or not.**
   for Gaussian fits and `criterion=:laplace`; the Pearson-scaled
   working-model REML for non-Gaussian `criterion=:working` fits (the two
   can differ by >100 log-units on one path, and refereeing a PQL search
-  with the family criterion would veto every move).
+  with the family criterion would veto every move). A proposal cut by the
+  trust region also defers the objective-stability convergence test to
+  the next iteration: smoothing selection is not finished while the cap
+  binds (without this, two smooths saturating the cap from a common λ₀
+  could be reported tied at λ₀·e^{k·log 1e3}).
 - `reason = :diverged`: the fitted values are not finite, or the final data
   loss exceeds 1000x the data loss at iteration 0. Such a fit is reported
   with `converged = false` whatever the stability test said (measured: a

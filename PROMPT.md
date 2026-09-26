@@ -155,6 +155,30 @@ Before reporting anything:
   suppressed inside bootstrap). The guard has no natural trigger left in
   the suite — it is documented by the measurement, not by a fabricated
   fixture. Regression test: the NegBin(25) block in the copepod testset.
+- **CollocationLAML walks the copepod to the λ boundary — KNOWN OPEN
+  (measured 2026-09-26).** Same march as the main loop had: λ → [8e15,
+  6e15, 3e18], EDF 1.00, `:plateau`, ridge, data loss 3.77e9. Its
+  per-level FS ratio step is unbounded (clamp 1e-20..1e20, beyond
+  `RHO_MAX`), and at those λ the verbose log shows NEGATIVE penalty values
+  (β'S_λβ = −348 … −164200 — a PSD quadratic form overflowing). A direct
+  port of the LAML safeguard (per-level cap log(1e3) + backtrack against
+  the working criterion) fixed this fixture (λ̂ [1.8e5, 3.9e7, 6.3e8], EDF
+  9.1, converged, no ridge) but REGRESSED the likelihood-aware fixtures:
+  Gaussian λ̂ 574.8 → 175.9 (the FS fixed point needs more capped steps
+  than the continuation has levels), Poisson counts non-convergent (a
+  capped DOWNWARD step held λ at 1.3e-5 where the old full jump to an
+  unpenalized fit converged; Pearson σ² 1.6e11). Reverted. Proposed design:
+  cap UPWARD moves only, and iterate FS (with the backtrack) to its fixed
+  point at the FINAL continuation level instead of once. Fixed on the way:
+  a callable u0 crashed CollocationLAML with `length(::Function)`.
+  GCVSolver needs no safeguard — it searches its criterion directly (grid
+  + refine) and landed interior (λ_R = 353) on the same fixture.
+- **LAML trust region and convergence — FOUND ON CI 2026-09-26.** With the
+  cap, two smooths saturating it from a common λ₀ move identically, and the
+  objective-stability test could fire mid-path: Julia 1.13/macOS reported
+  both λ̂ tied at exactly 9.999999999999998 (TransformedCovariate SIR
+  fixture). A clamped proposal now defers `converged_tol` to the next
+  iteration.
   STILL OPEN (benign): 38_transformed_covariates — null-space collapse,
   `λ = 1`, `edf = 1.0000`, the documented HOLD branch (table below).
 

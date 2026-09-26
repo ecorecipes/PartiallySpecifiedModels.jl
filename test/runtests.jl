@@ -12908,6 +12908,26 @@ end
         @test sol_nb.convergence.reason != :diverged
         @test sol_nb.convergence.smoothing_advanced
         @test sol_nb.edf < 20.0
+
+        # ── CollocationLAML on the same fixture. A callable u0 (the
+        # copepod's parameter-dependent initial state) used to crash the
+        # solver with `length(::Function)`; it is now evaluated at the
+        # initial coefficients (collocation estimates the whole trajectory,
+        # so u0 only fixes K and seeds unobserved states). KNOWN OPEN, not
+        # asserted away: its per-level Fellner–Schall ratio step is
+        # unbounded and walks this fixture to λ ≈ [8e15, 6e15, 3e18] — EDF
+        # 1.00, `reason = :plateau`, `ridge = true`, data loss 3.77e9 — the
+        # boundary optimum the main LAML loop reached before its safeguard.
+        # A per-level cap + backtrack (tried 2026-09-26) fixed this fixture
+        # (λ̂ [1.8e5, 3.9e7, 6.3e8], EDF 9.1) but regressed the small
+        # likelihood-aware fixtures (a capped downward step left the
+        # Poisson count fit non-convergent; the Gaussian fixed point was not
+        # reached within the continuation levels), so it was reverted. See
+        # PROMPT.md for the proposed design.
+        sol_coll = solve(prob_cop, CollocationLAML(maxiters=100, verbose=false))
+        @test all(isfinite, sol_coll.smoothing_params)
+        @test all(isfinite, sol_coll.fitted_values)
+        @test haskey(sol_coll.convergence, :ridge)
     end
 
     # ─── Gradient checks: Symbolics vs ForwardDiff vs finite differences ──
