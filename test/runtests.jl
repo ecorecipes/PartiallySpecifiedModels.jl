@@ -12886,6 +12886,28 @@ end
         @test sol_cop.convergence.smoothing_backtracked
         @test sol_cop.convergence.laml > -965.0
         @test all(sol_cop.smoothing_params .< 1e16)
+
+        # ── NegativeBinomial(25) on the same fixture. Before the safeguard
+        # this fit DIVERGED — EDF 0.00, every λ at RHO_MAX, data loss
+        # 2.6e114 (a negative death rate sent the populations to ~1e57) — and
+        # reported `converged = true`. Two things now prevent that report:
+        # the safeguard, refereed by the criterion the search actually
+        # optimises (the working-model REML for a non-Gaussian `:working`
+        # fit; the family LAML vetoed every move and froze λ at λ₀), and the
+        # exit divergence guard (`reason = :diverged`, never `converged`).
+        # Measured now: λ̂ = 2.02 on all three, EDF 12.9, backtracked at
+        # iteration 23, fitted values within the data's range.
+        prob_nb = PSMProblem(copepod_d!, copepod_u0, (0.0, 90.0), prob_cop.approximators;
+            data_times=cop_t, data_values=cop_y, obs_to_state=collect(1:11),
+            known_params=NamedTuple(), likelihood=NegativeBinomial(25.0), solver=BS3(),
+            abstol=1e-6, reltol=1e-6, maxiters=10000)
+        sol_nb = solve(prob_nb, LAML(maxiters=100, verbose=false))
+        @test all(isfinite, sol_nb.fitted_values)
+        @test maximum(sol_nb.fitted_values) < 10 * maximum(cop_y)   # measured 3.2e4 vs 3.9e4 data max
+        @test sol_nb.data_loss < 1e11                                 # measured 2.66e9; the blow-up was 2.6e114
+        @test sol_nb.convergence.reason != :diverged
+        @test sol_nb.convergence.smoothing_advanced
+        @test sol_nb.edf < 20.0
     end
 
     # ─── Gradient checks: Symbolics vs ForwardDiff vs finite differences ──

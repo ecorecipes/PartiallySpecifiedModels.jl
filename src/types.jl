@@ -2136,6 +2136,16 @@ converged or not.**
   consecutive iterations after a smoothing move, the fit reverts to that
   best (λ̂, β̂) and freezes smoothing. `true` means the reported λ̂ is that
   incumbent, not a Fellner–Schall fixed point — `stationarity` will say so.
+  The criterion tracked is the one the search optimises: the family LAML
+  for Gaussian fits and `criterion=:laplace`; the Pearson-scaled
+  working-model REML for non-Gaussian `criterion=:working` fits (the two
+  can differ by >100 log-units on one path, and refereeing a PQL search
+  with the family criterion would veto every move).
+- `reason = :diverged`: the fitted values are not finite, or the final data
+  loss exceeds 1000x the data loss at iteration 0. Such a fit is reported
+  with `converged = false` whatever the stability test said (measured: a
+  NegativeBinomial(25) copepod fit that ran to EDF 0 and a data loss of
+  2.6e114 used to report `converged = true`).
 - Proposal deferral is BOUNDED: while the step at the previous λ̂ still
   improves the penalized objective by more than `tol`, a live Fellner–Schall
   proposal is deferred in its favour — but for at most 5 consecutive

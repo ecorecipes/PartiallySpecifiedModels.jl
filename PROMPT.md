@@ -141,13 +141,20 @@ Before reporting anything:
   not a defect. Wood's data: simulated, ADDITIVE NORMAL noise (SD 8 on his
   scale); Poisson/NegBin are misspecified for it and do not help.
 
-- **NegativeBinomial(θ=25) on the copepod DIVERGES and reports
-  `converged = true`** (EDF 0.00, data loss 2.6e114, all λ at RHO_MAX,
-  μ_j up to 7, μ_a negative). Found 2026-09-25 as a control in the noise
-  experiment; not diagnosed. The objective-stability test is satisfied by
-  a blown-up fit whose objective stops changing. Worth a guard: a fit
-  whose data loss exceeds its starting value by orders of magnitude, or
-  whose EDF collapses to 0, is not "converged" in any useful sense.
+- **NegativeBinomial(θ=25) on the copepod DIVERGED and reported
+  `converged = true` — RESOLVED 2026-09-26** (was: EDF 0.00, data loss
+  2.6e114, all λ at RHO_MAX, μ_a negative). Two changes in `solve(::LAML)`:
+  (i) the true-criterion safeguard is refereed by the criterion the search
+  actually optimises — the family LAML for Gaussian/`:laplace`, the
+  Pearson-scaled WORKING-model REML for non-Gaussian `:working` (the family
+  V vetoed every FS move on this fit, −2620 vs −2774, and froze λ at λ₀);
+  now λ̂ = 2.02 ×3, EDF 12.9, backtracked at iteration 23, fitted values
+  within the data's range. (ii) an exit DIVERGENCE GUARD: non-finite fitted
+  values, or a data loss > 1000x the iteration-0 value, report
+  `converged = false, reason = :diverged` (warning `:laml_diverged`,
+  suppressed inside bootstrap). The guard has no natural trigger left in
+  the suite — it is documented by the measurement, not by a fabricated
+  fixture. Regression test: the NegBin(25) block in the copepod testset.
   STILL OPEN (benign): 38_transformed_covariates — null-space collapse,
   `λ = 1`, `edf = 1.0000`, the documented HOLD branch (table below).
 

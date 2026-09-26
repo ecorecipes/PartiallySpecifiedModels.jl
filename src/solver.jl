@@ -1640,6 +1640,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     # loop exhaustion; the breaks below overwrite them with the actual outcome.
     final_parameter_step = NaN   # relative size of one PCLS step from the reported pair (set at exit)
     n_defer = 0                  # consecutive deferrals of a live smoothing proposal
+    data_loss_init = Inf         # data loss at iteration 0 (divergence guard at exit)
     V_best = -Inf; have_incumbent = false; n_worse = 0
     theta_best = copy(theta); beta_best = copy(beta); fvec_best = copy(f_vec); J_best = copy(J)
     smoothing_frozen = false     # set by the true-criterion safeguard
@@ -1816,11 +1817,28 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
 
         # ── TRUE-CRITERION SAFEGUARD (see the constants) ──────────────
         if m > 0 && !smoothing_fixed && !smoothing_frozen && iter >= alg.warmup
+            # Score the optimiser against ITS OWN objective. Gaussian fits and
+            # `criterion=:laplace` optimise the family LAML, so that is V.
+            # Non-Gaussian `:working` fits run Fellner–Schall as a fixed
+            # point of the Pearson-scaled WORKING-model REML (PQL-flavoured;
+            # see the criterion note in laml.jl), which can disagree with the
+            # unit-scale family LAML by more than a hundred log-units on the
+            # same path (NegativeBinomial(25) on the copepod: −2620 vs −2774
+            # while FS moved the other way). Refereeing that search with the
+            # family V would veto every move; so for those fits V is the
+            # working-model REML on (z, W), the quantity FS is iterating on.
             V_now = try
                 w_now = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
-                laml_objective(prob.likelihood, beta, J, w_now, w_vec, y_vec, f_vec,
-                               S_list, uf_offsets, uf_nk,
-                               log.(max.(theta_fit, 1e-300)), n_p)[1]
+                rho_now = log.(max.(theta_fit, 1e-300))
+                if prob.likelihood isa Gaussian || alg.criterion === :laplace
+                    laml_objective(prob.likelihood, beta, J, w_now, w_vec, y_vec, f_vec,
+                                   S_list, uf_offsets, uf_nk, rho_now, n_p)[1]
+                else
+                    eta_now = J * beta
+                    z_now = _working_residual(prob.likelihood, y_vec, f_vec, w_vec) .+ eta_now
+                    laml_objective(Gaussian(), beta, J, w_now, w_vec, z_now, eta_now,
+                                   S_list, uf_offsets, uf_nk, rho_now, n_p)[1]
+                end
             catch e
                 _is_program_error(e) && rethrow()
                 NaN
@@ -1867,6 +1885,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         # haven't been optimised yet and the objective may improve further.
         min_conv_iter = smoothing_fixed ? 3 : max(3, alg.warmup + 3)
         curr_data_loss = sum((y_vec[i] - f_vec[i])^2 * w_vec[i] for i in 1:n_data)
+        iter == 0 && (data_loss_init = curr_data_loss)
         # alg.tol governs the penalized-objective test (as documented); the
         # data-loss test uses a proportionally looser threshold.
         obj_stable = abs(curr_obj - prev_obj) < alg.tol * max(abs(prev_obj), 1.0)
@@ -2040,6 +2059,24 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         _usable(y, wv) || continue
         data_loss += wv * (y - pred[i,j])^2
         n_used += 1
+    end
+
+    # DIVERGENCE GUARD. A fit whose objective has stopped changing is not
+    # "converged" if it stopped changing because it blew up: measured on the
+    # copepod under NegativeBinomial(25) before the true-criterion safeguard,
+    # the fit ran to EDF 0, all λ at RHO_MAX and a data loss of 2.6e114
+    # (fitted values ~1e57 from a negative death rate) and reported
+    # `converged = true, reason = :converged_tol`. Non-finite fitted values,
+    # or a data loss three orders of magnitude above where the fit STARTED,
+    # are reported as `:diverged` regardless of what the stability test said.
+    if !all(isfinite, pred) || (isfinite(data_loss_init) && data_loss > 1e3 * data_loss_init)
+        conv_converged = false
+        conv_reason = :diverged
+        @warn "LAML: the fit DIVERGED — " *
+              (all(isfinite, pred) ?
+               "the final data loss ($(round(data_loss, sigdigits=3))) is more than 1000x the data loss at the start of the fit ($(round(data_loss_init, sigdigits=3)))" :
+               "the fitted values are not finite") *
+              ". `converged` is false with `reason = :diverged`; the reported fit is not usable." maxlog=1 _id=:laml_diverged
     end
 
     # EDF from hat matrix
