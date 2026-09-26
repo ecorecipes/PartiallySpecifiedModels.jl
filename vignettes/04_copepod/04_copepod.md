@@ -1,6 +1,6 @@
 # Copepod Stage-Structured Population Model
 Simon Frost
-2026-09-24
+2026-09-25
 
 - [Overview](#overview)
 - [Setup](#setup)
@@ -16,8 +16,8 @@ Simon Frost
 - [Diagnostic Plots](#diagnostic-plots)
 - [Discussion](#discussion)
   - [Model complexity](#model-complexity)
-  - [What LAML chose](#what-laml-chose)
-  - [Dependent initial conditions](#dependent-initial-conditions)
+  - [What LAML chose — and what it nearly chose
+    instead](#what-laml-chose--and-what-it-nearly-chose-instead)
   - [Smoothing parameter
     interpretation](#smoothing-parameter-interpretation)
 - [Summary](#summary)
@@ -169,12 +169,10 @@ prob = PSMProblem(copepod!, compute_u0, (0.0, 90.0),
 
     PSMProblem{typeof(copepod!), typeof(compute_u0), Gaussian, BS3{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(copepod!, compute_u0, (0.0, 90.0), BSplineApproximator[BSplineApproximator(:R, (0.0, 90.0), 15, var"#2#3"()), BSplineApproximator(:mu_j, (0.0, 90.0), 15, var"#5#6"()), BSplineApproximator(:mu_a, (0.0, 90.0), 15, var"#8#9"())], [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0], [2853.9353 0.0 … 6893.1885 7983.0894; 10981.5 5793.3442 … 0.0 1473.7781; … ; 0.0 0.0 … 5107.6265 0.0; 1660.5525 15433.848 … 12018.808 0.0], [1.0 1.0 … 1.0 1.0; 1.0 1.0 … 1.0 1.0; … ; 1.0 1.0 … 1.0 1.0; 1.0 1.0 … 1.0 1.0], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], NamedTuple(), Gaussian(), BS3{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(:maxiters => 10000, :reltol => 1.0e-6, :abstol => 1.0e-6), false, Float64[], nothing)
 
-    ┌ Warning: LAML: the objective converged but the parameters did not — one more PCLS step from the reported fit moves β by 0.0367 (relative), above 0.001. The fit stopped on a flat ridge of the penalized objective: the fitted FUNCTIONS are usable, but individual coefficients and their covariance are not pinned. See `convergence.ridge` and `convergence.final_parameter_step`.
-    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2204
-    Data loss (SS):  3.8067e+09
-    Penalized obj:   1.9286e+09
-    EDF:             2.29
-    Smoothing λ:     [2.354e17, 2.354e17, 2.354e17]
+    Data loss (SS):  2.6324e+09
+    Penalized obj:   1.3763e+09
+    EDF:             7.85
+    Smoothing λ:     [2.023e12, 9.627e7, 2.023e12]
 
 ## Results
 
@@ -260,7 +258,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](04_copepod_files/figure-commonmark/cell-12-output-1.svg)
 
-    Durbin-Watson: 1.935, 1.753, 0.957, 1.382, 2.369, 2.034, 0.997, 1.711, 2.037, 1.449, 1.526
+    Durbin-Watson: 1.839, 2.024, 1.517, 2.281, 1.727, 2.596, 1.893, 2.311, 1.689, 1.173, 1.777
 
 ## Discussion
 
@@ -280,39 +278,67 @@ The ratio of data to parameters (110:45 ≈ 2.4:1) is low, making the
 smoothing penalty critical. Without it, the model could overfit easily —
 and the fit reported above shows LAML making exactly that call.
 
-### What LAML chose
+### What LAML chose — and what it nearly chose instead
 
-Read the numbers printed after the fit. All three smoothing parameters
-are driven to very large values, the effective degrees of freedom fall
-to about 2.3 *in total* across the three functions — essentially their
-penalty null spaces — and the data loss is roughly two and a half times
-what the unpenalized starting point achieves (1.5 × 10⁹). With ten
-sampling times per stage and residual standard deviations in the
-thousands of individuals, the marginal likelihood finds no support for
-time-varying recruitment or mortality beyond what a near-linear trend in
-each can explain: the flexible fit is fitting noise. That is a statement
-about this data set, not about the model; it is what an honest
-smoothing-parameter criterion should say when the data are this thin.
+These data are Wood’s (2001) simulated replicate: an 11-stage population
+run forward from a known recruitment function (a Gaussian pulse on a
+constant), a decaying-exponential naupliar death rate and a constant
+copepodite death rate, sampled at ten times and perturbed with additive
+normal noise. So the question “did the fit recover the right functions?”
+has an answer.
 
-The fit also reports `convergence.ridge = true`. With λ this large the
-penalized directions are pinned to zero, and what remains — the
-null-space components of three functions sharing 2.3 degrees of freedom
-— is only weakly determined by 110 noisy counts, so one more penalized
-least-squares step from the reported coefficients would still move them.
-The fitted *functions* (the near-linear trends above) are usable;
-individual spline coefficients and their covariance are not, which is
-the flag’s meaning.
+Read the numbers printed after the fit. The smoothing parameters are
+large but finite, the effective degrees of freedom are about eight in
+total, and `smoothing_backtracked = true`. That last flag records
+something worth knowing about how smoothing selection works here. LAML
+selects λ by *performance iteration* — a Fellner–Schall/Newton step on
+the linearised working model at each IRLS iteration — and on a nonlinear
+ODE map that iteration can march λ all the way to the boundary (≈ 10¹⁷
+for all three functions) even though the marginal likelihood it is
+supposed to maximise peaks well inside: on this fit the criterion is 35
+log-units better at the interior optimum than at the boundary. The
+solver therefore limits how far a single proposal may move λ, tracks the
+true criterion every iteration, and when it has been going downhill for
+three iterations reverts to the best point seen and freezes smoothing
+there. That is what happened here, and the reported λ̂ is that incumbent.
 
-This fit used to need ~130 iterations. At the initial smoothing the 45
-coefficients keep improving the penalized objective slowly, and the
-solver prefers that progress over a smoothing proposal that would change
-the fit sharply — reasonable for a few iterations, but with no natural
-end it kept re-proposing and deferring the same λ̂. Proposal deferral is
-now bounded (five consecutive iterations), after which the proposal is
-taken; the same fixed point is reached in under twenty iterations, well
-within the default `maxiters=100`.
+The recovered functions are a near-linear, declining recruitment, a
+U-shaped naupliar death rate and a rising copepodite death rate. Compare
+GCV — the criterion Wood used:
 
-### Dependent initial conditions
+``` julia
+sol_gcv = solve(prob, GCVSolver(maxiters=100, verbose=false))
+println("GCV — EDF: ", round(sol_gcv.edf, digits=2),
+        "  λ: ", [round(s, sigdigits=3) for s in sol_gcv.smoothing_params],
+        "  data loss: ", @sprintf("%.4e", sol_gcv.data_loss))
+p_cmp = plot(t_grid, [sol.unknown_functions[:R](t) * 1000.0 for t in t_grid],
+    lw=2, label="LAML", xlabel="Day", ylabel="R(t)", title="Recruitment: LAML vs GCV")
+plot!(p_cmp, t_grid, [sol_gcv.unknown_functions[:R](t) * 1000.0 for t in t_grid],
+    lw=2, ls=:dash, label="GCV")
+p_cmp
+```
+
+    ┌ Warning: GCV: the objective converged but the parameters did not — one more PCLS step from the reported fit moves β by 0.113 (relative), above 0.001. The fit stopped on a flat ridge of the penalized objective: the fitted FUNCTIONS are usable, but individual coefficients and their covariance are not pinned. See `convergence.ridge` and `convergence.final_parameter_step`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/gcv_solver.jl:944
+    GCV — EDF: 12.52  λ: [353.0, 1.38e12, 1.38e12]  data loss: 1.9133e+09
+
+![](04_copepod_files/figure-commonmark/cell-14-output-2.svg)
+
+GCV puts the flexibility into recruitment instead — a pulse peaking
+around day 30, which is the shape used in the simulation — and fits the
+mortalities as sloped lines. Its fit also reports the ridge flag (the
+warning above): the objective has converged but the coefficients could
+still move, which is the same flatness seen from the other side. The two
+answers are not a disagreement between the criteria about the *data*:
+evaluated at the GCV solution, the LAML criterion is within one log-unit
+of its value at LAML’s own solution. With ten sampling times, a pulse of
+recruitment and a dip in naupliar mortality produce nearly the same
+stage abundances, and neither criterion can separate them; the wide
+confidence intervals a bootstrap would give for the death rates are the
+honest statement of that. What the criterion does say firmly is that the
+data support roughly eight to twelve degrees of freedom across the three
+functions, not the forty-one an unpenalized fit would use. \###
+Dependent initial conditions
 
 The `compute_u0(p)` function demonstrates an important feature: the
 initial conditions depend on the unknown functions. As the IRLS
@@ -323,13 +349,13 @@ $R(0)$, $\mu_j(0)$, and $\mu_a(0)$.
 ### Smoothing parameter interpretation
 
 The three smoothing parameters $\lambda_k$ control the trade-off between
-data fit and smoothness independently for each unknown function, so in
-principle recruitment could be left more flexible than the two
-mortalities. On this data set all three end up large and the three
-functions are smoothed to near-linear trends (see above). If a more
-flexible fit is wanted for exploratory plotting, pass fixed smoothing
-parameters instead of letting LAML select them — but the marginal
-likelihood is telling you the data do not support that flexibility.
+data fit and smoothness independently for each unknown function, so the
+criterion can leave recruitment flexible while smoothing the mortalities
+hard — GCV does exactly that above, LAML does the reverse, and the two
+are within a log-unit of each other on LAML’s own criterion. When a
+criterion is that flat, the choice between the two fits is a modelling
+judgment (which function is *expected* to vary), not something the data
+decide.
 
 The LAML/REML criterion provides an automatic, principled way to set
 these parameters, avoiding the need for cross-validation on such a small

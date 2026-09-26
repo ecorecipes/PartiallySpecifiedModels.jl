@@ -124,6 +124,30 @@ Before reporting anything:
   (`cap = 0`, 7–17 iterations); copepod 132 → 19 iterations, same fixed
   point (EDF 2.269 vs 2.275, loss 3.799e9 vs 3.7991e9). The bound changes
   nothing that did not defer past five iterations.
+  SUPERSEDED 2026-09-25 — the "LAML says the copepod data support only
+  near-linear trends" reading was WRONG. It was the optimiser: performance
+  iteration (FS/Newton on a frozen linearisation) drove all three λ to
+  RHO_MAX where the true LAML criterion is V = −987.5, against −951.9 at a
+  common λ = 1e8 and −952.4 at the GCV solution (Wood's own criterion, which
+  recovers the simulated recruitment pulse). Measured with `fixed_lambda`
+  profiles and a direct `laml_objective` evaluation at the GCV fit (the
+  instrument reproduces the solver's reported `laml` to all digits). Fix in
+  `solve(::LAML)`: `_LAML_MAX_RHO_STEP` (≤ ×1e3 per iteration) plus an
+  incumbent on the true V with backtrack-and-freeze
+  (`_LAML_V_BACKTRACK = 3`, `_LAML_V_TOL = 0.5`, key
+  `smoothing_backtracked`). Copepod now V = −953.0, EDF 7.85, interior λ̂.
+  Remaining difference from GCV (bump in R vs U-shaped μ_j) is criterion
+  flatness — 0.6 log-units — i.e. identifiability with 10 sampling times,
+  not a defect. Wood's data: simulated, ADDITIVE NORMAL noise (SD 8 on his
+  scale); Poisson/NegBin are misspecified for it and do not help.
+
+- **NegativeBinomial(θ=25) on the copepod DIVERGES and reports
+  `converged = true`** (EDF 0.00, data loss 2.6e114, all λ at RHO_MAX,
+  μ_j up to 7, μ_a negative). Found 2026-09-25 as a control in the noise
+  experiment; not diagnosed. The objective-stability test is satisfied by
+  a blown-up fit whose objective stops changing. Worth a guard: a fit
+  whose data loss exceeds its starting value by orders of magnitude, or
+  whose EDF collapses to 0, is not "converged" in any useful sense.
   STILL OPEN (benign): 38_transformed_covariates — null-space collapse,
   `λ = 1`, `edf = 1.0000`, the documented HOLD branch (table below).
 

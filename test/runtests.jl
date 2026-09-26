@@ -12865,7 +12865,27 @@ end
         # and 4x over the 1.13 value; the deferral bound is what this
         # testset checks, and every other assertion held on all four jobs.
         @test sol_cop.edf < 20.0
-        @test all(sol_cop.smoothing_params .> 1e3)   # measured ~2e17; λ₀ was 2e-6
+        @test all(sol_cop.smoothing_params .> 1e3)   # λ₀ was 2e-6
+
+        # ── True-criterion safeguard. Before it, Fellner–Schall drove all
+        # three λ to the boundary (≈ 2e17, RHO_MAX) where the LAML criterion
+        # is V = −987.5, while V = −951.9 at a common λ = 1e8 and −952.4 at
+        # the GCV solution: a performance-iteration fixed point that is a
+        # bad optimum of its own criterion. With the per-iteration trust
+        # region and the incumbent backtrack the fit stops in the interior:
+        # measured λ̂ = [2.0e12, 9.6e7, 2.0e12], EDF 7.85, V = −953.0,
+        # `smoothing_backtracked = true` (reverted at iteration 28 of 30).
+        # Asserted: the safeguard fired, the criterion is far off the
+        # boundary value (−965 leaves 12 units over the boundary's −987.5
+        # and 12 under the measured −953), and no λ̂ sits at RHO_MAX. The
+        # EDF itself is NOT pinned: the criterion is flat between the
+        # interior solutions (0.6 log-units between LAML's and GCV's), and
+        # the incumbent lands at EDF 7.85 under `--project=.` but 14.3 under
+        # `Pkg.test` — both interior, both far from the boundary's 2.3 and
+        # λ₀'s 41 (the `edf < 20` above is the meaningful bound).
+        @test sol_cop.convergence.smoothing_backtracked
+        @test sol_cop.convergence.laml > -965.0
+        @test all(sol_cop.smoothing_params .< 1e16)
     end
 
     # ─── Gradient checks: Symbolics vs ForwardDiff vs finite differences ──

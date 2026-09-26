@@ -1194,6 +1194,20 @@ const _RIDGE_PARAM_TOL = 1e-3
 # favour of continued progress at the old θ before it is taken; see the
 # accept block in `solve(::PSMProblem, ::LAML)`.
 const _LAML_MAX_DEFER = 5
+# TRUE-CRITERION SAFEGUARD for smoothing selection (performance iteration
+# runs Fellner–Schall/Newton on a FROZEN linearisation of a nonlinear ODE
+# map, and its fixed point can sit at the λ boundary where the actual LAML
+# criterion is far worse — measured on the copepod vignette: V = −987.5 at
+# the FS answer λ ≈ 2e17 against −951.9 at λ = 1e8 and −952.4 at the GCV
+# solution). A proposal may move each log λ by at most this much per IRLS
+# iteration, so the path visits the interior and is re-linearised there …
+const _LAML_MAX_RHO_STEP = log(1e3)
+# … and the true V (one `laml_objective` evaluation per iteration, no ODE
+# solves) is tracked as an incumbent: after a smoothing move, this many
+# consecutive iterations more than `_LAML_V_TOL` below it revert to the
+# incumbent (λ, β) and freeze smoothing for the rest of the fit.
+const _LAML_V_BACKTRACK = 3
+const _LAML_V_TOL = 0.5
 
 # Relative nonlinearity across an FD step, required IN ADDITION to the
 # absolute curvature test before step growth stops. See `compute_jacobian!`.
@@ -1626,6 +1640,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     # loop exhaustion; the breaks below overwrite them with the actual outcome.
     final_parameter_step = NaN   # relative size of one PCLS step from the reported pair (set at exit)
     n_defer = 0                  # consecutive deferrals of a live smoothing proposal
+    V_best = -Inf; have_incumbent = false; n_worse = 0
+    theta_best = copy(theta); beta_best = copy(beta); fvec_best = copy(f_vec); J_best = copy(J)
+    smoothing_frozen = false     # set by the true-criterion safeguard
+    smoothing_backtracked = false
     deferral_cap_hits = 0        # proposals taken because the deferral bound was reached
     last_branch = :init          # accept-block branch taken last (verbose log)
     conv_converged = false
@@ -1796,6 +1814,42 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         # stationarity residual went 5.3e-6 → 0.9997.
         curr_obj = penalized_objective(beta, build_B(theta))
 
+        # ── TRUE-CRITERION SAFEGUARD (see the constants) ──────────────
+        if m > 0 && !smoothing_fixed && !smoothing_frozen && iter >= alg.warmup
+            V_now = try
+                w_now = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
+                laml_objective(prob.likelihood, beta, J, w_now, w_vec, y_vec, f_vec,
+                               S_list, uf_offsets, uf_nk,
+                               log.(max.(theta_fit, 1e-300)), n_p)[1]
+            catch e
+                _is_program_error(e) && rethrow()
+                NaN
+            end
+            if isfinite(V_now)
+                if !have_incumbent || V_now > V_best
+                    V_best = V_now; have_incumbent = true; n_worse = 0
+                    theta_best .= theta_fit; beta_best .= beta
+                    fvec_best .= f_vec; J_best .= J
+                elseif theta_fit != theta_best && V_now < V_best - _LAML_V_TOL
+                    n_worse += 1
+                    if n_worse >= _LAML_V_BACKTRACK
+                        if verbose
+                            println("Iter $iter: LAML backtrack — V=$(round(V_now, sigdigits=6)) " *
+                                    "has stayed below the incumbent $(round(V_best, sigdigits=6)) " *
+                                    "for $n_worse iterations; reverting to λ=$(round.(theta_best, sigdigits=3)) " *
+                                    "and freezing smoothing")
+                        end
+                        beta .= beta_best; f_vec .= fvec_best; J .= J_best
+                        theta .= theta_best; otheta .= theta_best; theta_fit .= theta_best
+                        smoothing_frozen = true; smoothing_backtracked = true
+                        curr_obj = penalized_objective(beta, build_B(theta))
+                    end
+                else
+                    n_worse = 0
+                end
+            end
+        end
+
         if verbose && (iter <= 4 || iter % 10 == 0)
             curr_data_ss = sum((y_vec[i] - f_vec[i])^2 * w_vec[i] for i in 1:n_data)
             println("Iter $iter: obj=$(round(curr_obj, sigdigits=6)), " *
@@ -1905,7 +1959,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         # In all three the truth lies in null(S), so EDF 2 is the correct
         # answer: the frozen fits were UNDERSMOOTHED, not merely mislabelled.
         w_irls_for_laml = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
-        if !smoothing_fixed && m > 0 && iter >= alg.warmup
+        if !smoothing_fixed && !smoothing_frozen && m > 0 && iter >= alg.warmup
             # sigma2_init caps the FS dispersion during early iterations to
             # prevent runaway smoothing while the fit is still poor; as
             # documented, the cap relaxes (×10 per iteration past warmup)
@@ -1930,6 +1984,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                 laml_failures += 1
                 (copy(theta), NaN)
             end
+            # Trust region on the proposal (see `_LAML_MAX_RHO_STEP`).
+            theta_new = otheta .* exp.(clamp.(log.(max.(theta_new, 1e-300) ./ max.(otheta, 1e-300)),
+                                              -_LAML_MAX_RHO_STEP, _LAML_MAX_RHO_STEP))
             theta .= theta_new
         end
     end
@@ -2226,6 +2283,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                         stationarity=stationarity,
                         smoothing_advanced=smoothing_advanced,
                         smoothing_fixed=smoothing_fixed,
+                        smoothing_backtracked=smoothing_backtracked,
                         solver=:LAML, smoothing_state=smoothing_state,
                         ridge=ridge, final_parameter_step=final_parameter_step,
                  deferral_cap_hits=deferral_cap_hits)

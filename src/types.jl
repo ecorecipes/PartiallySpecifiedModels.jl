@@ -2125,6 +2125,17 @@ converged or not.**
   other 16 span residuals from 0.016 to 8.7, so a fit can sit at a perfectly
   ordinary residual and still never have moved its λ̂.
 
+- `smoothing_backtracked::Bool`: the true-criterion safeguard fired.
+  Smoothing selection is performance iteration — Fellner–Schall/Newton on a
+  frozen linearisation — and on a nonlinear ODE map its fixed point can sit
+  at the λ boundary where the actual LAML criterion is far worse (copepod
+  vignette: V = −987.5 at the FS answer λ ≈ 2e17 against −952 at the
+  interior optimum). Each proposal may therefore move log λ by at most
+  `log(1e3)` per iteration, and the true criterion is evaluated every
+  iteration; when it has stayed more than 0.5 below its best value for 3
+  consecutive iterations after a smoothing move, the fit reverts to that
+  best (λ̂, β̂) and freezes smoothing. `true` means the reported λ̂ is that
+  incumbent, not a Fellner–Schall fixed point — `stationarity` will say so.
 - Proposal deferral is BOUNDED: while the step at the previous λ̂ still
   improves the penalized objective by more than `tol`, a live Fellner–Schall
   proposal is deferred in its favour — but for at most 5 consecutive
