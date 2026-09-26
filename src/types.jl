@@ -2143,8 +2143,11 @@ converged or not.**
   with the family criterion would veto every move). A proposal cut by the
   trust region also defers the objective-stability convergence test to
   the next iteration: smoothing selection is not finished while the cap
-  binds (without this, two smooths saturating the cap from a common λ₀
-  could be reported tied at λ₀·e^{k·log 1e3}).
+  binds. The region is applied to the step VECTOR — the whole log-step is
+  scaled so its largest component equals `log(1e3)`, preserving the
+  proposal's direction; clamping each component separately moved
+  unrelated smooths in lockstep and could report them tied at
+  λ₀·e^{k·log 1e3}.
 - `reason = :diverged`: the fitted values are not finite, or the final data
   loss exceeds 1000x the data loss at iteration 0. Such a fit is reported
   with `converged = false` whatever the stability test said (measured: a

@@ -2012,9 +2012,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             # reported tied at λ₀·e^{k·cap} (measured on CI: both λ̂ exactly
             # 9.999999999999998 on Julia 1.13/macOS, and a suite assertion
             # that they differ failed).
+            # The region is applied to the STEP VECTOR, not per component:
+            # scale the whole log-step so its largest component equals the
+            # cap, preserving the proposal's direction. Per-component
+            # clamping turned proposals like [x1e7, x1e5] into [x1e3, x1e3]
+            # and moved unrelated smooths in lockstep — on Julia 1.13/macOS
+            # the TransformedCovariate SIR fixture then backtracked to an
+            # incumbent with both λ̂ tied at exactly λ₀·1e3.
             d_rho_prop = log.(max.(theta_new, 1e-300) ./ max.(otheta, 1e-300))
-            rho_step_clamped = any(abs.(d_rho_prop) .> _LAML_MAX_RHO_STEP)
-            theta_new = otheta .* exp.(clamp.(d_rho_prop, -_LAML_MAX_RHO_STEP, _LAML_MAX_RHO_STEP))
+            d_max = maximum(abs.(d_rho_prop); init=0.0)
+            rho_step_clamped = d_max > _LAML_MAX_RHO_STEP
+            rho_scale = rho_step_clamped ? _LAML_MAX_RHO_STEP / d_max : 1.0
+            theta_new = otheta .* exp.(rho_scale .* d_rho_prop)
             theta .= theta_new
         end
     end
