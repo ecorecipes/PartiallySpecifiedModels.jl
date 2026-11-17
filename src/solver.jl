@@ -556,21 +556,9 @@ end
 Simulate a continuous-time (ODE) model.
 """
 function simulate_continuous(prob::PSMProblem, beta::AbstractVector)
-    p = build_param_struct(prob, beta)
-    u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
-    # Promote the state eltype when β carries ForwardDiff Duals (the
-    # jac=:forwarddiff Jacobian path differentiates straight through this
-    # solve): the integrator's in-place buffers take their eltype from u0,
-    # and writing a Dual du into a Float64 buffer is a MethodError. A no-op
-    # for Float64 β (Tel === Float64 keeps the original array).
-    Tel = promote_type(eltype(beta), eltype(u0))
-    u0 = Tel === eltype(u0) ? u0 : Tel.(u0)
-
-    function ode_rhs!(du, u, params, t)
-        prob.dynamics!(du, u, p, t)
-    end
-
-    ode_prob = ODEProblem(ode_rhs!, u0, prob.tspan)
+    # The same ODEProblem that `to_ode_problem` returns (src/resilience.jl), so the problem a
+    # user linearises is exactly the one fitted; it also promotes u0 for Dual β.
+    ode_prob = to_ode_problem(prob, beta)
 
     solve_kwargs = Dict{Symbol, Any}(
         :saveat => prob.data_times,

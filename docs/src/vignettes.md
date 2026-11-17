@@ -1,6 +1,6 @@
 # Vignettes
 
-The `vignettes/` directory contains 41 worked examples covering every solver, approximator, and likelihood type. Each vignette is a self-contained [Quarto](https://quarto.org/) document with rendered markdown available on GitHub.
+The `vignettes/` directory contains 42 worked examples covering every solver, approximator, and likelihood type. Each vignette is a self-contained [Quarto](https://quarto.org/) document with rendered markdown available on GitHub.
 
 ## Getting Started
 
@@ -67,6 +67,7 @@ The `vignettes/` directory contains 41 worked examples covering every solver, ap
 | 29 | [Bootstrap](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/29_bootstrap/29_bootstrap.md) | Parametric and nonparametric bootstrap CIs (Gaussian and Poisson) |
 | 30 | [Model Selection](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/30_model_selection/30_model_selection.md) | LAML marginal likelihood for knot, approximator, and structural selection |
 | 32 | [Profile Likelihood](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/32_profile_likelihood/32_profile_likelihood.md) | Identifiability analysis and likelihood-ratio CIs |
+| 42 | [Resilience](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/42_resilience/42_resilience.md) | Resilience of a fitted equilibrium with bootstrap intervals: a spline functional response vs a misspecified Type II (DynamicalResilience.jl) |
 
 ## Running Vignettes Locally
 

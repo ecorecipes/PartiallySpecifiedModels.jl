@@ -26,7 +26,8 @@ if !isempty(ARGS)
                   "calibration-suite" => "calibration_suite.jl",
                   "calibration-resume" => "calibration_resume.jl",
                   "calibration-checkpointed" => "calibration_checkpointed.jl",
-                  "kan-multivariate" => "kan_multivariate.jl")
+                  "kan-multivariate" => "kan_multivariate.jl",
+                  "resilience" => "resilience.jl")
     all(haskey(groups, arg) for arg in ARGS) ||
         throw(ArgumentError("unknown test group; choose from " * join(sort!(collect(keys(groups))), ", ")))
     for group in unique(ARGS)
@@ -69,6 +70,7 @@ include("smoothing_profiles.jl")
 include("calibration_suite.jl")
 include("calibration_resume.jl")
 include("calibration_checkpointed.jl")
+include("resilience.jl")
 
 # ─── Custom approximator for the "approximator extension protocol" testset ──
 # Struct and method definitions must live at top level; the tests themselves

@@ -40,6 +40,8 @@ import Optim
 import LineSearches
 import MCMCChains
 using DelayDiffEq
+import DynamicalResilience
+import DynamicalResilience: metrics_over
 
 # Core types
 include("types.jl")
@@ -159,6 +161,9 @@ include("simultaneous_bands.jl")
 # Opt-in Gaussian LAML smoothing-parameter covariance correction
 include("smoothing_uncertainty.jl")
 
+# Fitted models as SciML problems; resilience of their equilibria (DynamicalResilience.jl)
+include("resilience.jl")
+
 # Exports — types
 export AbstractApproximator, BSplineApproximator, NeuralApproximator, GPApproximator, SPDEApproximator
 export KANApproximator
@@ -183,6 +188,7 @@ export FGPGMSolver
 
 # Exports — functions
 export solve, simulate, predict
+export to_ode_problem, parameter_draws, metrics_over
 export spline_penalty_matrix, penalty_matrix, penalty_blocks, band_domain
 export nparams, initial_params, build_evaluator
 export optimize_spde_range, with_range_param

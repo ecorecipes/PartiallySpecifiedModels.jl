@@ -1,9 +1,17 @@
 [deps]
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+DynamicalResilience = "54629d0c-0bd5-4489-a333-4d325b057304"
 Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
 OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
 PartiallySpecifiedModels = "15ae6619-3517-4aad-88ea-30ec1d16fab1"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+ResilienceCore = "e31f93f6-99b1-4a70-b0c5-c402beffe4e1"
+StructuredPopulationCore = "33358fd2-7d60-4541-bded-caea801370e0"
+
+[sources]
+DynamicalResilience = {url = "https://github.com/ecorecipes/DynamicalResilience.jl"}
+ResilienceCore = {url = "https://github.com/ecorecipes/ResilienceCore.jl"}
+StructuredPopulationCore = {url = "https://github.com/ecorecipes/ProjectionModels.jl"}
 
 [compat]
 Documenter = "1"
