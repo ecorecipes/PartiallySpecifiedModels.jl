@@ -362,7 +362,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                 discrete=prob.discrete,
                 delays=prob.delays,
                 history=prob.history,
-                prob.ode_kwargs...)
+                _normalise_ode_kwargs(prob.ode_kwargs)...)
 
             sol_boot = try
                 _replicate_solve(prob_boot, alg)
@@ -452,7 +452,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                 discrete=prob.discrete,
                 delays=prob.delays,
                 history=prob.history,
-                prob.ode_kwargs...)
+                _normalise_ode_kwargs(prob.ode_kwargs)...)
 
             sol_boot = try
                 _replicate_solve(prob_boot, alg)

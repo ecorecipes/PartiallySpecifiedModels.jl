@@ -288,7 +288,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::RodeoSolver)
                     ODEProblem(ode_fn, eltype(β_).(u0_), prob.tspan, nothing),
                     prob.ode_solver;
                     saveat=prob.data_times, abstol=1e-7, reltol=1e-7,
-                    maxiters=100000, verbose=false)
+                    maxiters=100000, verbose=_quiet_solve())
                 pred = eltype(β_)[]
                 for j in 1:n_obs
                     sk = prob.obs_to_state[j]

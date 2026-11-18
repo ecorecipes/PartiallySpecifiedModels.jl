@@ -186,7 +186,7 @@ function PSM._adam_adjoint_loss_grad(prob::PSM.PSMProblem,
         return fail()
     end
     # Same success predicate as the ForwardDiff loss paths (Success only).
-    (sol.retcode == SciMLBase.ReturnCode.Success || sol.retcode == :Success) ||
+    sol.retcode == SciMLBase.ReturnCode.Success ||
         return fail()
 
     us = sol(prob.data_times).u
