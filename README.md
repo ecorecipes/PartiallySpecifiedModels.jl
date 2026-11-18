@@ -190,6 +190,10 @@ building the problem to use those four.
 - **Continuous-time**: ODEs via `OrdinaryDiffEq.jl`, DDEs via `DelayDiffEq.jl`
 - **Discrete-time**: Maps via `DiscreteProblem`
 - Construct from SciML problem types directly: `PSMProblem(ODEProblem(...), approximators; ...)`
+- Fitted models back as SciML problems: `to_ode_problem(prob, sol)`; the resilience of their
+  equilibria, with bootstrap or posterior uncertainty, through
+  [DynamicalResilience.jl](https://github.com/ecorecipes/DynamicalResilience.jl)
+  (`metrics_over(prob, bootstrap_result; u0)`)
 
 ### Shape Constraints (14 types)
 
@@ -209,7 +213,7 @@ Following Pya & Wood (2015), the monotone and monotone-plus-curvature constraint
 
 ## Vignettes
 
-The `vignettes/` directory contains 41 worked examples:
+The `vignettes/` directory contains 42 worked examples:
 
 | # | Vignette | Description |
 |---|----------|-------------|
@@ -254,6 +258,7 @@ The `vignettes/` directory contains 41 worked examples:
 | 39 | [Shape-Constrained GP](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/39_shape_constrained_gp/39_shape_constrained_gp.md) | Monotone Gaussian processes with `ShapeConstrainedGPApproximator`, audited with `check_constraints` |
 | 40 | [FGPGM](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/40_fgpgm/40_fgpgm.md) | Bayesian gradient matching with `FGPGMSolver` (Wenk et al. 2019) |
 | 41 | [Kolmogorov-Arnold Networks](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/41_kan/41_kan.md) | Fixed-grid KAN responses, spline baseline, diagnostics and pointwise uncertainty |
+| 42 | [Resilience](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/42_resilience/42_resilience.md) | Resilience of a fitted equilibrium with bootstrap intervals: a spline functional response vs a misspecified Type II (DynamicalResilience.jl) |
 
 ## Testing
 

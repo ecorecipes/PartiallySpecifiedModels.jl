@@ -1,0 +1,333 @@
+---
+title: "Resilience of a Fitted Equilibrium"
+author: "Simon Frost"
+date: today
+format:
+  html:
+    code-fold: false
+    toc: true
+  pdf:
+    toc: true
+  gfm:
+    toc: true
+engine: julia
+julia:
+  exeflags: ["--project=.."]
+---
+
+## Overview
+
+A fitted model is often used to answer a question its data never asked directly: how quickly
+does the system return to equilibrium after a disturbance, and how close is it to losing
+stability? These are properties of the **linearisation at the equilibrium**, so they depend on
+the fitted functional response *and its slope* at the equilibrium. When the form of the response
+is assumed, uncertainty in the assumption is invisible in the intervals.
+
+This vignette fits predator–prey data generated with a **Holling Type III** functional response
+in two ways:
+
+1. a partially specified model, with the response left as a penalised B-spline;
+2. a misspecified parametric model, assuming a **Type II** response.
+
+It then compares, with bootstrap intervals,
+
+- the **resilience** (the slowest return rate, `−max Re λ`) and **reactivity** (the largest
+  initial amplification rate) of the fitted equilibrium;
+- the **enrichment threshold**: the carrying capacity at which the equilibrium loses stability
+  in a Hopf bifurcation (the paradox of enrichment).
+
+The resilience calculations come from
+[DynamicalResilience.jl](https://github.com/ecorecipes/DynamicalResilience.jl):
+`to_ode_problem` turns a fitted PSM into an ordinary `ODEProblem`, `steady_state` and
+`linearise` give its equilibrium and Jacobian, `metrics_over` repeats this over bootstrap
+replicates, and `resilience_along` follows the equilibrium as a parameter changes.
+
+::: {.callout-tip}
+## See Also
+- [Vignette 27: Predator–Prey Functional Response](../27_predator_prey/27_predator_prey.qmd) — recovering a Type II response with confidence intervals
+- [Vignette 29: Bootstrap](../29_bootstrap/29_bootstrap.qmd) — the bootstrap in detail
+:::
+
+## Setup
+
+```{julia}
+using PartiallySpecifiedModels
+using PartiallySpecifiedModels: solve
+using DynamicalResilience: steady_state, linearise, resilience, reactivity, resilience_along
+using OrdinaryDiffEq
+using Statistics, Random, Printf
+import Optim
+using Plots; default(fmt=:png)
+Random.seed!(2026)
+```
+
+## The True Model
+
+The Rosenzweig–MacArthur model with logistic prey growth,
+
+$$
+\frac{dR}{dt} = r R \left(1 - \frac{R}{K}\right) - f(R)\,C, \qquad
+\frac{dC}{dt} = e\, f(R)\, C - d\, C,
+$$
+
+with a sigmoid (Type III) response $f(R) = aR^2/(1 + ahR^2)$, $a = h = 0.5$, and $r = 1$,
+$K = 10$, $e = 0.5$, $d = 0.9$. The interior equilibrium is $R^* = 6$, $C^* = 4/3$, a stable
+focus: perturbations return as damped oscillations.
+
+The same right-hand side serves the truth, the PSM and the Type II model: only `p.f` changes.
+The known parameters, including $K$, are fields of `p`, so they can be varied later.
+
+```{julia}
+f_true(R) = 0.5 * R^2 / (1 + 0.25 * R^2)
+
+function rm!(du, u, p, t)
+    R, C = u
+    f = max(p.f(R), 0.0)
+    du[1] = p.r * R * (1 - R / p.K) - f * C
+    du[2] = p.e * f * C - p.d * C
+end
+
+known = (r = 1.0, K = 10.0, e = 0.5, d = 0.9)
+truth = ODEProblem(rm!, [8.0, 0.5], (0.0, 40.0), merge((f = f_true,), known));
+```
+
+### Data
+
+Both species are observed every half time unit with Gaussian noise ($\sigma = 0.15$).
+
+```{julia}
+data_t = collect(0.0:0.5:40.0)
+sol_true = OrdinaryDiffEq.solve(truth, Tsit5(); saveat = data_t, abstol = 1e-10, reltol = 1e-10)
+data = max.(reduce(hcat, sol_true.u)' .+ 0.15 .* randn(length(data_t), 2), 0.01);
+```
+
+```{julia}
+#| echo: false
+#| label: fig-data
+#| fig-cap: "Synthetic predator–prey data from the Type III model (σ = 0.15)"
+p1 = plot(data_t, sol_true[1, :], lw = 2, color = :green, ls = :dash, label = "True R")
+scatter!(p1, data_t, data[:, 1], ms = 3, alpha = 0.6, color = :green, label = "R (obs)")
+p2 = plot(data_t, sol_true[2, :], lw = 2, color = :orange, ls = :dash, label = "True C")
+scatter!(p2, data_t, data[:, 2], ms = 3, alpha = 0.6, color = :orange, label = "C (obs)")
+plot(p1, p2, layout = (1, 2), size = (800, 330), xlabel = "Time", ylabel = "Density",
+     title = ["Prey" "Predator"])
+```
+
+### The true equilibrium
+
+```{julia}
+eq_true = steady_state(truth, [6.0, 1.3])
+J_true = linearise(truth, eq_true.u)
+@printf("R* = %.3f, C* = %.3f; resilience %.3f, reactivity %.3f\n",
+        eq_true.u..., resilience(J_true), reactivity(J_true))
+```
+
+The equilibrium is reactive (reactivity > 0): some perturbations grow at first before they
+decay.
+
+## Fit 1: Partially Specified Model
+
+The functional response is a B-spline on $[0, 10]$, accessed as `p.f`; the other parameters are
+known.
+
+```{julia}
+uf = BSplineApproximator(:f, (0.0, 10.0), 10; initial = R -> 0.3 * R)
+prob = PSMProblem(rm!, [8.0, 0.5], (0.0, 40.0), [uf];
+    data_times = data_t, data_values = data, obs_to_state = [1, 2],
+    known_params = known, likelihood = Gaussian(), solver = Tsit5())
+fit = solve(prob, LAML(maxiters = 200, verbose = false))
+@printf("data loss %.3f, EDF %.2f, stationarity %.1e\n",
+        fit.data_loss, fit.edf, fit.convergence.stationarity)
+```
+
+The fitted model is an ordinary `ODEProblem`; its equilibrium and Jacobian come from
+DynamicalResilience.jl, started near the equilibrium of interest.
+
+```{julia}
+ode = to_ode_problem(prob, fit)
+eq_psm = steady_state(ode, [6.0, 1.3])
+J_psm = linearise(ode, eq_psm.u)
+@printf("R* = %.3f, C* = %.3f; resilience %.3f, reactivity %.3f\n",
+        eq_psm.u..., resilience(J_psm), reactivity(J_psm))
+```
+
+## Fit 2: Misspecified Type II
+
+The parametric model assumes $f(R) = aR/(1 + ahR)$ and fits $\log a$ and $\log h$ by least
+squares, which is maximum likelihood for Gaussian noise.
+
+```{julia}
+f_type2(R, a, h) = a * R / (1 + a * h * R)
+type2(θ) = ODEProblem(rm!, [8.0, 0.5], (0.0, 40.0),
+                      merge((f = R -> f_type2(R, θ[1], θ[2]),), known))
+
+function sse(logθ, y)
+    s = OrdinaryDiffEq.solve(type2(exp.(logθ)), Tsit5(); saveat = data_t, abstol = 1e-8, reltol = 1e-8)
+    SciMLBase.successful_retcode(s) || return Inf
+    sum(abs2, reduce(hcat, s.u)' .- y)
+end
+fit_type2(y) = exp.(Optim.minimizer(Optim.optimize(lθ -> sse(lθ, y), log.([0.5, 0.3]),
+                                                   Optim.NelderMead(), Optim.Options(iterations = 2000))))
+
+θ2 = fit_type2(data)
+prob2 = type2(θ2)
+eq2 = steady_state(prob2, [6.0, 1.3])
+J2 = linearise(prob2, eq2.u)
+@printf("a = %.3f, h = %.3f; residual sum of squares %.3f (PSM %.3f)\n",
+        θ2..., sse(log.(θ2), data), fit.data_loss)
+@printf("R* = %.3f, C* = %.3f; resilience %.3f, reactivity %.3f\n",
+        eq2.u..., resilience(J2), reactivity(J2))
+```
+
+### The fitted responses
+
+```{julia}
+#| echo: false
+#| label: fig-responses
+#| fig-cap: "The true Type III response, the PSM spline and the fitted Type II. The shaded band is the range of prey densities in the data; the dotted line is the true R*."
+R_grid = range(0.05, 10.0, length = 200)
+R_range = extrema(sol_true[1, :])
+plot(R_grid, f_true.(R_grid), lw = 3, color = :black, ls = :dash, label = "True (Type III)",
+     xlabel = "Prey density R", ylabel = "f(R)", legend = :bottomright)
+plot!(R_grid, [fit.unknown_functions[:f](R) for R in R_grid], lw = 2, color = :teal, label = "PSM spline")
+plot!(R_grid, f_type2.(R_grid, θ2...), lw = 2, color = :purple, label = "Fitted Type II")
+vspan!([R_range...], alpha = 0.08, color = :steelblue, label = "Data range")
+vline!([eq_true.u[1]], color = :gray, ls = :dot, label = "")
+```
+
+The data only cover prey densities around the equilibrium, so neither fit can recover the
+low-density shape that distinguishes Type III from Type II. Local resilience depends only on
+$f$ and $f'$ at $R^*$, which the data do constrain.
+
+## Bootstrap Intervals for Resilience
+
+### PSM
+
+`bootstrap` refits the PSM to parametric pseudo-data; `metrics_over` then finds each replicate's
+equilibrium (warm-started from the previous one) and computes the metrics. Replicates without a
+converged or stable equilibrium are counted, not dropped.
+
+```{julia}
+bs = bootstrap(fit, prob, LAML(maxiters = 200, verbose = false);
+               nboot = 30, method = :parametric, rng = Random.Xoshiro(1))
+mo_psm = metrics_over(prob, bs; u0 = eq_psm.u)
+@printf("%d replicates: %d stable, %d unstable, %d without an equilibrium\n",
+        mo_psm.n, mo_psm.n_stable, mo_psm.n_unstable, mo_psm.n_unconverged)
+```
+
+### Type II
+
+The same parametric bootstrap for the Type II fit: simulate the fitted model, add Gaussian noise
+with the residual standard deviation, refit. `metrics_over` takes any function from a draw to a
+SciML problem.
+
+```{julia}
+s2 = OrdinaryDiffEq.solve(prob2, Tsit5(); saveat = data_t, abstol = 1e-10, reltol = 1e-10)
+fitted2 = reduce(hcat, s2.u)'
+σ2 = sqrt(sum(abs2, fitted2 .- data) / (length(data) - 2))
+rng = Random.Xoshiro(2)
+θ_boot = [fit_type2(max.(fitted2 .+ σ2 .* randn(rng, size(fitted2)...), 0.01)) for _ in 1:30]
+mo_t2 = metrics_over(type2, θ_boot; u0 = eq2.u)
+@printf("%d replicates: %d stable, %d unstable, %d without an equilibrium\n",
+        mo_t2.n, mo_t2.n_stable, mo_t2.n_unstable, mo_t2.n_unconverged)
+```
+
+### Comparison
+
+```{julia}
+#| echo: false
+function row(name, q, truth)
+    @printf("%-14s %.3f (%.3f–%.3f)   %s\n", name, q[2], q[1], q[3],
+            q[1] <= truth <= q[3] ? "contains the truth" : "misses the truth")
+end
+println("Resilience (median and 95% bootstrap interval); truth ", round(resilience(J_true), digits = 3))
+row("PSM spline", mo_psm.quantiles.resilience, resilience(J_true))
+row("Type II", mo_t2.quantiles.resilience, resilience(J_true))
+println("\nReactivity; truth ", round(reactivity(J_true), digits = 3))
+row("PSM spline", mo_psm.quantiles.reactivity, reactivity(J_true))
+row("Type II", mo_t2.quantiles.reactivity, reactivity(J_true))
+```
+
+```{julia}
+#| echo: false
+#| label: fig-resilience
+#| fig-cap: "Resilience of the fitted equilibrium over 30 bootstrap replicates of each fit. The dashed line is the true value."
+stripes = [mo_psm.metrics.resilience[mo_psm.stable], mo_t2.metrics.resilience[mo_t2.stable]]
+scatter(fill(1, length(stripes[1])) .+ 0.06 .* randn(length(stripes[1])), stripes[1],
+        color = :teal, alpha = 0.6, label = "PSM spline")
+scatter!(fill(2, length(stripes[2])) .+ 0.06 .* randn(length(stripes[2])), stripes[2],
+         color = :purple, alpha = 0.6, label = "Type II")
+hline!([resilience(J_true)], color = :black, ls = :dash, label = "Truth")
+plot!(xticks = ([1, 2], ["PSM spline", "Type II"]), xlims = (0.5, 2.5), ylabel = "Resilience",
+      legend = :topright, size = (600, 380))
+```
+
+## Distance to the Enrichment Threshold
+
+In this model the equilibrium prey density $R^*$ solves $e f(R^*) = d$ and does not depend on
+$K$, while the predator density and the prey's self-limitation do. Raising $K$ eventually
+destabilises the equilibrium in a Hopf bifurcation. `resilience_along` follows the equilibrium
+as $K$ increases and reports where stability is lost and how.
+
+```{julia}
+Ks = collect(10.0:0.25:30.0)
+setK(p, K) = merge(p, (K = K,))
+threshold(problem, u0) = resilience_along(problem, setK, Ks; u0 = u0).transition
+
+tr_true = threshold(truth, eq_true.u)
+tr_psm = threshold(ode, eq_psm.u)
+tr_t2 = threshold(prob2, eq2.u)
+for (name, tr) in (("truth", tr_true), ("PSM spline", tr_psm), ("Type II", tr_t2))
+    @printf("%-11s %s at K ≈ %.2f\n", name, tr.kind, tr.estimate)
+end
+```
+
+Over the bootstrap replicates:
+
+```{julia}
+KH(problem, u0) = (tr = threshold(problem, steady_state(problem, u0).u);
+                   tr === nothing ? NaN : tr.estimate)
+KH_psm = [KH(to_ode_problem(prob, β), eq_psm.u) for β in parameter_draws(bs)]
+KH_t2 = [KH(type2(θ), eq2.u) for θ in θ_boot]
+q(v) = quantile(filter(isfinite, v), [0.025, 0.5, 0.975])
+for (name, v) in (("PSM spline", KH_psm), ("Type II", KH_t2))
+    qq = q(v)
+    @printf("%-11s K_H %.2f (%.2f–%.2f), %d of %d replicates lose stability in range; %s\n",
+            name, qq[2], qq[1], qq[3], count(isfinite, v), length(v),
+            qq[1] <= tr_true.estimate <= qq[3] ? "contains the truth" : "misses the truth")
+end
+```
+
+```{julia}
+#| echo: false
+#| label: fig-enrichment
+#| fig-cap: "Resilience of the equilibrium as the carrying capacity K increases. It reaches zero at the Hopf bifurcation (dotted lines)."
+path_true = resilience_along(truth, setK, Ks; u0 = eq_true.u)
+path_psm = resilience_along(ode, setK, Ks; u0 = eq_psm.u)
+path_t2 = resilience_along(prob2, setK, Ks; u0 = eq2.u)
+plot(Ks, path_true.metrics.resilience, lw = 3, color = :black, ls = :dash, label = "Truth",
+     xlabel = "Carrying capacity K", ylabel = "Resilience")
+plot!(Ks, path_psm.metrics.resilience, lw = 2, color = :teal, label = "PSM spline")
+plot!(Ks, path_t2.metrics.resilience, lw = 2, color = :purple, label = "Type II")
+hline!([0], color = :gray, label = "")
+vline!([tr_true.estimate, tr_psm.estimate, tr_t2.estimate], color = [:black :teal :purple],
+       ls = :dot, label = "")
+```
+
+## What This Run Shows
+
+- **Point estimates agree.** Both fits describe the data about equally well, and their
+  equilibria, resilience, reactivity and enrichment thresholds are close to the truth and to
+  each other. Local stability depends on the response and its slope near $R^*$, which the data
+  constrain whatever form is assumed; the misspecified Type II does *not* predict a markedly
+  less resilient or oscillating system here.
+- **Intervals differ.** The Type II intervals are narrower, because its two parameters tie the
+  slope at $R^*$ to the response elsewhere. Compare above whether each interval contains the
+  true value. The spline's intervals are wider: it lets the slope at $R^*$ vary with the data
+  alone, which is the honest description of what the data say.
+- **One data set.** This is a single simulated data set with 30 replicates per bootstrap, an
+  illustration rather than a coverage study.
+
+Where the two forms *would* differ is far from the data: at low prey density, where the Type III
+response provides a refuge and the Type II does not. Neither fit can speak to that region, and
+no interval derived from these data covers it.

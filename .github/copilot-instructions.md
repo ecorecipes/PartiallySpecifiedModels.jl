@@ -11,7 +11,7 @@ transmission rates are often of uncertain shape.
 
 Scale: ~25k lines of source, 23 solvers, 12 approximators (including
 `KANApproximator`, backed by FluxKAN.jl through a package extension), 5
-likelihoods, 41 vignettes. The test suite is `test/runtests.jl` plus
+likelihoods, 42 vignettes. The test suite is `test/runtests.jl` plus
 topic files it includes; `Pkg.test(test_args=["kan"])` runs one group
 (see README for the group names).
 

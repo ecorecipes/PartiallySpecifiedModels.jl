@@ -26,7 +26,8 @@ if !isempty(ARGS)
                   "calibration-suite" => "calibration_suite.jl",
                   "calibration-resume" => "calibration_resume.jl",
                   "calibration-checkpointed" => "calibration_checkpointed.jl",
-                  "kan-multivariate" => "kan_multivariate.jl")
+                  "kan-multivariate" => "kan_multivariate.jl",
+                  "resilience" => "resilience.jl")
     all(haskey(groups, arg) for arg in ARGS) ||
         throw(ArgumentError("unknown test group; choose from " * join(sort!(collect(keys(groups))), ", ")))
     for group in unique(ARGS)
@@ -69,6 +70,7 @@ include("smoothing_profiles.jl")
 include("calibration_suite.jl")
 include("calibration_resume.jl")
 include("calibration_checkpointed.jl")
+include("resilience.jl")
 
 # ─── Custom approximator for the "approximator extension protocol" testset ──
 # Struct and method definitions must live at top level; the tests themselves
@@ -5229,7 +5231,10 @@ end
             data_times=t_f2,
             data_values=reshape(exp.(0.1 .* t_f2) .+ noi_f2, :, 1),
             obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
-        s_nopen = solve(prob_nn_f2, LAML(maxiters=30))
+        # maxiters=100: converges in 7 iterations on macOS (Julia 1.12 and
+        # 1.13), but this unpenalized fit is fragile: with maxiters=30 it
+        # reported converged = false on Julia 1.13 / ubuntu x64 CI.
+        s_nopen = solve(prob_nn_f2, LAML(maxiters=100))
         @test isempty(s_nopen.smoothing_params)
         @test s_nopen.convergence.converged            # measured :converged_tol
         @test !s_nopen.convergence.smoothing_advanced

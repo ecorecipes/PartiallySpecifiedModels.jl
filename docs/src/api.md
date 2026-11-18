@@ -263,3 +263,18 @@ check_constraints
 kan_edge_curves
 kan_activation_diagnostics
 ```
+
+## Resilience of Fitted Models
+
+A fitted PSM is an ordinary SciML problem once its unknown functions are evaluated at the
+fitted coefficients, so the resilience of its equilibria follows from
+[DynamicalResilience.jl](https://github.com/ecorecipes/DynamicalResilience.jl): `steady_state`
+finds the equilibrium, `linearise` its Jacobian, and `metrics_over` the distribution of
+resilience metrics over bootstrap replicates or posterior draws. See
+[Vignette 42](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/42_resilience/42_resilience.md).
+
+```@docs
+to_ode_problem
+parameter_draws
+metrics_over(::PSMProblem, ::Any)
+```
