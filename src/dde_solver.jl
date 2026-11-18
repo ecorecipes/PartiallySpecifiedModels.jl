@@ -57,9 +57,9 @@ function simulate_dde(prob::PSMProblem, beta::AbstractVector)
         :abstol => get(prob.ode_kwargs, :abstol, 1e-8),
         :reltol => get(prob.ode_kwargs, :reltol, 1e-8),
         :maxiters => get(prob.ode_kwargs, :maxiters, 1_000_000),
-        :verbose => get(prob.ode_kwargs, :verbose, false),
+        :verbose => _quiet_solve(),
     )
-    merge!(solve_kwargs, prob.ode_kwargs)
+    merge!(solve_kwargs, _normalise_ode_kwargs(prob.ode_kwargs))
 
     sol = DelayDiffEq.solve(dde_prob, dde_solver; solve_kwargs...)
 

@@ -43,6 +43,19 @@ using DelayDiffEq
 import DynamicalResilience
 import DynamicalResilience: metrics_over
 
+# OrdinaryDiffEq 7 / SciMLBase 3 take a verbosity object for `verbose`, not a Bool
+# (passing a Bool is an ArgumentError). The solvers run the ODE quietly by default,
+# as `verbose=false` used to, and a user's `ode_kwargs[:verbose]::Bool` is mapped.
+_quiet_solve() = OrdinaryDiffEq.DEVerbosity(OrdinaryDiffEq.SciMLLogging.None())
+_ode_verbosity(v::Bool) = v ? OrdinaryDiffEq.DEVerbosity() : _quiet_solve()
+_ode_verbosity(v) = v
+function _normalise_ode_kwargs(kw::AbstractDict)
+    haskey(kw, :verbose) || return kw
+    out = Dict{Symbol, Any}(kw)
+    out[:verbose] = _ode_verbosity(kw[:verbose])
+    return out
+end
+
 # Core types
 include("types.jl")
 
@@ -200,7 +213,10 @@ export bootstrap, BootstrapResult
 export confidence_band, smoothing_covariance_correction
 
 # Re-export common ODE solvers and problem types
-using OrdinaryDiffEq: Tsit5, BS3, Vern7, Vern9, TRBDF2
+using OrdinaryDiffEq: Tsit5, Vern7, Vern9
+# OrdinaryDiffEq 7 loads only its default solvers; the others come from sublibraries.
+using OrdinaryDiffEqLowOrderRK: BS3
+using OrdinaryDiffEqSDIRK: TRBDF2
 using SciMLBase: ODEProblem, DiscreteProblem
 export Tsit5, BS3, Vern7, Vern9, TRBDF2
 export ODEProblem, DiscreteProblem

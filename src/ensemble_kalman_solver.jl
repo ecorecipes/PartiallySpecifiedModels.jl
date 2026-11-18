@@ -101,7 +101,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
                 ode_prob = ODEProblem(prob.dynamics!, ode_u0, prob.tspan, p)
                 solver = prob.ode_solver === nothing ? Tsit5() : prob.ode_solver
                 ode_sol = OrdinaryDiffEq.solve(ode_prob, solver;
-                            saveat=prob.data_times, prob.ode_kwargs...)
+                            saveat=prob.data_times, _normalise_ode_kwargs(prob.ode_kwargs)...)
                 if ode_sol.retcode != :Success && ode_sol.retcode != SciMLBase.ReturnCode.Success
                     return nothing
                 end

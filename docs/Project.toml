@@ -16,4 +16,4 @@ StructuredPopulationCore = {url = "https://github.com/ecorecipes/ProjectionModel
 [compat]
 Documenter = "1"
 Lux = "1"
-OrdinaryDiffEq = "6"
+OrdinaryDiffEq = "7"

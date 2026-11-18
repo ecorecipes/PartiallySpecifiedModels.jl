@@ -45,7 +45,8 @@ logistic_problem(data) = PSMProblem(logistic!, [1.0], (0.0, 20.0),
         # `simulate` integrates exactly this problem with these options, so the predictions
         # are identical, not merely close
         sol = OrdinaryDiffEq.solve(ode, Tsit5(); saveat = TIMES, abstol = 1e-8, reltol = 1e-8,
-                                   maxiters = 1_000_000, verbose = false)
+                                   maxiters = 1_000_000,
+                                   verbose = PartiallySpecifiedModels._quiet_solve())
         @test simulate(prob, β) == reshape([u[1] for u in sol.u], :, 1)
     end
 

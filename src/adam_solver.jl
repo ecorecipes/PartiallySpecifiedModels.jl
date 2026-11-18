@@ -543,8 +543,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
                                        abstol=get(prob.ode_kwargs, :abstol, 1e-7),
                                        reltol=get(prob.ode_kwargs, :reltol, 1e-7),
                                        maxiters=get(prob.ode_kwargs, :maxiters, 10000))
-        (sol_ode.retcode == SciMLBase.ReturnCode.Success ||
-         sol_ode.retcode == :Success) && length(sol_ode.u) >= T_pts ||
+        sol_ode.retcode == SciMLBase.ReturnCode.Success && length(sol_ode.u) >= T_pts ||
             error("final ODE solve at the fitted parameters failed " *
                   "(retcode $(sol_ode.retcode))")
 

@@ -3304,13 +3304,29 @@ end
                 maximum(abs.(W .* r .- sc) ./ max.(abs.(sc), 1e-12))
             end
 
+            # The same identity measured on the scale of the score vector. For the
+            # families below it holds exactly, so the per-observation relative
+            # error above is ill-posed wherever the exact score is 0 (y = μ): there
+            # a one-ulp rounding residue in the AD gradient (2^-54 ≈ 5.6e-17 at
+            # y = μ = 2 for NegativeBinomial(3), seen from Julia 1.12/1.13 with
+            # ForwardDiff 1.x) divided by the 1e-12 floor gave 5.6e-5. The code is
+            # unchanged; only the metric is.
+            function score_err_scaled(fam, y, mu, w)
+                sc = FD.gradient(m -> log_likelihood(fam, y, m, w), mu)
+                W  = irls_weights(fam, y, mu, w)
+                r  = PSM._working_residual(fam, y, mu, w)
+                maximum(abs.(W .* r .- sc)) / maximum(abs, sc)
+            end
+
             w = [1.0, 2.0, 0.5, 1.0, 1.5, 1.0]
             # Families whose score IS (y−μ)/V(μ): identity already held, and
-            # must keep holding to roundoff (measured 0.0, 9.25e-16, 9.87e-16).
+            # must keep holding to roundoff (measured 0.0, 9.25e-16, 9.87e-16
+            # with the per-observation metric; 2.6e-16 for NegativeBinomial with
+            # the scaled one).
             mu_g = [0.5, 1.0, 2.0, 3.0, 5.0, 8.0]
-            @test score_err(Gaussian(), mu_g .+ 0.3, mu_g, w) < 1e-12
-            @test score_err(Poisson(), round.(mu_g .* 1.2), mu_g, w) < 1e-12
-            @test score_err(NegativeBinomial(3.0), round.(mu_g .* 1.2), mu_g, w) < 1e-12
+            @test score_err_scaled(Gaussian(), mu_g .+ 0.3, mu_g, w) < 1e-12
+            @test score_err_scaled(Poisson(), round.(mu_g .* 1.2), mu_g, w) < 1e-12
+            @test score_err_scaled(NegativeBinomial(3.0), round.(mu_g .* 1.2), mu_g, w) < 1e-12
 
             # TruncatedNormal across the range where the bound bites.
             fam = TruncatedNormal(sigma=1.0, lower=0.0)
