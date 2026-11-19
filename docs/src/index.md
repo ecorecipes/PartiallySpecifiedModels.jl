@@ -130,4 +130,4 @@ end
 - [`TruncatedNormal`](@ref) — Continuous data bounded below (e.g. non-negative densities)
 - [`CustomLikelihood`](@ref) — User-defined likelihood
 
-See the [Getting Started](getting_started.md) guide for a detailed tutorial. The [Vignettes](vignettes.md) page has 35 worked examples covering most of the solvers and approximators; for the complete reference, including the features no vignette yet demonstrates, browse the [Solvers](solvers.md) and [Approximators](approximators.md) pages.
+See the [Getting Started](getting_started.md) guide for a detailed tutorial. The [Vignettes](vignettes.md) page has 42 worked examples covering most of the solvers and approximators; for the complete reference, including the features no vignette yet demonstrates, browse the [Solvers](solvers.md) and [Approximators](approximators.md) pages.

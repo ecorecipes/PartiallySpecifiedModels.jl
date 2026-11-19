@@ -1,73 +1,73 @@
 # Vignettes
 
-The `vignettes/` directory contains 42 worked examples covering every solver, approximator, and likelihood type. Each vignette is a self-contained [Quarto](https://quarto.org/) document with rendered markdown available on GitHub.
+The `vignettes/` directory contains 42 worked examples covering every solver, approximator, and likelihood type. Each vignette is a self-contained [Quarto](https://quarto.org/) document; the rendered output of each is included in this documentation as a tutorial page, linked below.
 
 ## Getting Started
 
 | # | Vignette | Description |
 |:--|:---------|:------------|
-| 01 | [Getting Started](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/01_getting_started/01_getting_started.md) | Basic PSM workflow with logistic growth |
-| 02 | [Likelihoods](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/02_likelihoods/02_likelihoods.md) | Gaussian, Poisson, Negative Binomial, Truncated Normal, and custom likelihoods |
+| 01 | [Getting Started](tutorials/01_getting_started.md) | Basic PSM workflow with logistic growth |
+| 02 | [Likelihoods](tutorials/02_likelihoods.md) | Gaussian, Poisson, Negative Binomial, Truncated Normal, and custom likelihoods |
 
 ## Ecological Models
 
 | # | Vignette | Description |
 |:--|:---------|:------------|
-| 03 | [Lotka–Volterra](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/03_lotka_volterra/03_lotka_volterra.md) | Hare–lynx predator-prey with LAML and collocation |
-| 04 | [Copepod](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/04_copepod/04_copepod.md) | 11-stage structured population model with multiple unknown functions |
-| 08 | [Rosenzweig–MacArthur](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/08_rosenzweig_macarthur/08_rosenzweig_macarthur.md) | Recovering functional responses in consumer-resource dynamics |
-| 10 | [Chemostat](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/10_chemostat/10_chemostat.md) | Microbial dynamics recovering unknown Monod growth kinetics |
-| 11 | [Count Data SIR](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/11_count_data_sir/11_count_data_sir.md) | SIR model with Poisson and Negative Binomial likelihoods |
-| 12 | [Discrete Time](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/12_discrete_time/12_discrete_time.md) | Ricker, Beverton–Holt, and discrete competition models |
-| 20 | [DDE](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/20_dde/20_dde.md) | Delay differential equations with unknown functions |
-| 27 | [Predator-Prey Functional Response](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/27_predator_prey/27_predator_prey.md) | Holling Type II with shape constraints, Bayesian and bootstrap CIs |
-| 28 | [Fisheries](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/28_fisheries/28_fisheries.md) | Discrete stock-recruitment with Poisson counts and shape constraints |
+| 03 | [Lotka–Volterra](tutorials/03_lotka_volterra.md) | Hare–lynx predator-prey with LAML and collocation |
+| 04 | [Copepod](tutorials/04_copepod.md) | 11-stage structured population model with multiple unknown functions |
+| 08 | [Rosenzweig–MacArthur](tutorials/08_rosenzweig_macarthur.md) | Recovering functional responses in consumer-resource dynamics |
+| 10 | [Chemostat](tutorials/10_chemostat.md) | Microbial dynamics recovering unknown Monod growth kinetics |
+| 11 | [Count Data SIR](tutorials/11_count_data_sir.md) | SIR model with Poisson and Negative Binomial likelihoods |
+| 12 | [Discrete Time](tutorials/12_discrete_time.md) | Ricker, Beverton–Holt, and discrete competition models |
+| 20 | [DDE](tutorials/20_dde.md) | Delay differential equations with unknown functions |
+| 27 | [Predator-Prey Functional Response](tutorials/27_predator_prey.md) | Holling Type II with shape constraints, Bayesian and bootstrap CIs |
+| 28 | [Fisheries](tutorials/28_fisheries.md) | Discrete stock-recruitment with Poisson counts and shape constraints |
 
 ## Approximators
 
 | # | Vignette | Description |
 |:--|:---------|:------------|
-| 05 | [Neural Networks](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/05_neural_networks/05_neural_networks.md) | Comparing B-spline, GP, and neural network approximators |
-| 13 | [Shape Constraints](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/13_shape_constraints/13_shape_constraints.md) | Monotonicity, convexity, and zero-at-endpoint constraints |
-| 16 | [COMONet](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/16_comonet/16_comonet.md) | Shape-constrained neural network approximators |
-| 26 | [SPDE](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/26_spde/26_spde.md) | Matérn SPDE approximator with shape constraints and profile range optimization |
-| 41 | [Kolmogorov-Arnold Networks](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/41_kan/41_kan.md) | Fixed-grid KAN responses, spline comparison, edge diagnostics and pointwise uncertainty |
+| 05 | [Neural Networks](tutorials/05_neural_networks.md) | Comparing B-spline, GP, and neural network approximators |
+| 13 | [Shape Constraints](tutorials/13_shape_constraints.md) | Monotonicity, convexity, and zero-at-endpoint constraints |
+| 16 | [COMONet](tutorials/16_comonet.md) | Shape-constrained neural network approximators |
+| 26 | [SPDE](tutorials/26_spde.md) | Matérn SPDE approximator with shape constraints and profile range optimization |
+| 41 | [Kolmogorov-Arnold Networks](tutorials/41_kan.md) | Fixed-grid KAN responses, spline comparison, edge diagnostics and pointwise uncertainty |
 
 ## Solvers
 
 | # | Vignette | Description |
 |:--|:---------|:------------|
-| 06 | [Solver Comparison](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/06_solver_comparison/06_solver_comparison.md) | Side-by-side comparison of eleven solvers |
-| 07 | [Probabilistic Fitting](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/07_probabilistic_fitting/07_probabilistic_fitting.md) | Probabilistic ODE fitting with uncertainty quantification |
-| 09 | [Gradient Matching](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/09_gradient_matching/09_gradient_matching.md) | Integration-free inference with adaptive gradient matching |
-| 14 | [MCMC](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/14_mcmc/14_mcmc.md) | Full Bayesian inference with HMC/NUTS posterior sampling |
-| 15 | [MAGI](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/15_magi/15_magi.md) | Manifold-constrained Gaussian process inference |
-| 17 | [BNG](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/17_bng/17_bng.md) | Bayesian neural gradient matching |
-| 18 | [Dalton](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/18_dalton/18_dalton.md) | Data-adaptive Kalman likelihood fitting |
-| 19 | [Pseudo-Marginal](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/19_pseudo_marginal/19_pseudo_marginal.md) | Probabilistic ODE + Bayesian MCMC |
-| 21 | [GCV](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/21_gcv/21_gcv.md) | Generalized Cross-Validation vs LAML smoothing |
-| 22 | [Two-Stage](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/22_two_stage/22_two_stage.md) | Redirect — see Vignette 09 |
-| 23 | [Derivative-Free](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/23_derivative_free/23_derivative_free.md) | Nelder-Mead and Particle Swarm optimization |
-| 24 | [Variational](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/24_variational/24_variational.md) | Fast approximate Bayesian inference via variational methods |
-| 25 | [ABC](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/25_abc/25_abc.md) | Likelihood-free inference with ABC-SMC |
-| 31 | [Integral Matching](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/31_integral_matching/31_integral_matching.md) | Noise-robust integration-free estimation |
-| 33 | [Ensemble Kalman](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/33_ensemble_kalman/33_ensemble_kalman.md) | Derivative-free estimation via ensemble Kalman inversion |
-| 34 | [ODIN](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/34_odin/34_odin.md) | ODE-informed Gaussian process regression |
-| 35 | [RKHS](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/35_rkhs/35_rkhs.md) | Reproducing kernel Hilbert space estimation |
-| 36 | [Tensor Smooths](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/36_tensor_smooths/36_tensor_smooths.md) | Bivariate interaction surfaces with `TensorBSplineApproximator` — predator interference |
-| 37 | [Single-Index](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/37_single_index/37_single_index.md) | Rank-1 multivariate responses with `SingleIndexApproximator`, and when the direction is identifiable |
-| 38 | [Transformed Covariates](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/38_transformed_covariates/38_transformed_covariates.md) | Lagged environmental drivers with `TransformedCovariateApproximator` |
-| 39 | [Shape-Constrained GP](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/39_shape_constrained_gp/39_shape_constrained_gp.md) | Monotone Gaussian processes with `ShapeConstrainedGPApproximator`, audited with `check_constraints` |
-| 40 | [FGPGM](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/40_fgpgm/40_fgpgm.md) | Bayesian gradient matching with `FGPGMSolver` (Wenk et al. 2019) |
+| 06 | [Solver Comparison](tutorials/06_solver_comparison.md) | Side-by-side comparison of eleven solvers |
+| 07 | [Probabilistic Fitting](tutorials/07_probabilistic_fitting.md) | Probabilistic ODE fitting with uncertainty quantification |
+| 09 | [Gradient Matching](tutorials/09_gradient_matching.md) | Integration-free inference with adaptive gradient matching |
+| 14 | [MCMC](tutorials/14_mcmc.md) | Full Bayesian inference with HMC/NUTS posterior sampling |
+| 15 | [MAGI](tutorials/15_magi.md) | Manifold-constrained Gaussian process inference |
+| 17 | [BNG](tutorials/17_bng.md) | Bayesian neural gradient matching |
+| 18 | [Dalton](tutorials/18_dalton.md) | Data-adaptive Kalman likelihood fitting |
+| 19 | [Pseudo-Marginal](tutorials/19_pseudo_marginal.md) | Probabilistic ODE + Bayesian MCMC |
+| 21 | [GCV](tutorials/21_gcv.md) | Generalized Cross-Validation vs LAML smoothing |
+| 22 | [Two-Stage](tutorials/22_two_stage.md) | Redirect — see Vignette 09 |
+| 23 | [Derivative-Free](tutorials/23_derivative_free.md) | Nelder-Mead and Particle Swarm optimization |
+| 24 | [Variational](tutorials/24_variational.md) | Fast approximate Bayesian inference via variational methods |
+| 25 | [ABC](tutorials/25_abc.md) | Likelihood-free inference with ABC-SMC |
+| 31 | [Integral Matching](tutorials/31_integral_matching.md) | Noise-robust integration-free estimation |
+| 33 | [Ensemble Kalman](tutorials/33_ensemble_kalman.md) | Derivative-free estimation via ensemble Kalman inversion |
+| 34 | [ODIN](tutorials/34_odin.md) | ODE-informed Gaussian process regression |
+| 35 | [RKHS](tutorials/35_rkhs.md) | Reproducing kernel Hilbert space estimation |
+| 36 | [Tensor Smooths](tutorials/36_tensor_smooths.md) | Bivariate interaction surfaces with `TensorBSplineApproximator` — predator interference |
+| 37 | [Single-Index](tutorials/37_single_index.md) | Rank-1 multivariate responses with `SingleIndexApproximator`, and when the direction is identifiable |
+| 38 | [Transformed Covariates](tutorials/38_transformed_covariates.md) | Lagged environmental drivers with `TransformedCovariateApproximator` |
+| 39 | [Shape-Constrained GP](tutorials/39_shape_constrained_gp.md) | Monotone Gaussian processes with `ShapeConstrainedGPApproximator`, audited with `check_constraints` |
+| 40 | [FGPGM](tutorials/40_fgpgm.md) | Bayesian gradient matching with `FGPGMSolver` (Wenk et al. 2019) |
 
 ## Uncertainty Quantification
 
 | # | Vignette | Description |
 |:--|:---------|:------------|
-| 29 | [Bootstrap](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/29_bootstrap/29_bootstrap.md) | Parametric and nonparametric bootstrap CIs (Gaussian and Poisson) |
-| 30 | [Model Selection](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/30_model_selection/30_model_selection.md) | LAML marginal likelihood for knot, approximator, and structural selection |
-| 32 | [Profile Likelihood](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/32_profile_likelihood/32_profile_likelihood.md) | Identifiability analysis and likelihood-ratio CIs |
-| 42 | [Resilience](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/42_resilience/42_resilience.md) | Resilience of a fitted equilibrium with bootstrap intervals: a spline functional response vs a misspecified Type II (DynamicalResilience.jl) |
+| 29 | [Bootstrap](tutorials/29_bootstrap.md) | Parametric and nonparametric bootstrap CIs (Gaussian and Poisson) |
+| 30 | [Model Selection](tutorials/30_model_selection.md) | LAML marginal likelihood for knot, approximator, and structural selection |
+| 32 | [Profile Likelihood](tutorials/32_profile_likelihood.md) | Identifiability analysis and likelihood-ratio CIs |
+| 42 | [Resilience](tutorials/42_resilience.md) | Resilience of a fitted equilibrium with bootstrap intervals: a spline functional response vs a misspecified Type II (DynamicalResilience.jl) |
 
 ## Running Vignettes Locally
 

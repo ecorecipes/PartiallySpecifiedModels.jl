@@ -20,3 +20,6 @@ proofs/
 benchmarks/**/results/
 benchmarks/calibration/campaigns/
 benchmarks/calibration/runs/
+
+# Synced from vignettes/ by docs/make.jl
+docs/src/tutorials/
