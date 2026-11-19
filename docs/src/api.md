@@ -271,7 +271,7 @@ fitted coefficients, so the resilience of its equilibria follows from
 [DynamicalResilience.jl](https://github.com/ecorecipes/DynamicalResilience.jl): `steady_state`
 finds the equilibrium, `linearise` its Jacobian, and `metrics_over` the distribution of
 resilience metrics over bootstrap replicates or posterior draws. See
-[Vignette 42](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/42_resilience/42_resilience.md).
+[Vignette 42](tutorials/42_resilience.md).
 
 ```@docs
 to_ode_problem

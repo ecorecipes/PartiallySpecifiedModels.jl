@@ -516,7 +516,7 @@ from continuum-PDE accuracy.
 `benchmarks/kan/REACTION-DIFFUSION-REFINEMENTS.md` adds a controlled
 stopping/learning-rate comparison and no-refit transfer of the saved
 reaction functions to finer meshes.
-The runnable [KAN vignette](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/41_kan/41_kan.md)
+The runnable [KAN vignette](tutorials/41_kan.md)
 combines fitting, a spline baseline, edge diagnostics and both uncertainty workflows.
 
 ```@docs
