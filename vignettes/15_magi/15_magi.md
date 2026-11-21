@@ -1,6 +1,6 @@
 # MAGI: Manifold-Constrained Gaussian Process Inference
 Simon Frost
-2026-09-04
+2026-11-21
 
 - [Overview](#overview)
 - [Example 1: SIR Model (Fully
@@ -100,25 +100,25 @@ I_true = [sol_true.u[i][2] for i in 1:length(sol_true.t)]
 
     21-element Vector{Float64}:
      0.01
-     0.014798852083446426
-     0.021784934635223734
-     0.03182285803804494
-     0.04597475471170782
-     0.06539262284829846
-     0.09104385624411435
-     0.12321500350597699
-     0.16087652175445682
-     0.20121975916254814
+     0.014798852083446432
+     0.021784934635223737
+     0.03182285803804493
+     0.04597475471170783
+     0.0653926228482985
+     0.09104385624411433
+     0.12321500350597701
+     0.16087652175445702
+     0.2012197591625484
      ⋮
-     0.29365032687951853
-     0.3032531966247468
-     0.3013449791327519
+     0.2936503268795184
+     0.3032531966247466
+     0.30134497913275166
      0.2900296382132258
-     0.27202986429089393
-     0.25000017788742174
-     0.22607674059778435
-     0.20186897654053457
-     0.17847135397622216
+     0.2720298642908939
+     0.2500001778874217
+     0.22607674059778446
+     0.2018689765405344
+     0.17847135397622202
 
 ### Plot the Data
 
@@ -164,9 +164,9 @@ sol_sir = solve(prob_sir, MagiSolver(
     obs_var=noise^2, preoptimize=true, verbose=false))
 ```
 
-    [ Info: Found initial step size 0.00037841796875
+    [ Info: Found initial step size 0.0003662109375
 
-    PSMSolution((β = [0.27521549314799126, 0.299236672133189, 0.33782885448835476, 0.2933224348859286, 0.230083306961453, 0.16927523164893254]), 111.29450426165661, 0.001498350196212204, 6.0, Float64[], [0.9866600097637238 0.010227281766089941; 0.9795672702702342 0.01558920727561315; … ; 0.13317341320078904 0.2033377737385102; 0.11771448285538401 0.18079647737233245], [0.9867713466394801 0.002683743105555393; 0.9746336282649085 0.013710526549528696; … ; 0.13646451526712325 0.19328337605363644; 0.12652759050099308 0.18421483813613687], [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0  …  22.0, 24.0, 26.0, 28.0, 30.0, 32.0, 34.0, 36.0, 38.0, 40.0], Dict{Symbol, Any}(:β => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([0.27521549314799126, 0.299236672133189, 0.33782885448835476, 0.2933224348859286, 0.230083306961453, 0.16927523164893254], [0.0, 0.1, 0.2, 0.3, 0.4, 0.5], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 0.1, 0.1, 0.09999999999999998, 0.10000000000000003, 0.09999999999999998], [0.0, 5.69883253257972, -14.052728108338068, 0.6529187262173813, 0.20142821023891985, 0.0], DataInterpolations.ExtrapolationType.Linear, DataInterpolations.ExtrapolationType.Linear, FindFirstFunctions.Guesser{Vector{Float64}}([0.0, 0.1, 0.2, 0.3, 0.4, 0.5], Base.RefValue{Int64}(1), true), false, false)), (method = :magi, chains = MCMC chain (150×6×1 Array{Float64, 3}), state_mean = [0.9866600097637238 0.010227281766089941 -0.8111128401133345; 0.983485368558244 0.012838463135814389 -0.8069718171628889; … ; 0.12497800623909348 0.19224226334066166 -0.16664127203823043; 0.11771448285538401 0.18079647737233245 -0.1493224141476143], mean_logposterior = -111.29450426165661, converged = false, reason = :maxiters, iterations = 300))
+    PSMSolution((β = [0.2725673644645188, 0.298267636742948, 0.33767223562347426, 0.2931309575371555, 0.23389694762555593, 0.17865961037369296]), 112.5745843075786, 0.0015013897386099862, 6.0, Float64[], [0.9866847759340766 0.010543900052408045; 0.9796282128561605 0.015750617373829028; … ; 0.13333034527701426 0.20298918818649966; 0.11811138676898479 0.18073401588600882], [0.9867713466394801 0.002683743105555393; 0.9746336282649084 0.013710526549528701; … ; 0.1364645152671229 0.19328337605363627; 0.12652759050099283 0.18421483813613673], [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0  …  22.0, 24.0, 26.0, 28.0, 30.0, 32.0, 34.0, 36.0, 38.0, 40.0], Dict{Symbol, Any}(:β => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64, FindFirstFunctions.SearchProperties{Float64}}([0.2725673644645188, 0.298267636742948, 0.33767223562347426, 0.2931309575371555, 0.23389694762555593, 0.17865961037369296], [0.0, 0.1, 0.2, 0.3, 0.4, 0.5], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 0.1, 0.1, 0.09999999999999998, 0.10000000000000003, 0.09999999999999998], [0.0, 5.637883763423692, -14.328939092436515, 1.3103464262153468, 0.2719142924066487, 0.0], DataInterpolations.ExtrapolationType.Linear, DataInterpolations.ExtrapolationType.Linear, FindFirstFunctions.Guesser{Vector{Float64}}([0.0, 0.1, 0.2, 0.3, 0.4, 0.5], Base.RefValue{Int64}(1), true), FindFirstFunctions.SearchProperties{Float64}(true, false, false, false, false, 0.0, 0.0), FindFirstFunctions.KIND_LINEAR_SCAN, false)), (method = :magi, chains = MCMC chain (150×6×1 Array{Float64, 3}), state_mean = [0.9866847759340766 0.010543900052408045 -0.7102883376785912; 0.9834426278958378 0.012897710193773778 -0.7059343786170902; … ; 0.12522644006339417 0.19178268491799305 -0.04353597701369357; 0.11811138676898479 0.18073401588600882 -0.02458991695625233], mean_logposterior = -112.5745843075786, converged = false, reason = :maxiters, iterations = 300))
 
 ### Posterior Trajectories
 
@@ -185,20 +185,26 @@ traj_S = zeros(n_traj, length(t_pred_sir))
 traj_I = zeros(n_traj, length(t_pred_sir))
 
 knots_sir = collect(range(0.0, 0.5, length=uf_β.nknots))
+quiet = DEVerbosity(SciMLLogging.None())   # no solver warnings: failed draws are counted instead
 for i in 1:n_traj
     params_i = sample_sir[i, 1:np_sir]
     ev = PartiallySpecifiedModels.build_bspline_evaluator(knots_sir, params_i)
-    try
-        pred = solve(ODEProblem(sir!, [0.99, 0.01, 0.0], (0.0, 40.0), (; β = ev)),
-                     Tsit5(); saveat=t_pred_sir, abstol=1e-8, reltol=1e-8)
+    pred = solve(ODEProblem(sir!, [0.99, 0.01, 0.0], (0.0, 40.0), (; β = ev)),
+                 Tsit5(); saveat=t_pred_sir, abstol=1e-8, reltol=1e-8, verbose=quiet)
+    # a draw whose trajectory cannot be integrated is left out (NaN) and counted below;
+    # any other error is a bug and stops the render
+    if SciMLBase.successful_retcode(pred)
         traj_S[i, :] = [pred.u[k][1] for k in 1:length(pred.u)]
         traj_I[i, :] = [pred.u[k][2] for k in 1:length(pred.u)]
-    catch
+    else
         traj_S[i, :] .= NaN
         traj_I[i, :] .= NaN
     end
 end
+println("$(count(isnan, traj_S[:, 1])) of $(n_traj) posterior draws could not be integrated and are left out")
 ```
+
+    0 of 100 posterior draws could not be integrated and are left out
 
 ``` julia
 nanmed(x) = median(filter(!isnan, x))
@@ -250,26 +256,26 @@ end
 ```
 
     60-element Vector{Float64}:
-     0.35959643589166623
-     0.3503455488630173
-     0.3412386779395428
-     0.33241983922641727
-     0.32417600903158506
-     0.318544581102876
-     0.3133894482657055
-     0.30919798712107033
-     0.3073270338180058
-     0.30849258721093636
+     0.3245749222922434
+     0.320642063378897
+     0.3156937958930904
+     0.311817515539971
+     0.30880696891017967
+     0.3061220254729179
+     0.30595431654170757
+     0.30406561188106856
+     0.3045500048383153
+     0.30731443582150786
      ⋮
-     0.39197773414949255
-     0.4067691489064625
-     0.412563928996333
-     0.4181291791275986
-     0.43519805934782824
-     0.45268124893138845
-     0.46976449875948767
-     0.4870791974391904
-     0.5045096205446946
+     0.36526403855115647
+     0.3746788065497638
+     0.38932926787678057
+     0.40086838249500323
+     0.40780406198738817
+     0.41418381108285096
+     0.420498255012577
+     0.42596584594036857
+     0.43077131131151514
 
 ``` julia
 I_data_max = maximum(data_SI[:, 2])
@@ -350,26 +356,26 @@ prey_matrix = reshape(prey_data, :, 1)
 ```
 
     21×1 Matrix{Float64}:
-     2.022702057596512
-     3.415028879608531
-     4.214258981241622
-     4.584824474235758
-     4.61526706422983
-     4.804230089514967
-     4.786228223852146
-     4.873386494501624
-     4.854908537096776
-     4.82060855501909
+     1.8704759812320613
+     3.392603252751341
+     4.191426554920289
+     4.617582163495093
+     4.772456336278946
+     4.836202164663587
+     4.771290887116561
+     4.920471034537855
+     4.880041046507073
+     4.834511574749956
      ⋮
-     4.821014787264084
-     4.845386063773821
-     4.92833127890875
-     4.951370679010897
-     4.869431009103482
-     4.997746029371269
-     4.945066351193746
-     4.96633826360146
-     5.05081991898532
+     4.889448033063627
+     4.9375772976834975
+     5.035427569730906
+     4.937839746264299
+     4.862289706017904
+     4.976549305442561
+     4.943829782445786
+     4.948065253635994
+     5.04146753621536
 
 ### Plot the Data
 
@@ -417,7 +423,7 @@ sol_lv = solve(prob_lv, MagiSolver(
 
     [ Info: Found initial step size 0.00625
 
-    PSMSolution((g = [1.4979704418451532, 1.3425054452512597, 1.1908140087767105, 1.0438528733824048, 0.8960606039585476, 0.7444663192677281, 0.5837885270778967, 0.41969490895903516]), 57.616231827380346, 0.024150846195478123, 8.0, Float64[], [2.052556898986018; 3.3769422768526405; … ; 4.976552599016855; 5.0024813604592095;;], [2.022702057596512; 3.415028879608531; … ; 4.96633826360146; 5.05081991898532;;], [0.0, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0, 10.5, 12.0, 13.5  …  16.5, 18.0, 19.5, 21.0, 22.5, 24.0, 25.5, 27.0, 28.5, 30.0], Dict{Symbol, Any}(:g => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([1.4979704418451532, 1.3425054452512597, 1.1908140087767105, 1.0438528733824048, 0.8960606039585476, 0.7444663192677281, 0.5837885270778967, 0.41969490895903516], [0.0, 0.7142857142857143, 1.4285714285714286, 2.142857142857143, 2.857142857142857, 3.5714285714285716, 4.285714285714286, 5.0], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 0.7142857142857143, 0.7142857142857143, 0.7142857142857142, 0.7142857142857144, 0.7142857142857144, 0.714285714285714, 0.7142857142857144], [0.0, 0.007806250375272349, 0.013152065502398986, -0.004786171681204729, -0.003781514965106073, -0.024799467997846956, -0.0038426612318867986, 0.0], DataInterpolations.ExtrapolationType.Linear, DataInterpolations.ExtrapolationType.Linear, FindFirstFunctions.Guesser{Vector{Float64}}([0.0, 0.7142857142857143, 1.4285714285714286, 2.142857142857143, 2.857142857142857, 3.5714285714285716, 4.285714285714286, 5.0], Base.RefValue{Int64}(1), true), false, false)), (method = :magi, chains = MCMC chain (150×8×1 Array{Float64, 3}), state_mean = [2.052556898986018 0.530669175520933; 2.740710491856301 0.5358780766419609; … ; 4.988362940784754 0.021249889159111256; 5.0024813604592095 0.013331471961993588], mean_logposterior = -57.616231827380346, converged = false, reason = :maxiters, iterations = 300))
+    PSMSolution((g = [1.7129590880682444, 1.5384940035660235, 1.359012511842996, 1.180352319386026, 0.9977517206511007, 0.8075199720161504, 0.6051317265532498, 0.3952792399902134]), 57.31862856984498, 0.027489526869619245, 8.0, Float64[], [1.9093108203186162; 3.342010434878031; … ; 4.966881921613982; 4.989041632920878;;], [1.8704759812320613; 3.392603252751341; … ; 4.948065253635994; 5.04146753621536;;], [0.0, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0, 10.5, 12.0, 13.5  …  16.5, 18.0, 19.5, 21.0, 22.5, 24.0, 25.5, 27.0, 28.5, 30.0], Dict{Symbol, Any}(:g => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64, FindFirstFunctions.SearchProperties{Float64}}([1.7129590880682444, 1.5384940035660235, 1.359012511842996, 1.180352319386026, 0.9977517206511007, 0.8075199720161504, 0.6051317265532498, 0.3952792399902134], [0.0, 0.7142857142857143, 1.4285714285714286, 2.142857142857143, 2.857142857142857, 3.5714285714285716, 4.285714285714286, 5.0], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 0.7142857142857143, 0.7142857142857143, 0.7142857142857142, 0.7142857142857144, 0.7142857142857144, 0.714285714285714, 0.7142857142857144], [0.0, -0.017095858328613957, 0.009390484397770665, -0.010807599893635996, -0.012499262651976662, -0.028937672322752798, -0.014710450753710273, 0.0], DataInterpolations.ExtrapolationType.Linear, DataInterpolations.ExtrapolationType.Linear, FindFirstFunctions.Guesser{Vector{Float64}}([0.0, 0.7142857142857143, 1.4285714285714286, 2.142857142857143, 2.857142857142857, 3.5714285714285716, 4.285714285714286, 5.0], Base.RefValue{Int64}(1), true), FindFirstFunctions.SearchProperties{Float64}(true, false, false, false, false, 0.0, 0.0), FindFirstFunctions.KIND_LINEAR_SCAN, false)), (method = :magi, chains = MCMC chain (150×8×1 Array{Float64, 3}), state_mean = [1.9093108203186162 0.5216684768428231; 2.6508465501860017 0.5088596125882734; … ; 4.975830100994982 0.051803711348283404; 4.989041632920878 0.04758351590011138], mean_logposterior = -57.31862856984498, converged = false, reason = :maxiters, iterations = 300))
 
 ### Posterior Trajectories
 
@@ -436,17 +442,22 @@ knots_lv = collect(range(0.0, 5.0, length=uf_g.nknots))
 for i in 1:n_traj_lv
     params_i = sample_lv[i, 1:np_lv]
     ev = PartiallySpecifiedModels.build_bspline_evaluator(knots_lv, params_i)
-    try
-        pred = solve(ODEProblem(lv!, [2.0, 1.0], (0.0, 30.0), (; g = ev)),
-                     Tsit5(); saveat=t_pred_lv, abstol=1e-8, reltol=1e-8)
+    pred = solve(ODEProblem(lv!, [2.0, 1.0], (0.0, 30.0), (; g = ev)),
+                 Tsit5(); saveat=t_pred_lv, abstol=1e-8, reltol=1e-8, verbose=quiet)
+    # a draw whose trajectory cannot be integrated is left out (NaN) and counted below;
+    # any other error is a bug and stops the render
+    if SciMLBase.successful_retcode(pred)
         traj_H[i, :] = [pred.u[k][1] for k in 1:length(pred.u)]
         traj_P[i, :] = [pred.u[k][2] for k in 1:length(pred.u)]
-    catch
+    else
         traj_H[i, :] .= NaN
         traj_P[i, :] .= NaN
     end
 end
+println("$(count(isnan, traj_H[:, 1])) of $(n_traj_lv) posterior draws could not be integrated and are left out")
 ```
+
+    43 of 100 posterior draws could not be integrated and are left out
 
 ``` julia
 H_med = [nanmed(traj_H[:, j]) for j in 1:length(t_pred_lv)]
@@ -475,6 +486,12 @@ Figure 6: Posterior trajectories: prey (green) and inferred predator
 (orange)
 
 </div>
+
+Posterior draws whose trajectories diverge (the prey goes negative and
+the solution blows up) are left out, as the count above the figure
+reports. The band therefore describes only the draws that can be
+integrated, and when many diverge it understates the posterior
+uncertainty.
 
 ### Functional Response Recovery
 
@@ -537,11 +554,11 @@ Figure 7: Posterior credible interval for functional response g(H)
 </div>
 
     Posterior mean g(H) vs. true Holling Type II:
-      g(0.5) = 1.0397  [0.0076, 4.2148] (true: 0.1667)
-      g(1.0) = 0.9824  [0.0977, 3.7124] (true: 0.25)
-      g(2.0) = 0.873  [0.251, 2.7868] (true: 0.3333)
-      g(3.0) = 0.797  [0.2961, 1.9477] (true: 0.375)
-      g(4.0) = 0.6361  [0.3431, 1.139] (true: 0.4)
+      g(0.5) = 1.138  [-0.1617, 4.9251] (true: 0.1667)
+      g(1.0) = 1.0642  [-0.0522, 4.3443] (true: 0.25)
+      g(2.0) = 0.9427  [0.1398, 3.3169] (true: 0.3333)
+      g(3.0) = 0.84  [0.2201, 2.3947] (true: 0.375)
+      g(4.0) = 0.6397  [0.2794, 1.3803] (true: 0.4)
 
 Note that in this partially observed example the posterior misses the
 true functional response — the medians sit well above the truth at low
@@ -632,7 +649,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](15_magi_files/figure-commonmark/cell-22-output-1.svg)
 
-    Durbin-Watson: 1.86, 1.731
+    Durbin-Watson: 1.865, 1.738
 
 ## Summary
 
