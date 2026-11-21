@@ -124,19 +124,23 @@ traj_S = zeros(n_traj, length(t_pred_sir))
 traj_I = zeros(n_traj, length(t_pred_sir))
 
 knots_sir = collect(range(0.0, 0.5, length=uf_β.nknots))
+quiet = DEVerbosity(SciMLLogging.None())   # no solver warnings: failed draws are counted instead
 for i in 1:n_traj
     params_i = sample_sir[i, 1:np_sir]
     ev = PartiallySpecifiedModels.build_bspline_evaluator(knots_sir, params_i)
-    try
-        pred = solve(ODEProblem(sir!, [0.99, 0.01, 0.0], (0.0, 40.0), (; β = ev)),
-                     Tsit5(); saveat=t_pred_sir, abstol=1e-8, reltol=1e-8)
+    pred = solve(ODEProblem(sir!, [0.99, 0.01, 0.0], (0.0, 40.0), (; β = ev)),
+                 Tsit5(); saveat=t_pred_sir, abstol=1e-8, reltol=1e-8, verbose=quiet)
+    # a draw whose trajectory cannot be integrated is left out (NaN) and counted below;
+    # any other error is a bug and stops the render
+    if SciMLBase.successful_retcode(pred)
         traj_S[i, :] = [pred.u[k][1] for k in 1:length(pred.u)]
         traj_I[i, :] = [pred.u[k][2] for k in 1:length(pred.u)]
-    catch
+    else
         traj_S[i, :] .= NaN
         traj_I[i, :] .= NaN
     end
 end
+println("$(count(isnan, traj_S[:, 1])) of $(n_traj) posterior draws could not be integrated and are left out")
 ```
 
 ```{julia}
@@ -297,16 +301,19 @@ knots_lv = collect(range(0.0, 5.0, length=uf_g.nknots))
 for i in 1:n_traj_lv
     params_i = sample_lv[i, 1:np_lv]
     ev = PartiallySpecifiedModels.build_bspline_evaluator(knots_lv, params_i)
-    try
-        pred = solve(ODEProblem(lv!, [2.0, 1.0], (0.0, 30.0), (; g = ev)),
-                     Tsit5(); saveat=t_pred_lv, abstol=1e-8, reltol=1e-8)
+    pred = solve(ODEProblem(lv!, [2.0, 1.0], (0.0, 30.0), (; g = ev)),
+                 Tsit5(); saveat=t_pred_lv, abstol=1e-8, reltol=1e-8, verbose=quiet)
+    # a draw whose trajectory cannot be integrated is left out (NaN) and counted below;
+    # any other error is a bug and stops the render
+    if SciMLBase.successful_retcode(pred)
         traj_H[i, :] = [pred.u[k][1] for k in 1:length(pred.u)]
         traj_P[i, :] = [pred.u[k][2] for k in 1:length(pred.u)]
-    catch
+    else
         traj_H[i, :] .= NaN
         traj_P[i, :] .= NaN
     end
 end
+println("$(count(isnan, traj_H[:, 1])) of $(n_traj_lv) posterior draws could not be integrated and are left out")
 ```
 
 ```{julia}
@@ -329,6 +336,10 @@ plot!(p_lv_fit, t_lv_fine, P_fine, color=:darkorange, lw=1, ls=:dash, label="P (
 scatter!(p_lv_fit, t_lv, prey_data, ms=3, color=:forestgreen, alpha=0.5, label="H (data)")
 p_lv_fit
 ```
+
+Posterior draws whose trajectories diverge (the prey goes negative and the solution blows up) are
+left out, as the count above the figure reports. The band therefore describes only the draws that
+can be integrated, and when many diverge it understates the posterior uncertainty.
 
 ### Functional Response Recovery
 

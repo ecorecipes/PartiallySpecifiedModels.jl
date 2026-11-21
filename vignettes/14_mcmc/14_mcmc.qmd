@@ -155,20 +155,25 @@ n_plot = min(n_samp, 200)
 
 t_pred = collect(range(tspan..., length=100))
 trajectories = zeros(n_plot, length(t_pred))
+quiet = DEVerbosity(SciMLLogging.None())   # no solver warnings: failed draws are counted instead
 
 knots_x = collect(range(N_lo, N_hi, length=uf_r.nknots))
 
 for i in 1:n_plot
     params_i = sample_matrix[i, 1:np]
     ev = PartiallySpecifiedModels.build_bspline_evaluator(knots_x, params_i)
-    try
-        pred = solve(ODEProblem(logistic!, [10.0], tspan, (; r = ev)), Tsit5();
-                     saveat=t_pred, abstol=1e-8, reltol=1e-8)
+    pred = solve(ODEProblem(logistic!, [10.0], tspan, (; r = ev)), Tsit5();
+                 saveat=t_pred, abstol=1e-8, reltol=1e-8, verbose=quiet)
+    # a draw whose trajectory cannot be integrated is left out (NaN) and counted below;
+    # any other error is a bug and stops the render
+    if SciMLBase.successful_retcode(pred)
         trajectories[i, :] = [u[1] for u in pred.u]
-    catch
+    else
         trajectories[i, :] .= NaN
     end
 end
+n_failed = count(isnan, trajectories[:, 1])
+println("$(n_failed) of $(n_plot) posterior draws could not be integrated and are left out")
 ```
 
 ```{julia}
@@ -246,31 +251,34 @@ for i in 1:n_samp
     roughness[i] = dot(beta_i, S * beta_i)
 
     ev_i = PartiallySpecifiedModels.build_bspline_evaluator(knots_x, beta_i)
-    try
-        pred_i = solve(ODEProblem(logistic!, [10.0], tspan, (; r = ev_i)), Tsit5();
-                       saveat=collect(t_data), abstol=1e-8, reltol=1e-8)
-        y_base = [pred_i[1, k] for k in 1:length(t_data)]
-
-        # Jacobian via forward finite differences
-        J_i = zeros(length(t_data), np)
-        ε = 1e-5
-        for p_idx in 1:np
-            beta_pert = copy(beta_i)
-            beta_pert[p_idx] += ε
-            ev_pert = PartiallySpecifiedModels.build_bspline_evaluator(knots_x, beta_pert)
-            pred_pert = solve(ODEProblem(logistic!, [10.0], tspan, (; r = ev_pert)), Tsit5();
-                              saveat=collect(t_data), abstol=1e-8, reltol=1e-8)
-            J_i[:, p_idx] = ([pred_pert[1, k] for k in 1:length(t_data)] .- y_base) ./ ε
-        end
-
-        JWJ = J_i' * J_i
-        H_i = JWJ + λ_eff * S
-        edf_posterior[i] = tr(H_i \ JWJ)
-    catch
+    pred_i = solve(ODEProblem(logistic!, [10.0], tspan, (; r = ev_i)), Tsit5();
+                   saveat=collect(t_data), abstol=1e-8, reltol=1e-8, verbose=quiet)
+    # a draw whose trajectory cannot be integrated has no EDF (NaN, counted below); any other
+    # error is a bug and stops the render
+    if !SciMLBase.successful_retcode(pred_i)
         edf_posterior[i] = NaN
+        continue
     end
+    y_base = [pred_i[1, k] for k in 1:length(t_data)]
+
+    # Jacobian via forward finite differences
+    J_i = zeros(length(t_data), np)
+    ε = 1e-5
+    for p_idx in 1:np
+        beta_pert = copy(beta_i)
+        beta_pert[p_idx] += ε
+        ev_pert = PartiallySpecifiedModels.build_bspline_evaluator(knots_x, beta_pert)
+        pred_pert = solve(ODEProblem(logistic!, [10.0], tspan, (; r = ev_pert)), Tsit5();
+                          saveat=collect(t_data), abstol=1e-8, reltol=1e-8, verbose=quiet)
+        J_i[:, p_idx] = ([pred_pert[1, k] for k in 1:length(t_data)] .- y_base) ./ ε
+    end
+
+    JWJ = J_i' * J_i
+    H_i = JWJ + λ_eff * S
+    edf_posterior[i] = tr(H_i \ JWJ)
 end
-edf_valid = filter(!isnan, edf_posterior)
+edf_valid = filter(isfinite, edf_posterior)
+println("$(n_samp - length(edf_valid)) of $(n_samp) posterior draws have no EDF (integration failed)")
 ```
 
 ```{julia}

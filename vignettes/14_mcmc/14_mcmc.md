@@ -1,6 +1,6 @@
 # Bayesian Inference with MCMCSolver
 Simon Frost
-2026-09-04
+2026-11-21
 
 - [Overview](#overview)
 - [Example: Logistic Growth with Unknown Carrying
@@ -138,7 +138,7 @@ prob = PSMProblem(logistic!, [10.0], tspan, [uf_r];
     likelihood=PartiallySpecifiedModels.Gaussian())
 ```
 
-    PSMProblem{typeof(logistic!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(logistic!, [10.0], (0.0, 20.0), BSplineApproximator[BSplineApproximator(:r, (5.0, 110.0), 12, PartiallySpecifiedModels.var"#6#7"{Float64}(0.3))], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  15.5, 16.0, 16.5, 17.0, 17.5, 18.0, 18.5, 19.0, 19.5, 20.0], [8.909927555644668; 13.240842524024732; … ; 97.31083844618732; 99.33886943440814;;], [1.0; 1.0; … ; 1.0; 1.0;;], [1], NamedTuple(), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false, Float64[], nothing)
+    PSMProblem{typeof(logistic!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), FastBroadcast.Serial}}(logistic!, [10.0], (0.0, 20.0), BSplineApproximator[BSplineApproximator(:r, (5.0, 110.0), 12, PartiallySpecifiedModels.var"#6#7"{Float64}(0.3))], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  15.5, 16.0, 16.5, 17.0, 17.5, 18.0, 18.5, 19.0, 19.5, 20.0], [8.909927555644668; 13.240842524024732; … ; 97.31083844618732; 99.33886943440814;;], [1.0; 1.0; … ; 1.0; 1.0;;], [1], NamedTuple(), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), FastBroadcast.Serial}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, FastBroadcast.Serial()), Dict{Symbol, Any}(), false, Float64[], nothing)
 
 ### Step 1: Run LAML to Calibrate Smoothing
 
@@ -153,7 +153,7 @@ println("LAML smoothing parameter: λ = $(round(λ_laml, digits=4))")
 println("LAML effective degrees of freedom: EDF = $(round(edf_laml, digits=2))")
 ```
 
-    LAML smoothing parameter: λ = 2.57324221537e7
+    LAML smoothing parameter: λ = 2.62046945033e7
     LAML effective degrees of freedom: EDF = 2.0
 
 ### Why Smoothing Matters for MCMC
@@ -188,7 +188,7 @@ sol = solve(prob, MCMCSolver(
     verbose=false))
 ```
 
-    PSMSolution((r = [0.00997246136781523, 0.0087439984159119, 0.007542375903582127, 0.006372341379794244, 0.005214941464631835, 0.004057934814135894, 0.0029051163876757263, 0.001781870013770156, 0.0006243746930021479, -0.0005277787070219048, -0.0016953425948657045, -0.0028355774290577942]), 2568.794465563477, 215667.25988196032, 12.0, [6.601048255426268], [10.0; 10.046728910201363; … ; 11.965868256224047; 12.020261108404647;;], [8.909927555644668; 13.240842524024732; … ; 97.31083844618732; 99.33886943440814;;], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  15.5, 16.0, 16.5, 17.0, 17.5, 18.0, 18.5, 19.0, 19.5, 20.0], Dict{Symbol, Any}(:r => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64}([0.00997246136781523, 0.0087439984159119, 0.007542375903582127, 0.006372341379794244, 0.005214941464631835, 0.004057934814135894, 0.0029051163876757263, 0.001781870013770156, 0.0006243746930021479, -0.0005277787070219048, -0.0016953425948657045, -0.0028355774290577942], [5.0, 14.545454545454545, 24.09090909090909, 33.63636363636363, 43.18181818181818, 52.72727272727273, 62.27272727272727, 71.81818181818181, 81.36363636363636, 90.9090909090909, 100.45454545454545, 110.0], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 9.545454545454545, 9.545454545454545, 9.545454545454543, 9.545454545454547, 9.545454545454547, 9.545454545454547, 9.54545454545454, 9.545454545454547, 9.545454545454547, 9.545454545454547, 9.545454545454547], [0.0, 3.39533519617155e-7, 4.09317996851348e-7, 1.0327428267464272e-7, 9.578147923501055e-9, -1.1569026231818112e-7, 7.289788786708437e-7, -8.52895533123714e-7, 4.2729845363086487e-7, -5.045309834304324e-7, 5.760396154980055e-7, 0.0], DataInterpolations.ExtrapolationType.Linear, DataInterpolations.ExtrapolationType.Linear, FindFirstFunctions.Guesser{Vector{Float64}}([5.0, 14.545454545454545, 24.09090909090909, 33.63636363636363, 43.18181818181818, 52.72727272727273, 62.27272727272727, 71.81818181818181, 81.36363636363636, 90.9090909090909, 100.45454545454545, 110.0], Base.RefValue{Int64}(1), true), false, false)), MCMC chain (1000×13×1 Array{Float64, 3}))
+    PSMSolution((r = [0.2006037123815534, 0.178096878348609, 0.1555911843891486, 0.13308343542854822, 0.1105592783400006, 0.08805342904442902, 0.06557178150373957, 0.043118316062714886, 0.020717542814346374, -0.0016636686964536982, -0.02402810998101525, -0.04638844528504376]), 20757.610880103734, 48893.38372290153, 12.0, [3.519427758170875], [10.0; 10.983786757549021; … ; 79.93099939700886; 80.85468049897536;;], [8.909927555644668; 13.240842524024732; … ; 97.31083844618732; 99.33886943440814;;], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  15.5, 16.0, 16.5, 17.0, 17.5, 18.0, 18.5, 19.0, 19.5, 20.0], Dict{Symbol, Any}(:r => DataInterpolations.CubicSpline{Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Vector{Float64}, Float64, FindFirstFunctions.SearchProperties{Float64}}([0.2006037123815534, 0.178096878348609, 0.1555911843891486, 0.13308343542854822, 0.1105592783400006, 0.08805342904442902, 0.06557178150373957, 0.043118316062714886, 0.020717542814346374, -0.0016636686964536982, -0.02402810998101525, -0.04638844528504376], [5.0, 14.545454545454545, 24.09090909090909, 33.63636363636363, 43.18181818181818, 52.72727272727273, 62.27272727272727, 71.81818181818181, 81.36363636363636, 90.9090909090909, 100.45454545454545, 110.0], Float64[], DataInterpolations.CubicSplineParameterCache{Vector{Float64}}(Float64[], Float64[]), [0.0, 9.545454545454545, 9.545454545454545, 9.545454545454543, 9.545454545454547, 9.545454545454547, 9.545454545454547, 9.54545454545454, 9.545454545454547, 9.545454545454547, 9.545454545454547, 9.545454545454547], [0.0, 4.6627882353158315e-9, 5.642307376066346e-8, -3.6567760732581507e-7, 3.2580654922026494e-7, 2.6802580505852815e-7, 1.9578402142329492e-7, 8.046389579197434e-7, 5.5458955822286856e-8, 2.6167229132518763e-7, 2.1769808419397117e-9, 0.0], DataInterpolations.ExtrapolationType.Linear, DataInterpolations.ExtrapolationType.Linear, FindFirstFunctions.Guesser{Vector{Float64}}([5.0, 14.545454545454545, 24.09090909090909, 33.63636363636363, 43.18181818181818, 52.72727272727273, 62.27272727272727, 71.81818181818181, 81.36363636363636, 90.9090909090909, 100.45454545454545, 110.0], Base.RefValue{Int64}(1), true), FindFirstFunctions.SearchProperties{Float64}(true, true, false, false, true, 5.0, 0.10476190476190476), FindFirstFunctions.KIND_UNIFORM_STEP, false)), MCMC chain (1000×13×1 Array{Float64, 3}))
 
 ### Posterior Trajectory Predictions
 
@@ -204,21 +204,28 @@ n_plot = min(n_samp, 200)
 
 t_pred = collect(range(tspan..., length=100))
 trajectories = zeros(n_plot, length(t_pred))
+quiet = DEVerbosity(SciMLLogging.None())   # no solver warnings: failed draws are counted instead
 
 knots_x = collect(range(N_lo, N_hi, length=uf_r.nknots))
 
 for i in 1:n_plot
     params_i = sample_matrix[i, 1:np]
     ev = PartiallySpecifiedModels.build_bspline_evaluator(knots_x, params_i)
-    try
-        pred = solve(ODEProblem(logistic!, [10.0], tspan, (; r = ev)), Tsit5();
-                     saveat=t_pred, abstol=1e-8, reltol=1e-8)
+    pred = solve(ODEProblem(logistic!, [10.0], tspan, (; r = ev)), Tsit5();
+                 saveat=t_pred, abstol=1e-8, reltol=1e-8, verbose=quiet)
+    # a draw whose trajectory cannot be integrated is left out (NaN) and counted below;
+    # any other error is a bug and stops the render
+    if SciMLBase.successful_retcode(pred)
         trajectories[i, :] = [u[1] for u in pred.u]
-    catch
+    else
         trajectories[i, :] .= NaN
     end
 end
+n_failed = count(isnan, trajectories[:, 1])
+println("$(n_failed) of $(n_plot) posterior draws could not be integrated and are left out")
 ```
+
+    0 of 200 posterior draws could not be integrated and are left out
 
 ``` julia
 p_traj = plot(xlabel="Time", ylabel="Population N",
@@ -334,54 +341,37 @@ for i in 1:n_samp
     roughness[i] = dot(beta_i, S * beta_i)
 
     ev_i = PartiallySpecifiedModels.build_bspline_evaluator(knots_x, beta_i)
-    try
-        pred_i = solve(ODEProblem(logistic!, [10.0], tspan, (; r = ev_i)), Tsit5();
-                       saveat=collect(t_data), abstol=1e-8, reltol=1e-8)
-        y_base = [pred_i[1, k] for k in 1:length(t_data)]
-
-        # Jacobian via forward finite differences
-        J_i = zeros(length(t_data), np)
-        ε = 1e-5
-        for p_idx in 1:np
-            beta_pert = copy(beta_i)
-            beta_pert[p_idx] += ε
-            ev_pert = PartiallySpecifiedModels.build_bspline_evaluator(knots_x, beta_pert)
-            pred_pert = solve(ODEProblem(logistic!, [10.0], tspan, (; r = ev_pert)), Tsit5();
-                              saveat=collect(t_data), abstol=1e-8, reltol=1e-8)
-            J_i[:, p_idx] = ([pred_pert[1, k] for k in 1:length(t_data)] .- y_base) ./ ε
-        end
-
-        JWJ = J_i' * J_i
-        H_i = JWJ + λ_eff * S
-        edf_posterior[i] = tr(H_i \ JWJ)
-    catch
+    pred_i = solve(ODEProblem(logistic!, [10.0], tspan, (; r = ev_i)), Tsit5();
+                   saveat=collect(t_data), abstol=1e-8, reltol=1e-8, verbose=quiet)
+    # a draw whose trajectory cannot be integrated has no EDF (NaN, counted below); any other
+    # error is a bug and stops the render
+    if !SciMLBase.successful_retcode(pred_i)
         edf_posterior[i] = NaN
+        continue
     end
+    y_base = [pred_i[1, k] for k in 1:length(t_data)]
+
+    # Jacobian via forward finite differences
+    J_i = zeros(length(t_data), np)
+    ε = 1e-5
+    for p_idx in 1:np
+        beta_pert = copy(beta_i)
+        beta_pert[p_idx] += ε
+        ev_pert = PartiallySpecifiedModels.build_bspline_evaluator(knots_x, beta_pert)
+        pred_pert = solve(ODEProblem(logistic!, [10.0], tspan, (; r = ev_pert)), Tsit5();
+                          saveat=collect(t_data), abstol=1e-8, reltol=1e-8, verbose=quiet)
+        J_i[:, p_idx] = ([pred_pert[1, k] for k in 1:length(t_data)] .- y_base) ./ ε
+    end
+
+    JWJ = J_i' * J_i
+    H_i = JWJ + λ_eff * S
+    edf_posterior[i] = tr(H_i \ JWJ)
 end
-edf_valid = filter(!isnan, edf_posterior)
+edf_valid = filter(isfinite, edf_posterior)
+println("$(n_samp - length(edf_valid)) of $(n_samp) posterior draws have no EDF (integration failed)")
 ```
 
-    1000-element Vector{Float64}:
-     2.000202981594369
-     2.0002036410918946
-     2.000203582786047
-     2.0002035576637764
-     2.000203155809783
-     2.000203089735372
-     2.000202928278206
-     2.0002033006065894
-     2.000202321135682
-     2.000202221480372
-     ⋮
-     2.00009768751402
-     2.000062576983788
-     2.0000575023013165
-     2.0000943714134563
-     1.9999855378827338
-     1.9999529071193263
-     2.0000000239155233
-     1.9999132079865987
-     2.0000207079240124
+    0 of 1000 posterior draws have no EDF (integration failed)
 
 ``` julia
 p_edf = histogram(edf_valid, bins=30, normalize=:pdf, alpha=0.6, color=:dodgerblue,
@@ -462,11 +452,11 @@ Figure 6: Trace plots for selected B-spline coefficients
 #### Numerical Summary
 
     Posterior r(N) at selected points:
-      r(10): median=0.2169 [0.0099, 0.3344] (true: 0.45)
-      r(25): median=0.1834 [0.0078, 0.3015] (true: 0.375)
-      r(50): median=0.1255 [0.0042, 0.2444] (true: 0.25)
-      r(75): median=0.0676 [-0.0003, 0.1869] (true: 0.125)
-      r(100): median=0.0127 [-0.0107, 0.132] (true: 0.0)
+      r(10): median=0.2725 [0.1952, 0.3319] (true: 0.45)
+      r(25): median=0.2223 [0.1591, 0.2802] (true: 0.375)
+      r(50): median=0.1355 [0.0968, 0.1906] (true: 0.25)
+      r(75): median=0.0488 [0.0351, 0.1009] (true: 0.125)
+      r(100): median=-0.0297 [-0.0372, 0.0159] (true: 0.0)
 
 ### Comparison with LAML
 
@@ -476,26 +466,26 @@ r_laml_vals = [r_laml(N) for N in N_range]
 ```
 
     80-element Vector{Float64}:
-      0.46591988809169416
-      0.4594898611794377
-      0.4530598342665788
-      0.44662980735251495
-      0.4401997804366437
-      0.43376975351836256
-      0.42733972659706915
-      0.4209096996721609
-      0.41447967274234865
-      0.4080496458015535
+      0.46591893067925183
+      0.4594889209569739
+      0.45305891123406106
+      0.4466289015098782
+      0.44019889178379035
+      0.4337688820551624
+      0.42733887232335954
+      0.42090886258774657
+      0.41447885284696473
+      0.4080488430946069
       ⋮
-      0.009387389568488357
-      0.0029573414586758686
-     -0.0034727067617698467
-     -0.009902755076195185
-     -0.016332803468936875
-     -0.022762851924331712
-     -0.029192900426716295
-     -0.03562294896042742
-     -0.042052997509801814
+      0.009387620878290783
+      0.0029575888149123066
+     -0.00347244336464058
+     -0.009902475642867205
+     -0.016332508003321953
+     -0.022762540429559254
+     -0.029192572905133364
+     -0.03562260541359872
+     -0.04205263793850969
 
 ``` julia
 p_comp = plot(collect(N_range), r_median, ribbon=(r_median .- r_lower, r_upper .- r_median),
@@ -579,7 +569,7 @@ plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 
 ![](14_mcmc_files/figure-commonmark/cell-21-output-1.svg)
 
-    Durbin-Watson: 0.004
+    Durbin-Watson: 0.012
 
 > [!TIP]
 >
