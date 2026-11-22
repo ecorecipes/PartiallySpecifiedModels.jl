@@ -42,6 +42,7 @@ COMONET_CONSTRAINTS
 Detailed documentation for each solver is on the [Solvers](solvers.md) page.
 
 - [`LAML`](@ref)
+- [`MultiStart`](@ref) (wraps `LAML`)
 - [`GCVSolver`](@ref)
 - [`CollocationLAML`](@ref)
 - [`GradientMatching`](@ref)

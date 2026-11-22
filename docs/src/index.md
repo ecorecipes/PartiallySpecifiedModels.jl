@@ -83,6 +83,7 @@ end
 | Solver | Method | ODE-free? | Bayesian? | Reference |
 |--------|--------|:---------:|:---------:|-----------|
 | [`LAML`](@ref) | Penalized IRLS + LAML smoothing | No | No | Wood et al. (2016) |
+| [`MultiStart`](@ref) | Best of several `LAML` fits from re-seeded random initializations | No | No | — |
 | [`GCVSolver`](@ref) | Penalized IRLS + GCV smoothing | No | No | Wood (2001) |
 | [`CollocationLAML`](@ref) | Generalized profiling | No | No | Ramsay et al. (2007) |
 | [`GradientMatching`](@ref) | Smooth then match derivatives | Yes | No | — |
