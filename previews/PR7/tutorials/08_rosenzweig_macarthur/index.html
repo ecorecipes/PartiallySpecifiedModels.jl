@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><meta name="referrer" content="no-referrer"/><title>Recovering Functional Responses: The Rosenzweig-MacArthur Model · PartiallySpecifiedModels.jl</title><meta name="title" content="Recovering Functional Responses: The Rosenzweig-MacArthur Model · PartiallySpecifiedModels.jl"/><meta property="og:title" content="Recovering Functional Responses: The Rosenzweig-MacArthur Model · PartiallySpecifiedModels.jl"/><meta property="twitter:title" content="Recovering Functional Responses: The Rosenzweig-MacArthur Model · PartiallySpecifiedModels.jl"/><meta name="description" content="Documentation for PartiallySpecifiedModels.jl."/><meta property="og:description" content="Documentation for PartiallySpecifiedModels.jl."/><meta property="twitter:description" content="Documentation for PartiallySpecifiedModels.jl."/><meta property="og:url" content="https://ecorecipes.github.io/PartiallySpecifiedModels.jl/stable/tutorials/08_rosenzweig_macarthur/"/><meta property="twitter:url" content="https://ecorecipes.github.io/PartiallySpecifiedModels.jl/stable/tutorials/08_rosenzweig_macarthur/"/><link rel="canonical" href="https://ecorecipes.github.io/PartiallySpecifiedModels.jl/stable/tutorials/08_rosenzweig_macarthur/"/><script data-outdated-warner src="../../assets/warner.js"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/lato-font/3.0.0/css/lato-font.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.63.2/juliamono.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/fontawesome.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/solid.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/brands.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.8/katex.min.css" rel="stylesheet" type="text/css"/><script>documenterBaseURL="../.."</script><script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js" data-main="../../assets/documenter.js"></script><script src="../../search_index.js"></script><script src="../../siteinfo.js"></script><script src="../../../versions.js"></script><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-mocha.css" data-theme-name="catppuccin-mocha"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-macchiato.css" data-theme-name="catppuccin-macchiato"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-frappe.css" data-theme-name="catppuccin-frappe"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-latte.css" data-theme-name="catppuccin-latte"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/documenter-dark.css" data-theme-name="documenter-dark" data-theme-primary-dark/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/documenter-light.css" data-theme-name="documenter-light" data-theme-primary/><script src="../../assets/themeswap.js"></script></head><body><div id="documenter"><nav class="docs-sidebar"><div class="docs-package-name"><span class="docs-autofit"><a href="../../">PartiallySpecifiedModels.jl</a></span></div><button class="docs-search-query input is-rounded is-small is-clickable my-2 mx-auto py-1 px-2" id="documenter-search-query">Search docs (Ctrl + /)</button><ul class="docs-menu"><li><a class="tocitem" href="../../">Home</a></li><li><a class="tocitem" href="../../getting_started/">Getting Started</a></li><li><a class="tocitem" href="../../approximators/">Approximators</a></li><li><a class="tocitem" href="../../extending/">Custom Approximators</a></li><li><a class="tocitem" href="../../solvers/">Solvers</a></li><li><span class="tocitem">Vignettes</span><ul><li><a class="tocitem" href="../../vignettes/">Overview</a></li><li><a class="tocitem" href="../01_getting_started/">Getting Started with PartiallySpecifiedModels.jl</a></li><li><a class="tocitem" href="../02_likelihoods/">Likelihood Families</a></li><li><a class="tocitem" href="../03_lotka_volterra/">Lotka–Volterra Predator–Prey with Real Data</a></li><li><a class="tocitem" href="../04_copepod/">Copepod Stage-Structured Population Model</a></li><li><a class="tocitem" href="../05_neural_networks/">Alternative Approximators: Neural Networks and Gaussian Processes</a></li><li><a class="tocitem" href="../06_solver_comparison/">Solver Comparison: Eleven Methods on One Problem</a></li><li><a class="tocitem" href="../07_probabilistic_fitting/">Probabilistic ODE Fitting with RodeoSolver</a></li><li class="is-active"><a class="tocitem" href>Recovering Functional Responses: The Rosenzweig-MacArthur Model</a><ul class="internal"><li><a class="tocitem" href="#Overview"><span>Overview</span></a></li><li><a class="tocitem" href="#Setup"><span>Setup</span></a></li><li><a class="tocitem" href="#The-Consumer–Resource-Model"><span>The Consumer–Resource Model</span></a></li><li><a class="tocitem" href="#Define-the-PSM"><span>Define the PSM</span></a></li><li><a class="tocitem" href="#Fit-with-LAML"><span>Fit with LAML</span></a></li><li><a class="tocitem" href="#Comparison-Across-Solvers"><span>Comparison Across Solvers</span></a></li><li><a class="tocitem" href="#Ecological-Interpretation"><span>Ecological Interpretation</span></a></li><li><a class="tocitem" href="#Diagnostic-Plots"><span>Diagnostic Plots</span></a></li><li><a class="tocitem" href="#Phase-Portrait"><span>Phase Portrait</span></a></li></ul></li><li><a class="tocitem" href="../09_gradient_matching/">Integration-Free Inference with Gradient Matching</a></li><li><a class="tocitem" href="../10_chemostat/">Chemostat Dynamics: Recovering Microbial Growth Kinetics</a></li><li><a class="tocitem" href="../11_count_data_sir/">Epidemiological Count Data: Non-Gaussian Likelihoods</a></li><li><a class="tocitem" href="../12_discrete_time/">Discrete-Time Population Models</a></li><li><a class="tocitem" href="../13_shape_constraints/">Shape-Constrained Approximators</a></li><li><a class="tocitem" href="../14_mcmc/">Bayesian Inference with MCMCSolver</a></li><li><a class="tocitem" href="../15_magi/">MAGI: Manifold-Constrained Gaussian Process Inference</a></li><li><a class="tocitem" href="../16_comonet/">COMONet: Shape-Constrained Neural Network Approximators</a></li><li><a class="tocitem" href="../17_bng/">Fast Gradient Matching with BNGSolver</a></li><li><a class="tocitem" href="../18_dalton/">Probabilistic ODE Solving with DaltonSolver</a></li><li><a class="tocitem" href="../19_pseudo_marginal/">Bayesian Inference with PseudoMarginalSolver</a></li><li><a class="tocitem" href="../20_dde/">Delay Differential Equations</a></li><li><a class="tocitem" href="../21_gcv/">GCV Smoothing Parameter Selection</a></li><li><a class="tocitem" href="../22_two_stage/">Two-Stage Smooth-Then-Differentiate</a></li><li><a class="tocitem" href="../23_derivative_free/">Derivative-Free Optimization</a></li><li><a class="tocitem" href="../24_variational/">Variational Inference for PSMs</a></li><li><a class="tocitem" href="../25_abc/">Likelihood-Free Inference with ABC-SMC</a></li><li><a class="tocitem" href="../26_spde/">Matérn SPDE Approximator</a></li><li><a class="tocitem" href="../27_predator_prey/">Predator-Prey Functional Response with Confidence Intervals</a></li><li><a class="tocitem" href="../28_fisheries/">Fisheries Stock-Recruitment with Poisson Counts</a></li><li><a class="tocitem" href="../29_bootstrap/">Bootstrap Confidence Intervals</a></li><li><a class="tocitem" href="../30_model_selection/">Model Selection with Marginal Likelihood</a></li><li><a class="tocitem" href="../31_integral_matching/">Integral Matching: Noise-Robust Integration-Free Estimation</a></li><li><a class="tocitem" href="../32_profile_likelihood/">Profile Likelihood for Identifiability Analysis</a></li><li><a class="tocitem" href="../33_ensemble_kalman/">Ensemble Kalman Inversion: Derivative-Free Estimation</a></li><li><a class="tocitem" href="../34_odin/">ODIN: ODE-Informed Gaussian Process Regression</a></li><li><a class="tocitem" href="../35_rkhs/">RKHS: Reproducing Kernel Hilbert Space Estimation</a></li><li><a class="tocitem" href="../36_tensor_smooths/">Bivariate Interaction Surfaces</a></li><li><a class="tocitem" href="../37_single_index/">Single-Index Responses</a></li><li><a class="tocitem" href="../38_transformed_covariates/">Transformed Environmental Covariates</a></li><li><a class="tocitem" href="../39_shape_constrained_gp/">Shape-Constrained Gaussian Processes</a></li><li><a class="tocitem" href="../40_fgpgm/">Fast Gaussian Process Gradient Matching</a></li><li><a class="tocitem" href="../41_kan/">Kolmogorov-Arnold Networks as Functional Responses</a></li><li><a class="tocitem" href="../42_resilience/">Resilience of a Fitted Equilibrium</a></li></ul></li><li><a class="tocitem" href="../../api/">API Reference</a></li></ul><div class="docs-version-selector field has-addons"><div class="control"><span class="docs-label button is-static is-size-7">Version</span></div><div class="docs-selector control is-expanded"><div class="select is-fullwidth is-size-7"><select id="documenter-version-selector"></select></div></div></div></nav><div class="docs-main"><header class="docs-navbar"><a class="docs-sidebar-button docs-navbar-link fa-solid fa-bars is-hidden-desktop" id="documenter-sidebar-button" href="#"></a><nav class="breadcrumb"><ul class="is-hidden-mobile"><li><a class="is-disabled">Vignettes</a></li><li class="is-active"><a href>Recovering Functional Responses: The Rosenzweig-MacArthur Model</a></li></ul><ul class="is-hidden-tablet"><li class="is-active"><a href>Recovering Functional Responses: The Rosenzweig-MacArthur Model</a></li></ul></nav><div class="docs-right"><a class="docs-navbar-link" href="https://github.com/ecorecipes/PartiallySpecifiedModels.jl" title="View the repository on GitHub"><span class="docs-icon fa-brands"></span><span class="docs-label is-hidden-touch">GitHub</span></a><a class="docs-navbar-link" href="https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/docs/src/tutorials/08_rosenzweig_macarthur.md#" title="Edit source on GitHub"><span class="docs-icon fa-solid"></span></a><a class="docs-settings-button docs-navbar-link fa-solid fa-gear" id="documenter-settings-button" href="#" title="Settings"></a><a class="docs-article-toggle-button fa-solid fa-chevron-up" id="documenter-article-toggle-button" href="javascript:;" title="Collapse all docstrings"></a></div></header><article class="content" id="documenter-page"><h1 id="Recovering-Functional-Responses:-The-Rosenzweig-MacArthur-Model"><a class="docs-heading-anchor" href="#Recovering-Functional-Responses:-The-Rosenzweig-MacArthur-Model">Recovering Functional Responses: The Rosenzweig-MacArthur Model</a><a id="Recovering-Functional-Responses:-The-Rosenzweig-MacArthur-Model-1"></a><a class="docs-heading-anchor-permalink" href="#Recovering-Functional-Responses:-The-Rosenzweig-MacArthur-Model" title="Permalink"></a></h1><h2 id="Overview"><a class="docs-heading-anchor" href="#Overview">Overview</a><a id="Overview-1"></a><a class="docs-heading-anchor-permalink" href="#Overview" title="Permalink"></a></h2><p>A central question in ecology is: <strong>what is the functional form of predator–prey interactions?</strong> The <strong>functional response</strong> — how per-capita prey consumption varies with prey density — determines the stability, oscillations, and persistence of ecological communities. Classical forms include:</p><ul><li><strong>Type I</strong> (linear): <span>$f(R) = aR$</span></li><li><strong>Type II</strong> (saturating): <span>$f(R) = \frac{aR}{1 + ahR}$</span> (Holling disc equation)</li><li><strong>Type III</strong> (sigmoidal): <span>$f(R) = \frac{aR^2}{1 + ahR^2}$</span></li></ul><p>In practice, the true functional form is rarely known. <strong>Partially specified models</strong> let us estimate <span>$f(R)$</span> nonparametrically from population time series data, without assuming a specific mathematical form.</p><p>This vignette demonstrates how to recover a saturating functional response from a two-species consumer–resource system using <code>PartiallySpecifiedModels.jl</code>.</p><h2 id="Setup"><a class="docs-heading-anchor" href="#Setup">Setup</a><a id="Setup-1"></a><a class="docs-heading-anchor-permalink" href="#Setup" title="Permalink"></a></h2><pre><code class="language-julia hljs">using PartiallySpecifiedModels
+using PartiallySpecifiedModels: solve
+using OrdinaryDiffEq
+using Plots
+using Random
+Random.seed!(42)</code></pre><pre><code class="nohighlight hljs">TaskLocalRNG()</code></pre><h2 id="The-Consumer–Resource-Model"><a class="docs-heading-anchor" href="#The-Consumer–Resource-Model">The Consumer–Resource Model</a><a id="The-Consumer–Resource-Model-1"></a><a class="docs-heading-anchor-permalink" href="#The-Consumer–Resource-Model" title="Permalink"></a></h2><p>Consider a consumer (<span>$C$</span>) feeding on a resource (<span>$R$</span>) with continuous replenishment (e.g., a chemostat or open ecosystem):</p><p class="math-container">\[\begin{aligned}
+\frac{dR}{dt} &amp;= a(R_0 - R) - f(R) \cdot C \\
+\frac{dC}{dt} &amp;= \varepsilon \cdot f(R) \cdot C - d \cdot C
+\end{aligned}\]</p><p>where:</p><ul><li><p class="math-container">\[a\]</p>= resource turnover rate</li><li><p class="math-container">\[R_0\]</p>= resource supply concentration</li><li><p class="math-container">\[f(R)\]</p>= <strong>functional response</strong> (unknown)</li><li><p class="math-container">\[\varepsilon\]</p>= conversion efficiency</li><li><p class="math-container">\[d\]</p>= consumer death rate</li></ul><p>The true functional response is <strong>Holling Type II</strong>: <span>$f(R) = \frac{v_{\max} R}{K_m + R} = \frac{2R}{5 + R}$</span>.</p><h3 id="Visualise-the-true-functional-response"><a class="docs-heading-anchor" href="#Visualise-the-true-functional-response">Visualise the true functional response</a><a id="Visualise-the-true-functional-response-1"></a><a class="docs-heading-anchor-permalink" href="#Visualise-the-true-functional-response" title="Permalink"></a></h3><pre><code class="language-julia hljs">R_grid = range(0, 25, length=200)
+f_true = [2.0 * R / (5.0 + R) for R in R_grid]
+
+plot(R_grid, f_true, lw=3, color=:black,
+     xlabel=&quot;Resource density R&quot;, ylabel=&quot;Per-capita consumption f(R)&quot;,
+     title=&quot;True functional response (Holling Type II)&quot;,
+     label=&quot;f(R) = 2R/(5+R)&quot;, legend=:bottomright)
+hline!([2.0], ls=:dot, color=:gray, label=&quot;vmax = 2.0&quot;)
+vline!([5.0], ls=:dot, color=:gray, label=&quot;Km = 5.0&quot;)</code></pre><p><img src="../08_rosenzweig_macarthur_files/figure-commonmark/cell-3-output-1.svg" alt/></p><h3 id="Generate-data"><a class="docs-heading-anchor" href="#Generate-data">Generate data</a><a id="Generate-data-1"></a><a class="docs-heading-anchor-permalink" href="#Generate-data" title="Permalink"></a></h3><pre><code class="language-julia hljs">function cr_true!(du, u, p, t)
+    R, C = u
+    f = 2.0 * R / (5.0 + R)
+    du[1] = 0.5 * (20.0 - R) - f * C
+    du[2] = 0.4 * f * C - 0.3 * C
+end
+
+u0 = [20.0, 2.0]
+tspan = (0.0, 30.0)
+prob_ode = ODEProblem(cr_true!, u0, tspan)
+sol_ode = OrdinaryDiffEq.solve(prob_ode, Tsit5(), saveat=0.5)
+
+data_t = sol_ode.t
+σ_R, σ_C = 0.5, 0.3
+data = max.(hcat(sol_ode[1,:], sol_ode[2,:]) .+
+            hcat(σ_R .* randn(length(data_t)), σ_C .* randn(length(data_t))), 0.01)
+
+p1 = plot(sol_ode.t, sol_ode[1,:], label=&quot;True R&quot;, lw=2, color=:green, ls=:dash)
+scatter!(p1, data_t, data[:, 1], label=&quot;R (obs)&quot;, ms=3, alpha=0.6, color=:green)
+p2 = plot(sol_ode.t, sol_ode[2,:], label=&quot;True C&quot;, lw=2, color=:orange, ls=:dash)
+scatter!(p2, data_t, data[:, 2], label=&quot;C (obs)&quot;, ms=3, alpha=0.6, color=:orange)
+plot(p1, p2, layout=(1, 2), size=(800, 350),
+     xlabel=&quot;Time&quot;, ylabel=&quot;Density&quot;, title=[&quot;Resource&quot; &quot;Consumer&quot;])</code></pre><p><img src="../08_rosenzweig_macarthur_files/figure-commonmark/cell-4-output-1.svg" alt/></p><h2 id="Define-the-PSM"><a class="docs-heading-anchor" href="#Define-the-PSM">Define the PSM</a><a id="Define-the-PSM-1"></a><a class="docs-heading-anchor-permalink" href="#Define-the-PSM" title="Permalink"></a></h2><p>The functional response <span>$f(R)$</span> is left unspecified and modelled with a B-spline:</p><pre><code class="language-julia hljs">function consumer_resource!(du, u, p, t)
+    R, C = u
+    fR = p.f(max(R, 0.01))
+    du[1] = 0.5 * (20.0 - R) - max(fR, 0.0) * C
+    du[2] = 0.4 * max(fR, 0.0) * C - 0.3 * C
+end
+
+approx_f = BSplineApproximator(:f, (0.0, 22.0), 8; initial=1.0)
+
+prob = PSMProblem(consumer_resource!, u0, tspan, [approx_f];
+    data_times=data_t, data_values=data,
+    obs_to_state=[1, 2],
+    known_params=(a=0.5, R0=20.0, ε=0.4, d=0.3),
+    solver=Tsit5())</code></pre><pre><code class="nohighlight hljs">PSMProblem{typeof(consumer_resource!), Vector{Float64}, Gaussian, Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}}(consumer_resource!, [20.0, 2.0], (0.0, 30.0), BSplineApproximator[BSplineApproximator(:f, (0.0, 22.0), 8, PartiallySpecifiedModels.var&quot;#6#7&quot;{Float64}(1.0))], [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5  …  25.5, 26.0, 26.5, 27.0, 27.5, 28.0, 28.5, 29.0, 29.5, 30.0], [19.81832125927411 1.9844056499497738; 18.59217322955963 2.5007756990768337; … ; 3.0544691681141445 10.889505761680244; 2.5190470640325087 11.279979969880175], [1.0 1.0; 1.0 1.0; … ; 1.0 1.0; 1.0 1.0], [1, 2], (a = 0.5, R0 = 20.0, ε = 0.4, d = 0.3), Gaussian(), Tsit5{typeof(OrdinaryDiffEqCore.trivial_limiter!), typeof(OrdinaryDiffEqCore.trivial_limiter!), Static.False}(OrdinaryDiffEqCore.trivial_limiter!, OrdinaryDiffEqCore.trivial_limiter!, static(false)), Dict{Symbol, Any}(), false, Float64[], nothing)</code></pre><h2 id="Fit-with-LAML"><a class="docs-heading-anchor" href="#Fit-with-LAML">Fit with LAML</a><a id="Fit-with-LAML-1"></a><a class="docs-heading-anchor-permalink" href="#Fit-with-LAML" title="Permalink"></a></h2><pre><code class="nohighlight hljs">IRLS+LAML: 8 params, 122 data, 1 smooth terms
+Initial θ: [3.658e-5]
+Iter 0: obj=2237.89, SS=4475.73, θ=[3.66e-5]
+Iter 1: obj=1984.74, SS=3969.44, θ=[3.66e-5]
+Iter 2: obj=1618.14, SS=3235.98, θ=[3.66e-5]
+Iter 3: obj=1241.63, SS=2483.11, θ=[3.66e-5]
+LAML init: ρ = [-10.0]
+LAML-FS iter 1: σ̂²=1.789e-01 λ = [1.035e-5]
+LAML-FS iter 2: σ̂²=1.601e-01 λ = [6.368e-6]
+LAML-FS iter 3: σ̂²=1.571e-01 λ = [5.781e-6]
+LAML-FS iter 4: σ̂²=1.566e-01 λ = [5.686e-6]
+LAML-FS iter 5: σ̂²=1.565e-01 λ = [5.671e-6]
+LAML-FS iter 10: σ̂²=1.565e-01 λ = [5.668e-6]
+LAML-FS converged at iteration 10
+LAML-Newton iter 1: V=9.852444e+01 |grad|=2.360e-08
+Iter 4: obj=35.9612, SS=71.8034, θ=[5.67e-6]
+LAML init: ρ = [-10.0]
+LAML-FS iter 1: σ̂²=4.310e-01 λ = [8.443e-6]
+LAML-FS iter 2: σ̂²=3.026e-01 λ = [1.307e-6]
+LAML-FS iter 3: σ̂²=2.107e-01 λ = [3.695e-7]
+LAML-FS iter 4: σ̂²=1.775e-01 λ = [1.388e-7]
+LAML-FS iter 5: σ̂²=1.601e-01 λ = [7.731e-8]
+LAML-FS iter 10: σ̂²=1.510e-01 λ = [5.763e-8]
+LAML-FS iter 15: σ̂²=1.510e-01 λ = [5.761e-8]
+LAML-FS converged at iteration 15
+LAML-Newton iter 1: V=8.431429e+01 |grad|=4.704e-08
+LAML init: ρ = [-10.0]
+LAML-FS iter 1: σ̂²=1.654e-01 λ = [2.048e-5]
+LAML-FS iter 2: σ̂²=1.563e-01 λ = [1.316e-5]
+LAML-FS iter 3: σ̂²=1.523e-01 λ = [1.044e-5]
+LAML-FS iter 4: σ̂²=1.505e-01 λ = [9.354e-6]
+LAML-FS iter 5: σ̂²=1.497e-01 λ = [8.917e-6]
+LAML-FS iter 10: σ̂²=1.492e-01 λ = [8.62e-6]
+LAML-FS iter 18: σ̂²=1.492e-01 λ = [8.617e-6]
+LAML-FS converged at iteration 18
+LAML-Newton iter 1: V=9.505718e+01 |grad|=5.334e-08
+LAML init: ρ = [-10.0]
+LAML-FS iter 1: σ̂²=1.569e-01 λ = [9.438e-5]
+LAML-FS iter 2: σ̂²=1.597e-01 λ = [0.0001136]
+LAML-FS iter 3: σ̂²=1.606e-01 λ = [0.0001187]
+LAML-FS iter 4: σ̂²=1.609e-01 λ = [0.0001199]
+LAML-FS iter 5: σ̂²=1.609e-01 λ = [0.0001202]
+LAML-FS iter 10: σ̂²=1.609e-01 λ = [0.0001202]
+LAML-FS iter 11: σ̂²=1.609e-01 λ = [0.0001202]
+LAML-FS converged at iteration 11
+LAML-Newton iter 1: V=9.510433e+01 |grad|=6.305e-08
+LAML init: ρ = [-9.026]
+LAML-FS iter 1: σ̂²=1.634e-01 λ = [0.0001459]
+LAML-FS iter 2: σ̂²=1.643e-01 λ = [0.0001668]
+LAML-FS iter 3: σ̂²=1.650e-01 λ = [0.0001834]
+LAML-FS iter 4: σ̂²=1.655e-01 λ = [0.0001961]
+LAML-FS iter 5: σ̂²=1.659e-01 λ = [0.0002055]
+LAML-FS iter 10: σ̂²=1.666e-01 λ = [0.0002248]
+LAML-FS iter 20: σ̂²=1.667e-01 λ = [0.0002284]
+LAML-FS iter 30: σ̂²=1.667e-01 λ = [0.0002285]
+LAML-Newton iter 1: V=9.333077e+01 |grad|=8.655e-07
+LAML init: ρ = [-8.384]
+LAML-FS iter 1: σ̂²=1.724e-01 λ = [0.0002811]
+LAML-FS iter 2: σ̂²=1.735e-01 λ = [0.0003147]
+LAML-FS iter 3: σ̂²=1.741e-01 λ = [0.0003365]
+LAML-FS iter 4: σ̂²=1.745e-01 λ = [0.000351]
+LAML-FS iter 5: σ̂²=1.748e-01 λ = [0.0003606]
+LAML-FS iter 10: σ̂²=1.752e-01 λ = [0.0003779]
+LAML-FS iter 20: σ̂²=1.753e-01 λ = [0.0003807]
+LAML-FS iter 30: σ̂²=1.753e-01 λ = [0.0003808]
+LAML-Newton iter 1: V=8.562042e+01 |grad|=3.623e-07
+LAML init: ρ = [-7.873]
+LAML-FS iter 1: σ̂²=1.332e-01 λ = [0.001954]
+LAML-FS iter 2: σ̂²=1.347e-01 λ = [0.00972]
+LAML-FS iter 3: σ̂²=1.359e-01 λ = [0.02925]
+LAML-FS iter 4: σ̂²=1.375e-01 λ = [0.03133]
+LAML-FS iter 5: σ̂²=1.376e-01 λ = [0.03129]
+LAML-FS iter 7: σ̂²=1.376e-01 λ = [0.03129]
+LAML-FS converged at iteration 7
+LAML-Newton iter 1: V=1.095456e+02 |grad|=1.351e-07
+Iter 10: obj=12.9478, SS=16.4563, θ=[0.0313]
+LAML init: ρ = [-3.464]
+LAML-FS iter 1: σ̂²=1.382e-01 λ = [0.03124]
+LAML-FS iter 2: σ̂²=1.382e-01 λ = [0.03124]
+LAML-FS iter 3: σ̂²=1.382e-01 λ = [0.03124]
+LAML-FS iter 4: σ̂²=1.382e-01 λ = [0.03124]
+LAML-FS converged at iteration 4
+LAML-Newton iter 1: V=1.097727e+02 |grad|=1.929e-07
+LAML init: ρ = [-3.466]
+LAML-FS iter 1: σ̂²=1.382e-01 λ = [0.03177]
+LAML-FS iter 2: σ̂²=1.383e-01 λ = [0.03174]
+LAML-FS iter 3: σ̂²=1.383e-01 λ = [0.03175]
+LAML-FS iter 4: σ̂²=1.383e-01 λ = [0.03175]
+LAML-FS iter 5: σ̂²=1.383e-01 λ = [0.03175]
+LAML-FS converged at iteration 5
+LAML-Newton iter 1: V=1.098107e+02 |grad|=3.682e-08
+LAML init: ρ = [-3.45]
+LAML-FS iter 1: σ̂²=1.383e-01 λ = [0.03159]
+LAML-FS iter 2: σ̂²=1.382e-01 λ = [0.0316]
+LAML-FS iter 3: σ̂²=1.382e-01 λ = [0.0316]
+LAML-FS iter 4: σ̂²=1.382e-01 λ = [0.0316]
+LAML-FS iter 5: σ̂²=1.382e-01 λ = [0.0316]
+LAML-FS converged at iteration 5
+LAML-Newton iter 1: V=1.098459e+02 |grad|=1.791e-08
+LAML init: ρ = [-3.455]
+LAML-FS iter 1: σ̂²=1.382e-01 λ = [0.03159]
+LAML-FS iter 2: σ̂²=1.382e-01 λ = [0.03159]
+LAML-FS iter 3: σ̂²=1.382e-01 λ = [0.03159]
+LAML-FS iter 4: σ̂²=1.382e-01 λ = [0.03159]
+LAML-FS converged at iteration 4
+LAML-Newton iter 1: V=1.098475e+02 |grad|=2.012e-08
+LAML init: ρ = [-3.455]
+LAML-FS iter 1: σ̂²=1.382e-01 λ = [0.03159]
+LAML-FS iter 2: σ̂²=1.382e-01 λ = [0.03159]
+LAML-FS iter 3: σ̂²=1.382e-01 λ = [0.03159]
+LAML-FS converged at iteration 3
+LAML-Newton iter 1: V=1.098477e+02 |grad|=3.001e-08
+Converged at iter 15 (objective stable)
+
+Final: data_loss = 16.3205, penalty = 0.268609, EDF = 3.94
+Final θ: [0.03159]
+Data loss (SS): 16.32
+EDF: 3.94</code></pre><h3 id="Fitted-trajectories"><a class="docs-heading-anchor" href="#Fitted-trajectories">Fitted trajectories</a><a id="Fitted-trajectories-1"></a><a class="docs-heading-anchor-permalink" href="#Fitted-trajectories" title="Permalink"></a></h3><pre><code class="language-julia hljs">p1 = plot(sol_ode.t, sol_ode[1,:], label=&quot;True&quot;, lw=2, color=:black, ls=:dash,
+          xlabel=&quot;Time&quot;, ylabel=&quot;R&quot;, title=&quot;Resource&quot;)
+scatter!(p1, data_t, data[:, 1], label=&quot;Data&quot;, ms=3, alpha=0.5, color=:gray)
+plot!(p1, data_t, sol.fitted_values[:, 1], label=&quot;LAML fit&quot;, lw=2, color=:green)
+
+p2 = plot(sol_ode.t, sol_ode[2,:], label=&quot;True&quot;, lw=2, color=:black, ls=:dash,
+          xlabel=&quot;Time&quot;, ylabel=&quot;C&quot;, title=&quot;Consumer&quot;)
+scatter!(p2, data_t, data[:, 2], label=&quot;Data&quot;, ms=3, alpha=0.5, color=:gray)
+plot!(p2, data_t, sol.fitted_values[:, 2], label=&quot;LAML fit&quot;, lw=2, color=:orange)
+
+plot(p1, p2, layout=(1, 2), size=(800, 350))</code></pre><p><img src="../08_rosenzweig_macarthur_files/figure-commonmark/cell-7-output-1.svg" alt/></p><h3 id="Recovered-functional-response"><a class="docs-heading-anchor" href="#Recovered-functional-response">Recovered functional response</a><a id="Recovered-functional-response-1"></a><a class="docs-heading-anchor-permalink" href="#Recovered-functional-response" title="Permalink"></a></h3><p>The key result: we recover the shape of the Holling Type II functional response <strong>without assuming any parametric form</strong>:</p><pre><code class="language-julia hljs">R_eval = range(1.0, 20.0, length=100)
+f_true_vals = [2.0 * R / (5.0 + R) for R in R_eval]
+f_est = [sol.unknown_functions[:f](R) for R in R_eval]
+
+plot(R_eval, f_true_vals, label=&quot;True f(R) = 2R/(5+R)&quot;, lw=3, color=:black, ls=:dash,
+     xlabel=&quot;Resource density R&quot;, ylabel=&quot;Functional response f(R)&quot;,
+     title=&quot;Recovered functional response&quot;, legend=:bottomright)
+plot!(R_eval, f_est, label=&quot;PSM estimate&quot;, lw=2, color=:blue)
+hline!([2.0], ls=:dot, color=:gray, alpha=0.5, label=&quot;Asymptote (vmax)&quot;)</code></pre><p><img src="../08_rosenzweig_macarthur_files/figure-commonmark/cell-8-output-1.svg" alt/></p><p>The PSM correctly recovers:</p><ol><li><strong>Near-linear increase</strong> at low R (the “attack rate” region)</li><li><strong>Saturation</strong> at high R (the “handling time” limitation)</li><li><strong>No assumption</strong> about the Type II form was needed</li></ol><h2 id="Comparison-Across-Solvers"><a class="docs-heading-anchor" href="#Comparison-Across-Solvers">Comparison Across Solvers</a><a id="Comparison-Across-Solvers-1"></a><a class="docs-heading-anchor-permalink" href="#Comparison-Across-Solvers" title="Permalink"></a></h2><pre><code class="language-julia hljs">sol_coll = solve(prob, CollocationLAML(maxiters=50, verbose=false, n_continuation=6))
+sol_rodeo = solve(prob, RodeoSolver(n_steps=200, n_deriv=3, maxiters=200, verbose=false))
+
+p_compare = plot(R_eval, f_true_vals, label=&quot;True&quot;, lw=3, color=:black, ls=:dash,
+                 xlabel=&quot;Resource density R&quot;, ylabel=&quot;f(R)&quot;,
+                 title=&quot;Functional response: solver comparison&quot;)
+plot!(p_compare, R_eval, f_est, label=&quot;LAML&quot;, lw=2, color=:blue)
+plot!(p_compare, R_eval, [sol_coll.unknown_functions[:f](R) for R in R_eval],
+      label=&quot;CollocationLAML&quot;, lw=2, color=:red)
+plot!(p_compare, R_eval, [sol_rodeo.unknown_functions[:f](R) for R in R_eval],
+      label=&quot;RodeoSolver&quot;, lw=2, color=:green)
+p_compare</code></pre><p><img src="../08_rosenzweig_macarthur_files/figure-commonmark/cell-9-output-1.svg" alt/></p><h2 id="Ecological-Interpretation"><a class="docs-heading-anchor" href="#Ecological-Interpretation">Ecological Interpretation</a><a id="Ecological-Interpretation-1"></a><a class="docs-heading-anchor-permalink" href="#Ecological-Interpretation" title="Permalink"></a></h2><p>The nonparametric estimate of <span>$f(R)$</span> allows biologists to:</p><ol><li><strong>Test functional response hypotheses</strong> — Does the estimated curve  match Type I, II, or III?</li><li><strong>Detect departures</strong> from classical forms — e.g., a Type II that  starts declining at very high densities (interference)</li><li><strong>Predict dynamics</strong> under novel conditions — the fitted PSM can be  simulated forward</li></ol><p>This is fundamentally different from fitting parametric models (e.g., assuming Holling Type II and estimating <span>$a$</span> and <span>$h$</span>), because the PSM approach makes no assumption about the functional form and lets the data speak.</p><h2 id="Diagnostic-Plots"><a class="docs-heading-anchor" href="#Diagnostic-Plots">Diagnostic Plots</a><a id="Diagnostic-Plots-1"></a><a class="docs-heading-anchor-permalink" href="#Diagnostic-Plots" title="Permalink"></a></h2><p>A standard 4-panel diagnostic display assesses residual behaviour for the consumer–resource fit.</p><pre><code class="language-julia hljs">using PartiallySpecifiedModels: appraise
+
+diag = appraise(sol)
+
+p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
+    xlabel=&quot;Theoretical quantiles&quot;, ylabel=&quot;Sample quantiles&quot;,
+    title=&quot;QQ Plot of Residuals&quot;, ms=3, legend=false, color=:steelblue)
+mn, mx = extrema(vcat(diag.qq_theoretical, diag.qq_sample))
+plot!(p_qq, [mn, mx], [mn, mx], color=:red, ls=:dash, label=&quot;&quot;)
+
+p_rf = scatter(diag.fitted, diag.residuals,
+    xlabel=&quot;Fitted values&quot;, ylabel=&quot;Residuals&quot;,
+    title=&quot;Residuals vs Fitted&quot;, ms=3, legend=false, color=:steelblue)
+hline!(p_rf, [0], color=:gray, ls=:dot)
+
+p_hist = histogram(diag.residuals, normalize=:pdf,
+    xlabel=&quot;Residuals&quot;, ylabel=&quot;Density&quot;,
+    title=&quot;Histogram of Residuals&quot;, legend=false, color=:steelblue, alpha=0.7)
+
+p_of = scatter(diag.observed, diag.fitted,
+    xlabel=&quot;Observed&quot;, ylabel=&quot;Fitted&quot;,
+    title=&quot;Observed vs Fitted&quot;, ms=3, legend=false, color=:steelblue)
+mn2, mx2 = extrema(vcat(diag.observed, diag.fitted))
+plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label=&quot;&quot;)
+
+plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))</code></pre><p><img src="../08_rosenzweig_macarthur_files/figure-commonmark/cell-10-output-1.svg" alt/></p><pre><code class="nohighlight hljs">Durbin-Watson: 1.377, 1.826</code></pre><h2 id="Phase-Portrait"><a class="docs-heading-anchor" href="#Phase-Portrait">Phase Portrait</a><a id="Phase-Portrait-1"></a><a class="docs-heading-anchor-permalink" href="#Phase-Portrait" title="Permalink"></a></h2><pre><code class="language-julia hljs">plot(sol_ode[1,:], sol_ode[2,:], label=&quot;True trajectory&quot;, lw=2, color=:black, ls=:dash,
+     xlabel=&quot;Resource R&quot;, ylabel=&quot;Consumer C&quot;,
+     title=&quot;Phase portrait&quot;)
+plot!(sol.fitted_values[:, 1], sol.fitted_values[:, 2], label=&quot;PSM fit&quot;, lw=2, color=:blue)
+scatter!([u0[1]], [u0[2]], label=&quot;Start&quot;, ms=8, color=:red, marker=:star5)</code></pre><p><img src="../08_rosenzweig_macarthur_files/figure-commonmark/cell-12-output-1.svg" alt/></p></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../07_probabilistic_fitting/">« Probabilistic ODE Fitting with RodeoSolver</a><a class="docs-footer-nextpage" href="../09_gradient_matching/">Integration-Free Inference with Gradient Matching »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.20.0 on <span class="colophon-date" title="Sunday 22 November 2026 19:01">Sunday 22 November 2026</span>. Using Julia version 1.13.4.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
