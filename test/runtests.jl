@@ -5221,7 +5221,7 @@ end
         # Its remaining structural cause is a model with no penalized block at
         # all: an unpenalized `NeuralApproximator` (penalty_weight = 0)
         # contributes no S_k, so there is no smoothing parameter to select and
-        # the key is `false` by construction while the fit converges normally.
+        # the key is `false` by construction however the fit itself ends.
         # `stationarity` is 0.0 there by convention (nothing to be stationary
         # in), which is exactly why the two keys are not redundant.
         import Lux
@@ -5231,12 +5231,20 @@ end
             data_times=t_f2,
             data_values=reshape(exp.(0.1 .* t_f2) .+ noi_f2, :, 1),
             obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
-        # maxiters=100: converges in 7 iterations on macOS (Julia 1.12 and
-        # 1.13), but this unpenalized fit is fragile: with maxiters=30 it
-        # reported converged = false on Julia 1.13 / ubuntu x64 CI.
+        # `converged` is deliberately NOT asserted: how this unpenalized
+        # 13-weight tanh fit ends is chaotic in the exact arithmetic. On macOS
+        # (Julia 1.12, 1.13) seed 42 stalls at data loss 5.08 (noise floor
+        # 7.7e-4) and reports `:converged_tol` after 7 iterations, with
+        # `final_parameter_step` ~8e4. On some ubuntu x64 runners (Julia
+        # 1.13.4) the same fit escapes the stall, keeps improving and hits
+        # `maxiters` -- the old `converged` assertion failed that way in 4 CI
+        # jobs from 2026-11-18 to 11-21, all at maxiters=100 and all Julia 1 /
+        # ubuntu, while the same commits passed on other runners. Over
+        # rng_seed 1:40, 10 fits hit maxiters=100
+        # (jac=:forwarddiff does not help: 15 of 41 stall at a poor fit).
+        # The three keys below hold by construction whichever way it ends.
         s_nopen = solve(prob_nn_f2, LAML(maxiters=100))
         @test isempty(s_nopen.smoothing_params)
-        @test s_nopen.convergence.converged            # measured :converged_tol
         @test !s_nopen.convergence.smoothing_advanced
         @test s_nopen.convergence.stationarity == 0.0
 
