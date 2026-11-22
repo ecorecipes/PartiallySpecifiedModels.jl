@@ -170,12 +170,20 @@ strip_record(c) = Base.structdiff(c, NamedTuple{(:multistart,)})
         # reports :converged_tol. With n_starts = 8, every ms.rng_seed in
         # 1:10 returned a fit below data loss 0.01 (4 to 7 of the 8 starts
         # got there); the default rng_seed = 1 had 6 of 8.
+        # How start 1 ends is NOT asserted: as in the F2 testset, seed 42's
+        # ending is chaotic in the exact arithmetic. On an ubuntu x64 runner
+        # (Julia 1, 2026-11-22) start 1 escaped by itself to objective 1.4e-3
+        # and hit :maxiters. What holds everywhere is that the returned fit
+        # is good and is the best start.
         sol = solve(prob42, MultiStart(LAML(maxiters=100); n_starts=8))
         r = sol.convergence.multistart
-        @test r.values[1] > 1                 # start 1: the poor minimum
-        @test r.reasons[1] === :converged_tol # ...reported as converged
         @test sol.data_loss < 0.01
-        @test r.chosen != 1
+        ok = findall(isfinite, r.values)
+        @test r.values[r.chosen] == minimum(r.values[ok])
+        @test r.values[r.chosen] <= r.values[1]
+        if r.values[1] > 1   # start 1 stalled (macOS): it must not be returned
+            @test r.chosen != 1
+        end
     end
 
     mixed_problem(term) = growth_problem(
