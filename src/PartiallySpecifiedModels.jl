@@ -87,6 +87,9 @@ include("pcls.jl")
 # Main solver (IRLS + LAML)
 include("solver.jl")
 
+# Multistart wrapper around LAML
+include("multistart.jl")
+
 # Collocation-based solver
 include("collocation_solver.jl")
 
@@ -189,7 +192,7 @@ export ShapeConstrainedGPApproximator
 export COMONetApproximator, COMONET_CONSTRAINTS
 export AbstractLikelihood, Gaussian, Poisson, NegativeBinomial, TruncatedNormal,
        CustomLikelihood
-export PSMProblem, PSMSolution, LAML, CollocationLAML, GradientMatching
+export PSMProblem, PSMSolution, LAML, MultiStart, CollocationLAML, GradientMatching
 export AdamSolver, MultipleShootingSolver, AdaptiveGradientMatching
 export RodeoSolver, MCMCSolver, MagiSolver
 export BNGSolver, DaltonSolver, PseudoMarginalSolver

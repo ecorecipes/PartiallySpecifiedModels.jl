@@ -10,6 +10,7 @@ if !isempty(ARGS)
                   "adam-controls" => "adam_controls.jl",
                   "kan-uncertainty" => "kan_uncertainty.jl",
                   "laml-stalls" => "laml_stalls.jl",
+                  "multistart" => "multistart.jl",
                   "kan" => "kan.jl",
                   "kan-diagnostics" => "kan_diagnostics.jl",
                   "kan-reaction-diffusion" => "kan_reaction_diffusion.jl",
@@ -52,6 +53,7 @@ using Symbolics
 include("numerical_regressions.jl")
 include("adam_controls.jl")
 include("laml_stalls.jl")
+include("multistart.jl")
 include("kan.jl")
 include("kan_diagnostics.jl")
 include("kan_uncertainty.jl")

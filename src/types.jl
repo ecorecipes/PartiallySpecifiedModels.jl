@@ -2095,7 +2095,9 @@ Jacobian too noisy to build an accepted step from, and for a fit whose
 smoothing parameters never moved at all. The two keys below separate those
 cases. **They are additive diagnostics; they do not change `converged`,
 `reason`, or any fitted quantity, and they are present on every LAML solution,
-converged or not.**
+converged or not.** Neither they nor `converged` can detect a poor local
+minimum of a randomly initialized approximator. For that, refit from several
+initializations with [`MultiStart`](@ref).
 
 - `smoothing_advanced::Bool`: whether λ̂ ever moved off its initialization
 - `ridge::Bool`: the objective converged but one more PCLS step from the reported

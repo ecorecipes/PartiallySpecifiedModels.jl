@@ -74,6 +74,14 @@ The `:fd` path carries a **residual noise floor** that `:forwarddiff` does not: 
 LAML
 ```
 
+### MultiStart
+
+`MultiStart(LAML(); n_starts=8, rng_seed=1)` fits the problem `n_starts` times, re-seeding every randomly initialized approximator (`NeuralApproximator`, `KANApproximator`, `COMONetApproximator`) at each start after the first, and returns the best fit: the largest LAML criterion when every start has one, otherwise the smallest objective. Use it for unpenalized or weakly penalized networks, where the fit depends on the initialization and `converged` cannot detect a poor local minimum. Measured on an unpenalized growth-rate network, 15 of 41 `rng_seed`s ended at a local minimum with data loss 3.8 to 64, reported as `converged = true, reason = :converged_tol`, while the rest reached the noise floor (≈ 7.7e-4) or came close to it. Started from one of the poor seeds (data loss 5.08), `MultiStart(LAML(maxiters=100))` returned a fit with data loss below 0.01 for every `rng_seed` in 1:10, with both 4 and 8 starts (measured with the integrator cap described next). Each start costs one full `LAML` solve, and a restart whose trial steps make the ODE expensive to integrate can cost far more than the rest: one took more than 20 minutes for 3 iterations. `MultiStart` therefore caps every ODE solve at `ode_maxiters = 10_000` integrator steps unless the problem sets its own `maxiters`; pass `ode_maxiters = nothing` to turn the cap off, or raise it if your trajectories genuinely need more steps. With the cap, an 8-start fit of this fixture took a median of 23 s. The cap is not neutral: a trial solve that hits it fails, which changes the path of some starts. `sol.convergence.multistart` records the seeds, the criterion value and the stopping reason of every start.
+
+```@docs
+MultiStart
+```
+
 ### GCVSolver
 
 Penalized IRLS with **Generalized Cross-Validation** for smoothing parameter selection. An alternative to LAML that minimizes leave-one-out prediction error. With `criterion=:ncv` it instead minimizes **neighbourhood cross-validation** (NCV; Wood 2024), which leaves out a temporal neighbourhood of `ncv_width` time steps around each point — the recommended criterion when residuals are short-range autocorrelated, where ordinary GCV undersmooths. With `search=:reuse` the whole λ-search is evaluated from a single whitening + eigendecomposition per IRLS iteration (the classical ddefit / Demmler–Reinsch trick, several-fold faster for larger bases) instead of one O(p³) solve per candidate λ — an exact reformulation of the default `search=:direct` scores, with automatic fallback to the direct path when `J'WJ` is near-singular; GCV criterion only. Note that equal *scores* do not imply an equal *search endpoint*: where the GCV surface is flat or multimodal the two paths can settle on different, near-equally-good optima. Measured on a two-approximator fixture, λ̂ differed by a factor of ~470 between `:direct` and `:reuse` while the objectives agreed to 1.3e-6. Compare fits by objective or `data_loss`, not by λ̂.
@@ -300,6 +308,7 @@ RKHSSolver
 | Use case | Recommended solver |
 |----------|-------------------|
 | Default / first try | [`LAML`](@ref) |
+| Neural or KAN approximators with `LAML` | [`MultiStart`](@ref) |
 | Automatic smoothing comparison | [`GCVSolver`](@ref) |
 | Stiff or chaotic systems | [`CollocationLAML`](@ref) |
 | Quick baseline | [`TwoStageSolver`](@ref) |
