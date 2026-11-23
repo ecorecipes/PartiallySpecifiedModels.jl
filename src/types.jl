@@ -3938,8 +3938,8 @@ A partially specified model fitting problem.
 - `likelihood`: likelihood family
 - `ode_solver`: ODE/discrete solver (e.g. `Tsit5()` for continuous,
   `FunctionMap()` for discrete, or `nothing` for solvers that don't integrate)
-- `ode_kwargs`: additional solver keyword arguments. The ODE forward solve
-  defaults to `abstol = reltol = 1e-8` and `maxiters = 100_000` integrator
+- `ode_kwargs`: additional solver keyword arguments. The ODE and DDE forward
+  solves default to `abstol = reltol = 1e-8` and `maxiters = 100_000` integrator
   steps; pass `maxiters` to the constructor if your trajectories need more
 - `discrete`: whether this is a discrete-time model
 - `delays`: delay values for DDE problems (empty for ODE/discrete)

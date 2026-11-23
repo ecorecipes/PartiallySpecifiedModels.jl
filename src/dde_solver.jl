@@ -56,7 +56,8 @@ function simulate_dde(prob::PSMProblem, beta::AbstractVector)
         :saveat => prob.data_times,
         :abstol => get(prob.ode_kwargs, :abstol, 1e-8),
         :reltol => get(prob.ode_kwargs, :reltol, 1e-8),
-        :maxiters => get(prob.ode_kwargs, :maxiters, 1_000_000),
+        # Same default as the ODE forward solve (src/solver.jl).
+        :maxiters => get(prob.ode_kwargs, :maxiters, _DEFAULT_ODE_MAXITERS),
         :verbose => _quiet_solve(),
     )
     merge!(solve_kwargs, _normalise_ode_kwargs(prob.ode_kwargs))
