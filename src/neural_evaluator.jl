@@ -75,20 +75,71 @@ Lux `ComponentArray`, so slices of the global β vector plug in directly.
 """
 function mlp_evaluate(spec::MLPSpec, params, x_scalar)
     T = promote_type(eltype(params), typeof(x_scalar))
-    x = T[T(x_scalar)]
+    w = _mlp_width(spec)
+    _mlp_forward!(Vector{T}(undef, w), Vector{T}(undef, w), spec, params, T(x_scalar))
+end
+
+_mlp_width(spec::MLPSpec) =
+    maximum(((n_in, n_out),) -> max(n_in, n_out), spec.layer_sizes; init=1)
+
+# The forward pass over two ping-pong buffers, each at least `_mlp_width`
+# long. It used to build fresh arrays per layer (`act.(W * x .+ b)`): about
+# 900 bytes per call for a Dense(1,4)→Dense(4,1) net, i.e. per ODE
+# right-hand-side evaluation, which dominated the cost of neural fits
+# (measured: 178M calls and 152 GiB in one uncapped LAML fit).
+function _mlp_forward!(a::AbstractVector, b::AbstractVector, spec::MLPSpec,
+                       params, x)
+    a[1] = x
     offset = 0
-
+    n = 1
     for (i, (n_in, n_out)) in enumerate(spec.layer_sizes)
-        # Extract weights (column-major: n_out × n_in)
-        W = reshape(view(params, offset+1:offset+n_in*n_out), n_out, n_in)
-        offset += n_in * n_out
-        b = view(params, offset+1:offset+n_out)
-        offset += n_out
-
-        x = spec.activations[i].(W * x .+ b)
+        _mlp_layer!(spec.activations[i], b, a, params, offset, n_in, n_out)
+        offset += n_in * n_out + n_out
+        a, b = b, a
+        n = n_out
     end
+    n == 1 ? a[1] : a[1:n]
+end
 
-    length(x) == 1 ? x[1] : x
+# One Dense layer, out = act.(W * inp .+ bias), with W column-major
+# (n_out × n_in) at params[offset+1 : offset+n_in*n_out] and the bias after
+# it. A function barrier, so the loop is specialized on the activation
+# (MLPSpec stores them as abstract `Function`s).
+function _mlp_layer!(act::F, out, inp, params, offset::Int, n_in::Int,
+                     n_out::Int) where {F}
+    boff = offset + n_in * n_out
+    @inbounds for r in 1:n_out
+        s = params[offset + r] * inp[1]
+        for c in 2:n_in
+            s += params[offset + (c - 1) * n_out + r] * inp[c]
+        end
+        out[r] = act(s + params[boff + r])
+    end
+    out
+end
+
+# Float64 scratch owned by one evaluator closure. A closure can be shared
+# across threads (a parameter struct from `to_ode_problem` used in a
+# threaded ensemble), so the buffers are claimed with an atomic flag and a
+# concurrent or non-Float64 (Dual) call takes the allocating path instead.
+mutable struct _MLPScratch
+    a::Vector{Float64}
+    b::Vector{Float64}
+    @atomic busy::Bool
+end
+_MLPScratch(spec::MLPSpec) =
+    (w = _mlp_width(spec); _MLPScratch(zeros(w), zeros(w), false))
+
+function mlp_evaluate(spec::MLPSpec, params, x_scalar, sc::_MLPScratch)
+    if eltype(params) === Float64 && x_scalar isa Float64 &&
+       (@atomicreplace sc.busy false => true).success
+        try
+            return _mlp_forward!(sc.a, sc.b, spec, params, x_scalar)
+        finally
+            @atomic sc.busy = false
+        end
+    end
+    mlp_evaluate(spec, params, x_scalar)
 end
 
 """
@@ -186,7 +237,8 @@ function build_neural_evaluator(approx::NeuralApproximator, params_k)
     spec = neural_mlp_spec(approx)
 
     if spec !== nothing
-        let pk = params_k, s = spec, lo_ = lo, span_ = span
+        let pk = params_k, s = spec, lo_ = lo, span_ = span,
+            sc = _MLPScratch(spec)
             return x -> begin
                 xval = x isa AbstractArray ? x[1] : x
                 xn = if lo_ !== nothing && span_ !== nothing && span_ > 0
@@ -194,7 +246,7 @@ function build_neural_evaluator(approx::NeuralApproximator, params_k)
                 else
                     xval
                 end
-                mlp_evaluate(s, pk, xn)
+                mlp_evaluate(s, pk, xn, sc)
             end
         end
     end

@@ -3684,6 +3684,51 @@ end
             @test isfinite(ForwardDiff.derivative(ev_wf, 0.7))
         end
 
+        @testset "allocation-free neural evaluator" begin
+            # The evaluator runs once per ODE right-hand side. It used to
+            # allocate ~900 bytes per call (fresh arrays per layer), which
+            # was 152 GiB in one uncapped LAML fit of a Dense(1,4)→Dense(4,1)
+            # growth-rate network.
+            import ForwardDiff
+            using PartiallySpecifiedModels: build_neural_evaluator,
+                                            mlp_spec_from_lux, mlp_evaluate
+            PSMmod = PartiallySpecifiedModels
+            alloc_of(f, x) = (f(x); @allocated f(x))
+            softplus_(x) = log1p(exp(x))   # a user-defined activation
+            for model in (Lux.Chain(Lux.Dense(1, 4, tanh), Lux.Dense(4, 1)),
+                          Lux.Chain(Lux.Dense(1, 8, tanh),
+                                    Lux.Dense(8, 6, softplus_), Lux.Dense(6, 3)))
+                ps, st = Lux.setup(Random.Xoshiro(3), model)
+                ca = PSMmod.ComponentArray(ps)
+                p = Float64.(collect(ca))
+                ps64 = PSMmod.ComponentArray(p, PSMmod.getaxes(ca))
+                ev = build_neural_evaluator(NeuralApproximator(:f, model), p)
+                lux(x) = vec(first(Lux.apply(model, reshape([x], 1, 1), ps64, st)))
+                for x in (-1.3, 0.0, 0.4, 2.2)
+                    @test isapprox(vcat(ev(x)), lux(x); rtol=1e-12, atol=1e-14)
+                end
+                # Dual inputs and Dual parameters take the generic path.
+                @test isapprox(vcat(ForwardDiff.derivative(ev, 0.4)),
+                               vcat(ForwardDiff.derivative(lux, 0.4));
+                               rtol=1e-10)
+                spec = mlp_spec_from_lux(model)
+                @test all(isfinite, ForwardDiff.gradient(
+                    q -> sum(mlp_evaluate(spec, q, 0.4)), p))
+                # Scalar-output networks allocate nothing per call.
+                length(ev(0.4)) == 1 && @test alloc_of(ev, 0.4) == 0
+            end
+            # A scratch buffer already in use (a closure shared across
+            # threads) falls back to the allocating path with the same value.
+            model = Lux.Chain(Lux.Dense(1, 4, tanh), Lux.Dense(4, 1))
+            spec = mlp_spec_from_lux(model)
+            p = randn(Random.Xoshiro(5), spec.n_params)
+            sc = PSMmod._MLPScratch(spec)
+            free = mlp_evaluate(spec, p, 0.3, sc)
+            @atomic sc.busy = true
+            @test mlp_evaluate(spec, p, 0.3, sc) == free
+            @test mlp_evaluate(spec, p, 0.3) == free
+        end
+
         @testset "AdamSolver with NeuralApproximator" begin
             Random.seed!(42)
             function decay_nn!(du, u, p, t)
