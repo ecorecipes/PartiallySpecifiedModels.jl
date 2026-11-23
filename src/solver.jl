@@ -555,6 +555,15 @@ end
 
 Simulate a continuous-time (ODE) model.
 """
+# Default integrator step limit for the forward solve when the problem does
+# not set `maxiters`: OrdinaryDiffEq's own default. It was 1_000_000, which
+# let a bad trial point burn a million steps before failing. Measured on an
+# unpenalized neural growth-rate fit (rng_seed 42, LAML(maxiters=100)): the
+# typical forward solve took ~260 steps, but 24 line-search trial solves ran
+# to 1M steps and failed, which was 84% of all right-hand-side calls; the
+# fit ended in the same place.
+const _DEFAULT_ODE_MAXITERS = 100_000
+
 function simulate_continuous(prob::PSMProblem, beta::AbstractVector)
     # The same ODEProblem that `to_ode_problem` returns (src/resilience.jl), so the problem a
     # user linearises is exactly the one fitted; it also promotes u0 for Dual β.
@@ -564,7 +573,7 @@ function simulate_continuous(prob::PSMProblem, beta::AbstractVector)
         :saveat => prob.data_times,
         :abstol => get(prob.ode_kwargs, :abstol, 1e-8),
         :reltol => get(prob.ode_kwargs, :reltol, 1e-8),
-        :maxiters => get(prob.ode_kwargs, :maxiters, 1_000_000),
+        :maxiters => get(prob.ode_kwargs, :maxiters, _DEFAULT_ODE_MAXITERS),
         :verbose => _quiet_solve(),
     )
     merge!(solve_kwargs, _normalise_ode_kwargs(prob.ode_kwargs))
