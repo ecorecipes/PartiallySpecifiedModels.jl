@@ -46,7 +46,7 @@ This package includes 35 vignettes organized by topic:
 | **Count data** | 02 (likelihoods), 11 (epidemiological), 28 (fisheries) |
 | **Discrete time** | 12 (Ricker, Beverton-Holt), 28 (fisheries) |
 | **Delay equations** | 20 (DDE basics) |
-| **Diagnostics** | All vignettes include `appraise()` diagnostic plots |
+| **Diagnostics** | All vignettes include `psm_appraise()` diagnostic plots |
 
 ## Setup
 
@@ -135,7 +135,7 @@ prob = PSMProblem(
     data_times = data_times,
     data_values = reshape(observed_N, :, 1),  # n_times × 1 matrix
     obs_to_state = [1],             # observe state variable 1
-    likelihood = Gaussian(),        # Gaussian errors
+    likelihood = GaussianLikelihood(),        # Gaussian errors
     solver = Tsit5()                # ODE solver
 )
 ```
@@ -198,7 +198,7 @@ A `PSMProblem` combines:
 | `approximators` | Vector of `AbstractApproximator` (splines, neural nets) |
 | `data_times` | Observation times |
 | `data_values` | Data matrix (n_times × n_obs) |
-| `likelihood` | Error distribution (`Gaussian()`, `Poisson()`, etc.) |
+| `likelihood` | Error distribution (`GaussianLikelihood()`, `PoissonLikelihood()`, etc.) |
 | `solver` | ODE solver from OrdinaryDiffEq.jl |
 
 You can also construct a `PSMProblem` directly from a SciML problem type:
@@ -231,9 +231,7 @@ This is the behaviour to expect whenever the truth lies in the penalty null spac
 A standard 4-panel diagnostic display assesses residual behaviour. The QQ plot checks normality of standardized residuals, "Residuals vs Fitted" detects systematic patterns (a good fit shows random scatter around zero), the histogram visualises the residual distribution, and "Observed vs Fitted" checks overall calibration (points should lie near the diagonal).
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol)
+diag = psm_appraise(sol)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

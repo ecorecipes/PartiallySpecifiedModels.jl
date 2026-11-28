@@ -359,9 +359,7 @@ $\alpha_{12}$ without assuming any parametric functional form.
 A standard 4-panel diagnostic display assesses residual behaviour for the Ricker LAML fit. The QQ plot checks normality of standardized residuals, "Residuals vs Fitted" detects systematic patterns, the histogram visualises the residual distribution, and "Observed vs Fitted" checks overall calibration.
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol_laml)
+diag = psm_appraise(sol_laml)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

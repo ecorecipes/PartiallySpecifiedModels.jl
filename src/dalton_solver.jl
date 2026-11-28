@@ -41,7 +41,7 @@ predicted means.
 Also returns the quasi-maximum-likelihood global diffusion estimate
 `ssq = (1/(N·n_vars)) Σ_n νᵀS⁻¹ν` accumulated from the ODE innovations, and
 the raw statistic `calib_acc = Σ_n νᵀS⁻¹ν`.  These are what
-[`_dalton_loglik`](@ref) uses to put both DALTON passes on a single
+`_dalton_loglik` uses to put both DALTON passes on a single
 calibrated diffusion, matching the calibration `probsolve_filter` already
 applies for Fenrir.
 """
@@ -106,7 +106,8 @@ function _dalton_joint_evidence(ode_fun!, p, u0::AbstractVector,
                                                       n_steps, q, sigma,
                                                       obs_data, obs_times,
                                                       obs_to_state, obs_var;
-                                                      interrogate=interrogate)
+                                                      interrogate=interrogate,
+                                                      ode_nugget=ode_nugget)
     t_min, t_max = tspan
     dt = (t_max - t_min) / n_steps
     n_vars = length(u0); D = n_vars * q
@@ -221,15 +222,17 @@ function _dalton_loglik(ode_fun!, p, u0::AbstractVector,
     N = n_steps
     logZ = logZ0 - 0.5 * N * n_vars * log(ssq) + 0.5 * calib_acc - 0.5 * N * n_vars
 
-    # Scale the ODE nugget consistently with ssq so the joint pass and the
-    # rescaled marginal pass live on the EXACT same calibrated linear-Gaussian
-    # state-space model (making `_dalton_loglik == fenrir_loglik` on linear ODEs).
+    # Scale the ODE nugget consistently with ssq (clamped to [1e-13, 1e-6] so
+    # degenerate ssq can neither collapse S to singular nor erase the ODE constraint)
+    # so the joint pass and rescaled marginal pass live on the same calibrated
+    # linear-Gaussian state-space model (`_dalton_loglik == fenrir_loglik` on linear ODEs).
     sigma_c = sigma .* sqrt(ssq)
+    ode_nug = clamp(1e-10 * ssq, 1e-13, 1e-6)
     logYZ = _dalton_joint_evidence(ode_fun!, p, u0, tspan, n_steps, q, sigma_c,
                                    obs_data, obs_times, obs_to_state, obs_var;
                                    interrogate=interrogate,
                                    sqrt_filter=sqrt_filter,
-                                   ode_nugget=1e-10 * ssq)
+                                   ode_nugget=ode_nug)
 
     ll = logYZ - logZ
     isfinite(ll) ? ll : -Inf
@@ -255,7 +258,7 @@ marginal pass's by the ODE alone.
 3. Both evidences are then taken at that single calibrated diffusion (as
    `probsolve_filter` already does for Fenrir); without this the
    uncalibrated quadratic ODE-defect penalty makes the difference in step 5
-   unbounded above — see [`_dalton_loglik`](@ref).
+   unbounded above — see `_dalton_loglik`.
 4. Joint pass: filter assimilating both the ODE pseudo-observations and
    the data, re-interrogating the ODE at each data-informed predicted
    mean, giving `logp(Y,Z)`.
@@ -399,7 +402,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
 
     n_smooth = length(smooth_mats)
     edf_total = NaN
-    smooth_lambdas = fill(0.1, n_smooth)
+    smooth_lambdas = fill(0.1 / max(obs_var, 1e-6), n_smooth)
 
     # ── Objective: negative DALTON log-likelihood + penalty ──
 
@@ -546,7 +549,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
             n_data = length(y_vec)
             JWJ_ll = (J_ad' * J_ad) ./ obs_var
             σ²_hat = sum((y_vec .- mu_vec).^2) / max(n_data - sum(s -> size(s,1), smooth_mats), 1.0)
-            disp_ratio = σ²_hat / obs_var
+            disp_ratio = max(σ²_hat / obs_var, 1.0)
 
             for (k, (S, off)) in enumerate(zip(smooth_mats, smooth_offsets))
                 np_k = size(S, 1)

@@ -32,7 +32,7 @@ This vignette demonstrates both methods on an SIR epidemic model with a nonparam
 
 ```{julia}
 using PartiallySpecifiedModels
-using PartiallySpecifiedModels: solve, appraise
+using PartiallySpecifiedModels: solve
 using OrdinaryDiffEq
 using Plots
 using Statistics
@@ -120,7 +120,7 @@ prob = PSMProblem(
     data_values = reshape(I_obs, :, 1),
     obs_to_state = [2],
     known_params = (γ = 0.25, N = N_pop),
-    likelihood = Gaussian(),
+    likelihood = GaussianLikelihood(),
     solver = Tsit5()
 )
 
@@ -365,7 +365,7 @@ For **trajectory** CIs (fitted values at observed times), bootstrap coverage is 
 
 ## Section 6: Bootstrap with Non-Gaussian Likelihoods
 
-A key advantage of the parametric bootstrap is that it **respects the likelihood family**. When fitting count data with `Poisson()`, the parametric bootstrap samples $I^*_t \sim \text{Pois}(\hat{I}(t))$ instead of adding Gaussian noise. This naturally produces integer pseudo-data with variance proportional to the mean.
+A key advantage of the parametric bootstrap is that it **respects the likelihood family**. When fitting count data with `PoissonLikelihood()`, the parametric bootstrap samples $I^*_t \sim \text{Pois}(\hat{I}(t))$ instead of adding Gaussian noise. This naturally produces integer pseudo-data with variance proportional to the mean.
 
 ### Generate Poisson data
 
@@ -395,7 +395,7 @@ prob_pois = PSMProblem(
     data_values = reshape(I_pois, :, 1),
     obs_to_state = [2],
     known_params = (γ = 0.25, N = N_pop),
-    likelihood = Poisson(),
+    likelihood = PoissonLikelihood(),
     solver = Tsit5()
 )
 
@@ -446,7 +446,7 @@ Note how the Poisson CIs are **narrower near zero** (where counts are small and 
 Standard 4-panel diagnostics for the primary Gaussian fit help verify that the residuals are well-behaved:
 
 ```{julia}
-diag = appraise(sol)
+diag = psm_appraise(sol)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

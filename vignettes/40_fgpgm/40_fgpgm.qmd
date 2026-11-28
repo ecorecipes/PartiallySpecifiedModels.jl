@@ -65,7 +65,7 @@ dyn!(du, u, p, t) = (du[1] = p.r(u[1]) * u[1])
 prob = PSMProblem(dyn!, [0.7], (0.0, 25.0),
     [BSplineApproximator(:r, (0.0, 8.0), 6; initial = x -> 0.3)];
     data_times=ts, data_values=Y, obs_to_state=[1],
-    known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+    known_params=NamedTuple(), likelihood=GaussianLikelihood(), solver=Tsit5())
 
 sol = solve(prob, FGPGMSolver(n_samples=3000, n_warmup=1500, rng_seed=2))
 (; data_loss = sol.data_loss,

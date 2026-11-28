@@ -1,5 +1,5 @@
 using PartiallySpecifiedModels
-using PartiallySpecifiedModels: solve
+using PartiallySpecifiedModels: solve, nparams, initial_params, penalty_matrix, penalty_blocks, build_evaluator, band_domain
 using Lux, FluxKAN, StableRNGs
 using LinearAlgebra, Random, Statistics, Printf, TOML, SHA
 
@@ -140,7 +140,7 @@ function train_candidate(a, ds, eta, iterations, lr)
     if status == "ok"
         try
             val_prob = problem(a, 0.2, ds.validation_times, ds.validation_values, Ref(0))
-            pred = vec(simulate(val_prob, collect(fit.parameters)))
+            pred = vec(simulate_psm(val_prob, collect(fit.parameters)))
             validation_rmse = rmse(pred, ds.validation_values)
             if !isfinite(validation_rmse)
                 status, message = "validation_failed", "non-finite validation predictions"
@@ -177,7 +177,7 @@ function score_selected(a, fit, ds, case)
     pred = nothing
     try
         prob = problem(a, 0.5, ds.test_times, ds.test_truth, eval_calls)
-        pred = vec(simulate(prob, collect(fit.parameters)))
+        pred = vec(simulate_psm(prob, collect(fit.parameters)))
         trajectory_rmse = rmse(pred, ds.test_truth)
         if !isfinite(trajectory_rmse)
             status, message = "test_failed", "non-finite test predictions"
@@ -192,7 +192,7 @@ function score_selected(a, fit, ds, case)
             # A late forecast failure must not erase an otherwise valid
             # comparison over the state range actually informed by training.
             prob = problem(a, 0.5, ds.test_times[keep], ds.test_truth[keep], eval_calls)
-            supported = vec(simulate(prob, collect(fit.parameters)))
+            supported = vec(simulate_psm(prob, collect(fit.parameters)))
             supported_trajectory_rmse = rmse(supported, ds.test_truth[keep])
         end
         isfinite(supported_trajectory_rmse) ||

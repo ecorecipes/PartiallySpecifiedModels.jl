@@ -99,7 +99,7 @@ approx_β = BSplineApproximator(:β, (0.0, 0.15), 8; initial=0.4)
 prob = PSMProblem(sir!, u0, (0.0, 60.0), [approx_β];
     data_times=t_data, data_values=data_sir,
     obs_to_state=[1, 2], known_params=(γ=0.25,),
-    likelihood=PartiallySpecifiedModels.Gaussian(), solver=Tsit5())
+    likelihood=GaussianLikelihood(), solver=Tsit5())
 
 t_ek = @elapsed sol_ek = solve(prob,
     EnsembleKalmanSolver(n_ensemble=100, n_iterations=50, noise_scale=5.0, verbose=true))
@@ -148,9 +148,7 @@ end
 ## Diagnostic Plots
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol_ek)
+diag = psm_appraise(sol_ek)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

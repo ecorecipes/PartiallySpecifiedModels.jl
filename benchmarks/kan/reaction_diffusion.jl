@@ -161,7 +161,7 @@ function rd_train(a, ds, eta, cfg)
         try
             p = rd_problem(a, RD_VALIDATION_PROFILES, ds.grid, ds.validation_times,
                            ds.validation_values, Ref(0))
-            validation_rmse = rmse(simulate(p, collect(fit.parameters)), ds.validation_values)
+            validation_rmse = rmse(simulate_psm(p, collect(fit.parameters)), ds.validation_values)
             isfinite(validation_rmse) ||
                 (status="validation_failed"; message="non-finite validation predictions")
         catch e
@@ -208,7 +208,7 @@ function rd_score(a, beta, ds, profile_id)
     calls = Ref(0)
     try
         p = rd_problem(a, [RD_TEST_PROFILES[profile_id]], ds.grid, ds.test_times, reference, calls)
-        field_rmse = rmse(simulate(p, beta), reference)
+        field_rmse = rmse(simulate_psm(p, beta), reference)
         isfinite(field_rmse) ||
             (test_status="test_failed"; test_message="non-finite spatial predictions")
     catch e

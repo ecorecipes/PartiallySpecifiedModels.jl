@@ -61,7 +61,7 @@ uf = BSplineApproximator(:r, (0.0, 12.0), 6)
 prob = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf];
     data_times=t_data, data_values=reshape(y_data, :, 1),
     obs_to_state=[1], known_params=NamedTuple(),
-    likelihood=PartiallySpecifiedModels.Gaussian())
+    likelihood=GaussianLikelihood())
 ```
 
 ### Run Profile Likelihood
@@ -136,9 +136,7 @@ This is more reliable than Wald-based CIs (which assume local quadratic curvatur
 ## Diagnostic Plots
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol_pl)
+diag = psm_appraise(sol_pl)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

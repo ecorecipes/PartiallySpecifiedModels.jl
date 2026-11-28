@@ -134,7 +134,7 @@ known.
 uf = BSplineApproximator(:f, (0.0, 10.0), 10; initial = R -> 0.3 * R)
 prob = PSMProblem(rm!, [8.0, 0.5], (0.0, 40.0), [uf];
     data_times = data_t, data_values = data, obs_to_state = [1, 2],
-    known_params = known, likelihood = Gaussian(), solver = Tsit5())
+    known_params = known, likelihood = GaussianLikelihood(), solver = Tsit5())
 fit = solve(prob, LAML(maxiters = 200, verbose = false))
 @printf("data loss %.3f, EDF %.2f, stationarity %.1e\n",
         fit.data_loss, fit.edf, fit.convergence.stationarity)
@@ -287,7 +287,7 @@ Over the bootstrap replicates:
 ```{julia}
 KH(problem, u0) = (tr = threshold(problem, steady_state(problem, u0).u);
                    tr === nothing ? NaN : tr.estimate)
-KH_psm = [KH(to_ode_problem(prob, β), eq_psm.u) for β in parameter_draws(bs)]
+KH_psm = [KH(to_ode_problem(prob, β), eq_psm.u) for β in posterior_draws(bs)]
 KH_t2 = [KH(type2(θ), eq2.u) for θ in θ_boot]
 q(v) = quantile(filter(isfinite, v), [0.025, 0.5, 0.975])
 for (name, v) in (("PSM spline", KH_psm), ("Type II", KH_t2))

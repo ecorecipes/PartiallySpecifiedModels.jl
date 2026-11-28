@@ -73,7 +73,7 @@ function run_case(eff, mort, tmax, dt; seed=11)
     prob = PSMProblem(dyn!, [2.0, 0.6], (0.0, tmax),
         [SingleIndexApproximator(:g, 2, 8; xi=2.5, initial = z -> 0.2z)];
         data_times=collect(st.t), data_values=Y, obs_to_state=[1, 2],
-        known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+        known_params=NamedTuple(), likelihood=GaussianLikelihood(), solver=Tsit5())
     sol = solve(prob, LAML(maxiters=150, warmup=8, verbose=false))
     Ns = [u[1] for u in st.u]; Ps = [u[2] for u in st.u]
     mN, mP = sum(Ns)/length(Ns), sum(Ps)/length(Ps)

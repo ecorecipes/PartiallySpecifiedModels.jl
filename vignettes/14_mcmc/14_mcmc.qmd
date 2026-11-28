@@ -102,7 +102,7 @@ prob = PSMProblem(logistic!, [10.0], tspan, [uf_r];
     data_values=Float64.(data_matrix),
     obs_to_state=[1],
     known_params=NamedTuple(),
-    likelihood=PartiallySpecifiedModels.Gaussian())
+    likelihood=GaussianLikelihood())
 ```
 
 ### Step 1: Run LAML to Calibrate Smoothing
@@ -150,7 +150,7 @@ We draw posterior predictive trajectories by simulating the ODE for each MCMC sa
 chains = sol.convergence
 sample_matrix = Array(chains)
 n_samp = size(sample_matrix, 1)
-np = nparams(uf_r)
+np = PartiallySpecifiedModels.nparams(uf_r)
 n_plot = min(n_samp, 200)
 
 t_pred = collect(range(tspan..., length=100))
@@ -237,9 +237,9 @@ $$\text{EDF} = \text{tr}\left[(\mathbf{J}^\top \mathbf{W} \mathbf{J} + \lambda \
 We compute a posterior distribution of EDF by evaluating this at each MCMC sample. Since the Jacobian **J** depends on the ODE solution (which changes with each sample), we use a finite-difference approximation:
 
 ```{julia}
-# Penalty matrix — must use penalty_matrix(uf_r) which uses unit-interval
+# Penalty matrix — must use PartiallySpecifiedModels.penalty_matrix(uf_r) which uses unit-interval
 # knots, matching what the LAML solver uses internally
-S = penalty_matrix(uf_r)
+S = PartiallySpecifiedModels.penalty_matrix(uf_r)
 λ_eff = λ_laml  # effective λ = 1/prior_scale_calibrated = λ_laml
 
 # Compute posterior EDF for each sample
@@ -391,9 +391,7 @@ The solution demonstrated here is to **calibrate the MCMC prior using LAML's est
 A standard 4-panel diagnostic display assesses residual behaviour for the MCMC fit. The QQ plot checks normality of standardized residuals, "Residuals vs Fitted" detects systematic patterns, the histogram visualises the residual distribution, and "Observed vs Fitted" checks overall calibration.
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol)
+diag = psm_appraise(sol)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

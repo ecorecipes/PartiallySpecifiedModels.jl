@@ -74,8 +74,7 @@ import Lux
         prob = PSMProblem(dyn!, [10.0], (0.0, 5.0), [uf];
                           data_times=ts, data_values=y, likelihood=PoissonLikelihood())
         for alg in (LAML(maxiters=20, jac=:forwarddiff),
-                    GCVSolver(maxiters=20, jac=:forwarddiff),
-                    CollocationLAML(maxiters=15, n_continuation=3))
+                    GCVSolver(maxiters=20, jac=:forwarddiff))
             sol = solve(prob, alg)
             S = penalty_matrix(uf)
             β = collect(sol.parameters)
@@ -83,6 +82,13 @@ import Lux
             expected = -log_likelihood(PoissonLikelihood(), vec(y), vec(sol.fitted_values), ones(length(y))) + 0.5 * pen
             @test isapprox(sol.objective, expected; rtol=1e-6, atol=1e-6)
         end
+        # CollocationLAML deliberately honors the documented squared-error reporting
+        # convention `objective == data_loss + β'S^λβ` (docs/src/solvers.md).
+        sol_c = solve(prob, CollocationLAML(maxiters=15, n_continuation=3))
+        S_c = penalty_matrix(uf)
+        β_c = collect(sol_c.parameters)
+        pen_c = sol_c.smoothing_params[1] * dot(β_c, S_c * β_c)
+        @test isapprox(sol_c.objective, sol_c.data_loss + pen_c; rtol=1e-6, atol=1e-6)
     end
 
     @testset "H2/M1/H3/M2/M3/M4: SCOP :dec_positive, COMONet, confidence_band, NegBin, diagnostics" begin

@@ -89,7 +89,7 @@ function rd_replay_parity(model, a, beta, ds, archive)
         (RD_TRAIN_PROFILES,ds.train_times,ds.train_values,"training_rmse"),
         (RD_VALIDATION_PROFILES,ds.validation_times,ds.validation_values,"validation_rmse"))
         p = rd_problem(a,profiles,ds.grid,times,values,Ref(0))
-        compare(metric,rmse(simulate(p,beta),values),selected[Symbol(metric)])
+        compare(metric,rmse(simulate_psm(p,beta),values),selected[Symbol(metric)])
     end
     for id in eachindex(RD_TEST_PROFILES)
         old = only(filter(r -> rd_key(r) == key && parse(Int,r.profile_id) == id,archive.profiles))

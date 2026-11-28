@@ -317,9 +317,7 @@ end
 A standard 4-panel diagnostic display assesses residual behaviour for the recommended LAML solver.
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol_laml)
+diag = psm_appraise(sol_laml)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

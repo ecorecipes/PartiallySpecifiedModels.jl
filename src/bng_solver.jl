@@ -353,15 +353,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     # comparing uncalibrated losses across different bootstrap resamples.
     base_losses = [bng_loss(b, y_smooth_base, dydt_base) for b in member_betas]
     best_idx = argmin(base_losses)
-    # Ensemble median/mean for parameter vector when multiple finite members exist
-    finite_members = [i for i in eachindex(base_losses) if isfinite(base_losses[i])]
-    beta = if isempty(finite_members)
-        copy(member_betas[best_idx])
-    else
-        M_ens = hcat((member_betas[i] for i in finite_members)...)
-        vec(median(M_ens; dims=2))
-    end
-    best_loss = bng_loss(beta, y_smooth_base, dydt_base)
+    beta = copy(member_betas[best_idx])
+    best_loss = base_losses[best_idx]
 
     if verbose
         println("  Best member: $best_idx/$K_total, " *

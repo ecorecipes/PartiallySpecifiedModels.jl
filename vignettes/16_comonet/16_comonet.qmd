@@ -93,7 +93,7 @@ uf_bs = BSplineApproximator(:r, (0.5, 10.5), 10)
 prob_bs = PSMProblem(logistic!, [1.0], tspan, [uf_bs];
     data_times=t_data, data_values=Float64.(data_matrix),
     obs_to_state=[1], known_params=NamedTuple(),
-    likelihood=PartiallySpecifiedModels.Gaussian())
+    likelihood=GaussianLikelihood())
 
 sol_bs = solve(prob_bs, LAML(maxiters=60, verbose=false))
 ```
@@ -108,7 +108,7 @@ uf_scbs = ShapeConstrainedBSplineApproximator(:r, (0.5, 10.5), 10, :decreasing)
 prob_scbs = PSMProblem(logistic!, [1.0], tspan, [uf_scbs];
     data_times=t_data, data_values=Float64.(data_matrix),
     obs_to_state=[1], known_params=NamedTuple(),
-    likelihood=PartiallySpecifiedModels.Gaussian())
+    likelihood=GaussianLikelihood())
 
 sol_scbs = solve(prob_scbs, LAML(maxiters=60, verbose=false))
 ```
@@ -128,7 +128,7 @@ uf_como = COMONetApproximator(:r, (0.5, 10.5), (8,), :decreasing;
 prob_como = PSMProblem(logistic!, [1.0], tspan, [uf_como];
     data_times=t_data, data_values=Float64.(data_matrix),
     obs_to_state=[1], known_params=NamedTuple(),
-    likelihood=PartiallySpecifiedModels.Gaussian())
+    likelihood=GaussianLikelihood())
 
 sol_como = solve(prob_como, AdamSolver(lr=0.01, maxiters=3000, verbose=false))
 ```
@@ -332,9 +332,7 @@ rmse_como = sqrt(sum(res_como.^2) / length(res_como))
 A standard 4-panel diagnostic display assesses residual behaviour for the COMONet fit. The QQ plot checks normality of standardized residuals, "Residuals vs Fitted" detects systematic patterns, the histogram visualises the residual distribution, and "Observed vs Fitted" checks overall calibration.
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol_como)
+diag = psm_appraise(sol_como)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

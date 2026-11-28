@@ -125,9 +125,7 @@ plot!(prev_grid, [sol_laml.unknown_functions[:β](p) for p in prev_grid],
 ## Diagnostic Plots
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol_odin)
+diag = psm_appraise(sol_odin)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

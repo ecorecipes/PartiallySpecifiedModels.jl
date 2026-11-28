@@ -9,9 +9,10 @@ ResilienceCore = "e31f93f6-99b1-4a70-b0c5-c402beffe4e1"
 StructuredPopulationCore = "33358fd2-7d60-4541-bded-caea801370e0"
 
 [sources]
-DynamicalResilience = {url = "https://github.com/ecorecipes/DynamicalResilience.jl"}
-ResilienceCore = {url = "https://github.com/ecorecipes/ResilienceCore.jl"}
-StructuredPopulationCore = {url = "https://github.com/ecorecipes/ProjectionModels.jl"}
+DynamicalResilience = {rev = "main", url = "https://github.com/ecorecipes/DynamicalResilience.jl"}
+PartiallySpecifiedModels = {path = ".."}
+ResilienceCore = {rev = "main", url = "https://github.com/ecorecipes/ResilienceCore.jl"}
+StructuredPopulationCore = {rev = "main", url = "https://github.com/ecorecipes/ProjectionModels.jl"}
 
 [compat]
 Documenter = "1"

@@ -1,0 +1,165 @@
+# Seasonal Measles SEIR: Cyclic Splines, Interval Incidence & Negative Binomial Counts
+Simon Frost
+2026-11-27
+
+- [Overview](#overview)
+- [Setup](#setup)
+- [Seasonal SEIR Model and Biweekly Surveillance
+  Data](#seasonal-seir-model-and-biweekly-surveillance-data)
+- [Fitting Cyclic Seasonal Transmission with
+  `TrajectoryObservation`](#fitting-cyclic-seasonal-transmission-with-trajectoryobservation)
+- [Summary](#summary)
+
+## Overview
+
+Pre-vaccine childhood measles dynamics (e.g., London biweekly
+notifications, Bjørnstad et al. 2002) are driven by strong annual
+school-term seasonality in the transmission rate
+$\beta(t) = \beta(t + 1\,\text{yr})$, while surveillance reports record
+**overdispersed interval case counts** over reporting windows rather
+than instantaneous prevalence $I(t)$.
+
+This vignette showcases four flagship `PartiallySpecifiedModels.jl` v0.3
+features together:
+
+1.  `CyclicBSplineApproximator` enforcing exact $C^2$-periodic annual
+    forcing $\beta(0) = \beta(1)$, $\beta'(0) = \beta'(1)$,
+    $\beta''(0) = \beta''(1)$ across multi-year epidemics.
+2.  `TrajectoryObservation` mapping cumulative cases $C(t)$ to exact
+    biweekly reported incidence $\rho\big(C(t_i) - C(t_{i-1})\big)$.
+3.  Direct `Distributions.NegativeBinomial` likelihood coercion with
+    `LAML(criterion=:laplace)`.
+4.  `compare_models` comparing seasonal vs constant-transmission models
+    by AICc and Akaike weights.
+
+## Setup
+
+``` julia
+using PartiallySpecifiedModels
+using PartiallySpecifiedModels: solve
+using Distributions
+using OrdinaryDiffEq
+using Random
+using Statistics
+using Printf
+```
+
+## Seasonal SEIR Model and Biweekly Surveillance Data
+
+We track $(S, E, I, R, C)$ over 2 years (`tspan = (0.0, 2.0)` years,
+biweekly intervals $\Delta t = 1/26\,\text{yr}$), where $C(t)$
+integrates true incidence $\sigma E(t)$ and a fraction $\rho = 0.5$ of
+cases are reported with Negative Binomial overdispersion $\theta = 15$:
+
+``` julia
+rng = Random.Xoshiro(4501)
+N_pop = 100_000.0
+μ_demo = 0.02           # birth/death rate (1/yr)
+σ_lat = 365.0 / 8.0     # latent rate (8-day incubation)
+γ_rec = 365.0 / 5.0     # recovery rate (5-day infectious period)
+ρ_rep = 0.50            # reporting fraction
+
+# True seasonal transmission rate (annual period = 1 year)
+β_true(t) = 1100.0 * (1.0 + 0.25 * cos(2π * t))
+
+u0_seir = [0.075 * N_pop, 120.0, 120.0, N_pop - 0.075 * N_pop - 240.0, 0.0]
+ts = collect(range(0.0, 2.0, length=53))   # 52 biweekly reporting intervals
+
+function seir_true!(du, u, p, t)
+    S, E, I, R, C = u
+    inf = β_true(t) * S * I / N_pop
+    du[1] = μ_demo * N_pop - inf - μ_demo * S
+    du[2] = inf - (σ_lat + μ_demo) * E
+    du[3] = σ_lat * E - (γ_rec + μ_demo) * I
+    du[4] = γ_rec * I - μ_demo * R
+    du[5] = σ_lat * E
+end
+
+sol_truth = OrdinaryDiffEq.solve(ODEProblem(seir_true!, u0_seir, (0.0, 2.0)),
+                                 Tsit5(); saveat=ts, abstol=1e-10, reltol=1e-10)
+C_truth = Float64[sol_truth[5, i] for i in eachindex(ts)]
+mu_biweekly = vcat([1.0], max.(ρ_rep .* diff(C_truth), 1.0))
+
+# Sample Negative Binomial biweekly case reports (θ = 15)
+θ_nb = 15.0
+y_cases = zeros(length(ts), 1)
+for i in 2:length(ts)
+    p_nb = θ_nb / (θ_nb + mu_biweekly[i])
+    y_cases[i, 1] = Float64(rand(rng, Distributions.NegativeBinomial(θ_nb, p_nb)))
+end
+w_cases = ones(length(ts), 1)
+w_cases[1, 1] = 0.0   # mask t = 0 (no prior reporting interval)
+
+println("Biweekly measles cases range: $(minimum(y_cases[2:end])) – $(maximum(y_cases[2:end]))")
+```
+
+    Biweekly measles cases range: 0.0 – 363.0
+
+## Fitting Cyclic Seasonal Transmission with `TrajectoryObservation`
+
+``` julia
+function seir_psm!(du, u, p, t)
+    S, E, I, R, C = u
+    inf = p.beta(t) * S * I / p.N
+    du[1] = p.mu * p.N - inf - p.mu * S
+    du[2] = inf - (p.sigma + p.mu) * E
+    du[3] = p.sigma * E - (p.gamma + p.mu) * I
+    du[4] = p.gamma * I - p.mu * R
+    du[5] = p.sigma * E
+end
+
+biweekly_incidence = TrajectoryObservation((U, times, p) -> begin
+    T = eltype(U)
+    out = zeros(T, size(U, 1), 1)
+    out[1, 1] = one(T)
+    for i in 2:size(U, 1)
+        out[i, 1] = p.rho * (U[i, 5] - U[i - 1, 5])
+    end
+    out
+end)
+
+kp = (N=N_pop, mu=μ_demo, sigma=σ_lat, gamma=γ_rec, rho=ρ_rep)
+
+prob_seasonal = PSMProblem(
+    seir_psm!, u0_seir, (0.0, 2.0),
+    [CyclicBSplineApproximator(:beta, (0.0, 1.0), 8; initial=1100.0)];
+    data_times = ts,
+    data_values = y_cases,
+    data_weights = w_cases,
+    obs_fn = biweekly_incidence,
+    known_params = kp,
+    likelihood = Distributions.NegativeBinomial(θ_nb, 0.5))
+
+sol_seasonal = solve(prob_seasonal, LAML(maxiters=50, criterion=:laplace))
+# Null constant-transmission model (heavy smoothing shrinks cyclic spline to its 1D constant null space)
+sol_const = solve(prob_seasonal, LAML(maxiters=50, criterion=:laplace, fixed_lambda=1e12))
+
+β_hat = sol_seasonal.unknown_functions[:beta]
+t_yr = range(0.0, 1.0, length=50)
+rel_rmse = sqrt(mean(((β_hat(t) - β_true(t)) / 1100.0)^2 for t in t_yr))
+@printf("Seasonal β(t) relative RMSE: %.2f%%  (exact seam match |β(0)-β(1)| = %.2e)\n",
+        100 * rel_rmse, abs(β_hat(0.0) - β_hat(1.0)))
+
+tbl = compare_models(sol_const => prob_seasonal, sol_seasonal => prob_seasonal;
+                     names=["Constant β", "Cyclic β(t)"])
+println(tbl)
+```
+
+    ┌ Warning: LAML: the objective converged but the parameters did not — one more PCLS step from the reported fit moves β by 0.098 (relative), above 0.001. The fit stopped on a flat ridge of the penalized objective: the fitted FUNCTIONS are usable, but individual coefficients and their covariance are not pinned. See `convergence.ridge` and `convergence.final_parameter_step`.
+    └ @ PartiallySpecifiedModels ~/Projects/psm/PartiallySpecifiedModels.jl/src/solver.jl:2451
+    Seasonal β(t) relative RMSE: 10.32%  (exact seam match |β(0)-β(1)| = 0.00e+00)
+    ModelComparisonTable (2 models, sorted by :aicc):
+      Model                |  EDF  |    LogLik   |     AIC     |    AICc     |   ΔAICc  | Weight |     BIC
+      ----------------------------------------------------------------------------------------------------
+      Cyclic β(t)          |  3.99 |    -114.015 |     236.015 |     236.863 |    0.000 |  1.000 |     243.806
+      Constant β           |  0.00 |    -268.790 |     537.580 |     537.580 |  300.717 |  0.000 |     537.580
+
+## Summary
+
+- `CyclicBSplineApproximator` recovers smooth, exactly periodic seasonal
+  forcing across multi-year horizons without boundary artifacts.
+- `TrajectoryObservation` handles exact interval-aggregated surveillance
+  counts directly inside ForwardDiff-enabled LAML.
+- `Distributions.NegativeBinomial` is accepted directly by `PSMProblem`,
+  and `compare_models` quantifies the overwhelming AICc support for
+  seasonality.

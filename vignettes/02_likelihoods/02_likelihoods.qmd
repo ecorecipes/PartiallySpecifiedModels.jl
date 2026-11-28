@@ -23,10 +23,10 @@ Real-world ecological data are rarely Gaussian. Count data (e.g., population sur
 
 | Family | Typical use | Variance function |
 |--------|-------------|-------------------|
-| `Gaussian()` | Continuous measurements | $\sigma^2$ (profiled) |
-| `Poisson()` | Count data, no overdispersion | $\mu$ |
-| `NegativeBinomial(θ)` | Overdispersed count data | $\mu + \mu^2/\theta$ |
-| `TruncatedNormal(sigma=σ)` | Non-negative continuous data | $\sigma^2(1 - \delta(\mu))$ |
+| `GaussianLikelihood()` | Continuous measurements | $\sigma^2$ (profiled) |
+| `PoissonLikelihood()` | Count data, no overdispersion | $\mu$ |
+| `NegativeBinomialLikelihood(θ)` | Overdispersed count data | $\mu + \mu^2/\theta$ |
+| `TruncatedNormalLikelihood(sigma=σ)` | Non-negative continuous data | $\sigma^2(1 - \delta(\mu))$ |
 | `CustomLikelihood(f)` | Any distribution | Via ForwardDiff |
 
 This vignette demonstrates each family on an SIR epidemic model with a
@@ -145,7 +145,7 @@ make_approx(nk) = BSplineApproximator(:λ, foi_domain, nk;
 
 ## Fitting with Gaussian Likelihood
 
-For continuous measurements, `Gaussian()` profiles out the scale parameter
+For continuous measurements, `GaussianLikelihood()` profiles out the scale parameter
 $\sigma^2$ in the REML objective:
 
 $$
@@ -159,7 +159,7 @@ prob_gauss = PSMProblem(sir_psm!, u0, tspan, [make_approx(8)];
     data_values = reshape(y_gauss, :, 1),
     obs_to_state = [2],
     known_params = (γ = γ, N = N),
-    likelihood = Gaussian(),
+    likelihood = GaussianLikelihood(),
     solver = Tsit5())
 
 sol_gauss = solve(prob_gauss, LAML(maxiters=80, verbose=false))
@@ -170,7 +170,7 @@ println("Gaussian — SS: ", round(sol_gauss.data_loss, sigdigits=4),
 
 ## Fitting with Poisson Likelihood
 
-For count data, `Poisson()` uses the variance function $V(\mu) = \mu$.
+For count data, `PoissonLikelihood()` uses the variance function $V(\mu) = \mu$.
 The IRLS working weights on the identity scale are $\tilde{w}_i = w_i / \mu_i$,
 giving more weight to observations where the mean is small (lower variance).
 The LAML objective uses the full Poisson log-likelihood rather than a profiled
@@ -192,7 +192,7 @@ prob_poisson = PSMProblem(sir_psm!, u0, tspan,
     data_values = reshape(y_poisson, :, 1),
     obs_to_state = [2],
     known_params = (γ = γ, N = N),
-    likelihood = Poisson(),
+    likelihood = PoissonLikelihood(),
     solver = Tsit5())
 
 sol_poisson = solve(prob_poisson, LAML(maxiters=80, verbose=false))
@@ -203,7 +203,7 @@ println("Poisson — Loss: ", round(sol_poisson.data_loss, sigdigits=4),
 
 ## Fitting with Negative Binomial Likelihood
 
-`NegativeBinomial(θ)` adds an overdispersion parameter $\theta$ controlling
+`NegativeBinomialLikelihood(θ)` adds an overdispersion parameter $\theta$ controlling
 the variance: $\text{Var}(Y) = \mu + \mu^2/\theta$. Smaller $\theta$ means
 more overdispersion.
 
@@ -215,7 +215,7 @@ prob_nb = PSMProblem(sir_psm!, u0, tspan,
     data_values = reshape(y_negbin, :, 1),
     obs_to_state = [2],
     known_params = (γ = γ, N = N),
-    likelihood = NegativeBinomial(10.0),
+    likelihood = NegativeBinomialLikelihood(10.0),
     solver = Tsit5())
 
 sol_nb = solve(prob_nb, LAML(maxiters=80, verbose=false))
@@ -227,7 +227,7 @@ println("NegBin — Loss: ", round(sol_nb.data_loss, sigdigits=4),
 ## Fitting with Truncated Normal Likelihood
 
 For non-negative continuous measurements (e.g., population densities,
-concentrations), `TruncatedNormal(sigma=σ)` models data as drawn from
+concentrations), `TruncatedNormalLikelihood(sigma=σ)` models data as drawn from
 a Normal($\mu$, $\sigma^2$) truncated below at 0.  Unlike Gaussian, the
 truncation ensures the likelihood properly handles observations near zero
 without assigning probability to negative values.
@@ -252,7 +252,7 @@ prob_trnorm = PSMProblem(sir_psm!, u0, tspan,
     data_values = reshape(y_trnorm, :, 1),
     obs_to_state = [2],
     known_params = (γ = γ, N = N),
-    likelihood = TruncatedNormal(sigma=5.0),
+    likelihood = TruncatedNormalLikelihood(sigma=5.0),
     solver = Tsit5())
 
 sol_trnorm = solve(prob_trnorm, LAML(maxiters=80, verbose=false))
@@ -300,7 +300,7 @@ println("Laplace — Loss: ", round(sol_laplace.data_loss, sigdigits=4),
 ```
 
 ::: {.callout-note}
-The built-in `Gaussian()` profiles out the scale parameter $\sigma^2$ in the
+The built-in `GaussianLikelihood()` profiles out the scale parameter $\sigma^2$ in the
 REML objective, making it scale-free. Custom likelihoods use the raw
 log-likelihood without scale profiling, so you need to choose the scale
 parameter (here $b=10$) appropriately for your data.
@@ -380,9 +380,7 @@ p2
 A standard 4-panel diagnostic display assesses residual behaviour for the Gaussian fit, which serves as the baseline likelihood.
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol_gauss)
+diag = psm_appraise(sol_gauss)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",
@@ -423,10 +421,10 @@ println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_wa
 
 | Likelihood | When to use | LAML behaviour |
 |------------|-------------|----------------|
-| `Gaussian()` | Continuous, symmetric errors | Profiled REML ($\sigma^2$ estimated) |
-| `Poisson()` | Counts, variance ≈ mean | Full marginal likelihood, IRLS weights $w/\mu$ |
-| `NegativeBinomial(θ)` | Overdispersed counts | Full ML, IRLS weights $w/(\mu + \mu^2/\theta)$ |
-| `TruncatedNormal(sigma=σ)` | Non-negative continuous | Full ML, Fisher-information weights |
+| `GaussianLikelihood()` | Continuous, symmetric errors | Profiled REML ($\sigma^2$ estimated) |
+| `PoissonLikelihood()` | Counts, variance ≈ mean | Full marginal likelihood, IRLS weights $w/\mu$ |
+| `NegativeBinomialLikelihood(θ)` | Overdispersed counts | Full ML, IRLS weights $w/(\mu + \mu^2/\theta)$ |
+| `TruncatedNormalLikelihood(sigma=σ)` | Non-negative continuous | Full ML, Fisher-information weights |
 | `CustomLikelihood(f)` | Any distribution | Autodiff for IRLS weights |
 
 For Gaussian data, LAML is exactly equivalent to REML. For non-Gaussian data,

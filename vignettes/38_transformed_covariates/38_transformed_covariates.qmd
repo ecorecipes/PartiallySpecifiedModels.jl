@@ -92,7 +92,7 @@ approx = TransformedCovariateApproximator(:beta, tt, temp;
                                           constraint=:increasing)
 prob = PSMProblem(sir!, [N-5.0, 5.0], (0.0, 120.0), [approx];
     data_times=obs_t, data_values=Y, obs_to_state=[2],
-    known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+    known_params=NamedTuple(), likelihood=GaussianLikelihood(), solver=Tsit5())
 
 sol = solve(prob, LAML(maxiters=40, verbose=false))
 (; data_loss = sol.data_loss, edf = sol.edf,

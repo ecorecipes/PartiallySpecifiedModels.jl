@@ -476,7 +476,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
             end
 
             if n_valid == 0
-                elbo_val = -1e10
+                elbo_val = -Inf
                 fill!(grad_buf, 0.0)
             else
                 inv_S = 1.0 / (n_valid + n_failed)

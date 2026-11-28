@@ -33,7 +33,7 @@ function ce_fixed_fit(model,ds,values,rho,initial,indices,opts)
     y = vec(values)[indices]
     function objective(b,unused)
         pred = try
-            simulate(prob,b)
+            simulate_psm(prob,b)
         catch e
             ce_error(e)
             return Inf
@@ -47,7 +47,7 @@ function ce_fixed_fit(model,ds,values,rho,initial,indices,opts)
     converged,iterations = false,0
     for iteration in 1:opts.iterations
         iterations = iteration
-        pred = simulate(prob,theta)
+        pred = simulate_psm(prob,theta)
         J = ce_jacobian(prob,theta,pred)
         residual = L \ (vec(pred)[indices]-y)
         JW = L \ J[indices,:]
@@ -64,7 +64,7 @@ function ce_fixed_fit(model,ds,values,rho,initial,indices,opts)
             break
         end
     end
-    pred = simulate(prob,theta)
+    pred = simulate_psm(prob,theta)
     J = ce_jacobian(prob,theta,pred)
     residual = L \ (vec(pred)[indices]-y)
     score = sp_working_profile(L\J[indices,:],ones(length(indices)),theta,residual,q;

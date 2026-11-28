@@ -79,7 +79,7 @@ approx = TensorBSplineApproximator(:g, (0.0, 6.5), (0.0, 2.5), 4, 4;
                                    initial = (N, P) -> 0.3N)
 prob = PSMProblem(pp!, [2.0, 0.6], (0.0, 40.0), [approx];
     data_times=collect(st.t), data_values=Y, obs_to_state=[1, 2],
-    known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+    known_params=NamedTuple(), likelihood=GaussianLikelihood(), solver=Tsit5())
 
 sol = solve(prob, LAML(maxiters=40, verbose=false))
 (; data_loss=sol.data_loss, edf=sol.edf,

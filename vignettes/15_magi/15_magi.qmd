@@ -100,7 +100,7 @@ prob_sir = PSMProblem(sir!, [0.99, 0.01, 0.0], (0.0, 40.0), [uf_β];
     data_values=Float64.(data_SI),
     obs_to_state=[1, 2],
     known_params=NamedTuple(),
-    likelihood=PartiallySpecifiedModels.Gaussian())
+    likelihood=GaussianLikelihood())
 
 sol_sir = solve(prob_sir, MagiSolver(
     n_samples=150, n_warmup=150,
@@ -116,7 +116,7 @@ We reconstruct trajectory predictions by forward-solving the ODE for each poster
 chains_sir = sol_sir.convergence.chains
 sample_sir = Array(chains_sir)
 n_samp_sir = size(sample_sir, 1)
-np_sir = nparams(uf_β)
+np_sir = PartiallySpecifiedModels.nparams(uf_β)
 n_traj = min(n_samp_sir, 100)
 
 t_pred_sir = collect(range(0.0, 40.0, length=100))
@@ -276,7 +276,7 @@ prob_lv = PSMProblem(lv!, [2.0, 1.0], (0.0, 30.0), [uf_g];
     data_values=Float64.(prey_matrix),
     obs_to_state=[1],       # only prey observed!
     known_params=NamedTuple(),
-    likelihood=PartiallySpecifiedModels.Gaussian())
+    likelihood=GaussianLikelihood())
 
 sol_lv = solve(prob_lv, MagiSolver(
     n_samples=150, n_warmup=150,
@@ -290,7 +290,7 @@ sol_lv = solve(prob_lv, MagiSolver(
 chains_lv = sol_lv.convergence.chains
 sample_lv = Array(chains_lv)
 n_samp_lv = size(sample_lv, 1)
-np_lv = nparams(uf_g)
+np_lv = PartiallySpecifiedModels.nparams(uf_g)
 n_traj_lv = min(n_samp_lv, 100)
 
 t_pred_lv = collect(range(0.0, 30.0, length=100))
@@ -433,9 +433,7 @@ p_tr_lv
 A standard 4-panel diagnostic display assesses residual behaviour for the MAGI SIR fit. The QQ plot checks normality of standardized residuals, "Residuals vs Fitted" detects systematic patterns, the histogram visualises the residual distribution, and "Observed vs Fitted" checks overall calibration.
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol_sir)
+diag = psm_appraise(sol_sir)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

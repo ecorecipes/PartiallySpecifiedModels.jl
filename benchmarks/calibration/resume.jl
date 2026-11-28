@@ -73,7 +73,7 @@ function cer_working_fit(record,model,ds)
     # perturbing it through a transform/inverse-transform round trip.
     anchored = CERCoordinates(model.approx.name,model.approx,coordinates.transform,beta,theta)
     prob = sp_problem(ce_problem(model,ds,ds.observed),anchored)
-    pred = simulate(prob,theta)
+    pred = simulate_psm(prob,theta)
     J = ce_jacobian(prob,theta,pred)
     L = cholesky(Symmetric(ds.noise.shape)).L
     residual = L \ vec(pred-ds.observed)

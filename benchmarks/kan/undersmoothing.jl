@@ -12,7 +12,7 @@ function UndersmoothingFit(;fraction=0.25,iterations=40)
 end
 
 function PSM.SciMLBase.solve(prob::PSMProblem,alg::UndersmoothingFit)
-    prob.likelihood isa Gaussian && length(prob.approximators)==1 ||
+    prob.likelihood isa GaussianLikelihood && length(prob.approximators)==1 ||
         throw(ArgumentError("this experiment supports one Gaussian unknown function"))
     selected=solve(prob,LAML(maxiters=alg.iterations,jac=:forwarddiff))
     length(selected.smoothing_params)==1 ||

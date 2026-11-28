@@ -37,7 +37,7 @@ The model parameters are chosen to give a **stable interior equilibrium** (no li
 
 ```{julia}
 using PartiallySpecifiedModels
-using PartiallySpecifiedModels: solve, confidence_band, appraise
+using PartiallySpecifiedModels: solve, confidence_band
 using OrdinaryDiffEq
 using Plots; default(fmt=:png)
 using Random
@@ -138,7 +138,7 @@ prob_free = PSMProblem(rm_psm!, u0, tspan, [uf_free];
     data_times=data_t, data_values=data,
     obs_to_state=[1, 2],
     known_params=(K=10.0, e=0.5, d=0.8),
-    likelihood=Gaussian(),
+    likelihood=GaussianLikelihood(),
     solver=Tsit5())
 
 sol_free = solve(prob_free, CollocationLAML(
@@ -216,7 +216,7 @@ prob_sc = PSMProblem(rm_psm!, u0, tspan, [uf_sc];
     data_times=data_t, data_values=data,
     obs_to_state=[1, 2],
     known_params=(K=10.0, e=0.5, d=0.8),
-    likelihood=Gaussian(),
+    likelihood=GaussianLikelihood(),
     solver=Tsit5())
 
 sol_sc = solve(prob_sc, LAML(maxiters=200, verbose=false));
@@ -338,7 +338,7 @@ We assess the unconstrained fit using a standard 4-panel diagnostic display. The
 ```{julia}
 #| label: fig-diagnostics
 #| fig-cap: "Four-panel diagnostic plots for the unconstrained LAML fit"
-diag = appraise(sol_free)
+diag = psm_appraise(sol_free)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

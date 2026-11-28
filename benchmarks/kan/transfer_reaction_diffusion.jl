@@ -32,7 +32,7 @@ function rd_transfer_profile(a, beta, case, profile, cells, times, references)
         p = rd_problem(a,[profile],rd_grid(n),times,references[n],counter)
         prediction, message = nothing,""
         try
-            values = simulate(p,beta)
+            values = simulate_psm(p,beta)
             if all(isfinite,values)
                 prediction = Matrix{Float64}(values)
             else

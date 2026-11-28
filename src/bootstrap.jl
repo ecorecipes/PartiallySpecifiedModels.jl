@@ -85,6 +85,34 @@ end
 
 # ─── Bootstrap methods ────────────────────────────────────────────
 
+# Per-replicate convergence flags read defensively: only the LAML family
+# carries `smoothing_advanced`/`ridge`; other solvers are neither.
+_bs_stalled(sol) = hasproperty(sol.convergence, :smoothing_advanced) &&
+                   !sol.convergence.smoothing_advanced
+_bs_ridge(sol)   = hasproperty(sol.convergence, :ridge) && sol.convergence.ridge
+
+# A logger that drops the two per-fit LAML diagnostics by id and forwards
+# everything else to the enclosing logger. Inside a bootstrap those warnings
+# are aggregated into `n_smoothing_stalled` / `n_ridge` instead.
+struct _ReplicateLogger{L} <: Base.CoreLogging.AbstractLogger
+    parent::L
+end
+const _BS_SUPPRESSED_IDS = (:laml_smoothing_never_moved, :laml_ridge,
+                            :gcv_ridge, :collocation_ridge)
+Base.CoreLogging.shouldlog(l::_ReplicateLogger, level, _module, group, id) =
+    !(id in _BS_SUPPRESSED_IDS) &&
+    Base.CoreLogging.shouldlog(l.parent, level, _module, group, id)
+Base.CoreLogging.min_enabled_level(l::_ReplicateLogger) =
+    Base.CoreLogging.min_enabled_level(l.parent)
+Base.CoreLogging.catch_exceptions(l::_ReplicateLogger) =
+    Base.CoreLogging.catch_exceptions(l.parent)
+Base.CoreLogging.handle_message(l::_ReplicateLogger, args...; kwargs...) =
+    Base.CoreLogging.handle_message(l.parent, args...; kwargs...)
+_replicate_solve(prob, alg) =
+    Base.CoreLogging.with_logger(_ReplicateLogger(Base.CoreLogging.current_logger())) do
+        solve(prob, alg)
+    end
+
 """
     bootstrap(sol, prob, alg; nboot=200, method=:parametric, level=0.95,
               uf_ngrid=100, uf_points=nothing, rng=default_rng(), verbose=false)
@@ -171,34 +199,6 @@ plot(bs.uf_grid[:λ], bs.ci_uf[:λ].lower, fillrange=bs.ci_uf[:λ].upper,
      alpha=0.2, label="95% CI")
 ```
 """
-# Per-replicate convergence flags read defensively: only the LAML family
-# carries `smoothing_advanced`/`ridge`; other solvers are neither.
-_bs_stalled(sol) = hasproperty(sol.convergence, :smoothing_advanced) &&
-                   !sol.convergence.smoothing_advanced
-_bs_ridge(sol)   = hasproperty(sol.convergence, :ridge) && sol.convergence.ridge
-
-# A logger that drops the two per-fit LAML diagnostics by id and forwards
-# everything else to the enclosing logger. Inside a bootstrap those warnings
-# are aggregated into `n_smoothing_stalled` / `n_ridge` instead.
-struct _ReplicateLogger{L} <: Base.CoreLogging.AbstractLogger
-    parent::L
-end
-const _BS_SUPPRESSED_IDS = (:laml_smoothing_never_moved, :laml_ridge,
-                            :gcv_ridge, :collocation_ridge)
-Base.CoreLogging.shouldlog(l::_ReplicateLogger, level, _module, group, id) =
-    !(id in _BS_SUPPRESSED_IDS) &&
-    Base.CoreLogging.shouldlog(l.parent, level, _module, group, id)
-Base.CoreLogging.min_enabled_level(l::_ReplicateLogger) =
-    Base.CoreLogging.min_enabled_level(l.parent)
-Base.CoreLogging.catch_exceptions(l::_ReplicateLogger) =
-    Base.CoreLogging.catch_exceptions(l.parent)
-Base.CoreLogging.handle_message(l::_ReplicateLogger, args...; kwargs...) =
-    Base.CoreLogging.handle_message(l.parent, args...; kwargs...)
-_replicate_solve(prob, alg) =
-    Base.CoreLogging.with_logger(_ReplicateLogger(Base.CoreLogging.current_logger())) do
-        solve(prob, alg)
-    end
-
 function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                    nboot::Int=200,
                    method::Symbol=:parametric,

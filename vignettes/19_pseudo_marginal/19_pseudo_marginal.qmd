@@ -77,7 +77,7 @@ uf = BSplineApproximator(:r, (0.0, 12.0), 6)
 prob = PSMProblem(logistic!, [1.0], (0.0, 15.0), [uf];
     data_times=t_data, data_values=Float64.(data_matrix),
     obs_to_state=[1], known_params=NamedTuple(),
-    likelihood=PartiallySpecifiedModels.Gaussian())
+    likelihood=GaussianLikelihood())
 
 # LAML first for initialization
 sol_laml = solve(prob, LAML(maxiters=50, verbose=false));
@@ -199,9 +199,7 @@ plot!(sol_true.t, [sol_true.u[i][1] for i in 1:length(sol_true.t)],
 A standard 4-panel diagnostic display assesses residual behaviour. The QQ plot checks normality of standardized residuals, "Residuals vs Fitted" detects systematic patterns, the histogram visualises the residual distribution, and "Observed vs Fitted" checks overall calibration.
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol_pm)
+diag = psm_appraise(sol_pm)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

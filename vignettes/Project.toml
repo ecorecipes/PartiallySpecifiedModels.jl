@@ -1,25 +1,32 @@
 [deps]
 CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+DecisionAnalysis = "6a9d793e-d09c-4461-8cb4-55c12d181024"
 DelayDiffEq = "bcd4f6db-9728-5f36-b5f7-82caef46ccdb"
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
 DynamicalResilience = "54629d0c-0bd5-4489-a333-4d325b057304"
 FluxKAN = "5d54f141-216f-4d16-867d-ae7ad4aba2dd"
+GAM = "f5b95e24-6450-466f-92b1-fee0c65c0d6b"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
 MCMCChains = "c7f686f2-ff18-58e9-bc7b-31028e88f75d"
 Optim = "429524aa-4258-5aef-a3af-852621145aeb"
 OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
 PartiallySpecifiedModels = "15ae6619-3517-4aad-88ea-30ec1d16fab1"
 Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 ResilienceCore = "e31f93f6-99b1-4a70-b0c5-c402beffe4e1"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 StructuredPopulationCore = "33358fd2-7d60-4541-bded-caea801370e0"
 
 [sources]
-DynamicalResilience = {url = "https://github.com/ecorecipes/DynamicalResilience.jl"}
-ResilienceCore = {url = "https://github.com/ecorecipes/ResilienceCore.jl"}
-StructuredPopulationCore = {url = "https://github.com/ecorecipes/ProjectionModels.jl"}
+DecisionAnalysis = {rev = "main", url = "https://github.com/ecorecipes/DecisionAnalysis.jl"}
+DynamicalResilience = {rev = "main", url = "https://github.com/ecorecipes/DynamicalResilience.jl"}
+GAM = {rev = "main", url = "https://github.com/ecorecipes/GAM.jl"}
+PartiallySpecifiedModels = {path = ".."}
+ResilienceCore = {rev = "main", url = "https://github.com/ecorecipes/ResilienceCore.jl"}
+StructuredPopulationCore = {rev = "main", url = "https://github.com/ecorecipes/ProjectionModels.jl"}
 
 [compat]
 FluxKAN = "0.9"

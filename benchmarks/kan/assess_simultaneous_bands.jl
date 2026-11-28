@@ -17,7 +17,7 @@ function sb_solution(a,prob,saved,fit_row)
     beta=Float64.(saved["parameters"])
     covariance=permutedims(hcat(saved["V_beta"]...))
     f=build_evaluator(a,beta)
-    prediction=simulate(prob,beta)
+    prediction=simulate_psm(prob,beta)
     all(isfinite,prediction) || error("archived original trajectory no longer evaluates")
     PSMSolution(PSM.ComponentArray(r=beta),NaN,parse(Float64,fit_row.data_loss),
         parse(Float64,fit_row.edf),Float64.(saved["smoothing_params"]),
@@ -38,7 +38,7 @@ function sb_bootstrap(prob,a,saved,points,budget)
     for b in 1:n
         f=build_evaluator(a,@view betas[b,:])
         values[:,b] .= f.(points)
-        trajectories[:,:,b] .= simulate(prob,@view betas[b,:])
+        trajectories[:,:,b] .= simulate_psm(prob,@view betas[b,:])
         all(isfinite,@view trajectories[:,:,b]) || error("archived bootstrap trajectory no longer evaluates")
         replay_error=max(replay_error,maximum(abs,f.(saved["points"])-original_values[b,:]))
     end

@@ -888,24 +888,13 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
             Hs_inv = inv(C)
             ld_s = 2.0 * sum(log, diag(C.U))
         else
-            for rr in (1e-14, 1e-12, 1e-10, 1e-8)
-                Hs2 = copy(Hs)
-                @inbounds for i in 1:n_p
-                    Hs2[i, i] += rr
-                end
-                C2 = cholesky(Symmetric(Hs2), check=false)
-                if issuccess(C2)
-                    Hs_inv = inv(C2)
-                    ld_s = 2.0 * sum(log, diag(C2.U))
-                    break
-                end
-            end
-            if Hs_inv === nothing
-                ef_h = eigen(Symmetric(Hs))
-                pos = filter(e -> e > 0, ef_h.values)
-                ld_s = isempty(pos) ? 0.0 : sum(log, pos)
-                Hs_inv = pinv(Hs)
-            end
+            ef_h = eigen(Symmetric(Hs))
+            emax = maximum(abs, ef_h.values)
+            etol = max(1e-10 * emax, 1e-12)
+            pos = filter(e -> e > etol, ef_h.values)
+            ld_s = isempty(pos) ? 0.0 : sum(log, pos)
+            inv_vals = Float64[v > etol ? 1.0 / v : 0.0 for v in ef_h.values]
+            Hs_inv = ef_h.vectors * Diagonal(inv_vals) * ef_h.vectors'
         end
         H_Q_inv = Matrix{Float64}(undef, n_p, n_p)
         @inbounds for j in 1:n_p
@@ -1163,7 +1152,11 @@ function _equilibrate_pd(H::AbstractMatrix; rel_ridge::Float64=1e-12)
     n = size(H, 1)
     d_sqrt = Vector{Float64}(undef, n)
     @inbounds for i in 1:n
-        d_sqrt[i] = sqrt(max(abs(Float64(H[i, i])), 1e-30))
+        hii = abs(Float64(H[i, i]))
+        # Leave dead/zero diagonal columns unscaled (1.0) so rank-deficient
+        # unpenalized blocks (e.g. inactive NN weights) are never amplified by
+        # 1/1e-15 into O(1e14) roundoff blowups in `_safe_inv`.
+        d_sqrt[i] = hii > 1e-14 ? sqrt(hii) : 1.0
     end
     Hs = Matrix{Float64}(undef, n, n)
     @inbounds for j in 1:n
@@ -1210,7 +1203,7 @@ function _rank_penalty(S::AbstractMatrix)
     count(e -> e > tol, evals)
 end
 
-"""Safe matrix inverse via diagonally equilibrated Cholesky with fallback."""
+"""Safe matrix inverse via diagonally equilibrated Cholesky with eigendecomp pseudoinverse fallback."""
 function _safe_inv(H::AbstractMatrix)
     n = size(H, 1)
     n == 0 && return zeros(0, 0)
@@ -1219,19 +1212,15 @@ function _safe_inv(H::AbstractMatrix)
     Hs_inv = if issuccess(C)
         inv(C)
     else
-        found = nothing
-        for rr in (1e-14, 1e-12, 1e-10, 1e-8)
-            Hs2 = copy(Hs)
-            @inbounds for i in 1:n
-                Hs2[i, i] += rr
-            end
-            C2 = cholesky(Symmetric(Hs2), check=false)
-            if issuccess(C2)
-                found = inv(C2)
-                break
-            end
-        end
-        found === nothing ? pinv(Hs) : found
+        # Rank-deficient or numerically indefinite equilibrated matrix (e.g.,
+        # dead unpenalized NN weights): invert strictly positive eigenmodes and
+        # zero out dead null-space directions cleanly rather than dividing
+        # roundoff noise by a 1e-14 ridge.
+        ef = eigen(Symmetric(Hs))
+        emax = maximum(abs, ef.values)
+        etol = max(1e-10 * emax, 1e-12)
+        inv_vals = Float64[v > etol ? 1.0 / v : 0.0 for v in ef.values]
+        ef.vectors * Diagonal(inv_vals) * ef.vectors'
     end
     H_inv = Matrix{Float64}(undef, n, n)
     @inbounds for j in 1:n

@@ -1329,12 +1329,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     pen_total = sum((theta[l] * dot(beta[uf_offsets[l]+1:uf_offsets[l]+uf_nk[l]],
                     S_list[l] * beta[uf_offsets[l]+1:uf_offsets[l]+uf_nk[l]]) for l in 1:m);
                     init=0.0)
-    obj_val = if is_gauss
-        0.5 * (data_loss + pen_total)
-    else
-        fill_mu!(mu_flat, alpha)
-        -log_likelihood(lik, y_flat, mu_flat, w_vec) + 0.5 * pen_total
-    end
+    # Honor cross-solver squared-error reporting convention (`objective == data_loss + pen_total`).
+    obj_val = data_loss + pen_total
 
     if verbose
         println("\nFinal: data_SS=$(round(data_loss, sigdigits=5)) " *

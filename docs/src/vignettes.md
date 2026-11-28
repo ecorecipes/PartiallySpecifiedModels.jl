@@ -73,12 +73,12 @@ The `vignettes/` directory contains 48 worked examples covering every solver, ap
 
 | # | Vignette | Description |
 |:--|:---------|:------------|
-| 43 | Gause *Paramecium* Competition | Multi-replicate competition with `MultiTrajectoryPSMProblem`, `RandomEffectApproximator`, `:decreasing` SCOP-splines, and Wood (2013) `test_parametric_hypothesis` |
-| 44 | *Tribolium* LPA Beetle Chaos | Discrete-time cannibalism with `ShapeConstrainedBSplineApproximator` (`:dec_positive`) and `to_discrete_problem` (`DynamicalResilience.jl`) |
-| 45 | Seasonal Measles Forcing | Periodic transmission with `CyclicBSplineApproximator`, `TrajectoryObservation` interval incidence, `Distributions.NegativeBinomial`, and `compare_models` |
-| 46 | Fisheries Surplus Production & Decision Analysis | Surplus-production biomass (`LogNormalLikelihood`) bridged to `DecisionAnalysis.jl` (`ManagedPSM`, `sample_belief`, EVPI & EVPPI) |
-| 47 | GAM.jl & DynamicalResilience Ecosystem Bridge | Embedding `GAM.jl` smooths (`GAMSmoothApproximator`) inside ODEs with equilibrium resilience propagation |
-| 48 | Stochastic Predator–Prey with Process Noise | Separating environmental stochasticity from observation error via `SDEPSMProblem` and `EKFSolver` |
+| 43 | [Gause *Paramecium* Competition](tutorials/43_gause_competition.md) | Multi-replicate competition with `MultiTrajectoryPSMProblem`, `RandomEffectApproximator`, `:decreasing` SCOP-splines, and Wood (2013) `test_parametric_hypothesis` |
+| 44 | [*Tribolium* LPA Beetle Chaos](tutorials/44_tribolium_lpa.md) | Discrete-time cannibalism with `ShapeConstrainedBSplineApproximator` (`:dec_positive`) and `to_discrete_problem` (`DynamicalResilience.jl`) |
+| 45 | [Seasonal Measles Forcing](tutorials/45_measles_seasonal.md) | Periodic transmission with `CyclicBSplineApproximator`, `TrajectoryObservation` interval incidence, `Distributions.NegativeBinomial`, and `compare_models` |
+| 46 | [Fisheries Surplus Production & Decision Analysis](tutorials/46_fisheries_surplus_decision.md) | Surplus-production biomass (`LogNormalLikelihood`) bridged to `DecisionAnalysis.jl` (`ManagedPSM`, `sample_belief`, EVPI & EVPPI) |
+| 47 | [GAM.jl & DynamicalResilience Ecosystem Bridge](tutorials/47_gam_ecosystem_bridge.md) | Embedding `GAM.jl` smooths (`GAMSmoothApproximator`) inside ODEs with equilibrium resilience propagation |
+| 48 | [Stochastic Predator–Prey with Process Noise](tutorials/48_sde_process_noise.md) | Separating environmental stochasticity from observation error via `SDEPSMProblem` and `EKFSolver` |
 
 ## Running Vignettes Locally
 

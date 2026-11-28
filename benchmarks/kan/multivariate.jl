@@ -247,7 +247,7 @@ function mv_train_candidate(a, ds, eta, cfg)
         try
             prob_v = mv_problem(a, ds.validation_ics, ds.validation_times,
                                 ds.validation_values, Ref(0))
-            pred = simulate(prob_v, collect(fit.parameters))
+            pred = simulate_psm(prob_v, collect(fit.parameters))
             val_rmse = mv_scaled_rmse(pred, ds.validation_values)
             isfinite(val_rmse) ||
                 (status="validation_failed"; message="non-finite validation predictions")
@@ -285,7 +285,7 @@ function mv_score_trajectory(a, beta, ds, case, trajectory_id, radius)
     test_status, test_message = "ok", ""
     try
         p = mv_problem(a, [ds.test_ics[trajectory_id]], ds.test_times, reference, calls)
-        predicted = simulate(p, beta)
+        predicted = simulate_psm(p, beta)
         full_rmse = mv_scaled_rmse(predicted, reference)
         near_rmse = isempty(keep) ? NaN : mv_scaled_rmse(predicted[keep, :], reference[keep, :])
         isfinite(full_rmse) ||

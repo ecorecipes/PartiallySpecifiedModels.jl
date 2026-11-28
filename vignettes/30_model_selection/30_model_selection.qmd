@@ -490,7 +490,7 @@ p_traj
 ### Residual diagnostics
 
 ```{julia}
-diag = appraise(sol_best)
+diag = psm_appraise(sol_best)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

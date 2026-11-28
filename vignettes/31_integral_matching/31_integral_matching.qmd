@@ -92,7 +92,7 @@ for (i, σ) in enumerate(noise_levels)
     prob = PSMProblem(logistic!, [1.0], (0.0, 20.0), [uf];
         data_times=t_data, data_values=reshape(y_noisy, :, 1),
         obs_to_state=[1], known_params=NamedTuple(),
-        likelihood=PartiallySpecifiedModels.Gaussian())
+        likelihood=GaussianLikelihood())
 
     sol_im = solve(prob, IntegralMatchingSolver(maxiters=800, lr=0.01, lambda_smooth=1.0, verbose=false))
     sol_gm = solve(prob, GradientMatching(maxiters=200, verbose=false))
@@ -155,7 +155,7 @@ uf_f = BSplineApproximator(:f, (0.0, H_max), 10; initial=0.3)
 prob_lv = PSMProblem(lv!, [15.0, 3.0], (0.0, 60.0), [uf_f];
     data_times=t_lv, data_values=data_lv,
     obs_to_state=[1, 2], known_params=NamedTuple(),
-    likelihood=PartiallySpecifiedModels.Gaussian())
+    likelihood=GaussianLikelihood())
 
 t_im_lv = @elapsed sol_im_lv = solve(prob_lv,
     IntegralMatchingSolver(maxiters=1500, lr=0.01, lambda_smooth=1.0, verbose=false))
@@ -181,9 +181,7 @@ plot!(H_grid, [sol_gm_lv.unknown_functions[:f](h) for h in H_grid],
 ## Diagnostic Plots
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol_im_lv)
+diag = psm_appraise(sol_im_lv)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

@@ -79,7 +79,7 @@ function sp_coordinates(a, frame, rho::Real, beta)
 end
 
 function sp_problem(prob, a)
-    length(prob.approximators) == 1 && prob.likelihood isa Gaussian ||
+    length(prob.approximators) == 1 && prob.likelihood isa GaussianLikelihood ||
         throw(ArgumentError("smoothing profiles require one Gaussian approximator"))
     PSMProblem(prob.dynamics!, prob.u0, prob.tspan, [a];
         data_times=prob.data_times, data_values=prob.data_values,
@@ -192,7 +192,7 @@ function sp_evaluate(prob,frame,rho,beta; sigma2=nothing,jac=:forwarddiff)
     transformed = sp_problem(prob,a)
     theta = a.initial
     fit = (;rho,beta=a.transform*theta,theta,coordinates=a,problem=transformed,jac)
-    sp_score(fit,frame;sigma2,predictions=simulate(transformed,theta))
+    sp_score(fit,frame;sigma2,predictions=simulate_psm(transformed,theta))
 end
 
 function sp_native_terms(scored,frame,S)
@@ -204,7 +204,7 @@ function sp_native_terms(scored,frame,S)
     prob = scored.problem
     y, w = vec(prob.data_values), vec(prob.data_weights)
     weights = [PSM._usable(y[k],w[k]) ? w[k] : 0.0 for k in eachindex(y)]
-    value,H,B,_ = PSM.laml_objective(Gaussian(),scored.beta,native_J,weights,w,y,
+    value,H,B,_ = PSM.laml_objective(GaussianLikelihood(),scored.beta,native_J,weights,w,y,
         vec(scored.predictions),[S],[0],[length(scored.beta)],[scored.rho],length(scored.beta))
     penalty = dot(scored.beta,B*scored.beta)
     scale = (scored.rss+penalty)/scored.n_eff

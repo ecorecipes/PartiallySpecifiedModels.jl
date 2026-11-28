@@ -46,7 +46,7 @@ survey or catch records typically are. The fits below nevertheless use a
 **Gaussian** likelihood: with counts in the hundreds the Gaussian approximation
 to the Poisson is close, and it keeps the focus of this vignette on the shape
 constraint. The Poisson family enters only at the diagnostic stage, where
-`appraise(sol; family=Poisson())` computes deviance residuals appropriate to the
+`psm_appraise(sol; family=PoissonLikelihood())` computes deviance residuals appropriate to the
 counts. See the note at the end for what fitting a genuine Poisson likelihood
 would involve.
 
@@ -179,7 +179,7 @@ prob_unc = PSMProblem(stock_recruit!, [200.0], (1.0, Float64(n_years)), [uf_unc]
     data_values=reshape(y_pois, :, 1),
     obs_to_state=[1],
     known_params=NamedTuple(),
-    likelihood=PartiallySpecifiedModels.Gaussian(),
+    likelihood=GaussianLikelihood(),
     discrete=true)
 
 sol_unc = solve(prob_unc, LAML(maxiters=200, verbose=false))
@@ -203,7 +203,7 @@ prob_sc = PSMProblem(stock_recruit!, [200.0], (1.0, Float64(n_years)), [uf_sc];
     data_values=reshape(y_pois, :, 1),
     obs_to_state=[1],
     known_params=NamedTuple(),
-    likelihood=PartiallySpecifiedModels.Gaussian(),
+    likelihood=GaussianLikelihood(),
     discrete=true)
 
 sol_sc = solve(prob_sc, LAML(maxiters=200, verbose=false))
@@ -346,14 +346,12 @@ and where extrapolation uncertainty dominates (wide bands at the domain edges).
 
 ## Diagnostic Plots
 
-The `appraise` function produces standardised diagnostic quantities. For
-Poisson data, we pass `family=Poisson()` to compute deviance residuals rather
+The `psm_appraise` function produces standardised diagnostic quantities. For
+Poisson data, we pass `family=PoissonLikelihood()` to compute deviance residuals rather
 than raw residuals:
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol_sc)
+diag = psm_appraise(sol_sc)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",
@@ -448,10 +446,10 @@ This vignette demonstrated:
 | Feature | Implementation |
 |---------|---------------|
 | **Discrete-time model** | `DiscreteProblem` with `f!(u_next, u, p, t)` |
-| **Poisson-generated counts, Gaussian fit** | `likelihood=PartiallySpecifiedModels.Gaussian()` |
+| **Poisson-generated counts, Gaussian fit** | `likelihood=GaussianLikelihood()` |
 | **Shape constraints** | `ShapeConstrainedBSplineApproximator(:R, ..., :inc_concave)` |
 | **Bootstrap CIs** | `bootstrap(sol, prob, alg; nboot=50, method=:parametric)` |
-| **Diagnostics** | `appraise(sol; family=Poisson())` for deviance residuals |
+| **Diagnostics** | `psm_appraise(sol; family=PoissonLikelihood())` for deviance residuals |
 | **Ecological application** | Stock-recruitment, replacement line, MSY |
 
 **Key takeaways:**
@@ -461,8 +459,8 @@ This vignette demonstrated:
    approximation to the Poisson is good. It would *not* be defensible on small
    counts, where the Gaussian mis-states the mean-variance relationship and
    biases the fit. To fit the counts properly, pass
-   `likelihood=PartiallySpecifiedModels.Poisson()` to `PSMProblem` instead of
-   `Gaussian()`; `LAML`'s penalized IRLS loop is family-generic and handles it,
+   `likelihood=PoissonLikelihood()` to `PSMProblem` instead of
+   `GaussianLikelihood()`; `LAML`'s penalized IRLS loop is family-generic and handles it,
    and the parametric bootstrap would then resample from the Poisson rather than
    the Gaussian.
 2. **`:inc_concave` shape constraints** encode the biologically motivated

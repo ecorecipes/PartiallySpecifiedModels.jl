@@ -91,8 +91,8 @@ approx_r = BSplineApproximator(:r, (0.0, 180.0), 10;
 approx_δ = BSplineApproximator(:δ, (0.0, 80.0), 10;
                                 initial = x -> 0.3)
 
-println("Parameters: $(nparams(approx_r) + nparams(approx_δ)) ",
-        "($(nparams(approx_r)) for r(H) + $(nparams(approx_δ)) for δ(L))")
+println("Parameters: $(PartiallySpecifiedModels.nparams(approx_r) + PartiallySpecifiedModels.nparams(approx_δ)) ",
+        "($(PartiallySpecifiedModels.nparams(approx_r)) for r(H) + $(PartiallySpecifiedModels.nparams(approx_δ)) for δ(L))")
 ```
 
 Key design choices:
@@ -115,7 +115,7 @@ prob = PSMProblem(lotka_volterra!, u0, tspan,
     data_values = data_values,
     obs_to_state = [1, 2],
     known_params = (α = 0.01,),
-    likelihood = Gaussian(),
+    likelihood = GaussianLikelihood(),
     solver = BS3(),
     abstol = 1e-6, reltol = 1e-6, maxiters = 10000)
 ```
@@ -191,9 +191,7 @@ The total EDF of the model is the sum across all unknown functions.
 A standard 4-panel diagnostic display assesses residual behaviour:
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol)
+diag = psm_appraise(sol)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

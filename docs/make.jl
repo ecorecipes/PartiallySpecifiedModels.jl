@@ -71,7 +71,7 @@ makedocs(
         search_size_threshold_warn = 2 * 1024 * 1024,
     ),
     repo = "$REPO/blob/{commit}{path}#{line}",
-    warnonly = true,
+    warnonly = [:missing_docs],
     pages = [
         "Home" => "index.md",
         "Getting Started" => "getting_started.md",

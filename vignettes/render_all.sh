@@ -11,9 +11,9 @@ log=render_all.log
 # captured into the rendered .md as if it were vignette output — seen on
 # 01_getting_started, 18_dalton and 41_kan.
 echo "=== warming compile cache ===" | tee -a "$log"
-# Lux + FluxKAN are included so the PartiallySpecifiedModelsFluxKANExt
-# package extension compiles here rather than inside 41_kan's render.
-julia --project=. -e 'using PartiallySpecifiedModels, OrdinaryDiffEq, Plots, Random, Lux, FluxKAN' >>"$log" 2>&1
+# Warm all weak-dependency extensions (FluxKAN, Distributions, GAM, DecisionAnalysis)
+# alongside core dependencies so precompilation output is never captured into `.md`.
+julia --project=. -e 'using PartiallySpecifiedModels, OrdinaryDiffEq, Plots, Random, Lux, FluxKAN, Distributions, GAM, DecisionAnalysis, DynamicalResilience' >>"$log" 2>&1
 pass=0; fail=0
 for d in [0-9][0-9]_*/ ; do
     qmd="${d}$(basename "$d").qmd"

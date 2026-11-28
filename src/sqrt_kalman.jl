@@ -361,14 +361,15 @@ function _sqrt_dalton_reference(ode_fun!, p, u0::AbstractVector,
                                 n_steps::Int, q::Int, sigma::Vector{Float64};
                                 interrogate::Symbol=:kramer)
     t_min, t_max = tspan
+    dt = (t_max - t_min) / n_steps
     n_vars = length(u0); D = n_vars * q
-    A, _ = _joint_ibm((t_max - t_min) / n_steps, q, sigma)
-    R_Q = _sqrt_ibm_noise_factor((t_max - t_min) / n_steps, q, sigma)
+    A, _ = _joint_ibm(dt, q, sigma)
+    R_Q = _sqrt_ibm_noise_factor(dt, q, sigma)
     E0, E1 = _joint_selectors(n_vars, q)
     R_V = Matrix(sqrt(1e-10) * I, n_vars, n_vars)
 
     μf = _joint_init(ode_fun!, Float64.(u0), t_min, p, q)
-    R_f = zeros(D, D)
+    R_f = sqrt.(_joint_init_cov(n_vars, q, sigma, dt))
     logZ = 0.0
     calib_acc = 0.0
 
@@ -403,16 +404,18 @@ function _sqrt_dalton_joint_evidence(ode_fun!, p, u0::AbstractVector,
                                      n_steps::Int, q::Int, sigma::Vector{Float64},
                                      obs_data::Matrix{Float64}, obs_times::Vector{Float64},
                                      obs_to_state::Vector{Int}, obs_var::Float64;
-                                     interrogate::Symbol=:kramer)
+                                     interrogate::Symbol=:kramer,
+                                     ode_nugget::Float64=1e-10)
     t_min, t_max = tspan
+    dt = (t_max - t_min) / n_steps
     n_vars = length(u0); D = n_vars * q
-    A, _ = _joint_ibm((t_max - t_min) / n_steps, q, sigma)
-    R_Q = _sqrt_ibm_noise_factor((t_max - t_min) / n_steps, q, sigma)
+    A, _ = _joint_ibm(dt, q, sigma)
+    R_Q = _sqrt_ibm_noise_factor(dt, q, sigma)
     E0, E1 = _joint_selectors(n_vars, q)
-    R_V = Matrix(sqrt(1e-10) * I, n_vars, n_vars)
+    R_V = Matrix(sqrt(ode_nugget) * I, n_vars, n_vars)
 
     μf = _joint_init(ode_fun!, Float64.(u0), t_min, p, q)
-    R_f = zeros(D, D)
+    R_f = sqrt.(_joint_init_cov(n_vars, q, sigma, dt))
     times = collect(range(t_min, t_max, length = n_steps + 1))
     n_t_obs = size(obs_data, 1); n_obs_vars = length(obs_to_state)
     obs_ind = _nearest_grid_indices(times, obs_times)

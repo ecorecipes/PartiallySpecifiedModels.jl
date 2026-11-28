@@ -23,9 +23,9 @@ Epidemiological surveillance data are often **discrete counts** — case reports
 
 | Likelihood | Use case | Variance structure |
 |-----------|----------|-------------------|
-| `Gaussian()` | Continuous measurements | Constant (σ²) |
-| `Poisson()` | Count data, equidispersed | Var = Mean |
-| `NegativeBinomial()` | Count data, overdispersed | Var = Mean + Mean²/k |
+| `GaussianLikelihood()` | Continuous measurements | Constant (σ²) |
+| `PoissonLikelihood()` | Count data, equidispersed | Var = Mean |
+| `NegativeBinomialLikelihood()` | Count data, overdispersed | Var = Mean + Mean²/k |
 
 This vignette demonstrates fitting an SIR model with a density-dependent transmission rate to **count data**, comparing the effect of different likelihood specifications.
 
@@ -139,7 +139,7 @@ prob_gauss = PSMProblem(sir!, u0, tspan,
     [BSplineApproximator(:β, (0.005, 0.11), 8; initial=0.4)];
     data_times=data_t, data_values=data,
     obs_to_state=[1, 2], known_params=(γ=0.25,),
-    likelihood=Gaussian(), solver=Tsit5())
+    likelihood=GaussianLikelihood(), solver=Tsit5())
 
 sol_gauss = solve(prob_gauss, LAML(maxiters=100))
 println("Gaussian: data_loss = ", round(sol_gauss.data_loss, digits=1),
@@ -154,7 +154,7 @@ prob_pois = PSMProblem(sir!, u0, tspan,
     [BSplineApproximator(:β, (0.005, 0.11), 8; initial=0.4)];
     data_times=data_t, data_values=data,
     obs_to_state=[1, 2], known_params=(γ=0.25,),
-    likelihood=PartiallySpecifiedModels.Poisson(), solver=Tsit5())
+    likelihood=PoissonLikelihood(), solver=Tsit5())
 
 sol_pois = solve(prob_pois, LAML(maxiters=100))
 println("Poisson: data_loss = ", round(sol_pois.data_loss, digits=1),
@@ -169,7 +169,7 @@ prob_nb = PSMProblem(sir!, u0, tspan,
     [BSplineApproximator(:β, (0.005, 0.11), 8; initial=0.4)];
     data_times=data_t, data_values=data,
     obs_to_state=[1, 2], known_params=(γ=0.25,),
-    likelihood=NegativeBinomial(), solver=Tsit5())
+    likelihood=NegativeBinomialLikelihood(), solver=Tsit5())
 
 sol_nb = solve(prob_nb, LAML(maxiters=100))
 println("NegBin: data_loss = ", round(sol_nb.data_loss, digits=1),
@@ -261,10 +261,10 @@ end
 
 | Data type | Recommended | Rationale |
 |-----------|-------------|-----------|
-| Continuous measurements (concentrations, biomass) | `Gaussian()` | Constant variance assumption reasonable |
-| Count data with no overdispersion | `Poisson()` | Variance = mean; fails badly if data are overdispersed |
-| Overdispersed counts (aggregated reports, surveillance) | `NegativeBinomial()` | Extra variance parameter handles clustering |
-| Mixed or uncertain variance structure | `NegativeBinomial()` or `Gaussian()` | Both are robust; Poisson is fragile to misspecification |
+| Continuous measurements (concentrations, biomass) | `GaussianLikelihood()` | Constant variance assumption reasonable |
+| Count data with no overdispersion | `PoissonLikelihood()` | Variance = mean; fails badly if data are overdispersed |
+| Overdispersed counts (aggregated reports, surveillance) | `NegativeBinomialLikelihood()` | Extra variance parameter handles clustering |
+| Mixed or uncertain variance structure | `NegativeBinomialLikelihood()` or `GaussianLikelihood()` | Both are robust; Poisson is fragile to misspecification |
 
 ### Log-link for positive-constrained rates
 
@@ -283,7 +283,7 @@ approx_log_β = BSplineApproximator(:log_β, (0.005, 0.11), 8; initial=log(0.4))
 prob_log = PSMProblem(sir_log!, u0, tspan, [approx_log_β];
     data_times=data_t, data_values=data,
     obs_to_state=[1, 2], known_params=(γ=0.25,),
-    likelihood=NegativeBinomial(), solver=Tsit5())
+    likelihood=NegativeBinomialLikelihood(), solver=Tsit5())
 
 sol_log = solve(prob_log, LAML(maxiters=100))
 
@@ -299,9 +299,7 @@ plot!(prev_grid, β_log_est, label="Log-link NegBin", lw=2, color=:darkgreen)
 A standard 4-panel diagnostic display assesses residual behaviour for the primary Gaussian fit. The QQ plot checks normality of standardized residuals, "Residuals vs Fitted" detects systematic patterns, the histogram visualises the residual distribution, and "Observed vs Fitted" checks overall calibration.
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol_gauss)
+diag = psm_appraise(sol_gauss)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

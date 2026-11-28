@@ -223,9 +223,7 @@ hline!([0.0], color=:gray, ls=:dot, label=nothing)
 A standard 4-panel diagnostic display assesses residual behaviour for the Adaptive Gradient Matching fit.
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol_agm)
+diag = psm_appraise(sol_agm)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",
