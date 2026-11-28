@@ -87,59 +87,289 @@ function penalty_matrix(a::BSplineApproximator)
     spline_penalty_matrix(knots_unit)
 end
 
+# Precompute the (n × n) linear map from knot values `v` to natural cubic
+# spline second derivatives `z` on a uniform grid with spacing `h` (z₁ = zₙ = 0).
+function _natural_cubic_z_matrix(n::Int, h::Float64)
+    M = zeros(Float64, n, n)
+    n <= 2 && return M
+    m = n - 2
+    T_mat = SymTridiagonal(fill(2.0 / 3.0, m), fill(1.0 / 6.0, m - 1))
+    R_mat = zeros(Float64, m, n)
+    inv_h2 = 1.0 / (h * h)
+    @inbounds for i in 1:m
+        R_mat[i, i]     =  inv_h2
+        R_mat[i, i + 1] = -2.0 * inv_h2
+        R_mat[i, i + 2] =  inv_h2
+    end
+    M[2:(n - 1), :] .= T_mat \ R_mat
+    M
+end
+
+@inline function _eval_1d_natural_col(V::Matrix{T}, Z::Matrix{T}, j::Int,
+                                      x, x0::Float64, x1::Float64,
+                                      hx::Float64, inv_hx::Float64, nx::Int) where {T}
+    @inbounds if x < x0
+        slope = (V[2, j] - V[1, j]) * inv_hx - (hx / 6.0) * Z[2, j]
+        return V[1, j] + slope * (x - x0)
+    elseif x > x1
+        slope = (V[nx, j] - V[nx - 1, j]) * inv_hx + (hx / 6.0) * Z[nx - 1, j]
+        return V[nx, j] + slope * (x - x1)
+    else
+        xv = ForwardDiff.value(x)
+        i = clamp(floor(Int, (xv - x0) * inv_hx) + 1, 1, nx - 1)
+        b = (x - (x0 + (i - 1) * hx)) * inv_hx
+        a = one(b) - b
+        c = (hx * hx) / 6.0
+        return a * V[i, j] + b * V[i + 1, j] +
+               c * ((a * a * a - a) * Z[i, j] + (b * b * b - b) * Z[i + 1, j])
+    end
+end
+
+struct _TensorNaturalSplineEval{T}
+    C::Matrix{T}
+    Z_x::Matrix{T}
+    Z_y::Matrix{T}
+    Z_xy::Matrix{T}
+    x0::Float64
+    x1::Float64
+    hx::Float64
+    inv_hx::Float64
+    nx::Int
+    y0::Float64
+    y1::Float64
+    hy::Float64
+    inv_hy::Float64
+    ny::Int
+end
+
+function (e::_TensorNaturalSplineEval)(x, y)
+    C, Zx, Zy, Zxy = e.C, e.Z_x, e.Z_y, e.Z_xy
+    x0, x1, hx, inv_hx, nx = e.x0, e.x1, e.hx, e.inv_hx, e.nx
+    y0, y1, hy, inv_hy, ny = e.y0, e.y1, e.hy, e.inv_hy, e.ny
+    if y < y0
+        v1 = _eval_1d_natural_col(C, Zx, 1, x, x0, x1, hx, inv_hx, nx)
+        v2 = _eval_1d_natural_col(C, Zx, 2, x, x0, x1, hx, inv_hx, nx)
+        z2 = _eval_1d_natural_col(Zy, Zxy, 2, x, x0, x1, hx, inv_hx, nx)
+        slope_y = (v2 - v1) * inv_hy - (hy / 6.0) * z2
+        return v1 + slope_y * (y - y0)
+    elseif y > y1
+        vn1 = _eval_1d_natural_col(C, Zx, ny - 1, x, x0, x1, hx, inv_hx, nx)
+        vn  = _eval_1d_natural_col(C, Zx, ny, x, x0, x1, hx, inv_hx, nx)
+        zn1 = _eval_1d_natural_col(Zy, Zxy, ny - 1, x, x0, x1, hx, inv_hx, nx)
+        slope_y = (vn - vn1) * inv_hy + (hy / 6.0) * zn1
+        return vn + slope_y * (y - y1)
+    else
+        yv = ForwardDiff.value(y)
+        j = clamp(floor(Int, (yv - y0) * inv_hy) + 1, 1, ny - 1)
+        by = (y - (y0 + (j - 1) * hy)) * inv_hy
+        ay = one(by) - by
+        cy = (hy * hy) / 6.0
+        vj  = _eval_1d_natural_col(C, Zx, j, x, x0, x1, hx, inv_hx, nx)
+        vj1 = _eval_1d_natural_col(C, Zx, j + 1, x, x0, x1, hx, inv_hx, nx)
+        zj  = _eval_1d_natural_col(Zy, Zxy, j, x, x0, x1, hx, inv_hx, nx)
+        zj1 = _eval_1d_natural_col(Zy, Zxy, j + 1, x, x0, x1, hx, inv_hx, nx)
+        return ay * vj + by * vj1 +
+               cy * ((ay * ay * ay - ay) * zj + (by * by * by - by) * zj1)
+    end
+end
+
 """
     build_tensor_bspline_evaluator(a::TensorBSplineApproximator, params_k)
 
 Build the two-argument callable `f(x, y)` for a tensor-product spline from
 the column-major coefficient grid `params_k = vec(C)`, `C[i, j] = f(x_i, y_j)`.
 
-The construction is the tensor product of the SAME univariate machinery
-`BSplineApproximator` uses (`build_bspline_evaluator`: natural cubic
-interpolation THROUGH the values, linear extrapolation outside the knots):
-each x-column `C[:, j]` is interpolated in x once at build time; per call,
-the `nknots_y` line values `sⱼ(x)` are interpolated in y. Because both
-stages interpolate through values, the surface agrees exactly with the
-univariate evaluator on every grid line —
-`f(x, y_j) = CubicSpline(C[:, j], knots_x)(x)` and
-`f(x_i, y) = CubicSpline(C[i, :], knots_y)(y)` — and extrapolates linearly
-per margin, matching the univariate behavior. Eltype-generic in both
-`params_k` and `(x, y)`, so ForwardDiff Duals propagate through either.
+Uses the exact separable bicubic natural-spline representation precomputed
+once at build time (`Z_x = M_x C`, `Z_y = C M_y'`, `Z_xy = Z_x M_y'`), so each
+`f(x, y)` call runs in O(1) time with zero heap allocations while agreeing
+to machine precision with nested univariate `CubicSpline` interpolation and
+linear extrapolation along both margins. Eltype-generic in both `params_k`
+and `(x, y)`, so ForwardDiff Duals propagate through either.
 """
-function build_tensor_bspline_evaluator(a::TensorBSplineApproximator,
-                                        params_k::AbstractVector)
-    nx, ny = a.nknots_x, a.nknots_y
-    knots_x = collect(range(a.domain_x[1], a.domain_x[2], length=nx))
-    knots_y = collect(range(a.domain_y[1], a.domain_y[2], length=ny))
-    C = reshape(params_k, nx, ny)
-    col_splines = [build_bspline_evaluator(knots_x, C[:, j]) for j in 1:ny]
-    function tensor_eval(x, y)
-        line_vals = [s(x) for s in col_splines]
-        build_bspline_evaluator(knots_y, line_vals)(y)
+# ─── Periodic (cyclic) cubic spline evaluator and penalty ───────────
+
+# Circulant second-derivative map M_cyc (n × n) for a periodic cubic spline
+# on n uniform knots spaced by h: (1/6)z_{i-1} + (2/3)z_i + (1/6)z_{i+1}
+# = (v_{i+1} - 2v_i + v_{i-1}) / h² with wrap-around indices mod n.
+function _cyclic_cubic_z_matrix(n::Int, h::Float64)
+    B = zeros(Float64, n, n)
+    H = zeros(Float64, n, n)
+    inv_h2 = 1.0 / (h * h)
+    @inbounds for i in 1:n
+        im1 = i == 1 ? n : i - 1
+        ip1 = i == n ? 1 : i + 1
+        B[i, im1] = 1.0 / 6.0
+        B[i, i]   = 2.0 / 3.0
+        B[i, ip1] = 1.0 / 6.0
+        H[i, im1] =  inv_h2
+        H[i, i]   = -2.0 * inv_h2
+        H[i, ip1] =  inv_h2
     end
-    tensor_eval
+    B \ H
 end
 
 """
-    penalty_matrix(a::TensorBSplineApproximator)
+    cyclic_spline_penalty_matrix(n::Int) -> Matrix{Float64}
 
-Kronecker-sum roughness penalty on the column-major coefficient grid:
+Exact periodic cubic spline roughness penalty `S_cyc = ∫₀¹ (f''(u))² du` on `n`
+uniformly spaced periodic knots over the unit period `[0, 1]`.
 
-    S = I_ny ⊗ S_x + anisotropy · (S_y ⊗ I_nx)
-
-where `S_x`, `S_y` are the univariate natural-cubic `∫(f'')²` penalties
-(`spline_penalty_matrix`) on unit-interval knot grids, exactly as
-`penalty_matrix(::BSplineApproximator)` builds them. With `β = vec(C)` and
-the x index fastest, `β' (I_ny ⊗ S_x) β = Σⱼ C[:, j]' S_x C[:, j]`
-penalizes roughness along x only, and `β' (S_y ⊗ I_nx) β =
-Σᵢ C[i, :]' S_y C[i, :]` penalizes roughness along y only; `anisotropy` is
-their fixed relative weight under the single per-approximator λ.
-
-The null space is the intersection of "every column affine in x" with
-"every row affine in y": the bilinear surfaces
-`C[i, j] = a + b·x_i + c·y_j + d·x_i·y_j` (rank `nx·ny − 4`).
+Symmetric PSD circulant matrix of rank `n - 1` with 1D constant null space
+`ones(n)`: as `λ → ∞`, the periodic function shrinks smoothly to a constant.
 """
+function cyclic_spline_penalty_matrix(n::Int)
+    n >= 4 || throw(ArgumentError("cyclic_spline_penalty_matrix requires n ≥ 4, got $n"))
+    h = 1.0 / n
+    B = zeros(Float64, n, n)
+    H = zeros(Float64, n, n)
+    inv_h = 1.0 / h
+    @inbounds for i in 1:n
+        im1 = i == 1 ? n : i - 1
+        ip1 = i == n ? 1 : i + 1
+        B[i, im1] = h / 6.0
+        B[i, i]   = 2.0 * h / 3.0
+        B[i, ip1] = h / 6.0
+        H[i, im1] =  inv_h
+        H[i, i]   = -2.0 * inv_h
+        H[i, ip1] =  inv_h
+    end
+    S = H' * (B \ H)
+    0.5 .* (S .+ S')
+end
+
+penalty_matrix(a::CyclicBSplineApproximator) = cyclic_spline_penalty_matrix(a.nknots)
+
+struct _CyclicCubicSplineEval{T}
+    v::Vector{T}
+    z::Vector{T}
+    lo::Float64
+    period::Float64
+    h::Float64
+    inv_h::Float64
+    n::Int
+end
+
+function (e::_CyclicCubicSplineEval)(x)
+    # Wrap x periodically into [0, period) while preserving Dual derivatives
+    xv = ForwardDiff.value(x)
+    shift = floor((xv - e.lo) / e.period) * e.period
+    xw = x - e.lo - shift
+    xwv = ForwardDiff.value(xw)
+    k = clamp(floor(Int, xwv * e.inv_h) + 1, 1, e.n)
+    kn = k == e.n ? 1 : k + 1
+    b = (xw - (k - 1) * e.h) * e.inv_h
+    a = one(b) - b
+    c = (e.h * e.h) / 6.0
+    @inbounds a * e.v[k] + b * e.v[kn] +
+              c * ((a * a * a - a) * e.z[k] + (b * b * b - b) * e.z[kn])
+end
+
+function build_cyclic_bspline_evaluator(a::CyclicBSplineApproximator,
+                                        params_k::AbstractVector)
+    n = a.nknots
+    lo, hi = Float64(a.domain[1]), Float64(a.domain[2])
+    period = hi - lo
+    h = period / n
+    M = _cyclic_cubic_z_matrix(n, h)
+    v = Vector(params_k)
+    z = M * v
+    _CyclicCubicSplineEval(v, z, lo, period, h, 1.0 / h, n)
+end
+
+# ─── Wood (2006) t2 orthogonal tensor-product decomposition ─────────
+#
+# For `TensorBSplineApproximator(...; anisotropy=:estimate)`, rotates the
+# (nx × ny) grid coefficients via the orthogonal matrix Q = [U_y0 ⊗ U_x0,
+# U_y0 ⊗ U_x+, U_y+ ⊗ U_x0, U_y+ ⊗ U_x+] into four mutually orthogonal,
+# contiguous subspaces:
+#   1. Bilinear null space (size 4): unpenalized
+#   2. Smooth-x × affine-y (size 2*(nx-2)): own λ_x
+#   3. Affine-x × smooth-y (size 2*(ny-2)): own λ_y
+#   4. Pure interaction smooth (size (nx-2)*(ny-2)): own λ_xy
+# Each penalized block is pairwise disjoint so LAML/GCV/CollocationLAML
+# estimates all three smoothing parameters jointly with exact log|S_λ|₊!
+function _tensor_t2_decomp(nx::Int, ny::Int)
+    Sx = spline_penalty_matrix(collect(range(0.0, 1.0, length=nx)))
+    Sy = spline_penalty_matrix(collect(range(0.0, 1.0, length=ny)))
+    ex = eigen(Symmetric(Sx))
+    ey = eigen(Symmetric(Sy))
+    # Ascending eigenvalues: first 2 are null space, 3:n are strictly positive range space
+    Ux0 = ex.vectors[:, 1:2]
+    Uxp = ex.vectors[:, 3:nx]
+    dxp = max.(ex.values[3:nx], 1e-12)
+    Uy0 = ey.vectors[:, 1:2]
+    Uyp = ey.vectors[:, 3:ny]
+    dyp = max.(ey.values[3:ny], 1e-12)
+
+    Q00 = kron(Uy0, Ux0)   # (nx*ny) × 4
+    Q0x = kron(Uy0, Uxp)   # (nx*ny) × 2*(nx-2)
+    Qy0 = kron(Uyp, Ux0)   # (nx*ny) × 2*(ny-2)
+    Qxy = kron(Uyp, Uxp)   # (nx*ny) × (nx-2)*(ny-2)
+    Q = hcat(Q00, Q0x, Qy0, Qxy)
+
+    n0 = 4
+    n1 = 2 * (nx - 2)
+    n2 = 2 * (ny - 2)
+    n3 = (nx - 2) * (ny - 2)
+
+    S1 = Matrix{Float64}(Diagonal(repeat(dxp, 2)))
+    S2 = Matrix{Float64}(Diagonal(repeat(dyp; inner=2)))
+    # Interaction penalty: additive Kronecker sum of normalized positive eigenvalues
+    dx_n = dxp ./ maximum(dxp)
+    dy_n = dyp ./ maximum(dyp)
+    d_int = Float64[dx_n[ix] + dy_n[iy] for iy in 1:(ny - 2) for ix in 1:(nx - 2)]
+    S3 = Matrix{Float64}(Diagonal(d_int))
+
+    r1 = (n0 + 1):(n0 + n1)
+    r2 = (n0 + n1 + 1):(n0 + n1 + n2)
+    r3 = (n0 + n1 + n2 + 1):(n0 + n1 + n2 + n3)
+    blocks = Tuple{Matrix{Float64}, UnitRange{Int}}[(S1, r1), (S2, r2), (S3, r3)]
+    Q, blocks
+end
+
+function build_tensor_bspline_evaluator(a::TensorBSplineApproximator,
+                                        params_k::AbstractVector)
+    nx, ny = a.nknots_x, a.nknots_y
+    x0, x1 = Float64(a.domain_x[1]), Float64(a.domain_x[2])
+    y0, y1 = Float64(a.domain_y[1]), Float64(a.domain_y[2])
+    hx = (x1 - x0) / (nx - 1)
+    hy = (y1 - y0) / (ny - 1)
+    Mx = _natural_cubic_z_matrix(nx, hx)
+    My = _natural_cubic_z_matrix(ny, hy)
+    c_vec = if a.anisotropy === :estimate
+        Q, _ = _tensor_t2_decomp(nx, ny)
+        Q * params_k
+    else
+        params_k
+    end
+    C = Matrix(reshape(c_vec, nx, ny))
+    Z_x = Mx * C
+    Z_y = C * My'
+    Z_xy = Z_x * My'
+    _TensorNaturalSplineEval(C, Z_x, Z_y, Z_xy,
+                             x0, x1, hx, 1.0 / hx, nx,
+                             y0, y1, hy, 1.0 / hy, ny)
+end
+
+function penalty_blocks(a::TensorBSplineApproximator)
+    if a.anisotropy === :estimate
+        _, blocks = _tensor_t2_decomp(a.nknots_x, a.nknots_y)
+        return blocks
+    end
+    S = penalty_matrix(a)
+    S === nothing ? Tuple{Matrix{Float64}, UnitRange{Int}}[] : [(S, 1:nparams(a))]
+end
+
 function penalty_matrix(a::TensorBSplineApproximator)
     nx, ny = a.nknots_x, a.nknots_y
+    if a.anisotropy === :estimate
+        _, blocks = _tensor_t2_decomp(nx, ny)
+        S = zeros(Float64, nx * ny, nx * ny)
+        for (Sb, rb) in blocks
+            S[rb, rb] .= Sb
+        end
+        return 0.5 .* (S .+ S')
+    end
     Sx = spline_penalty_matrix(collect(range(0.0, 1.0, length=nx)))
     Sy = spline_penalty_matrix(collect(range(0.0, 1.0, length=ny)))
     S = kron(Matrix{Float64}(I, ny, ny), Sx) .+
@@ -218,39 +448,77 @@ function penalty_matrix(a::GPApproximator)
     spline_penalty_matrix(knots_unit)
 end
 
+@inline _gp_kernel_val(::Val{:sqexp}, r, ℓ::Float64, σ²::Float64) = _kernel_sqexp(r, ℓ, σ²)
+@inline _gp_kernel_val(::Val{:matern32}, r, ℓ::Float64, σ²::Float64) = _kernel_matern32(r, ℓ, σ²)
+@inline _gp_kernel_val(::Val{:matern52}, r, ℓ::Float64, σ²::Float64) = _kernel_matern52(r, ℓ, σ²)
+
+struct _GPMeanEval{K, W}
+    x_ind::Vector{Float64}
+    weights::Vector{W}
+    ℓ::Float64
+    σ²::Float64
+    lo::Float64
+    hi::Float64
+    f_lo::W
+    s_lo::W
+    f_hi::W
+    s_hi::W
+    offset::W
+end
+
+@inline function _gp_raw_eval(::Val{K}, x_ind::Vector{Float64}, weights::Vector{W},
+                              ℓ::Float64, σ²::Float64, xv) where {K, W}
+    T = promote_type(typeof(xv), W)
+    s = zero(T)
+    @inbounds for j in eachindex(x_ind)
+        s += _gp_kernel_val(Val(K), xv - x_ind[j], ℓ, σ²) * weights[j]
+    end
+    s
+end
+
+function (e::_GPMeanEval{K})(x) where {K}
+    xv = x isa AbstractArray ? x[1] : x
+    if xv < e.lo
+        return (e.f_lo - e.offset) + e.s_lo * (xv - e.lo)
+    elseif xv > e.hi
+        return (e.f_hi - e.offset) + e.s_hi * (xv - e.hi)
+    else
+        return _gp_raw_eval(Val(K), e.x_ind, e.weights, e.ℓ, e.σ², xv) - e.offset
+    end
+end
+
 """
-    _gp_mean_interpolant(a, values)
+    _gp_mean_interpolant(a, values; offset=nothing)
 
 Kernel predictive-mean interpolant through `values` at `a.inducing_points`:
   f(x) = k(x, X)' K⁻¹ values
-Shared by `GPApproximator` (whose parameters ARE the inducing values) and
-`ShapeConstrainedGPApproximator` (whose constrained values β = Σ·d(γ) are
-interpolated the same way). `a` needs the fields `kernel`, `lengthscale`,
-`variance`, `K_inv`, and `inducing_points`.
+Shared by `GPApproximator` and `ShapeConstrainedGPApproximator`. Concrete
+callable struct with Val-dispatched kernel evaluation — zero allocations per
+call and eltype-generic for ForwardDiff Duals.
 """
-function _gp_mean_interpolant(a, values::AbstractVector)
-    kfunc = _kernel_func(a.kernel, a.lengthscale, a.variance)
-    weights = a.K_inv * values  # precompute α = K⁻¹ f
+function _gp_mean_interpolant(a, values::AbstractVector; zero_at::Symbol=:none)
+    a.kernel in (:sqexp, :matern32, :matern52) ||
+        error("Unknown kernel: $(a.kernel). Use :sqexp, :matern32, or :matern52")
+    weights = Vector(a.K_inv * values)
     x_ind = a.inducing_points
-    raw = xv -> sum(kfunc(xv, x_ind[j]) * weights[j] for j in eachindex(x_ind))
-    # Outside the inducing-point range the kernel decays and the predictive
-    # mean reverts to 0 REGARDLESS of the fitted level — an ODE excursion
-    # past the domain saw f ≈ 0. Extrapolate linearly from the boundary
-    # value and slope instead (consistent with the spline evaluators).
+    ℓ = Float64(a.lengthscale)
+    σ² = Float64(a.variance)
     lo, hi = extrema(x_ind)
     h = (hi - lo) * 1e-6
-    f_lo = raw(lo);  s_lo = (raw(lo + h) - f_lo) / h
-    f_hi = raw(hi);  s_hi = (f_hi - raw(hi - h)) / h
-    x -> begin
-        xv = x isa AbstractArray ? x[1] : x   # keep Duals intact
-        if xv < lo
-            f_lo + s_lo * (xv - lo)
-        elseif xv > hi
-            f_hi + s_hi * (xv - hi)
-        else
-            raw(xv)
-        end
+    kv = Val(a.kernel)
+    f_lo = _gp_raw_eval(kv, x_ind, weights, ℓ, σ², lo)
+    s_lo = (_gp_raw_eval(kv, x_ind, weights, ℓ, σ², lo + h) - f_lo) / h
+    f_hi = _gp_raw_eval(kv, x_ind, weights, ℓ, σ², hi)
+    s_hi = (f_hi - _gp_raw_eval(kv, x_ind, weights, ℓ, σ², hi - h)) / h
+    off = if zero_at === :left
+        _gp_raw_eval(kv, x_ind, weights, ℓ, σ², Float64(a.domain[1]))
+    elseif zero_at === :right
+        _gp_raw_eval(kv, x_ind, weights, ℓ, σ², Float64(a.domain[2]))
+    else
+        zero(f_lo)
     end
+    _GPMeanEval{a.kernel, eltype(weights)}(
+        x_ind, weights, ℓ, σ², lo, hi, f_lo, s_lo, f_hi, s_hi, off)
 end
 
 """
@@ -359,15 +627,14 @@ monotonicity exactly and pins f(endpoint) = 0 despite the jittered K⁻¹
 function build_constrained_gp_evaluator(a::ShapeConstrainedGPApproximator,
                                         gamma::AbstractVector)
     beta = gamma_to_inducing_values(a, gamma)
-    core = _gp_mean_interpolant(a, beta)
-    offset = if a.constraint in (:inc_zero_left, :dec_zero_left)
-        core(a.domain[1])
+    za = if a.constraint in (:inc_zero_left, :dec_zero_left)
+        :left
     elseif a.constraint in (:inc_zero_right, :dec_zero_right)
-        core(a.domain[2])
+        :right
     else
-        nothing
+        :none
     end
-    offset === nothing ? core : (x -> core(x) - offset)
+    _gp_mean_interpolant(a, beta; zero_at=za)
 end
 
 """
@@ -854,11 +1121,51 @@ function _scam_knot_vector(domain::Tuple{Float64, Float64}, q::Int; m::Int=2)
     return xk
 end
 
+struct _SCBSplineEval{T}
+    beta::Vector{T}
+    ll::Float64
+    ul::Float64
+    dx::Float64
+    inv_dx::Float64
+    q::Int
+    f_ll::T
+    f_ul::T
+    slope_lo::T
+    slope_hi::T
+    offset::T
+end
+
+@inline function _eval_uniform_cubic_bspline(x, ll::Float64, dx::Float64,
+                                             inv_dx::Float64, q::Int,
+                                             beta::Vector{T}) where {T}
+    xv = ForwardDiff.value(x)
+    k = clamp(floor(Int, (xv - ll) * inv_dx) + 1, 1, q - 3)
+    u = (x - (ll + (k - 1) * dx)) * inv_dx
+    om = one(u) - u
+    u2 = u * u
+    u3 = u2 * u
+    b0 = (om * om * om) / 6
+    b1 = (3 * u3 - 6 * u2 + 4) / 6
+    b2 = (-3 * u3 + 3 * u2 + 3 * u + 1) / 6
+    b3 = u3 / 6
+    @inbounds b0 * beta[k] + b1 * beta[k + 1] + b2 * beta[k + 2] + b3 * beta[k + 3]
+end
+
+function (e::_SCBSplineEval)(x::Real)
+    if x < e.ll
+        return (e.f_ll - e.offset) + e.slope_lo * (x - e.ll)
+    elseif x > e.ul
+        return (e.f_ul - e.offset) + e.slope_hi * (x - e.ul)
+    else
+        return _eval_uniform_cubic_bspline(x, e.ll, e.dx, e.inv_dx, e.q, e.beta) - e.offset
+    end
+end
+
 """
     build_constrained_bspline_evaluator(a, gamma)
 
-Build a callable evaluator from unconstrained parameters γ using proper
-B-spline basis evaluation.
+Build a zero-allocation callable evaluator from unconstrained parameters γ
+using exact local uniform cubic B-spline evaluation (4 active basis terms).
 
 Uses the SCOP-spline approach (Pya & Wood 2015): the constrained coefficients
 β = Σ · _apply_constraint_transform(γ) are B-spline basis coefficients, and
@@ -870,33 +1177,19 @@ boundary value, pinning f(endpoint) = 0 exactly.
 """
 function build_constrained_bspline_evaluator(a::ShapeConstrainedBSplineApproximator,
                                              gamma::AbstractVector)
-    beta = gamma_to_knot_values(a, gamma)  # B-spline coefficients
-    xk = _scam_knot_vector(a.domain, a.nknots)
-    spline_order = 4  # cubic B-spline (m=2, order=m+2)
+    beta = Vector(gamma_to_knot_values(a, gamma))
+    q = a.nknots
+    ll = Float64(a.domain[1])
+    ul = Float64(a.domain[2])
+    dx = (ul - ll) / (q - 3)
+    inv_dx = 1.0 / dx
 
-    # Inner knot range for extrapolation
-    m = 2
-    ll = xk[m + 2]      # lower boundary of inner range
-    ul = xk[end - m - 1] # upper boundary of inner range
+    # Exact cubic B-spline boundary values and derivatives at uniform knots
+    f_ll = (beta[1] + 4 * beta[2] + beta[3]) / 6
+    f_ul = (beta[q - 2] + 4 * beta[q - 1] + beta[q]) / 6
+    slope_lo = 0.5 * (beta[3] - beta[1]) * inv_dx
+    slope_hi = 0.5 * (beta[q] - beta[q - 2]) * inv_dx
 
-    # Precompute linear extrapolation slopes at boundaries
-    h = (ul - ll) * 1e-7
-    B_ll = _bspline_basis_vector(ll, xk, spline_order)
-    B_ll_p = _bspline_basis_vector(ll + h, xk, spline_order)
-    slope_lo = ((B_ll_p .- B_ll) ./ h)' * beta  # derivative at lower boundary
-
-    B_ul = _bspline_basis_vector(ul, xk, spline_order)
-    B_ul_m = _bspline_basis_vector(ul - h, xk, spline_order)
-    slope_hi = ((B_ul .- B_ul_m) ./ h)' * beta  # derivative at upper boundary
-
-    f_ll = dot(B_ll, beta)
-    f_ul = dot(B_ul, beta)
-
-    # Zero-at-endpoint constraints: zeroing one B-spline COEFFICIENT does not
-    # zero the function VALUE at the boundary (three basis functions are
-    # active there, weights 1/6, 4/6, 1/6). Center the spline by subtracting
-    # its boundary value — a constant shift that is linear in β, preserves
-    # monotonicity/curvature exactly, and pins f(endpoint) = 0.
     offset = if a.constraint in (:inc_zero_left, :dec_zero_left)
         f_ll
     elseif a.constraint in (:inc_zero_right, :dec_zero_right)
@@ -905,20 +1198,7 @@ function build_constrained_bspline_evaluator(a::ShapeConstrainedBSplineApproxima
         zero(f_ll)
     end
 
-    # Return a callable that evaluates the (centered) B-spline at any point
-    function evaluator(x::Real)
-        if x < ll
-            # Linear extrapolation below domain
-            return f_ll - offset + slope_lo * (x - ll)
-        elseif x > ul
-            # Linear extrapolation above domain
-            return f_ul - offset + slope_hi * (x - ul)
-        else
-            B = _bspline_basis_vector(x, xk, spline_order)
-            return dot(B, beta) - offset
-        end
-    end
-    return evaluator
+    _SCBSplineEval(beta, ll, ul, dx, inv_dx, q, f_ll, f_ul, slope_lo, slope_hi, offset)
 end
 
 """
@@ -936,7 +1216,8 @@ the slope-like parameter is the LAST component, not the second.
 _penalty_skip_indices(constraint::Symbol, np::Int) =
     constraint in (:convex, :concave, :inc_convex, :dec_concave) ? (1, 2)  :
     constraint in (:inc_concave, :dec_convex)                    ? (1, np) :
-    constraint in (:increasing, :decreasing)                     ? (1,)    : ()
+    constraint in (:increasing, :decreasing)                     ? (1,)    :
+    constraint === :dec_positive                                 ? (np,)   : ()
 
 """
     _scop_difference_penalty(constraint, np) -> Matrix{Float64}
@@ -1038,103 +1319,153 @@ function _comonet_unpack(a::COMONetApproximator, theta::AbstractVector)
     _comonet_unpack_single(a.hidden_sizes, theta)
 end
 
-"""
-Positive-weight branch: exp(W̃)/fanin weights, ReLU/softplus (or negated
-concave) hidden activations, linear output. Convex-nondecreasing (or
-concave-nondecreasing) by construction.
-"""
-function _comonet_branch(layers, x, use_concave::Bool, activation::Symbol)
-    h = [x]
+# Precomputed COMONet branch with positive weights materialized once at build
+# time and atomic ping-pong scratch buffers for zero-allocation Float64 evaluation.
+struct _COMONetBranch{T}
+    Ws::Vector{Matrix{T}}
+    bs::Vector{Vector{T}}
+    width::Int
+end
+
+mutable struct _COMONetScratch
+    a::Vector{Float64}
+    b::Vector{Float64}
+    @atomic busy::Bool
+end
+_COMONetScratch(w::Int) = _COMONetScratch(zeros(w), zeros(w), false)
+
+function _build_comonet_branch(layers::Vector{Tuple{Matrix{T}, Vector{T}}},
+                               positive_weights::Bool) where {T}
     n_layers = length(layers)
-    for (i, (W_tilde, b)) in enumerate(layers)
-        W_pos = exp.(W_tilde) ./ size(W_tilde, 2)   # positive, fan-in scaled
-        z = W_pos * h .+ b
-        if i < n_layers
-            if activation == :softplus
-                h = use_concave ? [-_softplus(-zi) for zi in z] :
-                                  [_softplus(zi) for zi in z]
-            else  # :relu (default)
-                h = use_concave ? [-max(zero(eltype(z)), -zi) for zi in z] :
-                                  [max(zero(eltype(z)), zi) for zi in z]
+    Ws = Vector{Matrix{T}}(undef, n_layers)
+    bs = Vector{Vector{T}}(undef, n_layers)
+    wmax = 1
+    for i in 1:n_layers
+        W_raw, b_raw = layers[i]
+        Ws[i] = positive_weights ? (exp.(W_raw) ./ size(W_raw, 2)) : W_raw
+        bs[i] = b_raw
+        wmax = max(wmax, size(W_raw, 1), size(W_raw, 2))
+    end
+    _COMONetBranch{T}(Ws, bs, wmax)
+end
+
+@inline _como_relu(z) = max(zero(z), z)
+@inline _como_concave_relu(z) = -max(zero(z), -z)
+@inline _como_softplus(z) = _softplus(z)
+@inline _como_concave_softplus(z) = -_softplus(-z)
+@inline _como_tanh(z) = tanh(z)
+
+function _comonet_branch_forward!(a::AbstractVector, b::AbstractVector,
+                                  br::_COMONetBranch, x, act::F) where {F}
+    n_layers = length(br.Ws)
+    @inbounds a[1] = x
+    for i in 1:n_layers
+        W = br.Ws[i]
+        bias = br.bs[i]
+        n_out, n_in = size(W)
+        is_hidden = i < n_layers
+        @inbounds for r in 1:n_out
+            s = W[r, 1] * a[1]
+            for c in 2:n_in
+                s += W[r, c] * a[c]
             end
-        else
-            h = z   # linear output
+            val = s + bias[r]
+            b[r] = is_hidden ? act(val) : val
+        end
+        a, b = b, a
+    end
+    @inbounds a[1]
+end
+
+@inline function _comonet_eval_branch(br::_COMONetBranch{T}, x, act::F,
+                                      sc::_COMONetScratch) where {T, F}
+    if T === Float64 && x isa Float64 &&
+       (@atomicreplace sc.busy false => true).success
+        try
+            return _comonet_branch_forward!(sc.a, sc.b, br, x, act)
+        finally
+            @atomic sc.busy = false
         end
     end
-    h[1]
+    R = promote_type(T, typeof(x))
+    w = br.width
+    _comonet_branch_forward!(Vector{R}(undef, w), Vector{R}(undef, w), br, R(x), act)
 end
 
-"""
-Positive-weight monotone net: exp(W̃)/fanin weights with tanh hidden units.
-Monotone nondecreasing (positive weights + nondecreasing activation) but
-NOT constrained in curvature — tanh saturates, so sigmoids and other
-monotone-nonconvex shapes are representable.
-"""
-function _comonet_monotone(layers, x)
-    h = [x]
-    n_layers = length(layers)
-    for (i, (W_tilde, b)) in enumerate(layers)
-        W_pos = exp.(W_tilde) ./ size(W_tilde, 2)
-        z = W_pos * h .+ b
-        h = i < n_layers ? [tanh(zi) for zi in z] : z
-    end
-    h[1]
+struct _COMONetSingleEval{T, F}
+    br::_COMONetBranch{T}
+    sc::_COMONetScratch
+    act::F
+    lo::Float64
+    inv_span::Float64
+    negate_in::Bool
+    exp_out::Bool
 end
 
-"""
-Unconstrained tanh MLP (raw weights): used inside `exp(·)` for `:positive`,
-where positivity comes from the output transform alone.
-"""
-function _comonet_raw_mlp(layers, x)
-    h = [x]
-    n_layers = length(layers)
-    for (i, (W, b)) in enumerate(layers)
-        z = W * h .+ b
-        h = i < n_layers ? [tanh(zi) for zi in z] : z
-    end
-    h[1]
+function (e::_COMONetSingleEval)(x)
+    x_norm = (x - e.lo) * e.inv_span
+    xin = e.negate_in ? -x_norm : x_norm
+    y = _comonet_eval_branch(e.br, xin, e.act, e.sc)
+    e.exp_out ? exp(y) : y
 end
 
-function _comonet_forward(layers, x_norm, constraint::Symbol, activation::Symbol=:relu)
-    if constraint in (:convex, :concave)
-        # Two-branch input-convex construction: g₁(x) + g₂(−x), both convex
-        # nondecreasing ⇒ sum convex, possibly non-monotone (U-shapes).
-        l1, l2 = layers
-        s = _comonet_branch(l1, x_norm, false, activation) +
-            _comonet_branch(l2, -x_norm, false, activation)
-        return constraint == :convex ? s : -s
-    elseif constraint == :positive
-        return exp(_comonet_raw_mlp(layers, x_norm))
-    end
+struct _COMONetTwoBranchEval{T, F}
+    br1::_COMONetBranch{T}
+    br2::_COMONetBranch{T}
+    sc::_COMONetScratch
+    act::F
+    lo::Float64
+    inv_span::Float64
+    negate_out::Bool
+end
 
-    # Input transform for decreasing constraints
-    x = constraint in (:decreasing, :dec_convex, :dec_concave) ? -x_norm : x_norm
-
-    if constraint in (:increasing, :decreasing)
-        return _comonet_monotone(layers, x)
-    end
-
-    use_concave = constraint in (:inc_concave, :dec_concave)
-    _comonet_branch(layers, x, use_concave, activation)
+function (e::_COMONetTwoBranchEval)(x)
+    x_norm = (x - e.lo) * e.inv_span
+    s = _comonet_eval_branch(e.br1, x_norm, e.act, e.sc) +
+        _comonet_eval_branch(e.br2, -x_norm, e.act, e.sc)
+    e.negate_out ? -s : s
 end
 
 """
     build_comonet_evaluator(a::COMONetApproximator, theta)
 
-Build an evaluator function `x → f(x)` for a COMONet approximator with
-the given parameters. The function maps from the original domain to ℝ.
+Build a zero-allocation evaluator function `x → f(x)` for a COMONet
+approximator with the given parameters. Positive-weight exponentials are
+materialized once at build time and forward passes reuse atomic scratch
+buffers for Float64 inputs (falling back cleanly for ForwardDiff Duals).
 """
 function build_comonet_evaluator(a::COMONetApproximator, theta::AbstractVector)
-    layers = _comonet_unpack(a, theta)
-    lo, hi = a.domain
-    span = hi - lo
-    act = a.activation
+    lo, hi = Float64(a.domain[1]), Float64(a.domain[2])
+    inv_span = 1.0 / (hi - lo)
+    c = a.constraint
 
-    function evaluator(x)
-        x_norm = (x - lo) / span  # normalize to ~[0, 1]
-        return _comonet_forward(layers, x_norm, a.constraint, act)
+    if c in (:convex, :concave)
+        l1, l2 = _comonet_unpack(a, theta)
+        br1 = _build_comonet_branch(l1, true)
+        br2 = _build_comonet_branch(l2, true)
+        sc = _COMONetScratch(max(br1.width, br2.width))
+        act = a.activation == :softplus ? _como_softplus : _como_relu
+        return _COMONetTwoBranchEval(br1, br2, sc, act, lo, inv_span, c == :concave)
     end
-    return evaluator
+
+    layers = _comonet_unpack(a, theta)
+    if c == :positive
+        br = _build_comonet_branch(layers, false)
+        return _COMONetSingleEval(br, _COMONetScratch(br.width), _como_tanh,
+                                  lo, inv_span, false, true)
+    end
+
+    br = _build_comonet_branch(layers, true)
+    negate_in = c in (:decreasing, :dec_convex, :dec_concave)
+    act = if c in (:increasing, :decreasing)
+        _como_tanh
+    elseif c in (:inc_concave, :dec_concave)
+        a.activation == :softplus ? _como_concave_softplus : _como_concave_relu
+    else
+        a.activation == :softplus ? _como_softplus : _como_relu
+    end
+    _COMONetSingleEval(br, _COMONetScratch(br.width), act,
+                       lo, inv_span, negate_in, false)
 end
 
 """
@@ -1144,6 +1475,7 @@ L2 (Tikhonov) penalty matrix for COMONet: `penalty_weight * I`.
 This provides gentle regularization on the unconstrained weights.
 """
 function penalty_matrix(a::COMONetApproximator)
+    a.penalty_weight <= 0.0 && return nothing
     np = nparams(a)
     return a.penalty_weight * I(np) |> Matrix{Float64}
 end
@@ -1227,6 +1559,30 @@ standardization, and the outer evaluator are all eltype-generic, which
 autodiff solvers and stiff ODE integrators with autodiff Jacobians
 require (states arrive as `Dual`s).
 """
+struct _SingleIndexEval{VL<:AbstractVector, F, T}
+    load::VL
+    centre::T
+    inv_denom::T
+    outer_eval::F
+    p::Int
+    name::Symbol
+end
+
+function (e::_SingleIndexEval)(u::Vararg{Any, N}) where {N}
+    N == e.p || throw(ArgumentError(
+        "SingleIndexApproximator(:$(e.name)) is a function of $(e.p) arguments " *
+        "but was called with $N; the dynamics must pass " *
+        "exactly $(e.p) states, e.g. p.$(e.name)(u[1], …, u[$(e.p)])"))
+    @inbounds begin
+        s = e.load[1] * u[1]
+        for i in 2:N
+            s += e.load[i] * u[i]
+        end
+    end
+    z = (s - e.centre) * e.inv_denom
+    e.outer_eval(z)
+end
+
 function build_single_index_evaluator(a::SingleIndexApproximator,
                                       params_k::AbstractVector)
     (a.mu === nothing || a.Sigma === nothing) && error(
@@ -1244,17 +1600,9 @@ function build_single_index_evaluator(a::SingleIndexApproximator,
     floor_rel = 1e-8 * tr(Σ̂) / p
     denom = sqrt(max(q, floor_rel * dot(load, load)))
     centre = dot(load, μ̂)
-    nm = a.name
+    T = promote_type(typeof(centre), typeof(denom))
 
-    function single_index_eval(u...)
-        length(u) == p || throw(ArgumentError(
-            "SingleIndexApproximator(:$nm) is a function of $p arguments " *
-            "but was called with $(length(u)); the dynamics must pass " *
-            "exactly $p states, e.g. p.$nm(u[1], …, u[$p])"))
-        z = (sum(load[i] * u[i] for i in 1:p) - centre) / denom
-        outer_eval(z)
-    end
-    single_index_eval
+    _SingleIndexEval(load, T(centre), T(one(T) / denom), outer_eval, p, a.name)
 end
 
 """

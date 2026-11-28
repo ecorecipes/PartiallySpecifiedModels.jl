@@ -11,6 +11,58 @@
 using LinearAlgebra: Diagonal, dot, tr, Symmetric, eigvals, cholesky, norm, eigen
 using ForwardDiff   # jac=:forwarddiff prediction-Jacobian path
 
+# ─── Shared cross-solver helpers ─────────────────────────────────
+
+"""
+    _resolve_u0(prob, p_struct) -> Vector
+    _resolve_u0(prob, beta::AbstractVector) -> Vector
+
+Evaluate `prob.u0` uniformly whether it is a numeric vector, a function `u0(p)`,
+or partially/fully estimated via `prob.estimate_u0`.
+"""
+_resolve_u0(prob::PSMProblem, p_struct) =
+    prob.u0 isa Function ? collect(prob.u0(p_struct)) : prob.u0
+
+function _resolve_u0(prob::PSMProblem, beta::AbstractVector)
+    if !isempty(prob.estimate_u0)
+        n_ap = n_approx_params(prob)
+        Tel = promote_type(eltype(beta), eltype(prob.u0))
+        u0_vec = Vector{Tel}(prob.u0)
+        @inbounds for (k, idx) in enumerate(prob.estimate_u0)
+            u0_vec[idx] = beta[n_ap + k]
+        end
+        return u0_vec
+    end
+    prob.u0 isa Function || return prob.u0
+    p = build_param_struct(prob, beta)
+    collect(prob.u0(p))
+end
+
+"""Return a Float64 initial state vector at the problem's initial parameters."""
+function _resolve_u0_init(prob::PSMProblem)
+    prob.u0 isa Function || return Float64.(prob.u0)
+    beta0 = build_initial_params(prob)
+    Float64.(collect(_resolve_u0(prob, beta0)))
+end
+
+"""Return state dimension K whether `prob.u0` is a vector or a closure `u0(p)`."""
+_state_dim(prob::PSMProblem) =
+    prob.u0 isa Function ? length(_resolve_u0_init(prob)) : length(prob.u0)
+
+"""
+    _require_gaussian_likelihood(prob, solver_name)
+
+Throw `ArgumentError` when a Gaussian-only solver is invoked on a non-Gaussian
+likelihood family instead of silently falling back to unweighted Gaussian L2.
+"""
+function _require_gaussian_likelihood(prob::PSMProblem, solver_name::String)
+    prob.likelihood isa GaussianLikelihood || throw(ArgumentError(
+        "$solver_name only supports Gaussian likelihoods, got $(typeof(prob.likelihood)). " *
+        "Use LAML, GCVSolver, CollocationLAML, MCMCSolver, VariationalSolver, AdamSolver, " *
+        "MultipleShootingSolver, or DerivativeFreeSolver for non-Gaussian families."))
+    nothing
+end
+
 # ─── Input validation ─────────────────────────────────────────────
 
 """
@@ -73,24 +125,28 @@ function _validate_problem(prob::PSMProblem, solver_name::String;
     n_times = length(prob.data_times)
     n_obs = size(prob.data_values, 2)
 
-    n_times == 0 && error("$solver_name: data_times is empty")
+    n_times == 0 && throw(ArgumentError("$solver_name: data_times is empty"))
+    all(isfinite, prob.data_times) ||
+        throw(ArgumentError("$solver_name: data_times must be finite"))
     prob.discrete && _discrete_observation_steps(prob)
     issorted(prob.data_times) ||
-        error("$solver_name: data_times must be sorted increasing (the " *
+        throw(ArgumentError("$solver_name: data_times must be sorted non-decreasing (the " *
               "Kalman-filter and profiling paths assume monotone " *
-              "observation indices)")
+              "observation indices)"))
     size(prob.data_values, 1) != n_times &&
         error("$solver_name: data_values has $(size(prob.data_values, 1)) rows " *
               "but data_times has $n_times entries")
     size(prob.data_weights, 1) != n_times &&
         error("$solver_name: data_weights row count does not match data_times")
-    length(prob.obs_to_state) != n_obs &&
-        error("$solver_name: obs_to_state has $(length(prob.obs_to_state)) entries " *
-              "but data_values has $n_obs columns")
+    if prob.obs_fn === nothing
+        length(prob.obs_to_state) != n_obs &&
+            error("$solver_name: obs_to_state has $(length(prob.obs_to_state)) entries " *
+                  "but data_values has $n_obs columns")
+    end
     isempty(prob.approximators) &&
         error("$solver_name: no approximators specified")
     # Resolve u0 — may be a function of parameters (e.g., copepod model)
-    if !(prob.u0 isa Function)
+    if prob.obs_fn === nothing && !(prob.u0 isa Function)
         any(s -> s < 1 || s > length(prob.u0), prob.obs_to_state) &&
             error("$solver_name: obs_to_state contains indices outside " *
                   "range 1:$(length(prob.u0))")
@@ -115,14 +171,41 @@ end
 
 # ─── Parameter layout ─────────────────────────────────────────────
 
-"""Total number of parameters across all approximators."""
-function n_total_params(prob::PSMProblem)
+"""Number of parameters across all approximators (excluding any estimated u0)."""
+function n_approx_params(prob::PSMProblem)
     sum(nparams(a) for a in prob.approximators)
 end
 
-"""Build initial parameter vector by concatenating approximator initial params."""
+"""Total number of parameters across all approximators plus any estimated u0 entries."""
+function n_total_params(prob::PSMProblem)
+    n_approx_params(prob) + length(prob.estimate_u0)
+end
+
+"""Build initial parameter vector by concatenating approximator initial params (and u0 if estimated)."""
 function build_initial_params(prob::PSMProblem)
-    vcat([initial_params(a) for a in prob.approximators]...)
+    b = vcat([initial_params(a) for a in prob.approximators]...)
+    if !isempty(prob.estimate_u0)
+        b = vcat(b, Float64[Float64(prob.u0[idx]) for idx in prob.estimate_u0])
+    end
+    b
+end
+
+"""Pack parameter vector `beta` into a ComponentArray (including `:u0` when `estimate_u0` is active)."""
+function _build_solution_params(prob::PSMProblem, beta::AbstractVector)
+    syms = Symbol[a.name for a in prob.approximators]
+    vals = Vector{Float64}[]
+    offset = 0
+    for approx in prob.approximators
+        np = nparams(approx)
+        push!(vals, Float64.(beta[offset+1:offset+np]))
+        offset += np
+    end
+    if !isempty(prob.estimate_u0)
+        n_u0 = length(prob.estimate_u0)
+        push!(syms, :u0)
+        push!(vals, Float64.(beta[offset+1:offset+n_u0]))
+    end
+    ComponentArray(NamedTuple{Tuple(syms)}(Tuple(vals)))
 end
 
 """
@@ -478,13 +561,14 @@ Simulate the model with parameter vector β.
 Returns predicted values at data times as matrix (n_times × n_obs).
 Dispatches to ODE integration (continuous) or explicit iteration (discrete).
 """
-function simulate(prob::PSMProblem, beta::AbstractVector)
+function simulate_psm(prob::PSMProblem, beta::AbstractVector;
+                  maxiters_override::Union{Nothing,Int}=nothing)
     if !isempty(prob.delays)
-        return simulate_dde(prob, beta)
+        return simulate_dde(prob, beta; maxiters_override=maxiters_override)
     elseif prob.discrete
         return simulate_discrete(prob, beta)
     end
-    return simulate_continuous(prob, beta)
+    return simulate_continuous(prob, beta; maxiters_override=maxiters_override)
 end
 
 # ─── Companion simulated loss for state-estimating solvers ──────────
@@ -512,7 +596,7 @@ which is itself the strongest possible statement about the reported loss.
 function _simulated_companion(prob::PSMProblem, beta::AbstractVector,
                               reported_loss::Real)
     sim = try
-        simulate(prob, beta)
+        simulate_psm(prob, beta)
     catch e
         _is_program_error(e) && rethrow()
         return (NaN, true, NaN)
@@ -524,8 +608,11 @@ function _simulated_companion(prob::PSMProblem, beta::AbstractVector,
 end
 
 """Extract observations by time, rejecting incomplete saved trajectories."""
-function _observation_predictions(prob::PSMProblem, sol, ::Type{T}) where {T}
-    pred = zeros(T, length(prob.data_times), length(prob.obs_to_state))
+function _observation_predictions(prob::PSMProblem, sol, ::Type{T},
+                                  p_struct=nothing) where {T}
+    n_times = length(prob.data_times)
+    n_obs = size(prob.data_values, 2)
+    pred = zeros(T, n_times, n_obs)
     isempty(prob.data_times) && return pred
     isempty(sol.t) &&
         error("solve saved no trajectory (retcode $(sol.retcode)); " *
@@ -535,19 +622,58 @@ function _observation_predictions(prob::PSMProblem, sol, ::Type{T}) where {T}
         error("saved trajectory [$lo, $hi] does not cover all data times " *
               "(retcode $(sol.retcode)); cannot form predictions")
 
-    # Preserve the ordinary saveat path exactly; extra saved points (initial
-    # states, solver steps or callbacks) must not shift observation indices.
     direct = sol.t == prob.data_times
     reverse_times = first(sol.t) > last(sol.t)
-    for i in eachindex(prob.data_times)
-        t = prob.data_times[i]
-        idx = direct ? i : searchsortedlast(sol.t, t; rev=reverse_times)
-        u_i = idx > 0 && sol.t[idx] == t ? sol.u[idx] : sol(t)
-        for j in eachindex(prob.obs_to_state)
-            pred[i, j] = u_i[prob.obs_to_state[j]]
+
+    if prob.obs_fn === nothing
+        for i in eachindex(prob.data_times)
+            t = prob.data_times[i]
+            idx = direct ? i : searchsortedlast(sol.t, t; rev=reverse_times)
+            u_i = idx > 0 && sol.t[idx] == t ? sol.u[idx] : sol(t)
+            for j in eachindex(prob.obs_to_state)
+                pred[i, j] = u_i[prob.obs_to_state[j]]
+            end
         end
+        return pred
+    elseif prob.obs_fn isa TrajectoryObservation
+        n_vars = length(first(sol.u))
+        U = Matrix{T}(undef, n_times, n_vars)
+        for i in eachindex(prob.data_times)
+            t = prob.data_times[i]
+            idx = direct ? i : searchsortedlast(sol.t, t; rev=reverse_times)
+            u_i = idx > 0 && sol.t[idx] == t ? sol.u[idx] : sol(t)
+            @inbounds for k in 1:n_vars
+                U[i, k] = u_i[k]
+            end
+        end
+        Y = prob.obs_fn.fn(U, prob.data_times, p_struct)
+        if Y isa AbstractVector && n_obs == 1
+            @inbounds for i in 1:n_times
+                pred[i, 1] = Y[i]
+            end
+        else
+            @inbounds for j in 1:n_obs, i in 1:n_times
+                pred[i, j] = Y[i, j]
+            end
+        end
+        return pred
+    else
+        # Pointwise observation operator obs_fn(u_i, p, t)
+        for i in eachindex(prob.data_times)
+            t = prob.data_times[i]
+            idx = direct ? i : searchsortedlast(sol.t, t; rev=reverse_times)
+            u_i = idx > 0 && sol.t[idx] == t ? sol.u[idx] : sol(t)
+            y_i = prob.obs_fn(u_i, p_struct, t)
+            if y_i isa Number && n_obs == 1
+                pred[i, 1] = y_i
+            else
+                @inbounds for j in 1:n_obs
+                    pred[i, j] = y_i[j]
+                end
+            end
+        end
+        return pred
     end
-    pred
 end
 
 """
@@ -564,16 +690,18 @@ Simulate a continuous-time (ODE) model.
 # fit ended in the same place.
 const _DEFAULT_ODE_MAXITERS = 100_000
 
-function simulate_continuous(prob::PSMProblem, beta::AbstractVector)
+function simulate_continuous(prob::PSMProblem, beta::AbstractVector;
+                             maxiters_override::Union{Nothing,Int}=nothing)
     # The same ODEProblem that `to_ode_problem` returns (src/resilience.jl), so the problem a
     # user linearises is exactly the one fitted; it also promotes u0 for Dual β.
     ode_prob = to_ode_problem(prob, beta)
 
+    default_maxiters = maxiters_override === nothing ? _DEFAULT_ODE_MAXITERS : maxiters_override
     solve_kwargs = Dict{Symbol, Any}(
         :saveat => prob.data_times,
         :abstol => get(prob.ode_kwargs, :abstol, 1e-8),
         :reltol => get(prob.ode_kwargs, :reltol, 1e-8),
-        :maxiters => get(prob.ode_kwargs, :maxiters, _DEFAULT_ODE_MAXITERS),
+        :maxiters => get(prob.ode_kwargs, :maxiters, default_maxiters),
         :verbose => _quiet_solve(),
     )
     merge!(solve_kwargs, _normalise_ode_kwargs(prob.ode_kwargs))
@@ -587,7 +715,7 @@ function simulate_continuous(prob::PSMProblem, beta::AbstractVector)
         error("ODE solve failed: $(sol.retcode)")
     end
 
-    _observation_predictions(prob, sol, eltype(beta))
+    _observation_predictions(prob, sol, eltype(beta), ode_prob.p)
 end
 
 function _discrete_step_index(t::Real, t0::Real)
@@ -624,12 +752,13 @@ raise an error rather than leaving zero predictions.
 """
 function simulate_discrete(prob::PSMProblem, beta::AbstractVector)
     p = build_param_struct(prob, beta)
-    u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
-    T = eltype(beta)
+    u0 = !isempty(prob.estimate_u0) ? _resolve_u0(prob, beta) :
+         (prob.u0 isa Function ? prob.u0(p) : prob.u0)
+    T = promote_type(eltype(beta), eltype(u0))
 
     n_vars = length(u0)
     n_times = length(prob.data_times)
-    n_obs = length(prob.obs_to_state)
+    n_obs = size(prob.data_values, 2)
     pred = zeros(T, n_times, n_obs)
 
     t_start = prob.tspan[1]
@@ -637,46 +766,60 @@ function simulate_discrete(prob::PSMProblem, beta::AbstractVector)
 
     # Unit steps on the grid anchored at tspan[1].
     all_times = collect(t_start:1.0:t_end)
-
     data_time_set = _discrete_observation_steps(prob)
 
     u = T.(u0)
     u_next = similar(u)
+    U_obs = prob.obs_fn isa TrajectoryObservation ? Matrix{T}(undef, n_times, n_vars) : nothing
 
-    # Record initial condition if it's a data time
-    if haskey(data_time_set, 0)
-        for di in data_time_set[0]
-            for j in 1:n_obs
-                pred[di, j] = u[prob.obs_to_state[j]]
+    function _record_step!(step_idx::Int, u_cur, t_cur)
+        haskey(data_time_set, step_idx) || return
+        for di in data_time_set[step_idx]
+            if prob.obs_fn === nothing
+                for j in 1:n_obs
+                    pred[di, j] = u_cur[prob.obs_to_state[j]]
+                end
+            elseif prob.obs_fn isa TrajectoryObservation
+                for k in 1:n_vars
+                    U_obs[di, k] = u_cur[k]
+                end
+            else
+                y_i = prob.obs_fn(u_cur, p, t_cur)
+                if y_i isa Number && n_obs == 1
+                    pred[di, 1] = y_i
+                else
+                    for j in 1:n_obs
+                        pred[di, j] = y_i[j]
+                    end
+                end
             end
         end
     end
+
+    # Record initial condition if it's a data time
+    _record_step!(0, u, t_start)
 
     # Iterate forward
     for step in 1:(length(all_times)-1)
         t = all_times[step]
         prob.dynamics!(u_next, u, p, t)
         u = copy(u_next)
-        if haskey(data_time_set, step)
-            for di in data_time_set[step]
-                for j in 1:n_obs
-                    pred[di, j] = u[prob.obs_to_state[j]]
-                end
-            end
+        _record_step!(step, u, all_times[step + 1])
+    end
+
+    if prob.obs_fn isa TrajectoryObservation
+        Y = prob.obs_fn.fn(U_obs, prob.data_times, p)
+        if Y isa AbstractVector && n_obs == 1
+            for i in 1:n_times; pred[i, 1] = Y[i]; end
+        else
+            for j in 1:n_obs, i in 1:n_times; pred[i, j] = Y[i, j]; end
         end
     end
 
     pred
 end
 
-"""
-    predict(sol::PSMSolution, prob::PSMProblem)
-
-Predict at data times using the fitted solution.
-"""
-function predict(sol::PSMSolution, prob::PSMProblem)
-    sol.fitted_values
-end
+# `predict` is defined as `StatsAPI.predict` in src/statsapi.jl and re-exported.
 
 # ─── Prediction Jacobian (finite differences / ForwardDiff) ───────
 
@@ -719,7 +862,7 @@ function _forwarddiff_jacobian!(J::AbstractMatrix, prob::PSMProblem,
     n_data = n_times * n_obs
     # Flattened prediction map in the same obs-major order the FD path uses.
     predmap = function (b)
-        pred = simulate(prob, b)
+        pred = simulate_psm(prob, b)
         f = similar(b, n_data)
         k = 1
         for oi in 1:n_obs, ti in 1:n_times
@@ -787,8 +930,9 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
                            beta::AbstractVector, f0::AbstractVector,
                            n_times::Int, n_obs::Int;
                            dam::Vector{Float64}, jac::Symbol=:fd,
-                           fd_cfg=nothing, grow::Bool=true)
-    if jac === :forwarddiff
+                           fd_cfg=nothing, grow::Bool=true,
+                           maxiters_override::Union{Nothing,Int}=nothing)
+    if jac === :forwarddiff || jac === :auto
         _forwarddiff_jacobian!(J, prob, beta, n_times, n_obs, fd_cfg) &&
             return
         @debug "compute_jacobian!: ForwardDiff Jacobian failed or returned " *
@@ -833,7 +977,7 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
             nudged[j] += 1e-13 * max(1.0, abs(beta[j]))
         end
         pred_n = try
-            simulate(prob, nudged)
+            simulate_psm(prob, nudged; maxiters_override=maxiters_override)
         catch e
             _is_program_error(e) && rethrow()
             nothing
@@ -878,7 +1022,7 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
             # Forward perturbation
             p_pert[j] = beta[j] + da
             pred_fwd = try
-                simulate(prob, p_pert)
+                simulate_psm(prob, p_pert; maxiters_override=maxiters_override)
             catch e
                 _is_program_error(e) && rethrow()
                 nothing
@@ -894,7 +1038,7 @@ function compute_jacobian!(J::AbstractMatrix, prob::PSMProblem,
             # Backward perturbation
             p_pert[j] = beta[j] - da
             pred_bwd = try
-                simulate(prob, p_pert)
+                simulate_psm(prob, p_pert; maxiters_override=maxiters_override)
             catch
                 nothing
             end
@@ -1374,17 +1518,32 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     n_data = n_times * n_obs
     n_p = n_total_params(prob)
 
-    # jac=:forwarddiff — one JacobianConfig per solve (chunking depends only
-    # on n_p), reused by every compute_jacobian! call below.
-    fd_cfg = alg.jac === :forwarddiff ? _fd_jacobian_config(n_p) : nothing
+    # jac=:auto / :forwarddiff — one JacobianConfig per solve (chunking depends
+    # only on n_p), reused by every compute_jacobian! call below.
+    fd_cfg = (alg.jac === :forwarddiff || alg.jac === :auto) ? _fd_jacobian_config(n_p) : nothing
+    exp_maxiters = alg.exploratory_maxiters
 
     # Enumerate penalty blocks (default: one per penalized approximator; a
     # multi-block type contributes one entry — and hence one λ — per block)
     S_list, uf_offsets, uf_nk = build_penalty_matrices(prob)
     m = length(S_list)
-    smoothing_fixed = alg.fixed_lambda !== nothing
-    smoothing_fixed && m == 0 &&
-        throw(ArgumentError("LAML: fixed_lambda requires at least one penalty block"))
+    # Vector-valued or scalar fixed_lambda: supports fixing ALL blocks (scalar
+    # or all-non-nothing vector) OR fixing a subset while estimating the rest.
+    fixed_mask = falses(m)
+    if alg.fixed_lambda !== nothing
+        m == 0 && throw(ArgumentError("LAML: fixed_lambda requires at least one penalty block"))
+        if alg.fixed_lambda isa Float64
+            fill!(fixed_mask, true)
+        else
+            length(alg.fixed_lambda) == m || throw(ArgumentError(
+                "LAML: fixed_lambda vector length ($(length(alg.fixed_lambda))) must match " *
+                "the number of penalty blocks ($m)"))
+            for l in 1:m
+                fixed_mask[l] = alg.fixed_lambda[l] !== nothing
+            end
+        end
+    end
+    smoothing_fixed = m > 0 && all(fixed_mask)
 
     # Mixed-approximator dof advisory: parameters without a penalty block
     # (e.g. NeuralApproximator weights with penalty_weight = 0) are REML
@@ -1413,8 +1572,12 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     # Default: θ = 1/tr(S) ≈ 3.7e-5 (light initial smoothing).  LAML will
     # quickly adjust this once the warmup phase is complete.  For strongly
     # nonlinear problems, use initial_lambda=10.0 + warmup=5 or higher.
-    if smoothing_fixed
+    if alg.fixed_lambda isa Float64
         theta = fill(alg.fixed_lambda, m)
+    elseif alg.fixed_lambda isa Vector
+        theta = Float64[alg.fixed_lambda[l] !== nothing ? alg.fixed_lambda[l] :
+                        (alg.initial_lambda !== nothing ? alg.initial_lambda :
+                         1.0 / max(tr(S_list[l]), 1e-10)) for l in 1:m]
     elseif alg.initial_lambda !== nothing
         theta = fill(alg.initial_lambda, m)
     else
@@ -1460,25 +1623,37 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         k += 1
     end
 
-    # Evaluate model, return flattened predictions
-    function eval_model(p_eval)
-        pred = simulate(prob, p_eval)
-        f_tmp = zeros(n_data)
+    # Evaluate model, return flattened predictions (accepts optional exploratory maxiters cap)
+    function eval_model(p_eval; maxiters_override::Union{Nothing,Int}=nothing)
+        pred = simulate_psm(prob, p_eval; maxiters_override=maxiters_override)
+        f_tmp = Vector{Float64}(undef, n_data)
         local k = 1
-        for oi in 1:n_obs, ti in 1:n_times
+        @inbounds for oi in 1:n_obs, ti in 1:n_times
             f_tmp[k] = pred[ti, oi]
             k += 1
         end
         f_tmp, pred
     end
 
+    # Penalized objective computed from an ALREADY evaluated prediction vector
+    # (zero ODE solves).
+    function obj_from_f(f_eval, p_eval, B)
+        neg_ll = -log_likelihood(prob.likelihood, y_vec, f_eval, w_vec)
+        neg_ll + 0.5 * dot(p_eval, B * p_eval)
+    end
+
     # Penalized objective: -ℓ(y,μ) + ½β'Bβ
     # For Gaussian this equals ½(RSS + penalty); for other families uses the
-    # actual log-likelihood, ensuring correct step comparisons.
+    # actual log-likelihood, ensuring correct step comparisons. Uses the
+    # exploratory ODE step cap during line-search / trust-region probes.
     function penalized_objective(p_eval, B)
-        f_tmp, _ = try; eval_model(p_eval); catch; return Inf; end
-        neg_ll = -log_likelihood(prob.likelihood, y_vec, f_tmp, w_vec)
-        neg_ll + 0.5 * dot(p_eval, B * p_eval)
+        f_tmp, _ = try
+            eval_model(p_eval; maxiters_override=exp_maxiters)
+        catch e
+            _is_program_error(e) && rethrow()
+            return Inf
+        end
+        obj_from_f(f_tmp, p_eval, B)
     end
 
     # PCLS step: truncated-SVD solve of the augmented system
@@ -1501,6 +1676,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     beta = build_initial_params(prob)
     J = zeros(n_data, n_p)
     f_vec = zeros(n_data)
+    pred_curr = nothing
+    f_valid = false
+    J_valid = false
     dam = fill(1e-8, n_p)
 
     if verbose
@@ -1508,69 +1686,123 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         println("Initial θ: ", [round(t, sigdigits=4) for t in theta])
     end
 
-    f_vec, _ = eval_model(beta)
-    compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
-                      jac=alg.jac, fd_cfg=fd_cfg)
-
     # ─── Gaussian warm-start for non-Gaussian likelihoods ─────────
     # For Poisson/NegBin with identity link, the IRLS weights (1/V(μ))
     # can create local minima when the initial fit is poor.  We run a
     # full Gaussian IRLS+LAML solve (unit weights, profiled σ²) to find
     # good starting coefficients AND smoothing parameters, then switch
     # to the actual likelihood.  This mimics mgcv's initialization.
-    if !(prob.likelihood isa Gaussian) && m > 0
+    if !(prob.likelihood isa GaussianLikelihood) &&
+       !(prob.likelihood isa StudentTLikelihood) && m > 0
+        # For BinomialLikelihood, y_vec holds counts in [0, n_trials] while
+        # f_vec predicts probabilities in (0, 1); rescale targets to proportions.
+        y_gw = prob.likelihood isa BinomialLikelihood ?
+               (y_vec ./ prob.likelihood.n_trials) : y_vec
         gw_otheta = copy(theta)
         prev_gw_obj = Inf
+        function gauss_penalized_objective(p_eval, B)
+            f_tmp, _ = try
+                eval_model(p_eval; maxiters_override=exp_maxiters)
+            catch e
+                _is_program_error(e) && rethrow()
+                return Inf
+            end
+            rss_g = 0.0
+            for i in 1:n_data
+                w_vec[i] > 0 || continue
+                rss_g += w_vec[i] * (y_gw[i] - f_tmp[i])^2
+            end
+            0.5 * (rss_g + dot(p_eval, B * p_eval))
+        end
+        gauss_step_contract(a_old, a_new, B, fac) =
+            _pcls_step_contract(gauss_penalized_objective, a_old, a_new, B, fac)
 
         for gw_iter in 1:50
-            f_vec_new, _ = try; eval_model(beta); catch; break; end
-            f_vec .= f_vec_new
-            compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
-                              jac=alg.jac, fd_cfg=fd_cfg)
+            if !f_valid
+                res_gw = try
+                    eval_model(beta)
+                catch e
+                    _is_program_error(e) && rethrow()
+                    nothing
+                end
+                res_gw === nothing && break
+                f_vec .= res_gw[1]
+                pred_curr = res_gw[2]
+                f_valid = true
+            end
+            if !J_valid
+                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                                  jac=alg.jac, fd_cfg=fd_cfg,
+                                  maxiters_override=exp_maxiters)
+                J_valid = true
+            end
 
             w_gauss = copy(w_vec)
-            z_pseudo = y_vec .- f_vec .+ J * beta
+            z_pseudo = y_gw .- f_vec .+ J * beta
 
             # Try step with current θ
             a0_pcls, B0, fac0 = pcls_step(J, z_pseudo, gw_otheta, w_gauss)
-            a0, f01 = step_contract(beta, a0_pcls, B0, fac0)
+            a0, f01 = gauss_step_contract(beta, a0_pcls, B0, fac0)
 
             # After warmup iters, also estimate θ via Gaussian LAML
             if !smoothing_fixed && gw_iter > 3
                 theta_new, _ = try
                     rho0 = log.(max.(gw_otheta, 1e-20))
                     estimate_smoothing_params(J, w_gauss, w_vec,
-                        y_vec, f_vec, beta, S_list, uf_offsets, uf_nk, n_p;
-                        family=Gaussian(), rho_init=rho0, verbose=false)
+                        y_gw, f_vec, beta, S_list, uf_offsets, uf_nk, n_p;
+                        family=GaussianLikelihood(), rho_init=rho0,
+                        fixed_mask=any(fixed_mask) ? fixed_mask : nothing,
+                        verbose=false)
                 catch; (copy(gw_otheta), NaN); end
 
                 # Try step with new θ
                 a1_pcls, B1, fac1 = pcls_step(J, z_pseudo, theta_new, w_gauss)
-                a1, f11 = step_contract(beta, a1_pcls, B1, fac1)
+                a1, f11 = gauss_step_contract(beta, a1_pcls, B1, fac1)
 
                 # Accept new θ only if it improves the Gaussian data fit.
-                # Evaluate each candidate's model ONCE (a full ODE solve) —
-                # the previous generator re-solved the ODE per data point.
-                f_a0 = try; first(eval_model(a0)); catch e
-                    _is_program_error(e) && rethrow(); f_vec; end
-                f_a1 = try; first(eval_model(a1)); catch e
-                    _is_program_error(e) && rethrow(); f_vec; end
-                ss_a0 = sum((y_vec[i] - f_a0[i])^2 * w_vec[i] for i in 1:n_data)
-                ss_a1 = sum((y_vec[i] - f_a1[i])^2 * w_vec[i] for i in 1:n_data)
+                res_a0 = try; eval_model(a0); catch e
+                    _is_program_error(e) && rethrow(); nothing; end
+                res_a1 = try; eval_model(a1); catch e
+                    _is_program_error(e) && rethrow(); nothing; end
+                f_a0 = res_a0 === nothing ? f_vec : res_a0[1]
+                f_a1 = res_a1 === nothing ? f_vec : res_a1[1]
+                ss_a0 = sum((y_gw[i] - f_a0[i])^2 * w_vec[i] for i in 1:n_data)
+                ss_a1 = sum((y_gw[i] - f_a1[i])^2 * w_vec[i] for i in 1:n_data)
 
                 if ss_a1 <= ss_a0
                     beta .= a1
                     gw_otheta .= theta_new
-                    f_vec .= f_a1
+                    if res_a1 !== nothing
+                        f_vec .= res_a1[1]
+                        pred_curr = res_a1[2]
+                        f_valid = true
+                    else
+                        f_valid = false
+                    end
+                    J_valid = false
                 else
                     beta .= a0
-                    f_vec .= f_a0
+                    if res_a0 !== nothing
+                        f_vec .= res_a0[1]
+                        pred_curr = res_a0[2]
+                        f_valid = true
+                    else
+                        f_valid = false
+                    end
+                    J_valid = false
                 end
             else
                 beta .= a0
-                f_new = try; first(eval_model(a0)); catch e
-                    _is_program_error(e) && rethrow(); f_vec; end
-                f_vec .= f_new
+                res_a0 = try; eval_model(a0); catch e
+                    _is_program_error(e) && rethrow(); nothing; end
+                if res_a0 !== nothing
+                    f_vec .= res_a0[1]
+                    pred_curr = res_a0[2]
+                    f_valid = true
+                else
+                    f_valid = false
+                end
+                J_valid = false
             end
 
             # Convergence monitor uses the CURRENT step's fit (the old code
@@ -1635,17 +1867,32 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         # Adapt GP kernel hyperparameters to the evolving fit (before the
         # model evaluation so f/J/W below are consistent with the new kernel)
         if !smoothing_fixed && iter >= alg.warmup
-            _adapt_gp_approximators!(prob, beta)
+            if _adapt_gp_approximators!(prob, beta)
+                f_valid = false
+                J_valid = false
+            end
         end
-        # Re-evaluate model + Jacobian
-        f_vec_new, _ = try; eval_model(beta); catch e
-            if verbose; println("Iter $iter: simulation failed ($e)"); end
-            conv_reason = :early_break
-            break
+        # Evaluate model + Jacobian ONLY when invalidated (initial iteration,
+        # GP kernel adaptation, or after a step whose cache wasn't populated).
+        if !f_valid
+            res_curr = try
+                eval_model(beta)
+            catch e
+                _is_program_error(e) && rethrow()
+                if verbose; println("Iter $iter: simulation failed ($e)"); end
+                conv_reason = :early_break
+                break
+            end
+            f_vec .= res_curr[1]
+            pred_curr = res_curr[2]
+            f_valid = true
         end
-        f_vec .= f_vec_new
-        compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
-                          jac=alg.jac, fd_cfg=fd_cfg)
+        if !J_valid
+            compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                              jac=alg.jac, fd_cfg=fd_cfg,
+                              maxiters_override=exp_maxiters)
+            J_valid = true
+        end
 
         # Compute IRLS weights from current predictions
         w_irls = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
@@ -1662,61 +1909,66 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         a0, f01 = step_contract(beta, a0_pcls, B_old, fac0)
 
         stop = false
-        obj_prev = penalized_objective(beta, build_B(otheta))
+        obj_prev = obj_from_f(f_vec, beta, B_old)
 
         if iter > 0 && m > 0
             # PCLS with new θ (from LAML)
             a1_pcls, B_new, fac1 = pcls_step(J, z_pseudo, theta, w_irls)
             a1, f11 = step_contract(beta, a1_pcls, B_new, fac1)
 
-            f10 = penalized_objective(beta, B_new)
+            f10 = obj_from_f(f_vec, beta, B_new)
 
-            # Compare likelihoods while the old-θ fit is making material
-            # progress. Likelihood alone can reject legitimate smoothing
-            # increases, so a sub-tolerance old step must not veto a new-θ
-            # step that descends its OWN penalized objective.
-            dl_a0 = -log_likelihood(prob.likelihood, y_vec,
-                        (try; first(eval_model(a0)); catch; f_vec; end), w_vec)
-            dl_a1 = -log_likelihood(prob.likelihood, y_vec,
-                        (try; first(eval_model(a1)); catch; f_vec; end), w_vec)
+            # Evaluate each candidate ONCE and cache both (f, pred) for the
+            # accept branches below — eliminating redundant ODE solves.
+            res_a0 = try; eval_model(a0); catch e
+                _is_program_error(e) && rethrow(); nothing; end
+            res_a1 = try; eval_model(a1); catch e
+                _is_program_error(e) && rethrow(); nothing; end
+            f_a0 = res_a0 === nothing ? f_vec : res_a0[1]
+            f_a1 = res_a1 === nothing ? f_vec : res_a1[1]
+
+            dl_a0 = -log_likelihood(prob.likelihood, y_vec, f_a0, w_vec)
+            dl_a1 = -log_likelihood(prob.likelihood, y_vec, f_a1, w_vec)
             dl_curr = -log_likelihood(prob.likelihood, y_vec, f_vec, w_vec)
 
             if f11 < f10 && dl_a1 <= dl_a0
                 n_defer = 0
                 last_branch = :accept_new
                 # New theta + step is best (data loss confirms)
-                f1_vec, _ = try; eval_model(a1); catch; (f_vec, nothing); end
                 beta .= a1
-                f_vec .= f1_vec
-                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
-                                  jac=alg.jac, fd_cfg=fd_cfg)
+                if res_a1 !== nothing
+                    f_vec .= res_a1[1]
+                    pred_curr = res_a1[2]
+                    f_valid = true
+                    compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                                      jac=alg.jac, fd_cfg=fd_cfg,
+                                      maxiters_override=exp_maxiters)
+                    J_valid = true
+                else
+                    f_valid = false
+                    J_valid = false
+                end
                 otheta .= theta
                 theta_fit .= theta      # β was fitted under B(theta)
             elseif _laml_prefer_old_step(obj_prev, f01, f10, f11, alg.tol) &&
                    n_defer < _LAML_MAX_DEFER
-                # DEFERRAL, BOUNDED. Preferring the old-θ step while it still
-                # makes material progress is right for a few iterations — β
-                # should settle before λ moves — but it has no natural end:
-                # on the copepod vignette (45 coefficients, λ₀ = 1/tr(S),
-                # EDF 41, noisy counts) β at the INITIAL λ kept improving by
-                # more than `tol` for ~130 iterations, and every one of them
-                # regenerated the same Fellner–Schall proposal from the same
-                # `otheta`, checked it against the same veto, and deferred
-                # it again (428 s to reach the fixed point). The proposal is
-                # FS's answer for the current working model, not a stale
-                # guess, so after `_LAML_MAX_DEFER` consecutive deferrals of
-                # a LIVE proposal (one that descends its own objective) the
-                # next branch takes it. `n_defer` counts only live proposals
-                # and resets whenever a proposal is accepted.
                 n_defer += (isfinite(f11) && f11 < f10) ? 1 : 0
                 last_branch = :prefer_old
                 # Keep a materially improving old-θ step, or any improving
                 # old step when the new proposal has no finite descent.
-                f0_vec, _ = try; eval_model(a0); catch; (f_vec, nothing); end
                 beta .= a0
-                f_vec .= f0_vec
-                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
-                                  jac=alg.jac, fd_cfg=fd_cfg)
+                if res_a0 !== nothing
+                    f_vec .= res_a0[1]
+                    pred_curr = res_a0[2]
+                    f_valid = true
+                    compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                                      jac=alg.jac, fd_cfg=fd_cfg,
+                                      maxiters_override=exp_maxiters)
+                    J_valid = true
+                else
+                    f_valid = false
+                    J_valid = false
+                end
                 # a0 came from PCLS at the OLD θ, so record it BEFORE the
                 # otheta update below moves otheta onto the new proposal.
                 theta_fit .= otheta
@@ -1729,22 +1981,24 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                                                           :accept_new_old_exhausted
                 n_defer >= _LAML_MAX_DEFER && (deferral_cap_hits += 1)
                 n_defer = 0
-                # New theta step improved within new theta's metric. This
-                # includes an old-θ step already below convergence precision.
-                # Tensor probes previously kept old gains of 5.74e-13 /
-                # 6.74e-14 over new gains of 0.00683 / 0.00420, then stopped
-                # before smoothing advanced. Do not compare the absolute
-                # objectives across penalties; only their own-step descent.
-                f1_vec, _ = try; eval_model(a1); catch; (f_vec, nothing); end
                 beta .= a1
-                f_vec .= f1_vec
-                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
-                                  jac=alg.jac, fd_cfg=fd_cfg)
+                if res_a1 !== nothing
+                    f_vec .= res_a1[1]
+                    pred_curr = res_a1[2]
+                    f_valid = true
+                    compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                                      jac=alg.jac, fd_cfg=fd_cfg,
+                                      maxiters_override=exp_maxiters)
+                    J_valid = true
+                else
+                    f_valid = false
+                    J_valid = false
+                end
                 otheta .= theta
                 theta_fit .= theta      # β was fitted under B(theta)
             else
-                # No improvement from either: β is unchanged, so theta_fit
-                # stays on whatever θ produced it.
+                # No improvement from either: β is unchanged, so f_valid and
+                # J_valid remain true and theta_fit stays on whatever θ produced it.
                 last_branch = :reject
                 if iter >= 10
                     stop = true
@@ -1755,43 +2009,28 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
             # First iteration (or no penalized blocks): accept a0. Note this
             # branch does NOT update otheta — theta_fit therefore records
             # otheta, the θ a0 was actually stepped under.
-            f0_vec, _ = try; eval_model(a0); catch; (f_vec, nothing); end
+            res_a0 = try; eval_model(a0); catch e
+                _is_program_error(e) && rethrow(); nothing; end
             beta .= a0
-            f_vec .= f0_vec
-            compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
-                              jac=alg.jac, fd_cfg=fd_cfg)
+            if res_a0 !== nothing
+                f_vec .= res_a0[1]
+                pred_curr = res_a0[2]
+                f_valid = true
+                compute_jacobian!(J, prob, beta, f_vec, n_times, n_obs; dam=dam,
+                                  jac=alg.jac, fd_cfg=fd_cfg,
+                                  maxiters_override=exp_maxiters)
+                J_valid = true
+            else
+                f_valid = false
+                J_valid = false
+            end
             theta_fit .= otheta     # a0 came from PCLS at otheta
         end
 
-        # Track penalized objective for convergence monitoring.
-        #
-        # `theta`, NOT `theta_fit`, ON PURPOSE — and this is the one place in
-        # the loop where that is true. F1 moved every REPORTED θ-dependent
-        # quantity onto `theta_fit` (the θ β was actually fitted under) and
-        # deliberately left this monitor alone. Tested here, in isolation,
-        # on the 18-fixture characterization sweep: scoring at `theta_fit`
-        # is a REGRESSION, not the completion of F1.
-        #
-        # The reason is that `curr_obj` is not a report, it is a STOPPING
-        # SIGNAL, and it is the only term in the convergence test that can
-        # see the smoothing parameters still moving. `theta` carries the
-        # newest Fellner-Schall proposal, so B(theta) keeps changing while
-        # smoothing selection is still working even when β has settled;
-        # `theta_fit` lags a step behind and goes flat first. Freezing the
-        # monitor on `theta_fit` therefore fires `:converged_tol` BEFORE FS
-        # has advanced λ off its initialization.
-        #
-        # Measured (jac defaults, same fixtures, only this line changed):
-        # the loop stopped earlier on 6 of 18 fixtures — exponential-growth
-        # B-spline 9→7 iters, ODEProblem-converted growth 9→7, NegBin
-        # logistic 11→7, two-λ Lotka-Volterra 18→7, floor-kink map 32→13,
-        # clamp-kink map 22→20 — and three fits that are stationary today
-        # became non-stationary stalls whose λ̂ never left the default
-        # 1/tr(S). Worst case, two-λ Lotka-Volterra: EDF 4.00 → 11.99 and
-        # λ̂ [1.9e7, 3.1e7] → [1.569e-4, 1.569e-4] (i.e. exactly the
-        # initialization), with `converged == true` in both cases. Its
-        # stationarity residual went 5.3e-6 → 0.9997.
-        curr_obj = penalized_objective(beta, build_B(theta))
+        # Track penalized objective for convergence monitoring (zero ODE solves
+        # when f_valid is true).
+        curr_obj = f_valid ? obj_from_f(f_vec, beta, build_B(theta)) :
+                             penalized_objective(beta, build_B(theta))
 
         if verbose && (iter <= 4 || iter % 10 == 0)
             curr_data_ss = sum((y_vec[i] - f_vec[i])^2 * w_vec[i] for i in 1:n_data)
@@ -1921,6 +2160,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
                                          rho_init=rho_init,
                                          sigma2_max=s2cap,
                                          criterion=alg.criterion,
+                                         fixed_mask=any(fixed_mask) ? fixed_mask : nothing,
                                          verbose=verbose)
             catch e
                 if verbose; println("LAML failed: $e, keeping theta"); end
@@ -1966,9 +2206,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
         final_parameter_step = NaN
     end
 
-    # Build solution
+    # Build solution (reuse cached pred_curr and J when valid at p_opt == beta)
     p_opt = copy(beta)
-    pred = simulate(prob, p_opt)
+    pred = if f_valid && pred_curr !== nothing
+        pred_curr
+    else
+        simulate_psm(prob, p_opt)
+    end
 
     # Compute data loss (masked cells — zero weight or NaN datum — are
     # skipped; `0 * NaN = NaN` would otherwise contaminate the total)
@@ -1983,42 +2227,55 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     end
 
     # EDF from hat matrix
-    k = 1
-    for oi in 1:n_obs, ti in 1:n_times
-        f_vec[k] = pred[ti, oi]
-        k += 1
+    if !f_valid
+        k = 1
+        for oi in 1:n_obs, ti in 1:n_times
+            f_vec[k] = pred[ti, oi]
+            k += 1
+        end
     end
-    compute_jacobian!(J, prob, p_opt, f_vec, n_times, n_obs; dam=dam,
-                      jac=alg.jac, fd_cfg=fd_cfg)
+    if !J_valid
+        compute_jacobian!(J, prob, p_opt, f_vec, n_times, n_obs; dam=dam,
+                          jac=alg.jac, fd_cfg=fd_cfg)
+    end
 
     B_final = build_B(theta)
     W_irls = irls_weights(prob.likelihood, y_vec, f_vec, w_vec)
     JWJ = J' * Diagonal(W_irls) * J
     H_final = JWJ + B_final
-    maxd = maximum(abs.(diag(H_final)))
-    covariance_ridge = 1e-12 * maxd + 1e-15
+    covariance_ridge = [1e-12 * max(abs(H_final[i, i]), 1e-30) + 1e-15 for i in 1:n_p]
     for i in 1:n_p
-        H_final[i,i] += covariance_ridge
+        H_final[i, i] += covariance_ridge[i]
     end
-    edf = try
-        tr(cholesky(Symmetric(H_final)) \ JWJ)
+    V_beta = try
+        # Equilibrated Cholesky inverse preserves O(1) blocks when another
+        # smooth has O(1e14) penalty diagonal.
+        Hs_f, d_f = _equilibrate_pd(H_final; rel_ridge=0.0)
+        C_f = cholesky(Symmetric(Hs_f))
+        Hs_inv_f = inv(C_f)
+        V_tmp = Matrix{Float64}(undef, n_p, n_p)
+        @inbounds for j in 1:n_p, i in 1:n_p
+            V_tmp[i, j] = Hs_inv_f[i, j] / (d_f[i] * d_f[j])
+        end
+        V_tmp
     catch
-        tr(H_final \ JWJ)
+        try; inv(Symmetric(H_final)); catch; nothing; end
+    end
+    edf = if V_beta !== nothing
+        tr(V_beta * JWJ)
+    else
+        try; tr(H_final \ JWJ); catch; NaN; end
     end
 
     pen_ss = dot(p_opt, B_final * p_opt)
-    obj_val = 0.5 * (data_loss + pen_ss)
-
-    # Build ComponentArray for nice parameter access
-    uf_syms = Symbol[a.name for a in prob.approximators]
-    uf_vals = Vector{Float64}[]
-    offset = 0
-    for approx in prob.approximators
-        np = nparams(approx)
-        push!(uf_vals, Float64.(p_opt[offset+1:offset+np]))
-        offset += np
+    obj_val = if prob.likelihood isa GaussianLikelihood
+        0.5 * (data_loss + pen_ss)
+    else
+        -log_likelihood(prob.likelihood, y_vec, f_vec, w_vec) + 0.5 * pen_ss
     end
-    params = ComponentArray(NamedTuple{Tuple(uf_syms)}(Tuple(uf_vals)))
+
+    # Build ComponentArray for nice parameter access (includes `:u0` if estimate_u0 is active)
+    params = _build_solution_params(prob, p_opt)
 
     # Build unknown function evaluators for the solution
     uf_evals = Dict{Symbol, Any}()
@@ -2038,17 +2295,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
     end
 
     # Unscaled inverse penalized information, conditional on selected smoothing.
-    # confidence_band uses this covariance by default; analytic smoothing
-    # uncertainty is a separate opt-in postprocessing step.
-    # Nominal coverage, bias correction and identifiability are not guaranteed.
-    V_beta = try
-        inv(cholesky(Symmetric(H_final)))
-    catch
-        try; inv(Symmetric(H_final)); catch; nothing; end
-    end
+    # Computed via equilibrated Cholesky above alongside `edf`.
 
     # Estimate σ² for Gaussian (needed for CI scaling)
-    sigma2_hat = if prob.likelihood isa Gaussian
+    sigma2_hat = if prob.likelihood isa GaussianLikelihood
         # Divide the MASKED data_loss by the number of cells that actually
         # contributed to it, not by every cell in the data matrix: using
         # n_data biased σ̂² low (and CIs narrow) in proportion to the amount
@@ -2209,7 +2459,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::LAML)
 
     # Retain the final working model, not a new Jacobian evaluation with
     # different FD step history, for opt-in smoothing covariance correction.
-    smoothing_state = if prob.likelihood isa Gaussian && m > 0 &&
+    smoothing_state = if prob.likelihood isa GaussianLikelihood && m > 0 &&
                          V_beta !== nothing && all(isfinite, J)
         _laml_smoothing_state(prob, p_opt, theta, S_list, uf_offsets, uf_nk,
             J, W_irls, y_vec, f_vec, JWJ, data_loss, covariance_ridge; jac=alg.jac)

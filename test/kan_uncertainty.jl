@@ -3,6 +3,7 @@ module KANUncertaintyTests
 using Test
 using Random, LinearAlgebra, Statistics
 using PartiallySpecifiedModels, Lux, FluxKAN
+using PartiallySpecifiedModels: nparams, initial_params, build_evaluator
 using PartiallySpecifiedModels: solve
 
 const PSM = PartiallySpecifiedModels

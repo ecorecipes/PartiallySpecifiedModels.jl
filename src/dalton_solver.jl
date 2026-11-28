@@ -54,13 +54,14 @@ function _dalton_reference(ode_fun!, p, u0::AbstractVector,
                                                  n_steps, q, sigma;
                                                  interrogate=interrogate)
     t_min, t_max = tspan
+    dt = (t_max - t_min) / n_steps
     n_vars = length(u0); D = n_vars * q
-    A, Qmat = _joint_ibm((t_max - t_min) / n_steps, q, sigma)
+    A, Qmat = _joint_ibm(dt, q, sigma)
     E0, E1 = _joint_selectors(n_vars, q)
     V = Matrix(1e-10 * I, n_vars, n_vars)
 
     μf = _joint_init(ode_fun!, Float64.(u0), t_min, p, q)
-    Σf = zeros(D, D)
+    Σf = _joint_init_cov(n_vars, q, sigma, dt)
     logZ = 0.0
     calib_acc = 0.0
     ztarget = zeros(n_vars)
@@ -99,20 +100,22 @@ function _dalton_joint_evidence(ode_fun!, p, u0::AbstractVector,
                                 obs_data::Matrix{Float64}, obs_times::Vector{Float64},
                                 obs_to_state::Vector{Int}, obs_var::Float64;
                                 interrogate::Symbol=:kramer,
-                                sqrt_filter::Bool=false)
+                                sqrt_filter::Bool=false,
+                                ode_nugget::Float64=1e-10)
     sqrt_filter && return _sqrt_dalton_joint_evidence(ode_fun!, p, u0, tspan,
                                                       n_steps, q, sigma,
                                                       obs_data, obs_times,
                                                       obs_to_state, obs_var;
                                                       interrogate=interrogate)
     t_min, t_max = tspan
+    dt = (t_max - t_min) / n_steps
     n_vars = length(u0); D = n_vars * q
-    A, Qmat = _joint_ibm((t_max - t_min) / n_steps, q, sigma)
+    A, Qmat = _joint_ibm(dt, q, sigma)
     E0, E1 = _joint_selectors(n_vars, q)
-    V = Matrix(1e-10 * I, n_vars, n_vars)
+    V = Matrix(ode_nugget * I, n_vars, n_vars)
 
     μf = _joint_init(ode_fun!, Float64.(u0), t_min, p, q)
-    Σf = zeros(D, D)
+    Σf = _joint_init_cov(n_vars, q, sigma, dt)
     times = collect(range(t_min, t_max, length = n_steps + 1))
     n_t_obs = size(obs_data, 1); n_obs_vars = length(obs_to_state)
     obs_ind = _nearest_grid_indices(times, obs_times)
@@ -218,14 +221,15 @@ function _dalton_loglik(ode_fun!, p, u0::AbstractVector,
     N = n_steps
     logZ = logZ0 - 0.5 * N * n_vars * log(ssq) + 0.5 * calib_acc - 0.5 * N * n_vars
 
-    # The joint pass mixes ODE pseudo-observations (which scale with σ̂²) and
-    # data observations (fixed `obs_var`, which do not), so it must actually
-    # be run at the calibrated scale rather than rescaled after the fact.
+    # Scale the ODE nugget consistently with ssq so the joint pass and the
+    # rescaled marginal pass live on the EXACT same calibrated linear-Gaussian
+    # state-space model (making `_dalton_loglik == fenrir_loglik` on linear ODEs).
     sigma_c = sigma .* sqrt(ssq)
     logYZ = _dalton_joint_evidence(ode_fun!, p, u0, tspan, n_steps, q, sigma_c,
                                    obs_data, obs_times, obs_to_state, obs_var;
                                    interrogate=interrogate,
-                                   sqrt_filter=sqrt_filter)
+                                   sqrt_filter=sqrt_filter,
+                                   ode_nugget=1e-10 * ssq)
 
     ll = logYZ - logZ
     isfinite(ll) ? ll : -Inf
@@ -285,9 +289,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
     _validate_problem(prob, "DaltonSolver"; require_continuous=true,
                       reject_delays=true, delay_reason=
                       "It builds a probabilistic ODE / GP state-space manifold from the 4-argument ODE signature f!(du, u, p, t).")
+    _require_gaussian_likelihood(prob, "DaltonSolver")
     _reject_masked_data(prob, "DaltonSolver")
     verbose = alg.verbose
-    n_vars = length(prob.u0)
+    u0_init = _resolve_u0_init(prob)
+    n_vars = length(u0_init)
     n_obs = size(prob.data_values, 2)
     n_t = length(prob.data_times)
 
@@ -393,19 +399,20 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
 
     n_smooth = length(smooth_mats)
     edf_total = NaN
-    smooth_lambdas = fill(0.1 / max(obs_var, 1e-6), n_smooth)
+    smooth_lambdas = fill(0.1, n_smooth)
 
     # ── Objective: negative DALTON log-likelihood + penalty ──
 
     function neg_loglik(β_)
         p_ = build_autodiff_param_struct(prob, β_)
+        u0_cur = Float64.(_resolve_u0(prob, p_))
 
         function ode_rhs!(du, u, p_unused, t)
             prob.dynamics!(du, u, p_, t)
         end
 
         try
-            ll = _dalton_loglik(ode_rhs!, nothing, Float64.(prob.u0), prob.tspan,
+            ll = _dalton_loglik(ode_rhs!, nothing, u0_cur, prob.tspan,
                                 alg.n_steps, alg.n_deriv, sigma,
                                 Float64.(prob.data_values), Float64.(prob.data_times),
                                 prob.obs_to_state, obs_var;
@@ -537,60 +544,37 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
             y_vec = Float64[prob.data_values[i, j] for j in 1:n_obs for i in 1:n_t]
             mu_vec = Float64.(pred_vec_d(beta_opt))
             n_data = length(y_vec)
-            JWJ = J_ad' * J_ad
+            JWJ_ll = (J_ad' * J_ad) ./ obs_var
             σ²_hat = sum((y_vec .- mu_vec).^2) / max(n_data - sum(s -> size(s,1), smooth_mats), 1.0)
+            disp_ratio = σ²_hat / obs_var
 
             for (k, (S, off)) in enumerate(zip(smooth_mats, smooth_offsets))
                 np_k = size(S, 1)
                 β_k = beta_opt[off+1:off+np_k]
-                bSb = dot(β_k, S * β_k)   # raw: LAML's own 1e-30 test below
+                bSb = dot(β_k, S * β_k)
                 S_full = zeros(n_beta, n_beta)
                 for (kk, (Sk, offk)) in enumerate(zip(smooth_mats, smooth_offsets))
                     npk = size(Sk, 1); idx = (offk+1):(offk+npk)
-                    S_full[idx, idx] .+= smooth_lambdas[kk] .* Sk
+                    S_full[idx, idx] .+= (2.0 * smooth_lambdas[kk]) .* Sk
                 end
-                H_hat = JWJ + S_full
-                maxd = maximum(abs.(diag(H_hat)))
-                for i in 1:n_beta; H_hat[i,i] += 1e-12*maxd; end
-                H_inv = try; inv(cholesky(Symmetric(H_hat))); catch; pinv(H_hat); end
+                H_hat = JWJ_ll + S_full
+                H_inv = _safe_inv(H_hat)
                 idx_k = (off+1):(off+np_k)
-                # FS numerator rank(S_k) − λ_k·tr(H⁻¹S_k) (Wood & Fasiolo);
-                # the hat-trace form included the penalty null space.
                 r_k = _rank_penalty(S)
                 trHS = tr(H_inv[idx_k, idx_k] * S)
-                # Fellner-Schall step, matching `laml.jl`'s degenerate-case
-                # policy VERBATIM (see the long note there for why each
-                # branch is what it is). This previously clamped the
-                # NUMERATOR to [0.01, np_k], which silently converted the
-                # two degenerate cases into arbitrary lambda values instead
-                # of naming them:
-                #   * edf_k <= 0: clamping to 0.01 makes
-                #     lambda = sigma2*0.01/bSb, whose SIZE is set by bSb --
-                #     not a step in any controlled direction. LAML releases
-                #     lambda/10, bounded and monotone.
-                #   * bSb ~ 0: with bSb floored at 1e-20 (as it was here),
-                #     sigma2*0.01/1e-20 overflows straight to the RHO_MAX
-                #     rail -- maximum smoothing, the boundary solution
-                #     "carrying no usable uncertainty" that laml.jl
-                #     deliberately DECLINES. LAML holds instead. The floor is
-                #     therefore removed and LAML's raw `bSb > 1e-30` test used.
-                #   * non-finite lambda*: `clamp(NaN, lo, hi)` returns NaN in
-                #     Julia, and every comparison against NaN is false, so the
-                #     convergence test would have declared success on it --
-                #     exactly the hole laml.jl's isfinite guard names.
-                edf_k = r_k - smooth_lambdas[k] * trHS
+                edf_k = r_k - (2.0 * smooth_lambdas[k]) * trHS
                 lam_new = if bSb > 1e-30
                     if edf_k > 0
-                        lf = σ²_hat * edf_k / bSb
+                        lf = 0.5 * disp_ratio * edf_k / bSb
                         isfinite(lf) ? lf : smooth_lambdas[k]
                     else
-                        smooth_lambdas[k] / 10.0    # lambda* <= 0 — release
+                        smooth_lambdas[k] / 10.0
                     end
                 else
-                    smooth_lambdas[k]               # 0/0 or no finite lambda* — hold
+                    smooth_lambdas[k]
                 end
                 smooth_lambdas[k] = clamp(lam_new, exp(RHO_MIN), exp(RHO_MAX))
-                edf_total = clamp(tr(H_inv * JWJ), 1.0, Float64(n_beta))
+                edf_total = clamp(tr(H_inv * JWJ_ll), 1.0, Float64(n_beta))
             end
 
             if verbose; @printf("  FS cycle %d: λ = %s\n", fs_cycle, round.(smooth_lambdas, sigdigits=3)); end
@@ -599,6 +583,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
                 Optim.LBFGS(linesearch=LineSearches.BackTracking()),
                 Optim.Options(iterations=alg.maxiters ÷ 2, g_tol=1e-6, f_reltol=1e-10, show_trace=false);
                 inplace=false)
+            result = result_re
             beta_opt = Optim.minimizer(result_re)
             final_neg_loglik = Optim.minimum(result_re)
         end
@@ -614,8 +599,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
     end
 
     # Probabilistic solve for smooth posterior at optimal params
+    u0_opt = Float64.(_resolve_u0(prob, p_opt))
     μ_smooth, Σ_smooth, times = probsolve(
-        ode_rhs_opt!, nothing, Float64.(prob.u0),
+        ode_rhs_opt!, nothing, u0_opt,
         prob.tspan, alg.n_steps, alg.n_deriv, sigma;
         interrogate=alg.interrogate, sqrt_filter=alg.sqrt_filter)
 
@@ -669,7 +655,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DaltonSolver)
 
     PSMSolution(
         params,
-        -final_neg_loglik,                # objective (loglik) at returned β
+        final_neg_loglik,                 # penalized negative loglik at returned β
         data_loss,
         edf,
         Float64.(smooth_lambdas),            # smoothing_params (Fellner-Schall)

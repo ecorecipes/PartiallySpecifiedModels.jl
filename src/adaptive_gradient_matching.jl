@@ -80,6 +80,49 @@ function matern32_kernel_with_derivs(times::Vector{Float64}, σ²::Float64, ℓ:
     K, Kstar, Kstarstar
 end
 
+"""
+Compute Matérn 5/2 kernel and its first/second cross-derivatives.
+k(t, t') = σ²(1 + √5|d|/ℓ + 5d²/(3ℓ²)) exp(-√5|d|/ℓ)
+"""
+function matern52_kernel_with_derivs(times::Vector{Float64}, σ²::Float64, ℓ::Float64)
+    n = length(times)
+    K = zeros(n, n)
+    Kstar = zeros(n, n)
+    Kstarstar = zeros(n, n)
+
+    sqrt5 = sqrt(5.0)
+    inv_ℓ = 1.0 / ℓ
+    inv_ℓ2 = inv_ℓ * inv_ℓ
+
+    for j in 1:n, i in 1:n
+        d = times[i] - times[j]
+        r = abs(d)
+        sr = sqrt5 * r * inv_ℓ
+        exp_sr = exp(-sr)
+
+        K[i, j] = σ² * (1.0 + sr + sr^2 / 3.0) * exp_sr
+        # ∂k/∂t_i = -(5σ²/(3ℓ²)) * d * (1 + √5|d|/ℓ) * exp(-√5|d|/ℓ)
+        Kstar[i, j] = -(5.0 / 3.0) * σ² * inv_ℓ2 * d * (1.0 + sr) * exp_sr
+        # ∂²k/∂t_i∂t_j = (5σ²/(3ℓ²)) * (1 + √5|d|/ℓ - 5d²/ℓ²) * exp(-√5|d|/ℓ)
+        Kstarstar[i, j] = (5.0 / 3.0) * σ² * inv_ℓ2 * (1.0 + sr - sr^2) * exp_sr
+    end
+
+    K, Kstar, Kstarstar
+end
+
+function _gp_kernel_with_derivs(times::Vector{Float64}, σ²::Float64, ℓ::Float64,
+                                kernel::Symbol)
+    if kernel == :matern52
+        return matern52_kernel_with_derivs(times, σ², ℓ)
+    elseif kernel == :matern32
+        return matern32_kernel_with_derivs(times, σ², ℓ)
+    elseif kernel == :rbf
+        return rbf_kernel_with_derivs(times, σ², ℓ)
+    else
+        throw(ArgumentError("Unknown GP kernel :$kernel; use :rbf, :matern32, or :matern52"))
+    end
+end
+
 # ─── GP hyperparameter optimization ─────────────────────────────
 
 """
@@ -94,29 +137,20 @@ function optimize_gp_hyperparams(times::Vector{Float64}, y::Vector{Float64},
     time_span = times[end] - times[1]
     y_var = max(var(y), 1e-10)
 
-    # Initial guess: σ² = data variance, ℓ = time_span/5, σ_n² = 0.01*y_var
     best_σ² = y_var
     best_ℓ = time_span / 5.0
     best_σn² = 0.01 * y_var
     best_nll = Inf
 
-    # Grid search over lengthscale, signal variance, and noise level
-    # (all three are optimized against the marginal likelihood; σ² was
-    # previously pinned at var(y) despite the docstring saying otherwise)
-    kernel in (:rbf, :matern32) ||
-        error("AdaptiveGradientMatching: kernel must be :rbf or " *
-              ":matern32 (got :$(kernel)); :matern52 is not implemented")
+    kernel in (:rbf, :matern32, :matern52) ||
+        throw(ArgumentError("optimize_gp_hyperparams: kernel must be :rbf, :matern32, or :matern52 (got :$(kernel))"))
     for ℓ_frac in [0.05, 0.1, 0.15, 0.2, 0.3, 0.5]
         ℓ_try = time_span * ℓ_frac
         for σ_mult in [0.5, 1.0, 2.0]
             σ²_try = σ_mult * y_var
             for σn_frac in [1e-4, 1e-3, 1e-2, 5e-2, 0.1]
                 σn²_try = σn_frac * y_var
-                K, _, _ = if kernel == :matern32
-                    matern32_kernel_with_derivs(times, σ²_try, ℓ_try)
-                else
-                    rbf_kernel_with_derivs(times, σ²_try, ℓ_try)
-                end
+                K, _, _ = _gp_kernel_with_derivs(times, σ²_try, ℓ_try, kernel)
                 Ky = K + σn²_try * I(n)
                 try
                     C = cholesky(Symmetric(Ky))
@@ -292,42 +326,15 @@ function agm_loss(prob::PSMProblem, beta::AbstractVector,
             np = nparams(approx)
             beta_k = beta[offset+1:offset+np]
             offset += np
-            if approx isa BSplineApproximator
+            S = if approx isa BSplineApproximator
                 knots_x = collect(range(approx.domain[1], approx.domain[2],
                                         length=approx.nknots))
-                S = spline_penalty_matrix(knots_x)
+                spline_penalty_matrix(knots_x)
+            else
+                penalty_matrix(approx)
+            end
+            if S !== nothing
                 total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
-            elseif approx isa TensorBSplineApproximator
-                S = penalty_matrix(approx)
-                total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
-            elseif approx isa SingleIndexApproximator
-                S = penalty_matrix(approx)
-                total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
-            elseif approx isa TransformedCovariateApproximator
-                S = penalty_matrix(approx)
-                total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
-            elseif approx isa ShapeConstrainedBSplineApproximator
-                S = penalty_matrix(approx)
-                total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
-            elseif approx isa COMONetApproximator
-                S = penalty_matrix(approx)
-                total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
-            elseif approx isa SPDEApproximator
-                S = penalty_matrix(approx)
-                total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
-            elseif approx isa ShapeConstrainedSPDEApproximator
-                S = penalty_matrix(approx)
-                total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
-            elseif approx isa ShapeConstrainedGPApproximator
-                S = penalty_matrix(approx)
-                total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
-            elseif !(approx isa _BUILTIN_APPROX_TYPES)
-                # Custom protocol types: generic penalty (built-in
-                # treatment above unchanged; see _BUILTIN_APPROX_TYPES).
-                S = penalty_matrix(approx)
-                if S !== nothing
-                    total_loss += T(smoothing_lambda) * dot(beta_k, S * beta_k)
-                end
             end
         end
     end
@@ -354,11 +361,12 @@ function _agm_population_mcmc(prob::PSMProblem, alg::AdaptiveGradientMatching)
         throw(ArgumentError("AdaptiveGradientMatching: population MCMC needs " *
                             "n_chains ≥ 2 (got $(alg.n_chains))"))
     verbose = alg.verbose
+    _require_gaussian_likelihood(prob, "AdaptiveGradientMatching")
     times = Float64.(prob.data_times)
     T_pts = length(times)
-    K_states = length(prob.u0)
+    u0_vec = _resolve_u0_init(prob)
+    K_states = length(u0_vec)
     n_obs = size(prob.data_values, 2)
-    u0_vec = Float64.(prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)
     rng = alg.rng_seed === nothing ? Random.Xoshiro(rand(UInt32)) :
           Random.Xoshiro(alg.rng_seed)
     obs_of_state = Dict{Int, Vector{Int}}()
@@ -687,6 +695,9 @@ function _agm_population_mcmc(prob::PSMProblem, alg::AdaptiveGradientMatching)
                  # so this path never runs a reporting simulation and has
                  # nothing that can fail.
                  simulation_failed=false,
+                 converged=false,
+                 reason=:maxiters,
+                 iterations=alg.n_samples,
                  gp_hyperparams=gp_hyperparams,
                  gamma=gamma_mean,
                  beta_samples=beta_samples,
@@ -729,11 +740,12 @@ population-MCMC sampler over states, parameters, and mismatch variances
 """
 function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     _validate_problem(prob, "AdaptiveGradientMatching"; reject_delays=true)
+    _require_gaussian_likelihood(prob, "AdaptiveGradientMatching")
     alg.n_samples > 0 && return _agm_population_mcmc(prob, alg)
     verbose = alg.verbose
     times = Float64.(prob.data_times)
     T_pts = length(times)
-    K_states = length(prob.u0)
+    K_states = _state_dim(prob)
     n_obs = size(prob.data_values, 2)
 
     # Rows of the gradient-matching system that carry a REAL target.
@@ -838,9 +850,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     end
 
     # For unobserved states, initialize from u0 (constant)
+    u0_init_map = _resolve_u0_init(prob)
     for k in 1:K_states
         if !isassigned(grad_covs, k)
-            x_smooth[:, k] .= (prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)[k]
+            x_smooth[:, k] .= u0_init_map[k]
             grad_means[:, k] .= 0.0
             # Sized at n_match so every grad_covs entry agrees with the
             # truncated system below (no-op when n_match == T_pts).
@@ -972,7 +985,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     # of 496.
     sim_ok = true
     pred = try
-        simulate(prob, beta_opt)
+        simulate_psm(prob, beta_opt)
     catch e
         _is_program_error(e) && rethrow()
         sim_ok = false
@@ -998,9 +1011,21 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdaptiveGradientMatching)
     # stay at full T_pts — the trajectory IS reported at every observation
     # time; it is only the DERIVATIVE match that loses a row.)
     F_final = zeros(n_match, K_states)
+    n_dyn_fail = 0
     for i in 1:n_match
-        prob.dynamics!(du, x_smooth[i, :], p_opt, times[i])
-        F_final[i, :] .= du
+        try
+            prob.dynamics!(du, x_smooth[i, :], p_opt, times[i])
+            if all(isfinite, du)
+                F_final[i, :] .= du
+            else
+                n_dyn_fail += 1
+                F_final[i, :] .= 1e6
+            end
+        catch e
+            _is_program_error(e) && rethrow()
+            n_dyn_fail += 1
+            F_final[i, :] .= 1e6
+        end
     end
     deriv_loss = sum((grad_means[1:n_match, :] .- F_final).^2)
 

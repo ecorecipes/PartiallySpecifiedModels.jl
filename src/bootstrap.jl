@@ -217,7 +217,7 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
               "Use :parametric (any likelihood) or :nonparametric (Gaussian).")
     method in (:parametric, :nonparametric) ||
         error("bootstrap: method must be :parametric or :nonparametric")
-    method == :nonparametric && !(prob.likelihood isa Gaussian) &&
+    method == :nonparametric && !(prob.likelihood isa GaussianLikelihood) &&
         error("bootstrap: :nonparametric residual resampling produces " *
               "invalid pseudo-data for $(typeof(prob.likelihood)) " *
               "(negative/non-integer counts, values below a truncation " *
@@ -362,6 +362,8 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                 discrete=prob.discrete,
                 delays=prob.delays,
                 history=prob.history,
+                obs_fn=prob.obs_fn,
+                estimate_u0=prob.estimate_u0,
                 _normalise_ode_kwargs(prob.ode_kwargs)...)
 
             sol_boot = try
@@ -452,6 +454,8 @@ function bootstrap(sol::PSMSolution, prob::PSMProblem, alg;
                 discrete=prob.discrete,
                 delays=prob.delays,
                 history=prob.history,
+                obs_fn=prob.obs_fn,
+                estimate_u0=prob.estimate_u0,
                 _normalise_ode_kwargs(prob.ode_kwargs)...)
 
             sol_boot = try
@@ -669,7 +673,7 @@ end
 # unweighted one.
 _boot_wi(w, i, j) = w[i, j] > 0 ? Float64(w[i, j]) : 1.0
 
-function _parametric_resample!(y::Matrix, ::Gaussian, fitted::Matrix,
+function _parametric_resample!(y::Matrix, ::GaussianLikelihood, fitted::Matrix,
                                σ_hat::Vector, w::AbstractMatrix,
                                n_t::Int, n_obs::Int, rng)
     # σ̂ is the unit-weight scale; this cell's sd is σ̂/√w.
@@ -678,7 +682,7 @@ function _parametric_resample!(y::Matrix, ::Gaussian, fitted::Matrix,
     end
 end
 
-function _parametric_resample!(y::Matrix, ::Poisson, fitted::Matrix,
+function _parametric_resample!(y::Matrix, ::PoissonLikelihood, fitted::Matrix,
                                σ_hat::Vector, w::AbstractMatrix,
                                n_t::Int, n_obs::Int, rng)
     # Replicate-count reading of the precision weight: y* = Poisson(wμ)/w has
@@ -691,7 +695,7 @@ function _parametric_resample!(y::Matrix, ::Poisson, fitted::Matrix,
     end
 end
 
-function _parametric_resample!(y::Matrix, fam::NegativeBinomial, fitted::Matrix,
+function _parametric_resample!(y::Matrix, fam::NegativeBinomialLikelihood, fitted::Matrix,
                                σ_hat::Vector, w::AbstractMatrix,
                                n_t::Int, n_obs::Int, rng)
     θ = fam.theta
@@ -706,25 +710,99 @@ function _parametric_resample!(y::Matrix, fam::NegativeBinomial, fitted::Matrix,
     end
 end
 
-function _parametric_resample!(y::Matrix, fam::TruncatedNormal, fitted::Matrix,
+function _sample_lower_truncnorm_std(a::Float64, rng)
+    # Sample Z ~ N(0, 1) truncated to [a, ∞).
+    # For a <= 0, standard normal rejection has acceptance rate >= 0.5.
+    # For a > 0, Robert (1995) translated exponential proposal Exp(α) shifted to a
+    # has acceptance rate >= 0.76 for all a > 0 and approaches 1 as a -> ∞.
+    if a <= 0.0
+        while true
+            z = randn(rng)
+            z >= a && return z
+        end
+    else
+        α = 0.5 * (a + sqrt(a * a + 4.0))
+        while true
+            z = a - log(1.0 - rand(rng)) / α
+            u = rand(rng)
+            rho = exp(-0.5 * (z - α)^2)
+            u <= rho && return z
+        end
+    end
+end
+
+function _parametric_resample!(y::Matrix, fam::TruncatedNormalLikelihood, fitted::Matrix,
                                σ_hat::Vector, w::AbstractMatrix,
                                n_t::Int, n_obs::Int, rng)
     σ = fam.sigma
     lo = fam.lower
     for j in 1:n_obs, i in 1:n_t
-        # Rejection sampling from N(μ, σ²/w) truncated to [lower, ∞). The
+        # Exact sampling from N(μ, σ²/w) truncated to [lower, ∞). The
         # family's σ is fixed, so the precision weight enters as σ_eff = σ/√w.
         σ_eff = σ / sqrt(_boot_wi(w, i, j))
         μ = fitted[i, j]
-        for _ in 1:1000
-            z = μ + σ_eff * randn(rng)
-            if z >= lo
-                y[i, j] = z
-                @goto next_tn
-            end
+        a = (lo - μ) / σ_eff
+        y[i, j] = μ + σ_eff * _sample_lower_truncnorm_std(a, rng)
+    end
+end
+
+function _parametric_resample!(y::Matrix, fam::GammaLikelihood, fitted::Matrix,
+                               σ_hat::Vector, w::AbstractMatrix,
+                               n_t::Int, n_obs::Int, rng)
+    ν = 1.0 / fam.phi
+    for j in 1:n_obs, i in 1:n_t
+        wi = _boot_wi(w, i, j)
+        μ = max(abs(fitted[i, j]), 1e-6)
+        shape = wi * ν
+        y[i, j] = _sample_gamma(shape, μ / shape, rng)
+    end
+end
+
+function _parametric_resample!(y::Matrix, fam::LogNormalLikelihood, fitted::Matrix,
+                               σ_hat::Vector, w::AbstractMatrix,
+                               n_t::Int, n_obs::Int, rng)
+    σ = fam.sigma
+    for j in 1:n_obs, i in 1:n_t
+        wi = _boot_wi(w, i, j)
+        μ = max(abs(fitted[i, j]), 1e-6)
+        y[i, j] = μ * exp((σ / sqrt(wi)) * randn(rng))
+    end
+end
+
+function _sample_binomial(n::Int, p::Float64, rng)
+    p = clamp(p, 0.0, 1.0)
+    if n <= 100
+        s = 0
+        for _ in 1:n
+            rand(rng) < p && (s += 1)
         end
-        y[i, j] = max(μ, lo)  # fallback
-        @label next_tn
+        return s
+    else
+        return clamp(round(Int, n * p + sqrt(n * p * (1.0 - p)) * randn(rng)), 0, n)
+    end
+end
+
+function _parametric_resample!(y::Matrix, fam::BinomialLikelihood, fitted::Matrix,
+                               σ_hat::Vector, w::AbstractMatrix,
+                               n_t::Int, n_obs::Int, rng)
+    n = fam.n_trials
+    for j in 1:n_obs, i in 1:n_t
+        wi = _boot_wi(w, i, j)
+        p = clamp(fitted[i, j], 1e-6, 1.0 - 1e-6)
+        nw = max(1, round(Int, wi * n))
+        y[i, j] = Float64(_sample_binomial(nw, p, rng)) / wi
+    end
+end
+
+function _parametric_resample!(y::Matrix, fam::StudentTLikelihood, fitted::Matrix,
+                               σ_hat::Vector, w::AbstractMatrix,
+                               n_t::Int, n_obs::Int, rng)
+    ν = fam.df; σ = fam.sigma
+    for j in 1:n_obs, i in 1:n_t
+        wi = _boot_wi(w, i, j)
+        g = _sample_gamma(0.5 * ν, 1.0, rng)
+        t_draw = randn(rng) / sqrt(2.0 * g / ν)
+        y[i, j] = fitted[i, j] + (σ / sqrt(wi)) * t_draw
     end
 end
 

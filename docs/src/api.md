@@ -4,6 +4,9 @@
 
 ```@docs
 PSMProblem
+MultiTrajectoryPSMProblem
+SDEPSMProblem
+TrajectoryObservation
 PSMSolution
 ```
 
@@ -16,9 +19,12 @@ AbstractApproximator
 ```
 
 - [`BSplineApproximator`](@ref)
+- [`CyclicBSplineApproximator`](@ref)
 - [`TensorBSplineApproximator`](@ref)
 - [`SingleIndexApproximator`](@ref)
 - [`TransformedCovariateApproximator`](@ref)
+- [`RandomEffectApproximator`](@ref)
+- [`GAMSmoothApproximator`](@ref)
 - [`ShapeConstrainedBSplineApproximator`](@ref)
 - [`SPDEApproximator`](@ref)
 - [`ShapeConstrainedSPDEApproximator`](@ref)
@@ -42,6 +48,7 @@ COMONET_CONSTRAINTS
 Detailed documentation for each solver is on the [Solvers](solvers.md) page.
 
 - [`LAML`](@ref)
+- [`EKFSolver`](@ref)
 - [`MultiStart`](@ref) (wraps `LAML`)
 - [`GCVSolver`](@ref)
 - [`CollocationLAML`](@ref)
@@ -70,10 +77,14 @@ Detailed documentation for each solver is on the [Solvers](solvers.md) page.
 
 ```@docs
 AbstractLikelihood
-Gaussian
-Poisson
-NegativeBinomial
-TruncatedNormal
+GaussianLikelihood
+PoissonLikelihood
+NegativeBinomialLikelihood
+TruncatedNormalLikelihood
+GammaLikelihood
+LogNormalLikelihood
+BinomialLikelihood
+StudentTLikelihood
 CustomLikelihood
 ```
 
@@ -81,16 +92,30 @@ CustomLikelihood
 
 ```@docs
 solve
-simulate
+simulate_psm
+simulate_sde
+ekf_loglik
 predict
+```
+
+## Model Comparison & Hypothesis Testing
+
+```@docs
+ModelComparisonTable
+compare_models
+test_parametric_hypothesis
 ```
 
 ## Approximator Functions
 
+The extension-protocol methods (`nparams`, `initial_params`, `penalty_matrix`,
+`penalty_blocks`, `build_evaluator`, `band_domain`) are public unexported API
+in v0.3 — qualify or `import` them from `PartiallySpecifiedModels`.
+
 ```@docs
-nparams
-initial_params
-penalty_matrix
+PartiallySpecifiedModels.nparams
+PartiallySpecifiedModels.initial_params
+PartiallySpecifiedModels.penalty_matrix
 spline_penalty_matrix
 optimize_spde_range
 with_range_param
@@ -254,7 +279,7 @@ smoothing_covariance_correction
 ## Diagnostics
 
 ```@docs
-appraise
+psm_appraise
 deviance_residuals
 residual_diagnostics
 durbin_watson
@@ -265,17 +290,22 @@ kan_edge_curves
 kan_activation_diagnostics
 ```
 
-## Resilience of Fitted Models
+## Resilience & Decision Analysis Bridges (`ecorecipes`)
 
 A fitted PSM is an ordinary SciML problem once its unknown functions are evaluated at the
-fitted coefficients, so the resilience of its equilibria follows from
-[DynamicalResilience.jl](https://github.com/ecorecipes/DynamicalResilience.jl): `steady_state`
-finds the equilibrium, `linearise` its Jacobian, and `metrics_over` the distribution of
-resilience metrics over bootstrap replicates or posterior draws. See
-[Vignette 42](tutorials/42_resilience.md).
+fitted coefficients, so the resilience of its equilibria follows directly from
+[DynamicalResilience.jl](https://github.com/ecorecipes/DynamicalResilience.jl): `steady_state(prob, sol)`
+finds the equilibrium, `linearise(prob, sol)` its Jacobian, and `metrics_over` the distribution of
+resilience metrics over bootstrap replicates or posterior draws. Loading
+[DecisionAnalysis.jl](https://github.com/ecorecipes/DecisionAnalysis.jl) additionally activates
+`ManagedPSM` and `sample_belief` for EVPI, EVSI, and adaptive management. See
+[Vignettes 42, 44, 46, and 47](vignettes.md).
 
 ```@docs
 to_ode_problem
-parameter_draws
+to_discrete_problem
+posterior_draws
 metrics_over(::PSMProblem, ::Any)
+ManagedPSM
+sample_belief
 ```

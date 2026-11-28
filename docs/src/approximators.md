@@ -1,6 +1,6 @@
 # Approximators
 
-PartiallySpecifiedModels.jl provides twelve approximator types for representing unknown functions in dynamical systems, including an optional FluxKAN backend. Each approximator is a callable object that maps scalar inputs to scalar outputs and is fitted as part of the model (tensor-product and KAN approximators can take multiple inputs; the single-index approximator takes `p`; the transformed-covariate approximator takes time).
+PartiallySpecifiedModels.jl provides fifteen approximator types for representing unknown functions in dynamical systems, including optional `FluxKAN.jl` and `GAM.jl` backends. Each approximator is a callable object that maps inputs to scalar outputs and is fitted as part of the model (`TensorBSplineApproximator`, `KANApproximator`, and `GAMSmoothApproximator` can take multiple inputs; `SingleIndexApproximator` takes `p` states; `TransformedCovariateApproximator` takes time; `RandomEffectApproximator` takes an integer group index).
 
 ## BSplineApproximator
 
@@ -23,6 +23,43 @@ The smoothing parameter ``\lambda`` is estimated automatically by LAML or GCV.
 BSplineApproximator
 ```
 
+## CyclicBSplineApproximator
+
+$C^2$-periodic cubic B-spline basis for seasonal or circular forcing functions (e.g., annual transmission rates $\beta(t \bmod 1)$ where $\beta(0) = \beta(1)$, $\beta'(0) = \beta'(1)$, and $\beta''(0) = \beta''(1)$). Inputs outside `domain` wrap periodically, and the circulant second-derivative penalty has rank $n - 1$ (null space: constant functions).
+
+```@example approx
+approx_cyc = CyclicBSplineApproximator(:beta, (0.0, 1.0), 8; initial = t -> 0.5)
+```
+
+```@docs
+CyclicBSplineApproximator
+```
+
+## RandomEffectApproximator
+
+Ridge-penalized group-level random effects (`S = I`, matching `mgcv`'s `s(group, bs="re")`), intended for hierarchical [`MultiTrajectoryPSMProblem`](@ref) models where each replicate or site receives a shrunk random intercept/slope offset estimated automatically via LAML.
+
+```@example approx
+approx_re = RandomEffectApproximator(:u_site, 5)
+```
+
+```@docs
+RandomEffectApproximator
+```
+
+## GAMSmoothApproximator
+
+Thin weak-dependency adapter wrapping **any** smooth term from [GAM.jl](https://github.com/ecorecipes/GAM.jl) (`cr`, `tp`, `cc`, `ps`, `bs`, `re`, `ds`, `fs`, `mrf`, `te`, `ti`, `t2`) inside a `PSMProblem`, carrying over exact `GAM.jl` basis evaluation and penalty blocks into `LAML` and every other solver. Load `using GAM` to activate the extension.
+
+```julia
+using PartiallySpecifiedModels, GAM
+approx_gam = GAMSmoothApproximator(:f, GAM.s(:x; bs=:cr, k=10), (0.0, 10.0))
+```
+
+```@docs
+GAMSmoothApproximator
+```
+
 ## TensorBSplineApproximator
 
 Bivariate tensor-product spline for unknown functions of **two** state variables — the flagship ecological case in Wood (2001), where a predation response ``g(P, N)`` depends on both predator and prey densities.
@@ -34,7 +71,7 @@ approx2d = TensorBSplineApproximator(:g, (0.0, 3.0), (0.5, 3.0), 5, 5;
 
 - **`(0.0, 3.0)` / `(0.5, 3.0)`**: domains of the first and second argument
 - **`5, 5`**: knots per margin (`nparams = 5 × 5 = 25` coefficients — the surface values on the knot grid)
-- **`anisotropy`** (keyword, default 1.0): fixed relative weight of y-roughness against x-roughness in the Kronecker-sum penalty; a single smoothing parameter ``\lambda`` scales the whole penalty
+- **`anisotropy`** (keyword, default `1.0`): positive `Real` fixes the relative y-to-x roughness weight (1 smoothing parameter), or pass `anisotropy=:estimate` for Wood (2006) `t2` orthogonal 3-block decomposition (x-roughness, y-roughness, interaction roughness) with 3 independent scale-invariant smoothing parameters estimated jointly under `LAML`.
 
 In the dynamics the fitted surface is called with two arguments:
 
@@ -48,7 +85,7 @@ end
 prob = PSMProblem(predprey!, [1.0, 1.5], (0.0, 40.0), [approx2d];
                   data_times=ts, data_values=data, obs_to_state=[1, 2],
                   known_params=(K=6.0, e=0.5, m=0.25),
-                  likelihood=Gaussian(), solver=Tsit5())
+                  likelihood=GaussianLikelihood(), solver=Tsit5())
 sol = solve(prob, AdamSolver(maxiters=400, lr=0.05))
 sol.unknown_functions[:g](1.5, 2.0)   # fitted surface at (N, P)
 ```
@@ -138,7 +175,7 @@ temp_tc  = [18.0 + 7.0 * sin(2pi * t / 180 - pi / 3) for t in times_tc]
 approx_tc = TransformedCovariateApproximator(:beta, times_tc, temp_tc;
                                              trans = :expsm, nknots = 8,
                                              constraint = :increasing)
-nparams(approx_tc)   # 1 inertia parameter + 8 outer coefficients
+PartiallySpecifiedModels.nparams(approx_tc)   # 1 inertia parameter + 8 outer coefficients
 ```
 
 In the dynamics it is a **one-argument callable of time**, the same convention every
@@ -279,7 +316,7 @@ ShapeConstrainedSPDEApproximator
 
 ## NeuralApproximator
 
-Neural network approximator using [Lux.jl](https://github.com/LuxDL/Lux.jl). Suitable for complex or high-dimensional unknown functions. Compatible with gradient-based solvers (`AdamSolver`, `MultipleShootingSolver`).
+Neural network approximator using [Lux.jl](https://github.com/LuxDL/Lux.jl) for flexible 1D scalar responses (for multivariate responses, use [`TensorBSplineApproximator`](@ref), [`SingleIndexApproximator`](@ref), [`KANApproximator`](@ref), or [`GAMSmoothApproximator`](@ref)). Compatible with gradient-based solvers (`AdamSolver`, `MultipleShootingSolver`, `MultiStart`).
 
 ```@example approx
 import Lux
@@ -361,7 +398,7 @@ values, occupancy of the actual central knot intervals, and samples where
 every spline basis is zero:
 
 ```julia
-beta = initial_params(approx_g)  # Use sol.parameters.g after fitting.
+beta = PartiallySpecifiedModels.initial_params(approx_g)  # Use sol.parameters.g after fitting.
 samples = [10.0 2.0; 25.0 5.0; 40.0 10.0]
 exposure = kan_activation_diagnostics(approx_g, beta, samples)
 exposure.layers[2].coverage  # Hidden-layer coordinates, not rescaled inputs
@@ -525,7 +562,7 @@ KANApproximator
 
 ## GPApproximator
 
-Gaussian process approximator. Uses a GP prior over the unknown function with learnable hyperparameters (lengthscale, signal variance). Particularly useful with gradient matching solvers.
+Gaussian process kernel-interpolant approximator whose fitted parameters are the **function values at `n_inducing` inducing points** (with kernel hyperparameters `lengthscale` and `variance` either fixed or adapted via marginal likelihood during `LAML`/`GCVSolver`). Particularly useful alongside gradient matching solvers.
 
 ```@example approx
 approx_gp = GPApproximator(:f, (0.0, 10.0), 20)

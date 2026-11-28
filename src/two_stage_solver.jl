@@ -33,8 +33,10 @@ nonlinear least squares against those smoothed derivatives.
 4. Reconstruct the unknown functions at the fitted parameters.
 
 # References
-- Voss & Feng (2008), "Modelling Non-linear Differential Equations:
-  a Two-Stage Method", JRSS-C.
+- Varah (1982), "A spline least squares method for numerical parameter
+  estimation in differential equations", *SIAM J. Sci. Stat. Comput.* 3(1):28–46.
+- Brunel (2008), "Parameter estimation of ODE's via nonparametric estimators",
+  *Electronic Journal of Statistics* 2:1242–1267.
 
 # Returns
 `PSMSolution` with fitted parameters, trajectory, and unknown functions.
@@ -43,11 +45,13 @@ nonlinear least squares against those smoothed derivatives.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
     _validate_problem(prob, "TwoStageSolver"; reject_delays=true)
+    _require_gaussian_likelihood(prob, "TwoStageSolver")
     verbose = alg.verbose
 
     times = Float64.(prob.data_times)
     n_times = length(times)
-    n_vars = length(prob.u0)
+    u0_init = _resolve_u0_init(prob)
+    n_vars = length(u0_init)
     n_obs = size(prob.data_values, 2)
 
     # ── Stage 1: Smooth data and compute derivatives ─────────────
@@ -97,8 +101,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
     # Handle unobserved states: constant at initial condition value
     for k in 1:n_vars
         if k ∉ observed_states
-            u0_k = Float64(prob.u0 isa Function ? prob.u0(prob.known_params)[k] :
-                           prob.u0[k])
+            u0_k = u0_init[k]
             y_smooth[:, k] .= u0_k
             dydt[:, k] .= 0.0
         end
@@ -151,8 +154,22 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
                 "lambda_smooth=$(alg.lambda_smooth)")
     end
 
-    # Derivative matching loss (ForwardDiff-compatible)
+    # Precompute penalty terms once before Adam loop.
     lambda_smooth = alg.lambda_smooth
+    ts_mat_pens = Tuple{Int,Int,Matrix{Float64}}[]
+    ts_l2_pens = Tuple{Int,Int,Float64}[]
+    let off = 0
+        for approx in prob.approximators
+            np = nparams(approx)
+            if approx isa COMONetApproximator
+                approx.penalty_weight > 0.0 && push!(ts_l2_pens, (off, np, approx.penalty_weight))
+            elseif !(approx isa NeuralApproximator)
+                S = penalty_matrix(approx)
+                S !== nothing && push!(ts_mat_pens, (off, np, S))
+            end
+            off += np
+        end
+    end
 
     function twostage_loss(β_eval)
         T_el = eltype(β_eval)
@@ -169,40 +186,19 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
                 du .= T_el(1e6)
             end
             for k in 1:n_vars
-                # Only observed states carry real targets; unobserved ones
-                # were filled with a constant state and zero derivative,
-                # and matching those fabricated values biases the fit.
                 k in observed_states || continue
-                # …and only at times where that state actually has a usable
-                # observation (see `match_usable`).
                 match_usable[i, k] || continue
                 loss_val += (dydt[i, k] - du[k])^2
             end
         end
 
-        # Penalty terms from approximators
-        offset = 0
-        for approx in prob.approximators
-            np = nparams(approx)
-            params_k = β_eval[offset+1:offset+np]
-            offset += np
-
-            # Non-built-in (custom protocol) types take the generic branch
-            # too; built-in treatment is unchanged (see _BUILTIN_APPROX_TYPES).
-            if approx isa BSplineApproximator || approx isa GPApproximator || approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator || approx isa ShapeConstrainedGPApproximator || approx isa TensorBSplineApproximator || approx isa SingleIndexApproximator || approx isa TransformedCovariateApproximator || !(approx isa _BUILTIN_APPROX_TYPES)
-                S = penalty_matrix(approx)
-                if S !== nothing
-                    loss_val += lambda_smooth * dot(params_k, S * params_k)
-                end
-            elseif approx isa ShapeConstrainedBSplineApproximator
-                S = penalty_matrix(approx)
-                if S !== nothing
-                    loss_val += lambda_smooth * dot(params_k, S * params_k)
-                end
-            elseif approx isa COMONetApproximator
-                loss_val += approx.penalty_weight * sum(abs2, params_k)
-            end
-            # NeuralApproximator: no explicit penalty (implicit regularization)
+        for (off, np, w_l2) in ts_l2_pens
+            pk = @view β_eval[off+1:off+np]
+            loss_val += w_l2 * sum(abs2, pk)
+        end
+        for (off, np, S) in ts_mat_pens
+            pk = @view β_eval[off+1:off+np]
+            loss_val += lambda_smooth * dot(pk, S * pk)
         end
 
         loss_val
@@ -221,11 +217,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
     # criterion actually fires; otherwise the loop exhausted maxiters.
     conv_converged = false
     conv_reason = :maxiters
+    result = DiffResults.MutableDiffResult(0.0, (zeros(n_beta),))
 
     for iter in 1:alg.maxiters
         final_iter = iter
         # Compute gradient via ForwardDiff
-        result = DiffResults.MutableDiffResult(0.0, (zeros(n_beta),))
         ForwardDiff.gradient!(result, twostage_loss, beta)
         loss_val = DiffResults.value(result)
         grad = DiffResults.gradient(result)
@@ -306,7 +302,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::TwoStageSolver)
     # losses were 0.11172338 and 200.92415, a factor of 1798.
     sim_ok = true
     pred = try
-        simulate(prob, beta)
+        simulate_psm(prob, beta)
     catch e
         _is_program_error(e) && rethrow()
         sim_ok = false

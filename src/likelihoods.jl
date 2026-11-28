@@ -98,7 +98,7 @@ function _normlogcdf(x::Real)
 end
 
 """Return (response mean, variance / sigma^2) for a truncated normal."""
-function _truncated_normal_moments(fam::TruncatedNormal, mu::Real)
+function _truncated_normal_moments(fam::TruncatedNormalLikelihood, mu::Real)
     σ, a = fam.sigma, fam.lower
     ξ = (mu - a) / σ
     if ξ <= -1
@@ -110,7 +110,7 @@ function _truncated_normal_moments(fam::TruncatedNormal, mu::Real)
     mu + σ * λ, 1 - λ * (ξ + λ)
 end
 
-function _truncated_normal_loglik(fam::TruncatedNormal, y::Real, mu::Real)
+function _truncated_normal_loglik(fam::TruncatedNormalLikelihood, y::Real, mu::Real)
     σ, a = fam.sigma, fam.lower
     ξ = (mu - a) / σ
     if ξ <= -1
@@ -203,7 +203,7 @@ normalizing constants and are mutually comparable (e.g. for AIC). The
 elsewhere, so the −(n/2)log(2πσ²) term is omitted and Gaussian values are
 NOT comparable across families.
 """
-function log_likelihood(::Gaussian, y::AbstractVector,
+function log_likelihood(::GaussianLikelihood, y::AbstractVector,
                         mu::AbstractVector, w::AbstractVector)
     ll = 0.0
     for i in eachindex(y)
@@ -213,7 +213,7 @@ function log_likelihood(::Gaussian, y::AbstractVector,
     ll
 end
 
-function log_likelihood(::Poisson, y::AbstractVector,
+function log_likelihood(::PoissonLikelihood, y::AbstractVector,
                         mu::AbstractVector, w::AbstractVector)
     ll = 0.0
     for i in eachindex(y)
@@ -231,14 +231,14 @@ function log_likelihood(::Poisson, y::AbstractVector,
     ll
 end
 
-function log_likelihood(fam::NegativeBinomial, y::AbstractVector,
+function log_likelihood(fam::NegativeBinomialLikelihood, y::AbstractVector,
                         mu::AbstractVector, w::AbstractVector)
     θ = fam.theta
     lgθ = _loggamma(θ)
     ll = 0.0
     for i in eachindex(y)
         _usable(y[i], w[i]) || continue
-        mu_i = max(mu[i], 1e-10)
+        mu_i = max(abs(mu[i]), 1e-6)
         kern = y[i] * log(mu_i / (mu_i + θ)) + θ * log(θ / (mu_i + θ))
         norm = _loggamma(y[i] + θ) - lgθ - _loggamma(y[i] + 1)
         ll += w[i] * (kern + norm)
@@ -246,12 +246,71 @@ function log_likelihood(fam::NegativeBinomial, y::AbstractVector,
     ll
 end
 
-function log_likelihood(fam::TruncatedNormal, y::AbstractVector,
+function log_likelihood(fam::TruncatedNormalLikelihood, y::AbstractVector,
                         mu::AbstractVector, w::AbstractVector)
     ll = 0.0
     for i in eachindex(y)
         _usable(y[i], w[i]) || continue
         ll += w[i] * _truncated_normal_loglik(fam, y[i], mu[i])
+    end
+    ll
+end
+
+function log_likelihood(fam::GammaLikelihood, y::AbstractVector,
+                        mu::AbstractVector, w::AbstractVector)
+    ν = 1.0 / fam.phi
+    lgν = _loggamma(ν)
+    ll = 0.0
+    for i in eachindex(y)
+        _usable(y[i], w[i]) || continue
+        yi = max(y[i], 1e-10)
+        mi = max(abs(mu[i]), 1e-6)
+        ll += w[i] * (ν * log(ν / mi) + (ν - 1.0) * log(yi) - ν * yi / mi - lgν)
+    end
+    ll
+end
+
+function log_likelihood(fam::LogNormalLikelihood, y::AbstractVector,
+                        mu::AbstractVector, w::AbstractVector)
+    σ = fam.sigma
+    c = -log(σ) - 0.5 * log(2π)
+    inv_2s2 = 0.5 / (σ * σ)
+    ll = 0.0
+    for i in eachindex(y)
+        _usable(y[i], w[i]) || continue
+        yi = max(y[i], 1e-10)
+        mi = max(abs(mu[i]), 1e-6)
+        ly = log(yi)
+        d = ly - log(mi)
+        ll += w[i] * (c - ly - inv_2s2 * d * d)
+    end
+    ll
+end
+
+function log_likelihood(fam::BinomialLikelihood, y::AbstractVector,
+                        mu::AbstractVector, w::AbstractVector)
+    n = fam.n_trials
+    lgn = _loggamma(n + 1.0)
+    ll = 0.0
+    for i in eachindex(y)
+        _usable(y[i], w[i]) || continue
+        yi = clamp(y[i], 0.0, Float64(n))
+        pi = clamp(mu[i], 1e-6, 1.0 - 1e-6)
+        norm = lgn - _loggamma(yi + 1.0) - _loggamma(n - yi + 1.0)
+        ll += w[i] * (norm + yi * log(pi) + (n - yi) * log1p(-pi))
+    end
+    ll
+end
+
+function log_likelihood(fam::StudentTLikelihood, y::AbstractVector,
+                        mu::AbstractVector, w::AbstractVector)
+    ν = fam.df; σ = fam.sigma
+    c = _loggamma(0.5 * (ν + 1.0)) - _loggamma(0.5 * ν) - 0.5 * log(π * ν) - log(σ)
+    ll = 0.0
+    for i in eachindex(y)
+        _usable(y[i], w[i]) || continue
+        z = (y[i] - mu[i]) / σ
+        ll += w[i] * (c - 0.5 * (ν + 1.0) * log1p((z * z) / ν))
     end
     ll
 end
@@ -287,10 +346,10 @@ gradient contribution correctly zero rather than NaN. Zero-weight cells
 need no guard here: the caller multiplies by `w = 0`, and the value
 returned for a finite `y` is finite.
 """
-loglik_pointwise(::Gaussian, y::Real, mu::Real) =
+loglik_pointwise(::GaussianLikelihood, y::Real, mu::Real) =
     !isfinite(y) ? zero(y * mu) : -0.5 * (y - mu)^2
 
-function loglik_pointwise(::Poisson, y::Real, mu::Real)
+function loglik_pointwise(::PoissonLikelihood, y::Real, mu::Real)
     !isfinite(y) && return zero(y * mu)
     # Same μ ≤ 0 convention as log_likelihood/irls_weights: max(|μ|, 1e-6).
     mu_c = max(abs(mu), 1e-6)
@@ -298,17 +357,52 @@ function loglik_pointwise(::Poisson, y::Real, mu::Real)
     kern - _loggamma(y + 1)
 end
 
-function loglik_pointwise(fam::NegativeBinomial, y::Real, mu::Real)
+function loglik_pointwise(fam::NegativeBinomialLikelihood, y::Real, mu::Real)
     !isfinite(y) && return zero(y * mu)
     θ = fam.theta
-    mu_c = max(mu, 1e-10)
+    mu_c = max(abs(mu), 1e-6)
     kern = y * log(mu_c / (mu_c + θ)) + θ * log(θ / (mu_c + θ))
     kern + _loggamma(y + θ) - _loggamma(θ) - _loggamma(y + 1)
 end
 
-function loglik_pointwise(fam::TruncatedNormal, y::Real, mu::Real)
+function loglik_pointwise(fam::TruncatedNormalLikelihood, y::Real, mu::Real)
     !isfinite(y) && return zero(y * mu)
     _truncated_normal_loglik(fam, y, mu)
+end
+
+function loglik_pointwise(fam::GammaLikelihood, y::Real, mu::Real)
+    !isfinite(y) && return zero(y * mu)
+    ν = 1.0 / fam.phi
+    yi = max(y, 1e-10)
+    mi = max(abs(mu), 1e-6)
+    ν * log(ν / mi) + (ν - 1.0) * log(yi) - ν * yi / mi - _loggamma(ν)
+end
+
+function loglik_pointwise(fam::LogNormalLikelihood, y::Real, mu::Real)
+    !isfinite(y) && return zero(y * mu)
+    σ = fam.sigma
+    yi = max(y, 1e-10)
+    mi = max(abs(mu), 1e-6)
+    ly = log(yi)
+    d = ly - log(mi)
+    -ly - log(σ) - 0.5 * log(2π) - 0.5 * (d * d) / (σ * σ)
+end
+
+function loglik_pointwise(fam::BinomialLikelihood, y::Real, mu::Real)
+    !isfinite(y) && return zero(y * mu)
+    n = fam.n_trials
+    yi = clamp(y, 0.0, Float64(n))
+    pi = clamp(mu, 1e-6, 1.0 - 1e-6)
+    _loggamma(n + 1.0) - _loggamma(yi + 1.0) - _loggamma(n - yi + 1.0) +
+        yi * log(pi) + (n - yi) * log1p(-pi)
+end
+
+function loglik_pointwise(fam::StudentTLikelihood, y::Real, mu::Real)
+    !isfinite(y) && return zero(y * mu)
+    ν = fam.df; σ = fam.sigma
+    z = (y - mu) / σ
+    _loggamma(0.5 * (ν + 1.0)) - _loggamma(0.5 * ν) - 0.5 * log(π * ν) - log(σ) -
+        0.5 * (ν + 1.0) * log1p((z * z) / ν)
 end
 
 loglik_pointwise(fam::CustomLikelihood, y::Real, mu::Real) =
@@ -348,7 +442,7 @@ formulae give whenever `y` is finite; the guard matters when `y` is NaN
 differentiating `loglik_scalar(y, ·)`, which returns NaN for a NaN `y`
 and would then be multiplied by `w = 0` to give NaN, not 0.
 """
-function irls_weights(::Gaussian, y::AbstractVector,
+function irls_weights(::GaussianLikelihood, y::AbstractVector,
                       mu::AbstractVector, w::AbstractVector)
     wt = copy(w)
     for i in eachindex(wt)
@@ -357,7 +451,7 @@ function irls_weights(::Gaussian, y::AbstractVector,
     wt
 end
 
-function irls_weights(::Poisson, y::AbstractVector,
+function irls_weights(::PoissonLikelihood, y::AbstractVector,
                       mu::AbstractVector, w::AbstractVector)
     # Identity link, V(μ) = μ → W̃ = w / μ
     wt = similar(w)
@@ -371,7 +465,7 @@ function irls_weights(::Poisson, y::AbstractVector,
     wt
 end
 
-function irls_weights(fam::NegativeBinomial, y::AbstractVector,
+function irls_weights(fam::NegativeBinomialLikelihood, y::AbstractVector,
                       mu::AbstractVector, w::AbstractVector)
     # Identity link, V(μ) = μ + μ²/θ → W̃ = w / V(μ)
     θ = fam.theta
@@ -386,7 +480,7 @@ function irls_weights(fam::NegativeBinomial, y::AbstractVector,
     wt
 end
 
-function irls_weights(fam::TruncatedNormal, y::AbstractVector,
+function irls_weights(fam::TruncatedNormalLikelihood, y::AbstractVector,
                       mu::AbstractVector, w::AbstractVector)
     # For TruncatedNormal(a, σ), the observed (= Fisher) information is:
     #   I(μ) = (1/σ²)(1 - ξ·λ(ξ) - λ(ξ)²)
@@ -403,6 +497,64 @@ function irls_weights(fam::TruncatedNormal, y::AbstractVector,
         _, variance = _truncated_normal_moments(fam, mu[i])
         info = variance / σ^2
         wt[i] = w[i] * max(info, 1e-10)
+    end
+    wt
+end
+
+function irls_weights(fam::GammaLikelihood, y::AbstractVector,
+                      mu::AbstractVector, w::AbstractVector)
+    ϕ = fam.phi
+    wt = similar(w)
+    for i in eachindex(w)
+        if !_usable(y[i], w[i])
+            wt[i] = zero(eltype(wt)); continue
+        end
+        mi = max(abs(mu[i]), 1e-6)
+        wt[i] = w[i] / (ϕ * mi * mi)
+    end
+    wt
+end
+
+function irls_weights(fam::LogNormalLikelihood, y::AbstractVector,
+                      mu::AbstractVector, w::AbstractVector)
+    s2 = fam.sigma^2
+    wt = similar(w)
+    for i in eachindex(w)
+        if !_usable(y[i], w[i])
+            wt[i] = zero(eltype(wt)); continue
+        end
+        mi = max(abs(mu[i]), 1e-6)
+        wt[i] = w[i] / (s2 * mi * mi)
+    end
+    wt
+end
+
+function irls_weights(fam::BinomialLikelihood, y::AbstractVector,
+                      mu::AbstractVector, w::AbstractVector)
+    n = Float64(fam.n_trials)
+    wt = similar(w)
+    for i in eachindex(w)
+        if !_usable(y[i], w[i])
+            wt[i] = zero(eltype(wt)); continue
+        end
+        pi = clamp(mu[i], 1e-6, 1.0 - 1e-6)
+        wt[i] = w[i] * n / (pi * (1.0 - pi))
+    end
+    wt
+end
+
+function irls_weights(fam::StudentTLikelihood, y::AbstractVector,
+                      mu::AbstractVector, w::AbstractVector)
+    ν = fam.df; s2 = fam.sigma^2
+    wt = similar(w)
+    for i in eachindex(w)
+        if !_usable(y[i], w[i])
+            wt[i] = zero(eltype(wt)); continue
+        end
+        r = y[i] - mu[i]
+        # EM / IRLS robustness weight: strictly positive for all outliers and
+        # satisfies W̃_i * (y_i - μ_i) == w_i * ∂ℓ/∂μ_i identically.
+        wt[i] = w[i] * (ν + 1.0) / (ν * s2 + r * r)
     end
     wt
 end
@@ -507,7 +659,7 @@ lower tail the mean and information come directly from the normal
 log-CDF's continued fraction, without flooring Φ or subtracting large,
 nearly equal Mills-ratio terms.
 """
-function _working_residual_scalar(fam::TruncatedNormal, y::Real, mu::Real)
+function _working_residual_scalar(fam::TruncatedNormalLikelihood, y::Real, mu::Real)
     σ = fam.sigma
     mean_y, variance = _truncated_normal_moments(fam, mu)
     # Same guarded information as `irls_weights`, so W̃·(z−η) = w·score holds
@@ -534,6 +686,19 @@ form was off by 45.3%.
 The cost is one extra first-derivative sweep alongside the second-derivative
 sweep `irls_weights` already performs.
 """
+function _working_residual_scalar(fam::LogNormalLikelihood, y::Real, mu::Real)
+    yi = max(y, 1e-10)
+    mi = max(abs(mu), 1e-6)
+    mi * (log(yi) - log(mi))
+end
+
+function _working_residual_scalar(fam::BinomialLikelihood, y::Real, mu::Real)
+    n = Float64(fam.n_trials)
+    yi = clamp(y, 0.0, n)
+    pi = clamp(mu, 1e-6, 1.0 - 1e-6)
+    yi / n - pi
+end
+
 function _working_residual_scalar(fam::CustomLikelihood, y::Real, mu::Real)
     score = ForwardDiff.derivative(m -> fam.loglik_scalar(y, m), mu)
     neg_d2l = -ForwardDiff.derivative(
@@ -546,7 +711,17 @@ end
 # one for the LAML/GCV pseudodata and a scalar one for the collocation
 # residual rows) is precisely how a fix lands in one solver and not its
 # sibling, which is the defect class this package keeps rediscovering.
-_working_residual(fam::AbstractLikelihood, y::AbstractVector,
-                  mu::AbstractVector, w::AbstractVector) =
-    _working_residual_scalar.(Ref(fam), y, mu)
+function _working_residual(fam::AbstractLikelihood, y::AbstractVector,
+                           mu::AbstractVector, w::AbstractVector)
+    T = float(promote_type(eltype(y), eltype(mu)))
+    out = Vector{T}(undef, length(y))
+    @inbounds for i in eachindex(y)
+        if !_usable(y[i], w[i])
+            out[i] = zero(T)
+        else
+            out[i] = _working_residual_scalar(fam, y[i], mu[i])
+        end
+    end
+    out
+end
 

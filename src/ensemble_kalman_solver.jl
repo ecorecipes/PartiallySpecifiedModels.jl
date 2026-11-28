@@ -65,6 +65,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
     _validate_problem(prob, "EnsembleKalmanSolver"; reject_delays=true,
                       delay_reason=
                       "It builds a probabilistic ODE / GP state-space manifold from the 4-argument ODE signature f!(du, u, p, t).")
+    _require_gaussian_likelihood(prob, "EnsembleKalmanSolver")
     _reject_masked_data(prob, "EnsembleKalmanSolver")
     verbose = alg.verbose
 
@@ -101,7 +102,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
                 ode_prob = ODEProblem(prob.dynamics!, ode_u0, prob.tspan, p)
                 solver = prob.ode_solver === nothing ? Tsit5() : prob.ode_solver
                 ode_sol = OrdinaryDiffEq.solve(ode_prob, solver;
-                            saveat=prob.data_times, _normalise_ode_kwargs(prob.ode_kwargs)...)
+                            saveat=prob.data_times, verbose=_quiet_solve(),
+                            _normalise_ode_kwargs(prob.ode_kwargs)...)
                 if ode_sol.retcode != :Success && ode_sol.retcode != SciMLBase.ReturnCode.Success
                     return nothing
                 end
@@ -167,8 +169,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::EnsembleKalmanSolver)
         Cgg = (ΔG * ΔG') / max(Jv - 1, 1)
 
         # Kalman gain: K = Cθg * (Cgg + Γ)⁻¹
-        # Use pseudo-inverse for numerical stability
-        K = Cθg * pinv(Cgg + Γ)
+        # Cgg + Γ is SPD for σ_obs > 0; use Cholesky with pinv fallback.
+        S_obs = Symmetric(Cgg + Γ)
+        F_obs = cholesky(S_obs; check=false)
+        K = issuccess(F_obs) ? (Cθg / F_obs) : (Cθg * pinv(Cgg + Γ))
 
         # Update valid particles with the perturbed-observation EKI step
         for (k, j) in enumerate(valid)

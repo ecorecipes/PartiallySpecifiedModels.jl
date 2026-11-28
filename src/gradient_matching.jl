@@ -50,7 +50,9 @@ function _smoothing_spline(t::AbstractVector{Float64}, y::AbstractVector{Float64
     end
     P = D' * D
     BtB = B' * B; Bty = B' * y
-    best_gcv = Inf; β = BtB \ Bty
+    best_gcv = Inf
+    F0 = cholesky(Symmetric(BtB + 1e-6 * P + 1e-10 * I), check=false)
+    β = issuccess(F0) ? (F0 \ Bty) : (pinv(BtB + 1e-6 * P) * Bty)
     for logλ in range(-6.0, 6.0, length=40)
         λ = 10.0^logλ
         F = cholesky(Symmetric(BtB + λ * P + 1e-10 * I), check=false)
@@ -259,9 +261,10 @@ the smoothed derivatives to the model right-hand side.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
     _validate_problem(prob, "GradientMatching"; reject_delays=true)
+    _require_gaussian_likelihood(prob, "GradientMatching")
     times = Float64.(prob.data_times)
     T_pts = length(times)
-    K = length(prob.u0)
+    K = _state_dim(prob)
     n_obs = size(prob.data_values, 2)
 
     verbose = alg.verbose
@@ -424,7 +427,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
             prev_obj = obj
 
             JtJ = J' * J + B
-            neg_Jtr = -(J' * resid)
+            neg_Jtr = -(J' * resid .+ B * beta)
             delta = try
                 JtJ \ neg_Jtr
             catch e
@@ -652,9 +655,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
 
     # Build solution
 
-    # Derivative matching loss
+    # Derivative matching loss (weighted, matching the exact rows/states optimized)
     F_final, n_dyn_fail = eval_rhs_at_smooth(prob, times, y_smooth, beta)
-    deriv_loss = sum((dydt .- F_final).^2)
+    n_match_final = prob.discrete ? T_pts - 1 : T_pts
+    deriv_loss = 0.0
+    for k in 1:K, i in 1:n_match_final
+        idx = (k - 1) * n_match_final + i
+        wi = idx <= length(w) ? w[idx] : 1.0
+        deriv_loss += wi * (dydt[i, k] - F_final[i, k])^2
+    end
 
     # Sentinel accounting at the FITTED parameters. `_dynamics_failure_verdict`
     # errors on total failure (nothing was fitted) and downgrades a partial
@@ -689,7 +698,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
     # (instead of using smoothed states which give misleading data_loss=0)
     if prob.discrete
         p_sim = build_param_struct(prob, beta)
-        u_sim = Float64.(prob.u0)
+        u_sim = Float64.(_resolve_u0(prob, p_sim))
         u_next_sim = similar(u_sim)
         sim_states = zeros(T_pts, K)
         sim_states[1, :] .= u_sim
@@ -724,7 +733,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GradientMatching)
         # simulated data losses were 0.162944523148 and 201.599216257, a
         # factor of 1237.
         pred = try
-            simulate(prob, beta)
+            simulate_psm(prob, beta)
         catch e
             _is_program_error(e) && rethrow()
             sim_ok = false

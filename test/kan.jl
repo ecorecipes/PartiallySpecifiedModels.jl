@@ -7,6 +7,7 @@ using Lux
 using FluxKAN
 using SciMLSensitivity
 using PartiallySpecifiedModels
+using PartiallySpecifiedModels: penalty_matrix, penalty_blocks, nparams, initial_params, build_evaluator, band_domain
 using PartiallySpecifiedModels: solve
 
 const PSM = PartiallySpecifiedModels
@@ -376,7 +377,7 @@ end
             @test all(x -> isfinite(x) && x > 0, sol.smoothing_params)
             # Measured RSS <=1.71e-11 from initial 0.608; >5e7x headroom.
             @test sol.data_loss < 1e-3
-            @test sol.fitted_values == simulate(prob, collect(sol.parameters))
+            @test sol.fitted_values == simulate_psm(prob, collect(sol.parameters))
         end
     end
 
@@ -399,19 +400,19 @@ end
         stiff = PSMProblem(rhs!, [0.2], (0.0, 1.0), [a];
             data_times=times, data_values=prob.data_values, solver=TRBDF2(),
             abstol=1e-10, reltol=1e-10)
-        J = FD.jacobian(b -> vec(simulate(stiff, b)), beta)
+        J = FD.jacobian(b -> vec(simulate_psm(stiff, b)), beta)
         @test all(isfinite, J)
         @test norm(J) > 0
 
         dde!(du, u, h, p, t) = (du[1] = p.f(h(p, t-0.2)[1]))
         delayed = PSMProblem(dde!, [0.2], (0.0, 1.0), [a];
             data_times=times, data_values=prob.data_values, delays=[0.2])
-        @test all(isfinite, FD.jacobian(b -> vec(simulate(delayed, b)), beta))
+        @test all(isfinite, FD.jacobian(b -> vec(simulate_psm(delayed, b)), beta))
 
         map!(du, u, p, t) = (du[1] = u[1] + 0.1p.f(u[1]))
         discrete = PSMProblem(map!, [0.2], (0.5, 5.5), [a];
             data_times=collect(0.5:5.5), data_values=prob.data_values, discrete=true)
-        @test all(isfinite, FD.jacobian(b -> vec(simulate(discrete, b)), beta))
+        @test all(isfinite, FD.jacobian(b -> vec(simulate_psm(discrete, b)), beta))
     end
 
     @testset "Fitting and univariate bootstrap" begin
@@ -421,14 +422,14 @@ end
         rhs!(du, u, p, t) = (du[1] = p.r(t))
         prob = PSMProblem(rhs!, [0.2], (0.0, 1.0), [a];
             data_times=times, data_values=data, abstol=1e-10, reltol=1e-10)
-        initial_loss = PSM.weighted_data_loss(prob, simulate(prob, initial_params(a)))
+        initial_loss = PSM.weighted_data_loss(prob, simulate_psm(prob, initial_params(a)))
         for alg in (LAML(maxiters=20, jac=:forwarddiff),
                     GCVSolver(maxiters=20, jac=:forwarddiff),
                     AdamSolver(maxiters=200, lr=0.03))
             sol = solve(prob, alg)
             @test sol.data_loss < initial_loss
             @test sol.parameters.r != initial_params(a)
-            @test sol.fitted_values == simulate(prob, collect(sol.parameters))
+            @test sol.fitted_values == simulate_psm(prob, collect(sol.parameters))
             if alg isa AdamSolver
                 # Measured 2.08e-5 after 200 steps; >48x headroom.
                 @test sol.data_loss < 1e-3

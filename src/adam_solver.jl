@@ -162,7 +162,8 @@ function adam_loss_mse(prob::PSMProblem, beta, penalty_w::Float64=0.0)
                                  saveat=prob.data_times,
                                  abstol=get(prob.ode_kwargs, :abstol, 1e-7),
                                  reltol=get(prob.ode_kwargs, :reltol, 1e-7),
-                                 maxiters=get(prob.ode_kwargs, :maxiters, 10000))
+                                 maxiters=get(prob.ode_kwargs, :maxiters, 10000),
+                                 verbose=_quiet_solve())
         end
     catch e
         # Blow-up regions can throw from inside spline evaluators (NaN Dual
@@ -240,7 +241,8 @@ function adam_loss_poisson(prob::PSMProblem, beta, penalty_w::Float64=0.0)
                                  saveat=prob.data_times,
                                  abstol=get(prob.ode_kwargs, :abstol, 1e-7),
                                  reltol=get(prob.ode_kwargs, :reltol, 1e-7),
-                                 maxiters=get(prob.ode_kwargs, :maxiters, 10000))
+                                 maxiters=get(prob.ode_kwargs, :maxiters, 10000),
+                                 verbose=_quiet_solve())
         end
     catch e
         # Blow-up regions can throw from inside spline evaluators (NaN Dual
@@ -398,9 +400,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
     # choice is honored but warned about on mismatch.
     loss_sym = alg.loss
     if loss_sym == :auto
-        loss_sym = if prob.likelihood isa Gaussian
+        loss_sym = if prob.likelihood isa GaussianLikelihood
             :mse
-        elseif prob.likelihood isa Poisson
+        elseif prob.likelihood isa PoissonLikelihood
             :poisson
         else
             error("AdamSolver has no loss for $(typeof(prob.likelihood)); " *
@@ -408,8 +410,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
                   "Use LAML for other likelihood families.")
         end
     else
-        expected = prob.likelihood isa Poisson ? :poisson : :mse
-        if !(prob.likelihood isa Gaussian || prob.likelihood isa Poisson)
+        expected = prob.likelihood isa PoissonLikelihood ? :poisson : :mse
+        if !(prob.likelihood isa GaussianLikelihood || prob.likelihood isa PoissonLikelihood)
             @warn "AdamSolver: prob.likelihood is $(typeof(prob.likelihood)), " *
                   "which this solver cannot honor; fitting with loss=$loss_sym instead"
         elseif loss_sym != expected
@@ -542,7 +544,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::AdamSolver)
                                        saveat=prob.data_times,
                                        abstol=get(prob.ode_kwargs, :abstol, 1e-7),
                                        reltol=get(prob.ode_kwargs, :reltol, 1e-7),
-                                       maxiters=get(prob.ode_kwargs, :maxiters, 10000))
+                                       maxiters=get(prob.ode_kwargs, :maxiters, 10000),
+                                       verbose=_quiet_solve())
         sol_ode.retcode == SciMLBase.ReturnCode.Success && length(sol_ode.u) >= T_pts ||
             error("final ODE solve at the fitted parameters failed " *
                   "(retcode $(sol_ode.retcode))")

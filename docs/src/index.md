@@ -13,7 +13,7 @@ PartiallySpecifiedModels.jl provides a unified interface for specifying and fitt
 - **Basis function approximators** (B-splines, shape-constrained splines, Gaussian processes): fewer parameters, automatic smoothing via LAML/GCV, interpretable, and easy to constrain (monotonicity, convexity, positivity).
 - **Neural network approximators** (Lux.jl networks, fixed-grid KANs, COMONet): more flexible for high-dimensional or complex functional forms, compatible with gradient-based UDE-style training.
 
-The package supports 23 fitting algorithms, 12 approximator types (including an optional FluxKAN backend), 5 likelihood families, and 14 shape constraint types.
+The package supports 24 fitting algorithms (including continuous-discrete EKF for SDEs), 15 approximator types (including optional `FluxKAN.jl` and `GAM.jl` backends), 9 likelihood families (plus direct `Distributions.jl` coercion), and 14 shape constraint types.
 
 ## Installation
 
@@ -22,7 +22,7 @@ using Pkg
 Pkg.add(url="https://github.com/ecorecipes/PartiallySpecifiedModels.jl")
 ```
 
-Requires Julia ≥ 1.12.
+Requires Julia ≥ 1.13. Upgrading from v0.2? See [Migration to v0.3](migration_v03.md).
 
 ## Quick Start
 
@@ -64,7 +64,7 @@ prob = PSMProblem(
     data_times = data_times,
     data_values = reshape(observed_N, :, 1),
     obs_to_state = [1],
-    likelihood = Gaussian(),
+    likelihood = GaussianLikelihood(),
     solver = Tsit5()
 )
 sol = solve(prob, LAML())
@@ -82,16 +82,17 @@ end
 
 | Solver | Method | ODE-free? | Bayesian? | Reference |
 |--------|--------|:---------:|:---------:|-----------|
-| [`LAML`](@ref) | Penalized IRLS + LAML smoothing | No | No | Wood et al. (2016) |
+| [`LAML`](@ref) | Penalized IRLS + LAML smoothing (exact Wood 2011 Newton) | No | No | Wood et al. (2016) |
+| [`EKFSolver`](@ref) | Continuous-discrete EKF + RTS smoother (`SDEPSMProblem`) | No | No | Särkkä & Solin (2019) |
 | [`MultiStart`](@ref) | Best of several `LAML` fits from re-seeded random initializations | No | No | — |
-| [`GCVSolver`](@ref) | Penalized IRLS + GCV smoothing | No | No | Wood (2001) |
+| [`GCVSolver`](@ref) | Penalized IRLS + GCV/NCV smoothing | No | No | Wood (2001, 2024) |
 | [`CollocationLAML`](@ref) | Generalized profiling | No | No | Ramsay et al. (2007) |
 | [`GradientMatching`](@ref) | Smooth then match derivatives | Yes | No | — |
-| [`TwoStageSolver`](@ref) | Smooth then match (simple) | Yes | No | Varah (1982) |
+| [`TwoStageSolver`](@ref) | Smooth then match (simple) | Yes | No | Varah (1982); Brunel (2008) |
 | [`BNGSolver`](@ref) | Ensemble Bayesian gradient matching | Yes | Yes | Bonnaffé & Coulson (2023) |
 | [`AdaptiveGradientMatching`](@ref) | GP product-of-experts | Yes | No | Macdonald & Husmeier (2015) |
 | [`AdamSolver`](@ref) | Adam through ODE (UDE-style) | No | No | Rackauckas et al. (2020) |
-| [`MultipleShootingSolver`](@ref) | Multiple shooting + Adam | No | No | Turan & Jäschke (2021) |
+| [`MultipleShootingSolver`](@ref) | Multiple shooting (Augmented Lagrangian + L-BFGS) | No | No | Turan & Jäschke (2021) |
 | [`DerivativeFreeSolver`](@ref) | NelderMead / Particle Swarm | No | No | — |
 | [`RodeoSolver`](@ref) | Probabilistic ODE (Kalman) | No | No | Wu & Lysy (2024); Tronarp et al. (2022) for `:fenrir` |
 | [`DaltonSolver`](@ref) | Data-adaptive Kalman likelihood | No | No | Wu & Lysy (2024) |
@@ -112,23 +113,32 @@ end
 | Approximator | Description | Parameters |
 |-------------|-------------|------------|
 | [`BSplineApproximator`](@ref) | Cubic B-spline basis | Spline coefficients |
+| [`CyclicBSplineApproximator`](@ref) | $C^2$ periodic cubic B-spline for seasonal forcing | Periodic spline coefficients |
 | [`ShapeConstrainedBSplineApproximator`](@ref) | SCOP-spline (Pya & Wood 2015) | Constrained coefficients |
 | [`SPDEApproximator`](@ref) | Matérn SPDE penalty (Lindgren et al. 2011) | Mesh node values |
 | [`ShapeConstrainedSPDEApproximator`](@ref) | SPDE + shape constraints | Constrained mesh values |
 | [`NeuralApproximator`](@ref) | Lux.jl neural network | Network weights |
-| [`GPApproximator`](@ref) | Gaussian process | GP hyperparameters |
+| [`KANApproximator`](@ref) | Fixed-grid cubic KAN (load `FluxKAN.jl`) | Edge spline and residual weights |
+| [`GAMSmoothApproximator`](@ref) | Any `GAM.jl` smooth basis (load `GAM.jl`) | Smooth basis coefficients |
+| [`RandomEffectApproximator`](@ref) | Group-level random effects (`S = I`) | Group random effects |
+| [`GPApproximator`](@ref) | Gaussian process kernel interpolant | Inducing-point function values |
 | [`ShapeConstrainedGPApproximator`](@ref) | GP + shape constraints | Constrained inducing values |
 | [`COMONetApproximator`](@ref) | Constrained monotone network | exp(W) weights |
-| [`TensorBSplineApproximator`](@ref) | Bivariate tensor-product spline, Kronecker-sum penalty | Tensor-product coefficients |
+| [`TensorBSplineApproximator`](@ref) | Bivariate tensor-product spline (isotropic or `t2` anisotropic) | Tensor-product coefficients |
 | [`SingleIndexApproximator`](@ref) | Univariate smooth of one learned direction (Fasiolo et al. 2025) | Index loadings + outer-smooth coefficients |
 | [`TransformedCovariateApproximator`](@ref) | Smooth of a learned transform of an exogenous covariate | Transform + smooth coefficients |
 
 ### Likelihoods
 
-- [`Gaussian`](@ref) — Gaussian errors with identity link (default)
-- [`Poisson`](@ref) — Count data, fitted on the response scale (identity link)
-- [`NegativeBinomial`](@ref) — Overdispersed counts with fixed dispersion θ, identity link
-- [`TruncatedNormal`](@ref) — Continuous data bounded below (e.g. non-negative densities)
+- [`GaussianLikelihood`](@ref) — Gaussian errors with identity link (default)
+- [`PoissonLikelihood`](@ref) — Count data, fitted on the response scale (identity link)
+- [`NegativeBinomialLikelihood`](@ref) — Overdispersed counts with fixed dispersion θ, identity link
+- [`TruncatedNormalLikelihood`](@ref) — Continuous data bounded below (e.g. non-negative densities)
+- [`GammaLikelihood`](@ref) — Positive skewed continuous data (biomass, CPUE)
+- [`LogNormalLikelihood`](@ref) — Multiplicative log-scale observation error
+- [`BinomialLikelihood`](@ref) — Binomial counts / proportions
+- [`StudentTLikelihood`](@ref) — Heavy-tailed robust observations
 - [`CustomLikelihood`](@ref) — User-defined likelihood
+- Direct `Distributions.jl` coercion (`Normal`, `Poisson`, `NegativeBinomial`, `truncated(Normal(...), lo, Inf)`, `Gamma`, `LogNormal`, `Binomial`, `TDist`) when `Distributions` is loaded.
 
-See the [Getting Started](getting_started.md) guide for a detailed tutorial. The [Vignettes](vignettes.md) page has 42 worked examples covering most of the solvers and approximators; for the complete reference, including the features no vignette yet demonstrates, browse the [Solvers](solvers.md) and [Approximators](approximators.md) pages.
+See the [Getting Started](getting_started.md) guide for a detailed tutorial. The [Vignettes](vignettes.md) page has 48 worked examples covering every solver, approximator, and `ecorecipes` integration workflow; for the complete reference, browse the [Solvers](solvers.md) and [Approximators](approximators.md) pages.

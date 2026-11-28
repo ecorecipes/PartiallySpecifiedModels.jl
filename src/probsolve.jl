@@ -78,19 +78,60 @@ end
 """
     _joint_init(ode_fun!, u0, t0, p, q) -> X0
 
-Initial joint state: value and ODE-derived first derivative per variable,
-higher derivatives zero.
+Initial joint state using Taylor initialization (Krämer & Hennig 2024 §2.2):
+value `u₀`, first derivative `f(u₀, t₀)`, and (for `q ≥ 3`) exact second
+derivative `f'(t₀) = (∂f/∂u)·f(u₀) + ∂f/∂t` via finite-difference directional
+derivatives; derivatives of order ≥ 3 start at zero (paired with a diffuse
+initial covariance block in `_joint_init_cov`).
 """
 function _joint_init(ode_fun!, u0::AbstractVector, t0::Float64, p, q::Int)
     n_vars = length(u0)
+    u0f = Float64.(u0)
     du = zeros(n_vars)
-    ode_fun!(du, Float64.(u0), p, t0)
+    ode_fun!(du, u0f, p, t0)
     X0 = zeros(n_vars * q)
     for k in 1:n_vars
-        X0[(k-1)*q + 1] = u0[k]
+        X0[(k-1)*q + 1] = u0f[k]
         X0[(k-1)*q + 2] = du[k]
     end
+    if q >= 3
+        # Second derivative d²u/dt² = (∂f/∂u) f + ∂f/∂t via central directional diff
+        f_norm = norm(du)
+        eps_u = f_norm > 0 ? 1e-6 * max(norm(u0f), 1.0) / f_norm : 1e-6
+        du_p = zeros(n_vars); du_m = zeros(n_vars)
+        ode_fun!(du_p, u0f .+ eps_u .* du, p, t0 + eps_u)
+        ode_fun!(du_m, u0f .- eps_u .* du, p, t0 - eps_u)
+        d2u = (du_p .- du_m) ./ (2.0 * eps_u)
+        if all(isfinite, d2u)
+            for k in 1:n_vars
+                X0[(k-1)*q + 3] = d2u[k]
+            end
+        end
+    end
     X0
+end
+
+"""
+    _joint_init_cov(n_vars, q, sigma, dt) -> Matrix{Float64}
+
+Initial covariance for the joint IBM state (Krämer & Hennig 2024 §2.2):
+exact (zero variance) on initialized derivatives `0:min(2, q-1)`, and a
+moderately diffuse diagonal prior on uninitialized higher derivatives `3:(q-1)`
+when `q ≥ 4` so the filter does not experience an artificial zero-variance
+initial derivative shock.
+"""
+function _joint_init_cov(n_vars::Int, q::Int, sigma::Vector{Float64}, dt::Float64)
+    D = n_vars * q
+    Σ0 = zeros(D, D)
+    q >= 4 || return Σ0
+    for k in 1:n_vars
+        s2 = max(sigma[k]^2, 1e-6)
+        for d in 3:(q - 1)
+            # Scale with σ² / dt^(2d - 3) bounded to stay well-conditioned
+            Σ0[(k - 1) * q + d + 1, (k - 1) * q + d + 1] = clamp(s2 / max(dt, 1e-3), 1e-4, 1e4)
+        end
+    end
+    Σ0
 end
 
 """
@@ -179,10 +220,11 @@ function probsolve_filter(ode_fun!, p, u0::AbstractVector,
     μ_filt = Vector{Vector{Float64}}(undef, n_steps + 1)
     Σ_filt = Vector{Matrix{Float64}}(undef, n_steps + 1)
 
+    Σ0 = _joint_init_cov(n_vars, q, sigma, dt)
     μ_pred[1] = X0
-    Σ_pred[1] = zeros(D, D)
+    Σ_pred[1] = copy(Σ0)
     μ_filt[1] = X0
-    Σ_filt[1] = zeros(D, D)
+    Σ_filt[1] = copy(Σ0)
 
     calib_acc = 0.0  # Σ_n νᵀ S⁻¹ ν  (quasi-MLE diffusion statistic)
 

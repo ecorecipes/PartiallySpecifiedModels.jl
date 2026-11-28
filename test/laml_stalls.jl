@@ -36,9 +36,9 @@ include("../benchmarks/kan/multivariate.jl")
         @test 0 < old_value-old_candidate < tol*max(abs(old_value), 1.0)
         @test new_candidate < new_value
         @test sum(abs2, y-J*new_beta) > sum(abs2, y-J*old_beta)
-        old_V = first(PSM.laml_objective(Gaussian(), old_beta, J, ones(9), ones(9),
+        old_V = first(PSM.laml_objective(GaussianLikelihood(), old_beta, J, ones(9), ones(9),
             y, J*old_beta, [S], [0], [3], [log(old_lambda)], 3))
-        new_V = first(PSM.laml_objective(Gaussian(), new_beta, J, ones(9), ones(9),
+        new_V = first(PSM.laml_objective(GaussianLikelihood(), new_beta, J, ones(9), ones(9),
             y, J*new_beta, [S], [0], [3], [log(new_lambda)], 3))
         @test new_V > old_V
         @test !prefer(old_value, old_candidate, new_value, new_candidate, tol)
@@ -55,7 +55,7 @@ include("../benchmarks/kan/multivariate.jl")
             # Measured residuals 9.78e-6 / 1.18e-5; 1e-3 allows >84x
             # headroom, versus the previous 0.109 / 0.0985 stalls.
             @test fit.convergence.stationarity < 1e-3
-            @test fit.fitted_values == simulate(prob, collect(fit.parameters))
+            @test fit.fitted_values == simulate_psm(prob, collect(fit.parameters))
             scores = [mv_score_trajectory(a, collect(fit.parameters), ds, case, id, MV_SUPPORT_RADIUS)
                       for id in eachindex(ds.test_ics)]
             @test all(s.test_status == "ok" for s in scores)

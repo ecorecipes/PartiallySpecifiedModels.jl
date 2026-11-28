@@ -1,6 +1,8 @@
 # Custom approximators
 
-PartiallySpecifiedModels.jl ships with twelve approximator types, including the optional FluxKAN-backed KAN, but the set is open: every solver constructs and consumes unknown functions through four generic functions, so adding your own approximator requires no changes to any solver file. Define a struct, implement the four methods, and pass it to `PSMProblem` like any built-in type.
+PartiallySpecifiedModels.jl ships with fifteen approximator types, including the optional `FluxKAN.jl` and `GAM.jl` backends, but the set is open: every solver constructs and consumes unknown functions through four generic functions, so adding your own approximator requires no changes to any solver file. Define a struct, implement the four methods, and pass it to `PSMProblem` like any built-in type.
+
+> **v0.3 note:** The extension-protocol functions (`nparams`, `initial_params`, `penalty_matrix`, `penalty_blocks`, `build_evaluator`, `band_domain`) are public protocol API but are no longer exported at top level — import or qualify them from `PartiallySpecifiedModels` as shown below.
 
 ## The interface
 
@@ -77,14 +79,14 @@ obs = reshape(exp.(-0.35 .* ts), :, 1)
 approx = PolyApproximator(:f, (0.0, 1.0), 2)
 prob = PSMProblem(decay!, [1.0], (0.0, 5.0), [approx];
                   data_times=ts, data_values=obs, obs_to_state=[1],
-                  likelihood=Gaussian(), solver=Tsit5())
+                  likelihood=GaussianLikelihood(), solver=Tsit5())
 sol = solve(prob, AdamSolver(maxiters=500))
 fhat = sol.unknown_functions[:f]   # callable fitted polynomial
 ```
 
 ## Which solvers consume which functions
 
-All 23 solvers use `nparams` (parameter layout), `initial_params` (starting values), and `build_evaluator` (turning coefficient blocks into the callables the dynamics receive and into `unknown_functions`). `penalty_matrix` is consumed by the solver families that apply explicit smoothing:
+All 24 solvers use `nparams` (parameter layout), `initial_params` (starting values), and `build_evaluator` (turning coefficient blocks into the callables the dynamics receive and into `unknown_functions`). `penalty_matrix` is consumed by every solver family that applies explicit smoothing:
 
 | Solver family | `penalty_matrix` used for |
 |:---|:---|
@@ -99,9 +101,7 @@ Returning `nothing` from `penalty_matrix` is always safe: the approximator is th
 
 Caveats for custom types:
 
-- `KANApproximator` deliberately uses the generic penalty route even though its type is shipped by this package. The historical `_BUILTIN_APPROX_TYPES` union controls six per-type penalty branches; adding a new type to that union without implementing every branch can silently remove its penalty.
-- A handful of solver capabilities are gated on the built-in types (e.g. `AdaptiveGradientMatching`'s population-MCMC mode rejects `NeuralApproximator`; `optimize_spde_range` only operates on SPDE approximators). Custom types pass these gates like any non-listed type.
-- Six solvers (`TwoStageSolver`, `IntegralMatchingSolver`, `MagiSolver`, `AdaptiveGradientMatching`, `RodeoSolver`, `DaltonSolver`) assemble their smoothing penalty through per-type code whose built-in treatment is historical and deliberately preserved (the lists differ between solvers, and some build spline penalties on domain rather than unit knots). Custom types are **not** affected by those quirks: every one of these sites falls back to the generic `penalty_matrix(approx)` for any non-built-in type, so a custom penalty flows in everywhere — as it always did in the penalized-likelihood, through-the-solver, and MCMC/VI/ABC families.
+- All secondary solvers (`TwoStageSolver`, `IntegralMatchingSolver`, `MagiSolver`, `AdaptiveGradientMatching`, `RodeoSolver`, `DaltonSolver`) assemble penalties generically through `penalty_matrix(approx)` (unified in v0.3), so built-in and custom approximators follow the exact same penalty path.
 - The adaptive GP hyperparameter refitting inside `LAML`/`GCVSolver` is specific to `GPApproximator`; custom types keep whatever structure their four methods define.
 - `confidence_band`'s automatic grids support the built-in basis expansions and KANs. Explicit unary `uf_points` instead uses `build_evaluator` for parameter sensitivities, so custom unary types can use that path when the fit provides a covariance. Automatic bootstrap bands grid whatever [`band_domain`](@ref PartiallySpecifiedModels.band_domain) returns, skipping only the band with a warning when that is `nothing`; explicit unary points do not require a domain.
 
@@ -119,8 +119,8 @@ gridding an interval and evaluating every replicate's fitted curve on it.
 A `domain` field is **not** part of the interface above, so the interval is
 requested through a second optional protocol function, `band_domain(a)`,
 which returns a `(lo, hi)` tuple or `nothing`. Like `penalty_blocks` and the
-four required functions, it is exported — but adding a *method* to it still
-needs the qualified name (or an explicit `import`), as below.
+four required functions, it is public unexported protocol API — add a method
+using the qualified name (or an explicit `import`), as below.
 
 The default method reads an `a.domain` field when the type has one and
 returns `nothing` otherwise, so every built-in — and every custom type that
@@ -209,7 +209,7 @@ its initialization.
 If you pass an approximator type that does not implement the interface, `build_evaluator` fails with an error listing the four required functions.
 
 ```@docs
-build_evaluator
-penalty_blocks
+PartiallySpecifiedModels.build_evaluator
+PartiallySpecifiedModels.penalty_blocks
 PartiallySpecifiedModels.band_domain
 ```

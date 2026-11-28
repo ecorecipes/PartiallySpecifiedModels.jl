@@ -170,11 +170,12 @@ function PSM._adam_adjoint_loss_grad(prob::PSM.PSMProblem,
     reltol = get(prob.ode_kwargs, :reltol, 1e-7)
     maxiters = get(prob.ode_kwargs, :maxiters, 10000)
 
-    # Flat-vector parameters: the param NamedTuple (callable evaluators) is
-    # rebuilt inside the RHS so the adjoint's vjp differentiates through it.
+    # Flat-vector parameters: reuse the prebuilt NamedTuple on the forward
+    # pass (p === p_vec) to avoid rebuilding splines/closures at every RHS
+    # step, while still rebuilding when the adjoint VJP differentiates w.r.t. p.
     ode_fn = SciMLBase.ODEFunction{true, SciMLBase.FullSpecialize}(
         (du, u, p, t) -> prob.dynamics!(
-            du, u, PSM.build_autodiff_param_struct(prob, p), t))
+            du, u, p === p_vec ? p_struct : PSM.build_autodiff_param_struct(prob, p), t))
     ode_prob = SciMLBase.ODEProblem(ode_fn, u0, prob.tspan, p_vec)
 
     # Dense forward solve (the continuous adjoint interpolates through it).
@@ -220,17 +221,22 @@ function PSM._adam_adjoint_loss_grad(prob::PSM.PSMProblem,
     # failure that returns all-ZERO gradients is indistinguishable from a
     # genuine stationary point and passes this guard — the retcode of the
     # internal backward solution is not exposed to check.
-    all(isfinite, grad) || return fail()
-    _adjoint_penalty_grad!(grad, prob, beta, penalty_w)
-
     # u0 = u0(p): chain dG/du0 back to beta. Cheap forward-mode Jacobian of
     # the initial-condition map only (NOT through the ODE solve).
     if prob.u0 isa Function
-        J = ForwardDiff.jacobian(
-            b -> collect(prob.u0(PSM.build_autodiff_param_struct(prob, b))),
-            p_vec)
+        J = try
+            ForwardDiff.jacobian(
+                b -> collect(prob.u0(PSM.build_autodiff_param_struct(prob, b))),
+                p_vec)
+        catch e
+            PSM._is_program_error(e) && rethrow()
+            return fail()
+        end
         grad .+= J' * vec(collect(du0))
     end
+    all(isfinite, grad) || return fail()
+    _adjoint_penalty_grad!(grad, prob, beta, penalty_w)
+    all(isfinite, grad) || return fail()
 
     (loss, grad)
 end

@@ -66,6 +66,55 @@ function _pm_sample_traj(filt_out::Dict, rng)
     X
 end
 
+# Precompute the backward smoother gains G[n] and conditional Cholesky factors
+# L_cond[n] once per filter pass so all `n_particles` FFBS draws share them.
+function _pm_ffbs_cache(filt_out::Dict)
+    μ_filt = filt_out["μ_filt"]; Σ_filt = filt_out["Σ_filt"]
+    μ_pred = filt_out["μ_pred"]; Σ_pred = filt_out["Σ_pred"]; A = filt_out["A"]
+    N = length(μ_filt) - 1
+    G_list = Vector{Matrix{Float64}}(undef, N)
+    L_list = Vector{Union{Nothing,LowerTriangular{Float64,Matrix{Float64}}}}(undef, N + 1)
+
+    function _chol_factor(Σ::Matrix{Float64})
+        base = maximum(diag(Σ))
+        base <= 0 && return nothing
+        for jit in (1e-12, 1e-9, 1e-6)
+            F = cholesky(Symmetric(Σ + jit * max(base, 1.0) * I), check=false)
+            issuccess(F) && return F.L
+        end
+        cholesky(Symmetric(Σ + 1e-4 * max(base, 1.0) * I)).L
+    end
+
+    L_list[N + 1] = _chol_factor(Σ_filt[N + 1])
+    for n in N:-1:1
+        Σpf = cholesky(Symmetric(Σ_pred[n + 1]) + 1e-12 * I, check=false)
+        G = issuccess(Σpf) ? (Σ_filt[n] * A') / Σpf : (Σ_filt[n] * A') * pinv(Σ_pred[n + 1])
+        G_list[n] = G
+        Cov = Σ_filt[n] - G * Σ_pred[n + 1] * G'
+        Cov = 0.5 * (Cov + Cov')
+        L_list[n] = _chol_factor(Matrix(Cov))
+    end
+    (μ_filt=μ_filt, μ_pred=μ_pred, G=G_list, L=L_list, N=N)
+end
+
+function _pm_sample_traj_cached(cache, rng)
+    N = cache.N
+    μ_filt = cache.μ_filt
+    μ_pred = cache.μ_pred
+    G = cache.G
+    L = cache.L
+    D = length(μ_filt[1])
+    X = Vector{Vector{Float64}}(undef, N + 1)
+    LN = L[N + 1]
+    X[N + 1] = LN === nothing ? copy(μ_filt[N + 1]) : (μ_filt[N + 1] .+ LN * randn(rng, D))
+    for n in N:-1:1
+        m = μ_filt[n] + G[n] * (X[n + 1] - μ_pred[n + 1])
+        Ln = L[n]
+        X[n] = Ln === nothing ? m : (m .+ Ln * randn(rng, D))
+    end
+    X
+end
+
 """
     _pm_loglik_hat(ode_rhs!, u0, tspan, n_steps, n_deriv, sigma,
                    data, dtimes, obs_to_state, obs_var, n_particles, rng;
@@ -84,8 +133,10 @@ function _pm_loglik_hat(ode_rhs!, u0, tspan, n_steps, n_deriv, sigma,
     obs_ind = _nearest_grid_indices(times, dtimes)
     logws = Vector{Float64}(undef, n_particles)
     c = -0.5 * log(2π * obs_var)
+    use_cache = !haskey(filt, "R_filt")
+    cache = use_cache ? _pm_ffbs_cache(filt) : nothing
     for s in 1:n_particles
-        X = _pm_sample_traj(filt, rng)
+        X = use_cache ? _pm_sample_traj_cached(cache, rng) : _pm_sample_traj(filt, rng)
         ll = 0.0
         for i in 1:length(dtimes)
             gi = obs_ind[i]
@@ -151,9 +202,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
     _validate_problem(prob, "PseudoMarginalSolver"; require_continuous=true,
                       reject_delays=true, delay_reason=
                       "It builds a probabilistic ODE / GP state-space manifold from the 4-argument ODE signature f!(du, u, p, t).")
+    _require_gaussian_likelihood(prob, "PseudoMarginalSolver")
     _reject_masked_data(prob, "PseudoMarginalSolver")
     verbose = alg.verbose
-    n_vars = length(prob.u0)
+    u0_init = _resolve_u0_init(prob)
+    n_vars = length(u0_init)
     n_obs = size(prob.data_values, 2)
     n_t = length(prob.data_times)
     # Solver-owned RNG stream (AGM/BNG convention): seeded when rng_seed is
@@ -205,7 +258,6 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
 
     data = Float64.(prob.data_values)
     dtimes = Float64.(prob.data_times)
-    u0 = Float64.(prob.u0)
 
     # Likelihood estimator selected by alg.inner_method:
     #   :ffbs   — unbiased FFBS Monte-Carlo average (pseudo-marginal MCMC
@@ -220,20 +272,21 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
               "or :dalton (got :$(alg.inner_method))")
     function loglik_hat(beta)
         p = build_param_struct(prob, beta)
+        u0_cur = Float64.(_resolve_u0(prob, p))
         rhs!(du, u, pu, t) = prob.dynamics!(du, u, p, t)
         try
             if alg.inner_method == :fenrir
-                fenrir_loglik(rhs!, nothing, u0, prob.tspan, alg.n_steps,
+                fenrir_loglik(rhs!, nothing, u0_cur, prob.tspan, alg.n_steps,
                               alg.n_deriv, sigma, data, dtimes,
                               prob.obs_to_state, obs_var;
                               sqrt_filter=alg.sqrt_filter)
             elseif alg.inner_method == :dalton
-                _dalton_loglik(rhs!, nothing, u0, prob.tspan, alg.n_steps,
+                _dalton_loglik(rhs!, nothing, u0_cur, prob.tspan, alg.n_steps,
                                alg.n_deriv, sigma, data, dtimes,
                                prob.obs_to_state, obs_var;
                                sqrt_filter=alg.sqrt_filter)
             else
-                _pm_loglik_hat(rhs!, u0, prob.tspan, alg.n_steps, alg.n_deriv,
+                _pm_loglik_hat(rhs!, u0_cur, prob.tspan, alg.n_steps, alg.n_deriv,
                                sigma, data, dtimes, prob.obs_to_state,
                                obs_var, n_particles, rng;
                                sqrt_filter=alg.sqrt_filter)
@@ -299,8 +352,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
     # Posterior mean parameters for the point estimate / evaluators.
     map_beta = vec(mean(samples, dims=1))
     p_opt = build_param_struct(prob, map_beta)
+    u0_opt = Float64.(_resolve_u0(prob, p_opt))
     ode_rhs_opt!(du, u, pu, t) = prob.dynamics!(du, u, p_opt, t)
-    μ_smooth, Σ_smooth, times = probsolve(ode_rhs_opt!, nothing, u0,
+    μ_smooth, Σ_smooth, times = probsolve(ode_rhs_opt!, nothing, u0_opt,
                                           prob.tspan, alg.n_steps, alg.n_deriv, sigma;
                                           interrogate=:kramer,
                                           sqrt_filter=alg.sqrt_filter)
@@ -333,17 +387,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::PseudoMarginalSolver)
     end
     ca = ComponentArray(NamedTuple(ca_entries))
 
-    sol_var = zeros(n_t, n_vars)
-    for i in 1:n_t
-        idx = _nearest_grid_index(times, prob.data_times[i])
-        for k in 1:n_vars
-            sol_var[i, k] = Σ_smooth[idx][k][1, 1]
-        end
-    end
-
     PSMSolution(
         ca,
-        ll_cur,
+        -ll_cur,
         data_loss,
         Float64(n_beta),
         Float64[],

@@ -57,6 +57,10 @@ function mlp_spec_from_lux(model::Lux.Chain)
               "only; the given model has $(Lux.parameterlength(model)) " *
               "parameters but its Dense layers account for $n_params. " *
               "Restructure the network or use a different solver.")
+    isempty(layers) && throw(ArgumentError("NeuralApproximator: model must have at least one Dense layer"))
+    layers[1][1] == 1 || throw(ArgumentError(
+        "NeuralApproximator: scalar evaluator requires first layer in_dims == 1, got $(layers[1][1]). " *
+        "For multivariate inputs use TensorBSplineApproximator or SingleIndexApproximator."))
     MLPSpec(layers, activations, n_params)
 end
 
@@ -179,7 +183,7 @@ function neural_mlp_spec(approx::NeuralApproximator)
     try
         mlp_spec_from_lux(approx.model)
     catch e
-        e isa InterruptException && rethrow()
+        (e isa InterruptException || e isa ArgumentError) && rethrow()
         # Not silent: without this the only symptom of a genuine bug (a
         # typo or a Lux rename inside mlp_spec_from_lux) would be every
         # model quietly taking the slower, less Dual-safe fallback.

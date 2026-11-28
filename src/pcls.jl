@@ -39,10 +39,23 @@ function _pcls_factorize(J_mat::AbstractMatrix, z_pseudo::AbstractVector,
                          B::AbstractMatrix, w_irls::AbstractVector)
     C = penalty_sqrt_matrix(B)
     n_pen = size(C, 1)
-    W_sqrt = sqrt.(max.(w_irls, 1e-15))
+    n_data = length(w_irls)
+    W_sqrt = Vector{Float64}(undef, n_data)
+    z_weighted = Vector{Float64}(undef, n_data)
+    @inbounds for i in 1:n_data
+        wi = w_irls[i]
+        if !(isfinite(wi) && wi > 0.0) || !isfinite(z_pseudo[i])
+            W_sqrt[i] = 0.0
+            z_weighted[i] = 0.0
+        else
+            ws = sqrt(max(wi, 1e-15))
+            W_sqrt[i] = ws
+            z_weighted[i] = ws * z_pseudo[i]
+        end
+    end
     A_data = Diagonal(W_sqrt) * J_mat
     F = svd(vcat(A_data, C))
-    z_aug = vcat(W_sqrt .* z_pseudo, zeros(n_pen))
+    z_aug = vcat(z_weighted, zeros(n_pen))
     # Reference scale for the rank test.  Fall back to the augmented scale
     # only when the data block is identically zero: there is then no data
     # scale to reference, and β is zero regardless (z_aug's penalty block is

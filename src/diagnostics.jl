@@ -59,11 +59,11 @@ where ``d_i`` is the unit deviance contribution.
 
 For a well-specified model, deviance residuals are approximately standard normal.
 """
-function deviance_residuals(::Gaussian, y::AbstractVector, mu::AbstractVector)
+function deviance_residuals(::GaussianLikelihood, y::AbstractVector, mu::AbstractVector)
     y .- mu
 end
 
-function deviance_residuals(::Poisson, y::AbstractVector, mu::AbstractVector)
+function deviance_residuals(::PoissonLikelihood, y::AbstractVector, mu::AbstractVector)
     [begin
         yi, mi = y[i], max(mu[i], 1e-10)
         d = yi > 0 ? 2.0 * (yi * log(yi / mi) - (yi - mi)) : 2.0 * mi
@@ -71,7 +71,7 @@ function deviance_residuals(::Poisson, y::AbstractVector, mu::AbstractVector)
     end for i in eachindex(y)]
 end
 
-function deviance_residuals(fam::NegativeBinomial, y::AbstractVector, mu::AbstractVector)
+function deviance_residuals(fam::NegativeBinomialLikelihood, y::AbstractVector, mu::AbstractVector)
     k = fam.theta
     [begin
         yi, mi = y[i], max(mu[i], 1e-10)
@@ -81,14 +81,43 @@ function deviance_residuals(fam::NegativeBinomial, y::AbstractVector, mu::Abstra
     end for i in eachindex(y)]
 end
 
-function deviance_residuals(fam::TruncatedNormal, y::AbstractVector, mu::AbstractVector)
-    # Response-scale residuals centre on the OBSERVABLE's mean E[Y|μ] = μ+σλ,
-    # not on the latent location μ. Centring on μ gives residuals with a
-    # systematic positive mean (E[Y]−μ reaches 1.525σ at ξ=−1, 0.798σ at
-    # ξ=0), which the autocorrelation and Durbin–Watson diagnostics then read
-    # as structure in a correctly-specified fit. `_family_mean` is the same
-    # E[Y|μ] the Pearson dispersion uses. Identical to `y − μ` as ξ → ∞.
-    y .- _family_mean.(Ref(fam), mu)   # scalar method; broadcast over μ
+function deviance_residuals(fam::TruncatedNormalLikelihood, y::AbstractVector, mu::AbstractVector)
+    y .- _family_mean.(Ref(fam), mu)
+end
+
+function deviance_residuals(fam::GammaLikelihood, y::AbstractVector, mu::AbstractVector)
+    ν = 1.0 / fam.phi
+    [begin
+        yi = max(y[i], 1e-10); mi = max(abs(mu[i]), 1e-6)
+        d = 2.0 * ν * (-log(yi / mi) + (yi - mi) / mi)
+        sign(yi - mi) * sqrt(max(d, 0.0))
+    end for i in eachindex(y)]
+end
+
+function deviance_residuals(fam::LogNormalLikelihood, y::AbstractVector, mu::AbstractVector)
+    σ = fam.sigma
+    [(log(max(y[i], 1e-10)) - log(max(abs(mu[i]), 1e-6))) / σ for i in eachindex(y)]
+end
+
+function deviance_residuals(fam::BinomialLikelihood, y::AbstractVector, mu::AbstractVector)
+    n = Float64(fam.n_trials)
+    [begin
+        yi = clamp(y[i], 0.0, n)
+        pi = clamp(mu[i], 1e-6, 1.0 - 1e-6)
+        t1 = yi > 0 ? yi * log(yi / (n * pi)) : 0.0
+        t2 = yi < n ? (n - yi) * log((n - yi) / (n * (1.0 - pi))) : 0.0
+        d = 2.0 * (t1 + t2)
+        sign(yi - n * pi) * sqrt(max(d, 0.0))
+    end for i in eachindex(y)]
+end
+
+function deviance_residuals(fam::StudentTLikelihood, y::AbstractVector, mu::AbstractVector)
+    ν = fam.df; σ = fam.sigma
+    [begin
+        r = y[i] - mu[i]
+        d = (ν + 1.0) * log1p((r / σ)^2 / ν)
+        sign(r) * sqrt(max(d, 0.0))
+    end for i in eachindex(y)]
 end
 
 # Fallback for unknown families — use raw residuals
@@ -167,14 +196,14 @@ p_of = scatter(diag.observed, diag.fitted, title="Observed vs Fitted")
 plot(p_qq, p_rf, p_hist, p_of, layout=(2,2))
 ```
 """
-function appraise(sol::PSMSolution; family::Union{Nothing, AbstractLikelihood}=nothing)
+function psm_appraise(sol::PSMSolution; family::Union{Nothing, AbstractLikelihood}=nothing)
     keep = _diag_usable(sol)
     # `vec` is column-major, and so is `vec(keep)` — the linear indices line up.
     idx = findall(vec(keep))
     y = vec(sol.data_values)[idx]
     mu = vec(sol.fitted_values)[idx]
 
-    if family !== nothing && !(family isa Gaussian)
+    if family !== nothing && !(family isa GaussianLikelihood)
         r = deviance_residuals(family, y, mu)
         # Robust scale: for N(0,1)-distributed residuals, median|r| ≈ 0.6745,
         # so dividing by the raw median|r| inflates the standardized
@@ -199,9 +228,17 @@ function appraise(sol::PSMSolution; family::Union{Nothing, AbstractLikelihood}=n
     theoretical = [_qnorm((i - 0.5) / n) for i in 1:n]
 
     # DW per observed state, over that state's usable rows only.
-    resid_mat = sol.data_values .- sol.fitted_values
-    dw = [durbin_watson(resid_mat[_diag_rows(keep, j), j])
-          for j in axes(resid_mat, 2)]
+    # For non-Gaussian families, use the family deviance residuals so DW
+    # reflects the declared likelihood rather than unweighted Gaussian errors.
+    dw = Vector{Float64}(undef, size(sol.data_values, 2))
+    for j in axes(sol.data_values, 2)
+        rows = _diag_rows(keep, j)
+        yj = sol.data_values[rows, j]
+        muj = sol.fitted_values[rows, j]
+        rj = (family !== nothing && !(family isa GaussianLikelihood)) ?
+            deviance_residuals(family, yj, muj) : (yj .- muj)
+        dw[j] = durbin_watson(rj)
+    end
 
     (residuals=r_std, fitted=mu, observed=y,
      qq_theoretical=theoretical, qq_sample=sorted,
@@ -251,6 +288,7 @@ at low lags indicate the model is over- or under-smoothing.
 function residual_acf(r::AbstractVector; maxlag::Int=10)
     n = length(r)
     maxlag = min(maxlag, n - 1)
+    maxlag <= 0 && return Float64[]
     r_centered = r .- mean(r)
     var_r = sum(r_centered .^ 2)
     var_r < 1e-30 && return fill(NaN, maxlag)
@@ -684,7 +722,7 @@ function _eval_approx_at(approx::TransformedCovariateApproximator,
 end
 
 function _eval_approx_at(approx, p::Vector{Float64}, x::Real)
-    error("confidence_band: unsupported approximator type $(typeof(approx))")
+    build_evaluator(approx, p)(x)
 end
 
 # ─── Post-fit shape-constraint audit ──────────────────────────────
@@ -751,6 +789,13 @@ function check_constraints(f, constraint::Symbol, domain::Tuple{<:Real,<:Real};
     xs = collect(range(lo, hi, length=grid_size))
     h = xs[2] - xs[1]
     ys = Float64[f(x) for x in xs]
+    if !all(isfinite, ys)
+        bad_idx = findfirst(!isfinite, ys)
+        return (constraint=constraint, satisfied=false,
+                worst_relative=Inf, worst_absolute=Inf,
+                worst_quantity=:nonfinite, worst_location=xs[bad_idx],
+                grid_size=grid_size, tol=Float64(tol))
+    end
     d1 = diff(ys) ./ h        # forward-difference slope estimates
     d2 = diff(d1) ./ h        # second-difference curvature estimates
     yscale = maximum(abs, ys)

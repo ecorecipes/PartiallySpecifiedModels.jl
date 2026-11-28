@@ -64,10 +64,18 @@ function _gcv_score(J::AbstractMatrix, W_irls::AbstractVector,
     end
 
     # Solve penalized LS: β̂ = (J'WJ + S^λ)⁻¹ J'Wz
+    # Zero out masked/non-usable rows BEFORE multiplying W_irls .* z so
+    # `0.0 * NaN = NaN` cannot poison the RHS.
+    Wz = similar(z, Float64)
+    @inbounds for i in eachindex(W_irls)
+        wi = W_irls[i]
+        Wz[i] = (isfinite(wi) && wi > 0.0 && isfinite(z[i])) ? wi * z[i] : 0.0
+    end
+    JWz = J' * Wz
     beta_hat = try
-        cholesky(Symmetric(H_reg)) \ (J' * (W_irls .* z))
+        cholesky(Symmetric(H_reg)) \ JWz
     catch
-        H_reg \ (J' * (W_irls .* z))
+        H_reg \ JWz
     end
 
     # Weighted RSS: ||W^½(z - Jβ̂)||²
@@ -597,7 +605,7 @@ function _coordinate_gcv(scorer,
             end
             rho_k_new = (a + b) / 2
             g_new, beta_new, _, trA_new = eval_k(rho_k_new)
-            if g_new < best_gcv - 1e-12
+            if isfinite(g_new) && g_new < best_gcv - 1e-12 * max(abs(best_gcv), 1e-30)
                 rho = copy(rho); rho[k] = rho_k_new
                 best_gcv, best_beta, best_trA = g_new, beta_new, trA_new
                 improved = true
@@ -704,7 +712,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
 
     # Evaluate model → flattened predictions
     function eval_model(p_eval)
-        pred = simulate(prob, p_eval)
+        pred = simulate_psm(prob, p_eval)
         f_tmp = zeros(n_data)
         local k = 1
         for oi in 1:n_obs, ti in 1:n_times
@@ -896,7 +904,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
 
     # ── Build solution ──
     p_opt = copy(beta)
-    pred  = simulate(prob, p_opt)
+    pred  = simulate_psm(prob, p_opt)
 
     # Data loss (weighted SS)
     data_loss = weighted_data_loss(prob, pred)
@@ -925,7 +933,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::GCVSolver)
     end
 
     pen_ss  = dot(p_opt, B_final * p_opt)
-    obj_val = 0.5 * (data_loss + pen_ss)
+    obj_val = if prob.likelihood isa GaussianLikelihood
+        0.5 * (data_loss + pen_ss)
+    else
+        -log_likelihood(prob.likelihood, y_vec, f_vec, w_vec) + 0.5 * pen_ss
+    end
 
     # RIDGE PROBE (LAML parity): one full, uncontracted PCLS step from the
     # reported (λ̂, β̂) with the final Jacobian and weights. Same semantics

@@ -44,79 +44,89 @@ integration, providing a robust and computationally efficient estimator.
 function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
     _validate_problem(prob, "IntegralMatchingSolver"; require_continuous=true,
                       reject_delays=true)
+    _require_gaussian_likelihood(prob, "IntegralMatchingSolver")
     verbose = alg.verbose
 
     times = Float64.(prob.data_times)
     n_times = length(times)
-    n_vars = length(prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)
+    u0_init = _resolve_u0_init(prob)
+    n_vars = length(u0_init)
     n_obs = size(prob.data_values, 2)
 
     # ── Stage 1: Smooth data ─────────────────────────────────────
     if verbose; println("IntegralMatchingSolver Stage 1: Smoothing data..."); end
 
     y_smooth = zeros(n_times, n_vars)
+    t_mid = n_times > 1 ? [0.5 * (times[i] + times[i+1]) for i in 1:(n_times - 1)] : Float64[]
+    y_mid = zeros(max(n_times - 1, 0), n_vars)
     observed_states = Set{Int}()
 
     # Penalized GCV smoother — an interpolating spline evaluated at its own
-    # knots returns the raw data (a no-op "smoothing" step).
+    # knots returns the raw data (a no-op "smoothing" step). Evaluate on both
+    # data times and midpoints so Stage 2 uses 4th-order composite Simpson
+    # quadrature instead of 2nd-order trapezoidal rule.
     for j in 1:n_obs
         sk = prob.obs_to_state[j]
         push!(observed_states, sk)
         # Masked rows must be dropped from the smoother's normal equations,
         # not merely ignored afterwards: one NaN makes every spline
         # coefficient NaN, so `y_smooth` — and hence the integral-matching
-        # residual `delta` — is NaN everywhere. There is no finiteness
-        # sentinel in `integral_loss`, so the NaN reaches the Adam moments
-        # and the solver silently returns its initial parameters.
+        # residual — is NaN everywhere.
         sval, _ = _smoothing_spline_masked(times,
                                            Float64.(prob.data_values[:, j]),
                                            @view(prob.data_weights[:, j]))
         for i in 1:n_times
             y_smooth[i, sk] = sval(times[i])
         end
+        for i in 1:(n_times - 1)
+            y_mid[i, sk] = sval(t_mid[i])
+        end
     end
 
     # Unobserved states: hold at initial condition
     for k in 1:n_vars
         if k ∉ observed_states
-            u0_k = Float64(prob.u0 isa Function ? prob.u0(prob.known_params)[k] :
-                           prob.u0[k])
-            y_smooth[:, k] .= u0_k
+            y_smooth[:, k] .= u0_init[k]
+            if n_times > 1
+                y_mid[:, k] .= u0_init[k]
+            end
         end
     end
 
-    # Which (time, state) cells carry a usable observation, and which row
-    # each observed state measures its increment FROM. Masked rows are
+    # Which (time, state) cells carry a usable observation. Masked rows are
     # dropped from the smoother above, so `y_smooth` there is a pure
     # interpolation with no data behind it: including it in the loss would
-    # fit the model to the smoother's own extrapolation. The three sibling
-    # gradient-matching solvers (TwoStage, BNG, ODIN) all gate; this one
-    # ran over every time index ungated.
+    # fit the model to the smoother's own extrapolation.
     match_usable = falses(n_times, n_vars)
-    base_row = ones(Int, n_vars)          # baseline row per state
     for j in 1:n_obs
         sk = prob.obs_to_state[j]
         for i in 1:n_times
             usable_cell(prob, i, j) && (match_usable[i, sk] = true)
         end
     end
+    usable_idx = Vector{Vector{Int}}(undef, n_vars)
     for k in 1:n_vars
-        k in observed_states || continue
-        # The baseline ŷ_k(t_b) must itself be anchored on data: with row 1
-        # masked, `y_smooth[1, k]` is an extrapolation and every increment
-        # in the column inherits its error.
-        b = findfirst(@view match_usable[:, k])
-        b === nothing && error("IntegralMatchingSolver: state $k has no " *
-            "usable observation (every cell is masked — zero weight or " *
-            "non-finite value); there is nothing to match.")
-        base_row[k] = b
+        if k in observed_states
+            idx_k = findall(@view match_usable[:, k])
+            isempty(idx_k) && error("IntegralMatchingSolver: state $k has no " *
+                "usable observation (every cell is masked — zero weight or " *
+                "non-finite value); there is nothing to match.")
+            usable_idx[k] = idx_k
+        else
+            usable_idx[k] = Int[]
+        end
     end
 
-    # Trajectory increments: Δ[i,k] = ŷ_k(t_i) - ŷ_k(t_b(k))
-    delta = zeros(n_times, n_vars)
-    for k in 1:n_vars
-        for i in 1:n_times
-            delta[i, k] = y_smooth[i, k] - y_smooth[base_row[k], k]
+    # Dattner & Klaassen (2015) time-mean centering eliminates the unknown
+    # initial state x_k(t_0) without anchoring every residual to the noisy
+    # boundary estimate ŷ_k(t_1): match (ŷ_k(t_i) - mean(ŷ_k)) against
+    # (I_k(t_i) - mean(I_k)) across all usable times.
+    y_centered = zeros(n_times, n_vars)
+    for k in observed_states
+        idx_k = usable_idx[k]
+        ybar_k = sum(y_smooth[i, k] for i in idx_k) / length(idx_k)
+        for i in idx_k
+            y_centered[i, k] = y_smooth[i, k] - ybar_k
         end
     end
 
@@ -144,8 +154,22 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
     end
 
     lambda_smooth = alg.lambda_smooth
+    im_mat_pens = Tuple{Int,Int,Matrix{Float64}}[]
+    im_l2_pens = Tuple{Int,Int,Float64}[]
+    let off = 0
+        for approx in prob.approximators
+            np = nparams(approx)
+            if approx isa COMONetApproximator
+                approx.penalty_weight > 0.0 && push!(im_l2_pens, (off, np, approx.penalty_weight))
+            elseif !(approx isa NeuralApproximator)
+                S = penalty_matrix(approx)
+                S !== nothing && push!(im_mat_pens, (off, np, S))
+            end
+            off += np
+        end
+    end
 
-    # Pre-compute time step widths for the composite trapezoidal quadrature
+    # Pre-compute time step widths for composite Simpson quadrature
     dt = diff(times)
 
     function integral_loss(β_eval)
@@ -153,7 +177,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
         p = build_autodiff_param_struct(prob, β_eval)
         du = zeros(T_el, n_vars)
 
-        # Evaluate ODE RHS at all smooth points
+        # Evaluate ODE RHS at smoothed data times and midpoints
         F = zeros(T_el, n_times, n_vars)
         for i in 1:n_times
             u = T_el.(y_smooth[i, :])
@@ -167,63 +191,54 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
                 F[i, k] = du[k]
             end
         end
+        F_mid = zeros(T_el, max(n_times - 1, 0), n_vars)
+        for i in 1:(n_times - 1)
+            u_m = T_el.(y_mid[i, :])
+            try
+                prob.dynamics!(du, u_m, p, t_mid[i])
+            catch e
+                _is_program_error(e) && rethrow()
+                du .= T_el(1e6)
+            end
+            for k in 1:n_vars
+                F_mid[i, k] = du[k]
+            end
+        end
 
-        # Cumulative integral via composite trapezoidal rule:
+        # Cumulative integral via composite Simpson's rule:
         # I[i,k] = ∫_{t_1}^{t_i} f_k(ŷ(s), p, s) ds
         I_cum = zeros(T_el, n_times, n_vars)
         for k in 1:n_vars
             for i in 2:n_times
-                # Trapezoidal: I[i] = I[i-1] + (f[i-1] + f[i]) * dt / 2
-                I_cum[i, k] = I_cum[i-1, k] + (F[i-1, k] + F[i, k]) * dt[i-1] / 2
+                I_cum[i, k] = I_cum[i-1, k] +
+                    (F[i-1, k] + 4 * F_mid[i-1, k] + F[i, k]) * dt[i-1] / 6
             end
         end
 
-        # Loss over OBSERVED states (unobserved states hold a fabricated
-        # constant, so their delta ≡ 0 would push the unknown functions to
-        # zero the RHS along a fictitious path) and USABLE rows only.
-        #
-        # `I_cum` is still cumulative from t_1, so the increment matching
-        # the baseline-shifted `delta[i,k] = ŷ(t_i) − ŷ(t_b)` is
-        # `I_cum[i,k] − I_cum[b,k]`. For complete data b = 1 and
-        # `I_cum[1,k] = 0`, so this is bit-for-bit the previous expression.
+        # Dattner & Klaassen (2015) time-mean-centered integral matching loss
         loss_val = zero(T_el)
         for k in 1:n_vars
             k in observed_states || continue
-            b = base_row[k]
-            for i in 1:n_times
-                (i != b && match_usable[i, k]) || continue
-                loss_val += (delta[i, k] - (I_cum[i, k] - I_cum[b, k]))^2
+            idx_k = usable_idx[k]
+            nk = length(idx_k)
+            I_bar = zero(T_el)
+            for i in idx_k
+                I_bar += I_cum[i, k]
+            end
+            I_bar /= nk
+            for i in idx_k
+                loss_val += (y_centered[i, k] - (I_cum[i, k] - I_bar))^2
             end
         end
 
-        # Smoothing penalty
-        offset = 0
-        for approx in prob.approximators
-            np = nparams(approx)
-            params_k = β_eval[offset+1:offset+np]
-            offset += np
-
-            # Non-built-in (custom protocol) types take the generic branch
-            # too; built-in treatment is unchanged (see _BUILTIN_APPROX_TYPES).
-            if approx isa BSplineApproximator || approx isa GPApproximator ||
-               approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator ||
-               approx isa ShapeConstrainedGPApproximator ||
-               approx isa TensorBSplineApproximator ||
-               approx isa SingleIndexApproximator ||
-               approx isa TransformedCovariateApproximator ||
-               !(approx isa _BUILTIN_APPROX_TYPES)
-                S = penalty_matrix(approx)
-                if S !== nothing
-                    loss_val += lambda_smooth * dot(params_k, S * params_k)
-                end
-            elseif approx isa ShapeConstrainedBSplineApproximator
-                S = penalty_matrix(approx)
-                if S !== nothing
-                    loss_val += lambda_smooth * dot(params_k, S * params_k)
-                end
-            elseif approx isa COMONetApproximator
-                loss_val += approx.penalty_weight * sum(abs2, params_k)
-            end
+        # Smoothing penalty (precomputed)
+        for (off, np, w_l2) in im_l2_pens
+            pk = @view β_eval[off+1:off+np]
+            loss_val += w_l2 * sum(abs2, pk)
+        end
+        for (off, np, S) in im_mat_pens
+            pk = @view β_eval[off+1:off+np]
+            loss_val += lambda_smooth * dot(pk, S * pk)
         end
 
         loss_val
@@ -242,10 +257,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
     # criterion actually fires; otherwise the loop exhausted maxiters.
     conv_converged = false
     conv_reason = :maxiters
+    result = DiffResults.MutableDiffResult(0.0, (zeros(n_beta),))
 
     for iter in 1:alg.maxiters
         final_iter = iter
-        result = DiffResults.MutableDiffResult(0.0, (zeros(n_beta),))
         ForwardDiff.gradient!(result, integral_loss, beta)
         loss_val = DiffResults.value(result)
         grad = DiffResults.gradient(result)
@@ -314,7 +329,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::IntegralMatchingSolver)
     # 0.18993396 and 205.61006, a factor of 1083.
     sim_ok = true
     pred = try
-        simulate(prob, beta)
+        simulate_psm(prob, beta)
     catch e
         _is_program_error(e) && rethrow()
         sim_ok = false

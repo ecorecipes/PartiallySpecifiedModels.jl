@@ -119,7 +119,7 @@ prob_spline = PSMProblem(sir!, u0_true, tspan, [approx_spline];
     data_values = data_values,
     obs_to_state = [1, 2],
     known_params = (γ = γ, N = N),
-    likelihood = Gaussian(),
+    likelihood = GaussianLikelihood(),
     solver = Tsit5())
 
 sol_spline = solve(prob_spline, LAML(maxiters=60, verbose=false))
@@ -142,7 +142,7 @@ prob_gp = PSMProblem(sir!, u0_true, tspan, [approx_gp_sqexp];
     data_values = data_values,
     obs_to_state = [1, 2],
     known_params = (γ = γ, N = N),
-    likelihood = Gaussian(),
+    likelihood = GaussianLikelihood(),
     solver = Tsit5())
 
 sol_gp_sqexp = solve(prob_gp, LAML(maxiters=60, verbose=false))
@@ -161,12 +161,12 @@ approx_gp_m52 = GPApproximator(:β, I_domain, 10;
 
 sol_gp_m32 = solve(PSMProblem(sir!, u0_true, tspan, [approx_gp_m32];
     data_times=data_times, data_values=data_values, obs_to_state=[1,2],
-    known_params=(γ=γ, N=N), likelihood=Gaussian(), solver=Tsit5()),
+    known_params=(γ=γ, N=N), likelihood=GaussianLikelihood(), solver=Tsit5()),
     LAML(maxiters=60, verbose=false))
 
 sol_gp_m52 = solve(PSMProblem(sir!, u0_true, tspan, [approx_gp_m52];
     data_times=data_times, data_values=data_values, obs_to_state=[1,2],
-    known_params=(γ=γ, N=N), likelihood=Gaussian(), solver=Tsit5()),
+    known_params=(γ=γ, N=N), likelihood=GaussianLikelihood(), solver=Tsit5()),
     LAML(maxiters=60, verbose=false))
 
 println("GP (Matérn 3/2) — SS: ", round(sol_gp_m32.data_loss, sigdigits=4),
@@ -189,14 +189,14 @@ nn_model = Lux.Chain(
 approx_neural = NeuralApproximator(:β, nn_model;
                                     domain = I_domain,
                                     rng_seed = 42)
-println("Neural network parameters: ", nparams(approx_neural))
+println("Neural network parameters: ", PartiallySpecifiedModels.nparams(approx_neural))
 
 prob_neural = PSMProblem(sir!, u0_true, tspan, [approx_neural];
     data_times = data_times,
     data_values = data_values,
     obs_to_state = [1, 2],
     known_params = (γ = γ, N = N),
-    likelihood = Gaussian(),
+    likelihood = GaussianLikelihood(),
     solver = Tsit5())
 
 sol_neural = solve(prob_neural, AdamSolver(maxiters=2000, lr=0.01, verbose=false))
@@ -314,7 +314,7 @@ prob_gm = PSMProblem(sir!, u0_true, tspan, [approx_gm];
     data_values = data_values,
     obs_to_state = [1, 2],
     known_params = (γ = γ, N = N),
-    likelihood = Gaussian(),
+    likelihood = GaussianLikelihood(),
     solver = Tsit5())
 
 sol_gm = solve(prob_gm, GradientMatching(maxiters=500, lr=0.05,
@@ -433,9 +433,7 @@ Parameters are **weights and biases** of a Lux.jl model. There is no structural 
 A standard 4-panel diagnostic display assesses residual behaviour for the B-spline baseline fit.
 
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol_spline)
+diag = psm_appraise(sol_spline)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",

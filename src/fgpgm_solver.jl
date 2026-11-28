@@ -46,10 +46,11 @@ applies, without which the ODE expert dwarfs the data expert and the
 states abandon the data to satisfy `f = Dx̃` exactly.
 """
 function _fgpgm_state_matrices(times::Vector{Float64}, σ²::Float64,
-                               ℓ::Float64, σn²::Float64, γ_user::Float64)
-    K, dK, d2K = rbf_kernel_with_derivs(times, σ², ℓ)
-    # Noiseless RBF Grams are severely ill-conditioned; regularize with a
-    # small jitter before factorizing (ODIN/AGM convention).
+                               ℓ::Float64, σn²::Float64, γ_user::Float64,
+                               kernel::Symbol=:rbf)
+    K, dK, d2K = _gp_kernel_with_derivs(times, σ², ℓ, kernel)
+    # Noiseless GP Grams can be ill-conditioned; regularize with a small
+    # jitter before factorizing (ODIN/AGM convention).
     jitter = 1e-6 * σ²
     C = cholesky(Symmetric(K + jitter * I))
     Cinv = Matrix(inv(C))
@@ -117,14 +118,7 @@ sampler has no stopping criterion, so judge it by the R̂/ESS of
 function SciMLBase.solve(prob::PSMProblem, alg::FGPGMSolver)
     _validate_problem(prob, "FGPGMSolver"; require_continuous=true,
                       reject_delays=true)
-    # The product-of-experts density assumes Gaussian observation noise
-    # (the data expert is a Gaussian quadratic form), so refuse other
-    # families rather than silently fitting Gaussian (MagiSolver style).
-    prob.likelihood isa Gaussian ||
-        error("FGPGMSolver supports Gaussian likelihoods only (the " *
-              "product-of-experts density assumes Gaussian observation " *
-              "noise); got $(typeof(prob.likelihood)). " *
-              "Use MCMCSolver or LAML for other likelihood families.")
+    _require_gaussian_likelihood(prob, "FGPGMSolver")
     any(a -> a isa Union{NeuralApproximator,KANApproximator}, prob.approximators) &&
         error("FGPGMSolver does not support NeuralApproximator or KANApproximator (random-walk " *
               "Metropolis over network weights does not mix); use " *
@@ -133,7 +127,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::FGPGMSolver)
 
     times = Float64.(prob.data_times)
     n_times = length(times)
-    u0_vec = Float64.(prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)
+    u0_vec = _resolve_u0_init(prob)
     n_vars = length(u0_vec)
     n_obs = size(prob.data_values, 2)
     obs_of_state = Dict{Int, Vector{Int}}()   # state ↦ data columns
@@ -178,16 +172,16 @@ function SciMLBase.solve(prob::PSMProblem, alg::FGPGMSolver)
             # (ODIN convention).
             (alg.gp_variance, alg.gp_lengthscale, 0.01 * alg.gp_variance)
         else
-            optimize_gp_hyperparams(times[keep_k], yc, :rbf; verbose=verbose)
+            optimize_gp_hyperparams(times[keep_k], yc, alg.kernel; verbose=verbose)
         end
         alg.obs_sigma !== nothing && (σn² = alg.obs_sigma^2)
         hyper[sk] = (σ²=σ², ℓ=ℓ, σn²=σn², observed=true)
         data_w[sk] = 1.0 / σn²
         Cinv[sk], Lp[sk], D[sk], Λinv[sk] =
-            _fgpgm_state_matrices(times, σ², ℓ, σn², alg.gamma)
+            _fgpgm_state_matrices(times, σ², ℓ, σn², alg.gamma, alg.kernel)
         # Initialise at the GP posterior mean, conditioned on the usable
         # rows and evaluated on the full grid via K(t, t_keep).
-        K_full, _, _ = rbf_kernel_with_derivs(times, σ², ℓ)
+        K_full, _, _ = _gp_kernel_with_derivs(times, σ², ℓ, alg.kernel)
         if length(keep_k) == n_times
             x_init[:, sk] = m_center[sk] .+
                             K_full * (cholesky(Symmetric(K_full + σn² * I)) \ yc)
@@ -211,7 +205,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::FGPGMSolver)
             m_center[k] = u0_vec[k]
             hyper[k] = (σ²=σ²_bar, ℓ=ℓ_bar, σn²=σn²_bar, observed=false)
             Cinv[k], Lp[k], D[k], Λinv[k] =
-                _fgpgm_state_matrices(times, σ²_bar, ℓ_bar, σn²_bar, alg.gamma)
+                _fgpgm_state_matrices(times, σ²_bar, ℓ_bar, σn²_bar, alg.gamma, alg.kernel)
             x_init[:, k] .= u0_vec[k]
         end
     end

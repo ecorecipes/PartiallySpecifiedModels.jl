@@ -1,5 +1,5 @@
 ---
-title: "Copepod Stage-Structured Population Model"
+title: "Copepod Stage-Structured Population Model (Wood 2001 DDE)"
 author: "Simon Frost"
 date: today
 format:
@@ -17,15 +17,15 @@ julia:
 
 ## Overview
 
-This vignette demonstrates `PartiallySpecifiedModels.jl` on a complex, multivariate ecological model: the **11-stage copepod population model** from Wood (2001). This is the canonical PSM example — the model that motivated the original methodology.
+This vignette demonstrates `PartiallySpecifiedModels.jl` on the canonical ecological benchmark from Wood (2001): an **11-stage fixed-duration delay-differential equation (DDE)** model of *Calanus finmarchicus* population dynamics.
 
-The copepod *Calanus finmarchicus* passes through 11 developmental stages (6 naupliar, 5 copepodite). Stage durations are known from laboratory experiments, but three vital rates are unknown functions of time:
+The copepod passes through 11 pre-adult developmental stages: six naupliar stages (N1–N6) and five copepodite stages (C1–C5; adult C6 is not included in the stage table). Fixed stage durations $\tau_1, \dots, \tau_{11}$ are known from laboratory rearing experiments, while three strictly positive biological vital rates are unknown smooth functions of time:
 
-- $R(t)$ — egg recruitment rate
-- $\mu_j(t)$ — naupliar (juvenile) per-capita death rate
-- $\mu_a(t)$ — copepodite (adult) per-capita death rate
+- $R(t) > 0$ — egg recruitment rate (scaled by $1000$)
+- $\mu_j(t) > 0$ — naupliar (N1–N6) per-capita mortality rate
+- $\mu_a(t) > 0$ — copepodite (C1–C5) per-capita mortality rate
 
-With 11 simultaneously observed state variables, 3 unknown functions, and 45 total parameters, this is a substantially more complex problem than the Lotka–Volterra example.
+> **Dataset provenance**: The bundled dataset `data/cop.dat` is the simulated 11-stage benchmark dataset distributed with Simon Wood's `DDEfit` software (10 sampling days over $[0, 90]$ days across stages N1–N6 and C1–C5).
 
 ## Setup
 
@@ -34,137 +34,162 @@ using PartiallySpecifiedModels
 using PartiallySpecifiedModels: solve
 using OrdinaryDiffEq
 using DelimitedFiles
+using Statistics
 using Plots
 using Printf
 ```
 
-## Data
+## Data and Stage Weighting
 
-The data consist of abundance estimates for each of the 11 developmental stages, observed at 10 time points over 90 days:
+Raw stage counts span four orders of magnitude (from `0` up to `38,783` in N3). An unweighted Gaussian loss lets high-abundance naupliar stages dominate the objective by $\sim 100\times$ over late copepodites. Following Wood (2001), we weight each stage inversely by its empirical variance so every developmental stage contributes equitably:
 
 ```{julia}
-#| echo: false
 data_path = joinpath(@__DIR__, "..", "..", "data", "cop.dat")
 raw = readdlm(data_path)
 data_times = Float64.(raw[:, 1])
-data_values = Float64.(raw[:, 2:12])
+data_values = Float64.(raw[:, 2:12])   # N1–N6, C1–C5
 
-println("Observations: $(size(data_values, 1)) times × $(size(data_values, 2)) stages")
+n_times, n_stages = size(data_values)
+stage_names = ["N1", "N2", "N3", "N4", "N5", "N6", "C1", "C2", "C3", "C4", "C5"]
+
+col_stds = [max(std(data_values[:, j]), 1.0) for j in 1:n_stages]
+w_stage = 1.0 ./ (col_stds .^ 2)
+w_stage ./= mean(w_stage)
+data_weights = repeat(reshape(w_stage, 1, n_stages), n_times, 1)
+
+println("Observations: $n_times times × $n_stages stages (N1–N6, C1–C5)")
 println("Time range: $(data_times[1])–$(data_times[end]) days")
-println("Total data points: $(length(data_values))")
 ```
 
 ```{julia}
-p_data = plot(xlabel="Day", ylabel="Abundance", title="Copepod stage abundances",
+p_data = plot(xlabel="Day", ylabel="Abundance",
+              title="Copepod stage abundances (DDEfit benchmark)",
               legend=:topright)
-stage_names = ["N1", "N2", "N3", "N4", "N5", "N6", "C1", "C2", "C3", "C4", "C5"]
 for j in [1, 3, 6, 7, 11]
     scatter!(p_data, data_times, data_values[:, j], label=stage_names[j], ms=4)
 end
 p_data
 ```
 
-## Model
+## Fixed-Duration Stage-Structured DDE Model
 
-### Stage-structured dynamics
-
-Each stage $i$ has exponential residence time with known mean duration $c_i$. The rate of passage through stage $i$ is $s_i / c_i$:
+Following Nisbet & Gurney (1983) and Wood (1994, 2001), each stage $i$ has a **fixed residence duration** $\tau_i$ rather than an exponential 1-box rate. Let $T_i = \sum_{k=1}^i \tau_k$ be cumulative age at exit from stage $i$, and track two auxiliary cumulative mortality integrals:
 
 $$
-\frac{ds_i}{dt} = \text{inflow}_i - \frac{s_i}{c_i} - \mu(t) \cdot s_i
+\frac{dL_j}{dt} = \mu_j(t), \qquad \frac{dL_a}{dt} = \mu_a(t),
 $$
 
-where:
+with steady-state pre-history $L_j(t) = \mu_j(0)\,t$ and $L_a(t) = \mu_a(0)\,t$ for $t \le 0$. An individual maturing out of stage $i$ at time $t$ was recruited at $t - T_i$ and survived cumulative mortality $\Lambda_i(t)$:
 
-- $\text{inflow}_1 = R(t) \times 1000$ (recruitment, scaled)
-- $\text{inflow}_i = s_{i-1} / c_{i-1}$ for $i > 1$ (outflow from previous stage)
-- $\mu(t) = \mu_j(t)$ for stages 1–6, $\mu_a(t)$ for stages 7–11
+$$
+\Lambda_i(t) =
+\begin{cases}
+L_j(t) - L_j(t - T_i), & i \le 6, \\
+\big(L_j(t - (T_i - T_6)) - L_j(t - T_i)\big) + \big(L_a(t) - L_a(t - (T_i - T_6))\big), & i \ge 7.
+\end{cases}
+$$
+
+The maturation flux out of stage $i$ is $M_i(t) = R_1(t - T_i)\exp(-\Lambda_i(t))$, yielding the exact stage-balance DDEs:
+
+$$
+\frac{ds_i}{dt} = R_i(t) - M_i(t) - \mu_i(t)\,s_i(t), \qquad R_1(t) = 1000\,R(t),\quad R_i(t) = M_{i-1}(t).
+$$
 
 ```{julia}
-# Known stage durations (days)
+# Known fixed stage durations (days) for N1–N6 and C1–C5 (Wood 2001)
 durations = [0.75, 1.4, 4.55, 2.8, 2.5, 1.7, 3.5, 3.1, 3.2, 3.7, 4.7]
+cum_T = cumsum(durations)
+T_N6 = cum_T[6]
+copepod_delays = sort(unique(vcat(cum_T, [cum_T[i] - T_N6 for i in 7:11])))
 
-function copepod!(du, u, p, t)
+@inline expm1_ratio(x) = abs(x) < 1e-8 ? (1 - x / 2 + x^2 / 6) : (1 - exp(-x)) / x
+
+function copepod_dde!(du, u, h, p, t)
     R_t = p.R(t) * 1000.0
     μ_j = p.mu_j(t)
     μ_a = p.mu_a(t)
+    du[12] = μ_j
+    du[13] = μ_a
+    Lj_now, La_now = u[12], u[13]
     inflow = R_t
-    for i in 1:11
-        death = i <= 6 ? μ_j : μ_a
-        du[i] = inflow - u[i] / durations[i] - death * u[i]
-        inflow = u[i] / durations[i]
+    @inbounds for i in 1:11
+        t_rec = t - cum_T[i]
+        R_rec = p.R(t_rec <= 0.0 ? 0.0 : t_rec) * 1000.0
+        if i <= 6
+            cum_mort = Lj_now - h(p, t_rec; idxs=12)
+            death = μ_j
+        else
+            t_trans = t - (cum_T[i] - T_N6)
+            cum_mort = (h(p, t_trans; idxs=12) - h(p, t_rec; idxs=12)) +
+                       (La_now - h(p, t_trans; idxs=13))
+            death = μ_a
+        end
+        maturation = R_rec * exp(-cum_mort)
+        du[i] = inflow - maturation - death * u[i]
+        inflow = maturation
     end
 end
-```
 
-### Initial conditions
-
-We compute steady-state abundances from the initial values of the unknown functions. This ensures the model starts in a self-consistent state:
-
-```{julia}
-function compute_u0(p)
+function copepod_history(p, t)
     R0 = p.R(0.0) * 1000.0
     μ_j0 = p.mu_j(0.0)
     μ_a0 = p.mu_a(0.0)
-    u0 = zeros(Float64, 11)
-    inflow = R0
-    for i in 1:11
-        death = i <= 6 ? μ_j0 : μ_a0
-        u0[i] = inflow / (1.0 / durations[i] + death)
-        inflow = u0[i] / durations[i]
+    T = promote_type(typeof(R0), typeof(μ_j0), typeof(μ_a0), typeof(t))
+    u = zeros(T, 13)
+    inflow = T(R0)
+    @inbounds for i in 1:11
+        death = i <= 6 ? T(μ_j0) : T(μ_a0)
+        τ = durations[i]
+        u[i] = inflow * τ * expm1_ratio(death * τ)
+        inflow = inflow * exp(-death * τ)
     end
-    u0
+    u[12] = T(μ_j0) * t
+    u[13] = T(μ_a0) * t
+    u
 end
+
+copepod_u0(p) = copepod_history(p, 0.0)
 ```
 
-Note that `compute_u0` receives the parameter struct `p` containing callable unknown functions. This means the initial conditions are automatically consistent with the current iterate during the IRLS optimization.
+## Strictly Positive Vital Rate Approximators
 
-## Unknown Function Approximators
-
-Each unknown function gets 15 B-spline knots over the observation period $[0, 90]$ days:
+Using `ShapeConstrainedBSplineApproximator(..., :positive)` enforces $R(t) > 0$, $\mu_j(t) > 0$, and $\mu_a(t) > 0$ at every point during optimization and uncertainty quantification, ruling out biologically impossible negative recruitment or mortality rates:
 
 ```{julia}
-#| echo: false
-approx_R = BSplineApproximator(:R, (0.0, 90.0), 15;
+approx_R = ShapeConstrainedBSplineApproximator(:R, (0.0, 90.0), 12, :positive;
     initial = t -> begin
         μ, σ = 30.0, 20.0
         (0.01 + 0.39894228 / σ * exp(-(t - μ)^2 / σ^2)) * 400.0
     end)
 
-approx_mu_j = BSplineApproximator(:mu_j, (0.0, 90.0), 15;
+approx_mu_j = ShapeConstrainedBSplineApproximator(:mu_j, (0.0, 90.0), 12, :positive;
     initial = t -> 0.1 * exp(-0.02 * t))
 
-approx_mu_a = BSplineApproximator(:mu_a, (0.0, 90.0), 15;
+approx_mu_a = ShapeConstrainedBSplineApproximator(:mu_a, (0.0, 90.0), 12, :positive;
     initial = t -> 0.1)
-
-println("Total parameters: ", nparams(approx_R) + nparams(approx_mu_j) + nparams(approx_mu_a))
 ```
-
-The initial guesses encode biological prior knowledge:
-
-- **Recruitment** $R(t)$: Gaussian pulse peaking at day 30 (spring spawning)
-- **Naupliar death** $\mu_j(t)$: exponential decay (mortality decreases as conditions improve)
-- **Copepodite death** $\mu_a(t)$: constant (no prior information)
 
 ## Building and Solving
 
 ```{julia}
-prob = PSMProblem(copepod!, compute_u0, (0.0, 90.0),
+prob = PSMProblem(copepod_dde!, copepod_u0, (0.0, 90.0),
     [approx_R, approx_mu_j, approx_mu_a];
     data_times = data_times,
     data_values = data_values,
+    data_weights = data_weights,
     obs_to_state = collect(1:11),
+    delays = copepod_delays,
+    history = copepod_history,
     known_params = NamedTuple(),
-    likelihood = Gaussian(),
+    likelihood = GaussianLikelihood(),
     solver = BS3(),
-    abstol = 1e-6, reltol = 1e-6, maxiters = 10000)
-```
+    order_discontinuity_t0 = 2,
+    abstol = 1e-5, reltol = 1e-5, maxiters = 10_000)
 
-```{julia}
-#| echo: false
-sol = solve(prob, LAML(maxiters=100, verbose=false))
+sol = solve(prob, LAML(maxiters=40, verbose=false))
 
-println("Data loss (SS):  ", @sprintf("%.4e", sol.data_loss))
+println("Converged:       ", sol.convergence.converged, " ($(sol.convergence.reason))")
+println("Weighted loss:   ", @sprintf("%.4e", sol.data_loss))
 println("Penalized obj:   ", @sprintf("%.4e", sol.objective))
 println("EDF:             ", round(sol.edf, digits=2))
 println("Smoothing λ:     ", [round(s, sigdigits=4) for s in sol.smoothing_params])
@@ -176,11 +201,10 @@ println("Smoothing λ:     ", [round(s, sigdigits=4) for s in sol.smoothing_para
 
 ```{julia}
 pred = sol.fitted_values
-layout = @layout [a b; c d]
 plots_stages = []
 
-for (stages, title) in [([1,2,3], "Naupliar 1–3"), ([4,5,6], "Naupliar 4–6"),
-                          ([7,8,9], "Copepodite 1–3"), ([10,11], "Copepodite 4–5")]
+for (stages, title) in [([1,2,3], "Naupliar N1–N3"), ([4,5,6], "Naupliar N4–N6"),
+                          ([7,8,9], "Copepodite C1–C3"), ([10,11], "Copepodite C4–C5")]
     p = plot(xlabel="Day", ylabel="Abundance", title=title, legend=:topright)
     for j in stages
         scatter!(p, data_times, data_values[:, j], label=stage_names[j], ms=4, alpha=0.7)
@@ -192,36 +216,30 @@ end
 plot(plots_stages..., layout=(2, 2), size=(800, 600))
 ```
 
-### Estimated Unknown Functions
+### Estimated Strictly Positive Vital Rates
 
 ```{julia}
 t_grid = range(0.0, 90.0, length=200)
 
 p1 = plot(t_grid, [sol.unknown_functions[:R](t) * 1000.0 for t in t_grid],
           xlabel="Day", ylabel="R(t) × 1000",
-          title="Recruitment", lw=2, color=:forestgreen, label=nothing)
+          title="Egg recruitment", lw=2, color=:forestgreen, label=nothing)
 
 p2 = plot(t_grid, [sol.unknown_functions[:mu_j](t) for t in t_grid],
           xlabel="Day", ylabel="μⱼ(t)",
-          title="Naupliar death rate", lw=2, color=:steelblue, label=nothing)
-hline!(p2, [0.0], color=:gray, ls=:dot, label=nothing)
+          title="Naupliar mortality (N1–N6)", lw=2, color=:steelblue, label=nothing)
 
 p3 = plot(t_grid, [sol.unknown_functions[:mu_a](t) for t in t_grid],
           xlabel="Day", ylabel="μₐ(t)",
-          title="Copepodite death rate", lw=2, color=:indianred, label=nothing)
-hline!(p3, [0.0], color=:gray, ls=:dot, label=nothing)
+          title="Copepodite mortality (C1–C5)", lw=2, color=:indianred, label=nothing)
 
 plot(p1, p2, p3, layout=(1, 3), size=(900, 300))
 ```
 
 ## Diagnostic Plots
 
-A standard 4-panel diagnostic display assesses residual behaviour across all 11 stage variables.
-
 ```{julia}
-using PartiallySpecifiedModels: appraise
-
-diag = appraise(sol)
+diag = psm_appraise(sol)
 
 p_qq = scatter(diag.qq_theoretical, diag.qq_sample,
     xlabel="Theoretical quantiles", ylabel="Sample quantiles",
@@ -247,73 +265,10 @@ plot!(p_of, [mn2, mx2], [mn2, mx2], color=:red, ls=:dash, label="")
 plot(p_qq, p_rf, p_hist, p_of, layout=(2, 2), size=(700, 600))
 ```
 
-```{julia}
-#| echo: false
-println("Durbin-Watson: ", join(["$(round(d, digits=3))" for d in diag.durbin_watson], ", "))
-```
-
-## Discussion
-
-### Model complexity
-
-This model illustrates several features of complex PSMs:
-
-| Feature | Value |
-|---------|-------|
-| State variables | 11 (6 naupliar + 5 copepodite stages) |
-| Unknown functions | 3 ($R$, $\mu_j$, $\mu_a$) |
-| Knots per function | 15 |
-| Total parameters | 45 |
-| Data points | 110 (10 times × 11 stages) |
-
-The ratio of data to parameters (110:45 ≈ 2.4:1) is low, making the smoothing penalty critical. Without it, the model could overfit easily — and the fit reported above shows LAML making exactly that call.
-
-### What LAML chose
-
-Read the numbers printed after the fit. All three smoothing parameters are
-driven to very large values, the effective degrees of freedom fall to about
-2.3 *in total* across the three functions — essentially their penalty null
-spaces — and the data loss is roughly two and a half times what the
-unpenalized starting point achieves (1.5 × 10⁹). With ten sampling times per
-stage and residual standard deviations in the thousands of individuals, the
-marginal likelihood finds no support for time-varying recruitment or
-mortality beyond what a near-linear trend in each can explain: the flexible
-fit is fitting noise. That is a statement about this data set, not about the
-model; it is what an honest smoothing-parameter criterion should say when the
-data are this thin.
-
-The fit also reports `convergence.ridge = true`. With λ this large the
-penalized directions are pinned to zero, and what remains — the null-space
-components of three functions sharing 2.3 degrees of freedom — is only weakly
-determined by 110 noisy counts, so one more penalized least-squares step from
-the reported coefficients would still move them. The fitted *functions* (the
-near-linear trends above) are usable; individual spline coefficients and
-their covariance are not, which is the flag's meaning.
-
-This fit used to need ~130 iterations. At the initial smoothing the 45
-coefficients keep improving the penalized objective slowly, and the solver
-prefers that progress over a smoothing proposal that would change the fit
-sharply — reasonable for a few iterations, but with no natural end it kept
-re-proposing and deferring the same λ̂. Proposal deferral is now bounded (five
-consecutive iterations), after which the proposal is taken; the same fixed
-point is reached in under twenty iterations, well within the default
-`maxiters=100`.
-
-### Dependent initial conditions
-
-The `compute_u0(p)` function demonstrates an important feature: the initial conditions depend on the unknown functions. As the IRLS algorithm iterates and updates the spline coefficients, the initial conditions are automatically recomputed from the current estimate of $R(0)$, $\mu_j(0)$, and $\mu_a(0)$.
-
-### Smoothing parameter interpretation
-
-The three smoothing parameters $\lambda_k$ control the trade-off between data fit and smoothness independently for each unknown function, so in principle recruitment could be left more flexible than the two mortalities. On this data set all three end up large and the three functions are smoothed to near-linear trends (see above). If a more flexible fit is wanted for exploratory plotting, pass fixed smoothing parameters instead of letting LAML select them — but the marginal likelihood is telling you the data do not support that flexibility.
-
-The LAML/REML criterion provides an automatic, principled way to set these parameters, avoiding the need for cross-validation on such a small dataset.
-
 ## Summary
 
-The copepod model demonstrates that `PartiallySpecifiedModels.jl` can handle:
+This faithful Wood (2001) copepod benchmark showcases:
 
-- High-dimensional state spaces (11 ODEs)
-- Multiple unknown functions with different smoothing requirements
-- Parameter-dependent initial conditions
-- Real ecological data with complex dynamics
+- **Fixed-duration stage-structured DDEs** via `delays` and parameter-dependent `history`
+- **Strictly positive unknown vital rates** via `ShapeConstrainedBSplineApproximator(..., :positive)`
+- **Stage-weighted Gaussian LAML** balancing observations spanning four orders of magnitude across stages N1–N6 and C1–C5

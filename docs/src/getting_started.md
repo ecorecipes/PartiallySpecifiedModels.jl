@@ -96,7 +96,7 @@ prob = PSMProblem(
     data_times = data_times,
     data_values = reshape(observed_N, :, 1),  # n_times × 1 matrix
     obs_to_state = [1],             # observe state variable 1
-    likelihood = Gaussian(),        # Gaussian errors
+    likelihood = GaussianLikelihood(), # Gaussian errors (or Normal(...) with Distributions.jl)
     solver = Tsit5()                # ODE solver
 )
 nothing # hide
@@ -148,7 +148,7 @@ A [`PSMProblem`](@ref) combines:
 | `approximators` | Vector of [`AbstractApproximator`](@ref) (splines, neural nets) |
 | `data_times`    | Observation times                                       |
 | `data_values`   | Data matrix (n\_times × n\_obs)                         |
-| `likelihood`    | Error distribution ([`Gaussian`](@ref), [`Poisson`](@ref), etc.) |
+| `likelihood`    | Error distribution ([`GaussianLikelihood`](@ref), [`PoissonLikelihood`](@ref), or a `Distributions.jl` distribution) |
 | `solver`        | ODE solver from OrdinaryDiffEq.jl                       |
 
 ### Observation times
@@ -203,8 +203,8 @@ The basic workflow is:
 
 1. Write `dynamics!(du, u, p, t)` — access unknown functions via `p.name(x)`
 2. Create [`BSplineApproximator`](@ref)`(:name, domain, nknots)` for each unknown
-3. Build [`PSMProblem`](@ref)`(dynamics!, u0, tspan, approximators; data=..., likelihood=...)`
+3. Build [`PSMProblem`](@ref)`(dynamics!, u0, tspan, approximators; data_times=..., data_values=..., obs_to_state=..., likelihood=...)`
 4. Call `solve(prob, LAML())`
 5. Access `sol.unknown_functions[:name]` for the fitted functions
 
-See the [Approximators](approximators.md) and [Solvers](solvers.md) pages for detailed documentation of all available options, or the [Vignettes](vignettes.md) page for 35 worked examples.
+See the [Approximators](approximators.md) and [Solvers](solvers.md) pages for detailed documentation of all available options, or the [Vignettes](vignettes.md) page for 48 worked examples.

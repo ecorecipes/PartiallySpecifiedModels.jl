@@ -1,14 +1,15 @@
 # ─── RKHS solver (trajectory in a reproducing kernel Hilbert space) ─
 #
-# González et al. (2014): the state trajectory is placed in a
-# time-kernel RKHS, x_k(t) = m_k + Σᵢ b_{k,i} k(t, tᵢ), so its
-# derivative ẋ_k(t) = Σᵢ b_{k,i} k̇(t, tᵢ) is available analytically.
-# Estimation alternates a joint LINEAR Gauss–Newton solve for all
-# states' trajectory coefficients B (data fit + RKHS norm + ODE-gradient
-# term with f linearized around the previous trajectory) with gradient
-# steps on the unknown-function parameters θ.
+# Trajectory-in-RKHS gradient matching inspired by González et al. (2014):
+# each state trajectory is expanded in a time-kernel RKHS over the data times,
+# x_k(t) = m_k + Σᵢ b_{k,i} k(t, tᵢ), so its derivative ẋ_k(t) = Σᵢ b_{k,i} k̇(t, tᵢ)
+# is available analytically. Unlike González et al. (2014)'s full representer-
+# theorem basis (which also includes derivative-kernel atoms k̇(t, t_g)), this
+# implementation uses the compact state-center basis {k(·, tᵢ)} with a joint
+# Gauss–Newton B-step (linearizing f via ∂f/∂x to couple unobserved states)
+# alternating with Adam updates on the unknown-function parameters θ.
 #
-# Reference: González et al. (2014), Pattern Recognition Letters —
+# Reference: González et al. (2014), Pattern Recognition Letters 45:26-32 —
 #            "Reproducing kernel Hilbert space based estimation of
 #             systems of ordinary differential equations"
 #            Schölkopf & Smola (2002), Learning with Kernels
@@ -50,11 +51,12 @@ values are the RKHS trajectory at the data times.
 function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
     _validate_problem(prob, "RKHSSolver"; require_continuous=true,
                       reject_delays=true)
+    _require_gaussian_likelihood(prob, "RKHSSolver")
     verbose = alg.verbose
 
     times = Float64.(prob.data_times)
     n_times = length(times)
-    u0_vec = Float64.(prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)
+    u0_vec = _resolve_u0_init(prob)
     n_vars = length(u0_vec)
     n_obs = size(prob.data_values, 2)
     obs_of_state = Dict{Int, Vector{Int}}()
@@ -191,6 +193,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
         F
     end
 
+    # Precompute smoothing penalties once before alternating optimization.
+    rkhs_penalties = Tuple{Int,Int,Matrix{Float64}}[]
+    let off = 0
+        for approx in prob.approximators
+            np = nparams(approx)
+            S = penalty_matrix(approx)
+            S !== nothing && push!(rkhs_penalties, (off, np, S))
+            off += np
+        end
+    end
+
     # θ objective: ODE mismatch on the grid + smoothing penalty
     function theta_loss(β_eval, Xg, dXg, ρ_use=ρ)
         T_el = eltype(β_eval)
@@ -201,13 +214,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::RKHSSolver)
                 loss += ρ_use * (dXg[i, k] - F[i, k])^2
             end
         end
-        offset = 0
-        for approx in prob.approximators
-            np = nparams(approx)
-            pk = @view β_eval[offset+1:offset+np]
-            offset += np
-            S = penalty_matrix(approx)
-            S !== nothing && (loss += dot(pk, S * pk))
+        for (off, np, S) in rkhs_penalties
+            pk = @view β_eval[off+1:off+np]
+            loss += dot(pk, S * pk)
         end
         loss
     end

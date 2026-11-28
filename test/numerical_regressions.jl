@@ -4,6 +4,7 @@ using Test
 using LinearAlgebra
 using Random
 using PartiallySpecifiedModels
+using PartiallySpecifiedModels: penalty_matrix, penalty_blocks, nparams, build_evaluator
 using PartiallySpecifiedModels: solve
 
 const PSM = PartiallySpecifiedModels
@@ -48,7 +49,7 @@ end
 
 @testset "Numerical regression fixes" begin
     @testset "Truncated-normal tails and dispersion" begin
-        for fam in (TruncatedNormal(), TruncatedNormal(lower=3.0, sigma=0.5))
+        for fam in (TruncatedNormalLikelihood(), TruncatedNormalLikelihood(lower=3.0, sigma=0.5))
             a, sigma = fam.lower, fam.sigma
             for xi in (-1e6, -1000.0, -40.0, -10.0, -8.0, -6.0, -1.0,
                        -0.999, 0.0, 4.0)
@@ -83,7 +84,7 @@ end
             end
         end
 
-        fam = TruncatedNormal()
+        fam = TruncatedNormalLikelihood()
         times = collect(1.0:20.0)
         data = reshape(repeat([0.02, 0.04, 0.06, 0.08], 5), :, 1)
         map!(du, u, p, t) = (du[1] = p.g(u[1]))
@@ -107,7 +108,7 @@ end
         S = Matrix(Diagonal([0.0, 0.0, 1.0]))
         lambdas = Float64[]
         for shift in (0.0, -5.0)
-            family = TruncatedNormal(lower=shift)
+            family = TruncatedNormalLikelihood(lower=shift)
             beta = [0.2 + shift, 0.05, 0.1]
             mu = J * beta
             y = mu + [0.1, 1.2, 2.5, 0.4, 3.3, 1.1]
@@ -138,18 +139,18 @@ end
         @test isapprox(lambdas[1], lambdas[2]; rtol=1e-6)
 
         for (family, target, noise) in (
-            (TruncatedNormal(sigma=0.15), collect(range(0.30, 0.02, length=25)),
+            (TruncatedNormalLikelihood(sigma=0.15), collect(range(0.30, 0.02, length=25)),
              (m, rng) -> max.(m .+ 0.15 .* randn(rng, 25), 0.0)),
-            (Gaussian(), collect(range(2.0, 0.5, length=25)),
+            (GaussianLikelihood(), collect(range(2.0, 0.5, length=25)),
              (m, rng) -> m .+ 0.10 .* randn(rng, 25)),
-            (Poisson(), collect(range(9.0, 2.0, length=25)),
+            (PoissonLikelihood(), collect(range(9.0, 2.0, length=25)),
              (m, rng) -> max.(round.(m .+ 0.8 .* randn(rng, 25)), 0.0)),
-            (NegativeBinomial(4.0), collect(range(9.0, 2.0, length=25)),
+            (NegativeBinomialLikelihood(4.0), collect(range(9.0, 2.0, length=25)),
              (m, rng) -> max.(round.(m .+ 0.8 .* randn(rng, 25)), 0.0)))
             lambda, edf = d5_smoothing_fixture(family, target, noise)
             @test isfinite(only(lambda)) && only(lambda) > 0
             @test 0 < edf <= 8  # hat-trace bound for this eight-coefficient fixture
-            if !(family isa TruncatedNormal)
+            if !(family isa TruncatedNormalLikelihood)
                 # Legacy D5 controls: measured EDF 1.90..1.99 across local/CI
                 # resolutions; the bounds leave >=0.51 EDF headroom.
                 @test 1.0 < edf < 2.5
@@ -178,8 +179,8 @@ end
                     [ConstantApproximator(:g, 0.4)];
                     data_times=times, data_values=expected, obs_to_state=[2, 1, 2],
                     delays=delayed ? [1.0] : Float64[], kwargs...)
-                pred = simulate(prob, [0.4])
-                J = FD.jacobian(b -> vec(simulate(prob, b)), [0.4])
+                pred = simulate_psm(prob, [0.4])
+                J = FD.jacobian(b -> vec(simulate_psm(prob, b)), [0.4])
                 # Review affine prediction error <=5.78e-15; this 1e-10
                 # gate leaves >17000x headroom, including a second state.
                 @test maximum(abs, pred-expected) < 1e-10
@@ -200,7 +201,7 @@ end
                 data_times=[1.0, 3.0, 5.0], data_values=expected[[1, 3, 5], :],
                 obs_to_state=[2, 1, 2], delays=delayed ? [1.0] : Float64[],
                 callback=stop, tstops=[2.0], save_start=true)
-            @test_throws ErrorException simulate(prob, [0.4])
+            @test_throws ErrorException simulate_psm(prob, [0.4])
         end
 
         # EKI forwards save options through its own ODE path.
@@ -235,7 +236,7 @@ end
                 discrete=true, solver=nothing)
             beta = [0.4]
             p = PSM.build_autodiff_param_struct(prob, beta)
-            pred = simulate(prob, beta)
+            pred = simulate_psm(prob, beta)
             pred_adam = PSM.adam_simulate_discrete(prob, p, Float64)
             # Review unit-step error <=4.45e-16; 1e-12 gives >2000x headroom.
             @test maximum(abs, pred-expected) < 1e-12
@@ -272,7 +273,7 @@ end
                 [ConstantApproximator(:g, 0.4)];
                 data_times=times, data_values=zeros(2, 2), discrete=true,
                 solver=nothing)
-            @test_throws ArgumentError simulate(prob, [0.4])
+            @test_throws ArgumentError simulate_psm(prob, [0.4])
             @test_throws ArgumentError solve(prob, LAML(maxiters=1))
         end
     end

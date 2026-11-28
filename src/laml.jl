@@ -16,10 +16,24 @@ const RHO_MIN = -20.0
 const RHO_MAX = 40.0   # exp(40) ≈ 2.4e17
 
 # Variance function V(μ) for each family (used in Pearson dispersion)
-_variance_function(::Gaussian, mu) = 1.0
-_variance_function(::Poisson, mu) = mu
-_variance_function(fam::NegativeBinomial, mu) = mu + mu^2 / fam.theta
-function _variance_function(fam::TruncatedNormal, mu)
+_variance_function(::GaussianLikelihood, mu) = 1.0
+_variance_function(::PoissonLikelihood, mu) = mu
+_variance_function(fam::NegativeBinomialLikelihood, mu) = mu + mu^2 / fam.theta
+_variance_function(fam::GammaLikelihood, mu) = fam.phi * max(abs(mu), 1e-6)^2
+function _variance_function(fam::LogNormalLikelihood, mu)
+    s2 = fam.sigma^2
+    m = max(abs(mu), 1e-6)
+    (exp(s2) - 1.0) * exp(s2) * m^2
+end
+function _variance_function(fam::BinomialLikelihood, mu)
+    p = clamp(mu, 1e-6, 1.0 - 1e-6)
+    fam.n_trials * p * (1.0 - p)
+end
+function _variance_function(fam::StudentTLikelihood, mu)
+    ν = fam.df; s2 = fam.sigma^2
+    ν > 2.0 ? s2 * ν / (ν - 2.0) : s2 * (ν + 1.0) / ν
+end
+function _variance_function(fam::TruncatedNormalLikelihood, mu)
     _, variance = _truncated_normal_moments(fam, mu)
     fam.sigma^2 * variance
 end
@@ -41,11 +55,15 @@ end
 #
 # `CustomLikelihood` keeps the identity deliberately: the mean of an
 # arbitrary user kernel is not recoverable from `loglik_scalar`.
-_family_mean(::Gaussian, mu) = mu
-_family_mean(::Poisson, mu) = mu
-_family_mean(::NegativeBinomial, mu) = mu
+_family_mean(::GaussianLikelihood, mu) = mu
+_family_mean(::PoissonLikelihood, mu) = mu
+_family_mean(::NegativeBinomialLikelihood, mu) = mu
+_family_mean(::GammaLikelihood, mu) = max(abs(mu), 1e-6)
+_family_mean(fam::LogNormalLikelihood, mu) = max(abs(mu), 1e-6) * exp(0.5 * fam.sigma^2)
+_family_mean(fam::BinomialLikelihood, mu) = fam.n_trials * clamp(mu, 1e-6, 1.0 - 1e-6)
+_family_mean(::StudentTLikelihood, mu) = mu
 _family_mean(::CustomLikelihood, mu) = mu
-function _family_mean(fam::TruncatedNormal, mu)
+function _family_mean(fam::TruncatedNormalLikelihood, mu)
     first(_truncated_normal_moments(fam, mu))
 end
 
@@ -62,7 +80,9 @@ end
 # A truncated-normal location can legitimately be negative; reflecting it
 # changes the distribution rather than regularizing an invalid count mean.
 _pearson_variance(fam::AbstractLikelihood, mu) = _variance_function(fam, abs(mu))
-_pearson_variance(fam::TruncatedNormal, mu) = _variance_function(fam, mu)
+_pearson_variance(fam::TruncatedNormalLikelihood, mu) = _variance_function(fam, mu)
+_pearson_variance(fam::BinomialLikelihood, mu) = _variance_function(fam, mu)
+_pearson_variance(fam::StudentTLikelihood, mu) = _variance_function(fam, mu)
 
 # ─── Penalty matrix assembly ──────────────────────────────────────
 
@@ -161,7 +181,7 @@ function laml_objective(family::AbstractLikelihood,
     # (equals Mp whenever those columns are of full rank; see below).
     Mp_eff = _restricted_dof_Mp(J, W_irls, offsets, nknots_list, n_p, total_rank)
 
-    if family isa Gaussian
+    if family isa GaussianLikelihood
         # This branch IS the full Laplace criterion of the non-Gaussian
         # branch, specialized to Gaussian and with σ² profiled out — which is
         # why `LAML(criterion=:laplace)` needs no separate Gaussian path and
@@ -235,16 +255,49 @@ Gradient ∂V/∂ρ_k.
 For Gaussian:  ∂V/∂ρ_k = -½ λ_k β̂'S_k β̂/σ̂² + ½ rank(S_k) - ½ tr(H⁻¹ λ_k S_k)
 For others:    ∂V/∂ρ_k = -½ λ_k β̂'S_k β̂ + ½ rank(S_k) - ½ tr(H⁻¹ λ_k S_k)
 """
+function _laml_objective_precomputed(family::AbstractLikelihood,
+                                     beta::AbstractVector,
+                                     JWJ::AbstractMatrix,
+                                     S_list::Vector{Matrix{Float64}},
+                                     offsets::Vector{Int},
+                                     nknots_list::Vector{Int},
+                                     ranks::Vector{Int},
+                                     log_det_plus_k::Vector{Float64},
+                                     rho::AbstractVector, n_p::Int,
+                                     n_eff::Float64, Mp::Int,
+                                     data_term::Float64)
+    S_lambda = build_S_lambda(S_list, offsets, nknots_list, rho, n_p)
+    H = JWJ + S_lambda
+    pen = dot(beta, S_lambda * beta)
+
+    log_det_S_plus = 0.0
+    @inbounds for l in eachindex(S_list)
+        log_det_S_plus += ranks[l] * rho[l] + log_det_plus_k[l]
+    end
+    log_det_H = _log_det_pd(H)
+
+    if family isa GaussianLikelihood
+        sigma2 = max((data_term + pen) / n_eff, 1e-30)
+        V = -0.5 * n_eff * log(sigma2) + 0.5 * log_det_S_plus - 0.5 * log_det_H
+    else
+        sigma2 = 1.0
+        V = data_term - 0.5 * pen + 0.5 * log_det_S_plus - 0.5 * log_det_H + 0.5 * Mp * log(2π)
+    end
+    V, H, S_lambda, sigma2
+end
+
 function laml_gradient(family::AbstractLikelihood,
                        beta::AbstractVector,
                        S_list::Vector{Matrix{Float64}},
                        offsets::Vector{Int}, nknots_list::Vector{Int},
                        rho::AbstractVector, n_p::Int,
-                       H::AbstractMatrix, sigma2::Float64)
+                       H::AbstractMatrix, sigma2::Float64;
+                       H_inv::Union{Nothing,AbstractMatrix}=nothing,
+                       ranks::Union{Nothing,Vector{Int}}=nothing)
     m = length(rho)
     lambda = exp.(rho)
     grad = zeros(m)
-    H_inv = _safe_inv(H)
+    Hi = H_inv === nothing ? _safe_inv(H) : H_inv
 
     for k in 1:m
         nk = nknots_list[k]
@@ -252,16 +305,17 @@ function laml_gradient(family::AbstractLikelihood,
 
         beta_k = @view beta[off+1:off+nk]
         bSb = dot(beta_k, S_list[k] * beta_k)
-        rk = _rank_penalty(S_list[k])
+        rk = ranks === nothing ? _rank_penalty(S_list[k]) : ranks[k]
 
         # tr(H⁻¹ λ_k S_k)
         tr_val = 0.0
-        for i in 1:nk, j in 1:nk
-            tr_val += H_inv[off + i, off + j] * S_list[k][j, i]
+        Sk = S_list[k]
+        @inbounds for i in 1:nk, j in 1:nk
+            tr_val += Hi[off + i, off + j] * Sk[j, i]
         end
         tr_val *= lambda[k]
 
-        if family isa Gaussian
+        if family isa GaussianLikelihood
             grad[k] = -0.5 * lambda[k] * bSb / sigma2 + 0.5 * rk - 0.5 * tr_val
         else
             grad[k] = -0.5 * lambda[k] * bSb + 0.5 * rk - 0.5 * tr_val
@@ -277,47 +331,59 @@ end
                  rho, n_p, H, sigma2)
 
 Expected Hessian ∂²V/∂ρ_j∂ρ_k (Wood et al. approximation).
+Evaluated block-sparsely using O(m² nk³) active sub-blocks of `H⁻¹` instead
+of materializing dense `n_p × n_p` penalty blocks.
 """
 function laml_hessian(family::AbstractLikelihood,
                       beta::AbstractVector,
                       S_list::Vector{Matrix{Float64}},
                       offsets::Vector{Int}, nknots_list::Vector{Int},
                       rho::AbstractVector, n_p::Int,
-                      H::AbstractMatrix, sigma2::Float64)
+                      H::AbstractMatrix, sigma2::Float64;
+                      H_inv::Union{Nothing,AbstractMatrix}=nothing)
     m = length(rho)
     lambda = exp.(rho)
     hess = zeros(m, m)
-    H_inv = _safe_inv(H)
+    Hi = H_inv === nothing ? _safe_inv(H) : H_inv
 
-    # Precompute H⁻¹ λ_k S_k (full)
-    HinvS = Vector{Matrix{Float64}}(undef, m)
-    for k in 1:m
-        nk = nknots_list[k]
-        off = offsets[k]
-        S_k_full = zeros(n_p, n_p)
-        for i in 1:nk, j in 1:nk
-            S_k_full[off + i, off + j] = lambda[k] * S_list[k][i, j]
-        end
-        HinvS[k] = H_inv * S_k_full
-    end
-
-    for j in 1:m, k in j:m
-        tr_val = sum(HinvS[j][i, l] * HinvS[k][l, i] for i in 1:n_p, l in 1:n_p)
-
-        if j == k
+    # Block-sparse trace: tr((H⁻¹ λ_j S_j)(H⁻¹ λ_k S_k))
+    # = λ_j λ_k tr( (H⁻¹[r_k, r_j] S_j) (H⁻¹[r_j, r_k] S_k) )
+    for j in 1:m
+        nj = nknots_list[j]
+        oj = offsets[j]
+        rj = (oj + 1):(oj + nj)
+        Sj = S_list[j]
+        for k in j:m
             nk = nknots_list[k]
-            off = offsets[k]
-            beta_k = @view beta[off+1:off+nk]
-            bSb = dot(beta_k, S_list[k] * beta_k)
-            tr_single = tr(HinvS[k])
-            if family isa Gaussian
-                hess[k, k] = -0.5 * lambda[k] * bSb / sigma2 - 0.5 * tr_single + 0.5 * tr_val
+            ok = offsets[k]
+            rk = (ok + 1):(ok + nk)
+            Sk = S_list[k]
+
+            if j == k
+                Mjj = @view(Hi[rj, rj]) * Sj
+                tr_single = lambda[j] * tr(Mjj)
+                tr_sq = 0.0
+                @inbounds for a in 1:nj, b in 1:nj
+                    tr_sq += Mjj[a, b] * Mjj[b, a]
+                end
+                tr_val = lambda[j]^2 * tr_sq
+                beta_k = @view beta[rj]
+                bSb = dot(beta_k, Sj * beta_k)
+                if family isa GaussianLikelihood
+                    hess[j, j] = -0.5 * lambda[j] * bSb / sigma2 - 0.5 * tr_single + 0.5 * tr_val
+                else
+                    hess[j, j] = -0.5 * lambda[j] * bSb - 0.5 * tr_single + 0.5 * tr_val
+                end
             else
-                hess[k, k] = -0.5 * lambda[k] * bSb - 0.5 * tr_single + 0.5 * tr_val
+                Mkj = @view(Hi[rk, rj]) * Sj   # nk × nj
+                Mjk = @view(Hi[rj, rk]) * Sk   # nj × nk
+                tr_sq = 0.0
+                @inbounds for a in 1:nk, b in 1:nj
+                    tr_sq += Mkj[a, b] * Mjk[b, a]
+                end
+                hess[j, k] = 0.5 * lambda[j] * lambda[k] * tr_sq
+                hess[k, j] = hess[j, k]
             end
-        else
-            hess[j, k] = 0.5 * tr_val
-            hess[k, j] = hess[j, k]
         end
     end
     hess
@@ -350,6 +416,52 @@ Estimate smoothing parameters by maximizing LAML using two phases:
 
 Returns `(lambda, edf)` where lambda[k] are the smoothing parameters.
 """
+# Exact implicit-derivative Newton Hessian (Wood 2011, Theorem 1) when β̂(ρ)
+# is re-solved at each ρ: adds the ∂β̂/∂ρ = −H⁻¹(λ_j S_j β̂) and (for Gaussian)
+# profiled ∂σ̂²/∂ρ_j = (λ_j β̂'S_j β̂)/n_eff curvature terms to the frozen-β Hessian.
+function _laml_newton_hessian(family::AbstractLikelihood,
+                              beta::AbstractVector,
+                              S_list::Vector{Matrix{Float64}},
+                              offsets::Vector{Int}, nknots_list::Vector{Int},
+                              rho::AbstractVector, n_p::Int,
+                              H::AbstractMatrix, sigma2::Float64,
+                              n_eff::Float64;
+                              H_inv::Union{Nothing,AbstractMatrix}=nothing)
+    Hi = H_inv === nothing ? _safe_inv(H) : H_inv
+    hess = laml_hessian(family, beta, S_list, offsets, nknots_list, rho, n_p,
+                        H, sigma2; H_inv=Hi)
+    m = length(rho)
+    lambda = exp.(rho)
+    # g_k = λ_k S_k β̂ (embedded in ℝ^{n_p}, nonzero only on block k)
+    # and bSb_k = λ_k β̂' S_k β̂.
+    g_vecs = Vector{Vector{Float64}}(undef, m)
+    lam_bSb = Vector{Float64}(undef, m)
+    for k in 1:m
+        nk = nknots_list[k]; off = offsets[k]
+        rk = (off + 1):(off + nk)
+        bk = @view beta[rk]
+        Sk_bk = S_list[k] * bk
+        g_vecs[k] = lambda[k] .* Sk_bk
+        lam_bSb[k] = lambda[k] * dot(bk, Sk_bk)
+    end
+    scale_inv = family isa GaussianLikelihood ? (1.0 / sigma2) : 1.0
+    for j in 1:m
+        nj = nknots_list[j]; oj = offsets[j]; rj = (oj + 1):(oj + nj)
+        for k in j:m
+            nk = nknots_list[k]; ok = offsets[k]; rk = (ok + 1):(ok + nk)
+            # Implicit ∂β̂/∂ρ term: + (1/σ̂²) g_jᵀ H⁻¹[rj, rk] g_k
+            imp_beta = scale_inv * dot(g_vecs[j], @view(Hi[rj, rk]) * g_vecs[k])
+            imp_sig = family isa GaussianLikelihood ?
+                      (0.5 / (n_eff * sigma2^2)) * lam_bSb[j] * lam_bSb[k] : 0.0
+            hess[j, k] += imp_beta + imp_sig
+            if j != k
+                hess[k, j] = hess[j, k]
+            end
+        end
+    end
+    hess
+end
+
 function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
                                    w_data::AbstractVector,
                                    y::AbstractVector, mu::AbstractVector,
@@ -357,11 +469,12 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
                                    S_list::Vector{Matrix{Float64}},
                                    offsets::Vector{Int}, nknots_list::Vector{Int},
                                    n_p::Int;
-                                   family::AbstractLikelihood=Gaussian(),
+                                   family::AbstractLikelihood=GaussianLikelihood(),
                                    rho_init::Union{Nothing,Vector{Float64}}=nothing,
                                    sigma2_max::Float64=Inf,
                                    maxiter::Int=50, tol::Float64=1e-6,
                                    criterion::Symbol=:working,
+                                   fixed_mask::Union{Nothing,AbstractVector{Bool}}=nothing,
                                    verbose::Bool=false)
     m = length(S_list)
     # USABLE-cell count, not `length(y)` — see the note in `laml_objective`.
@@ -402,7 +515,7 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
     # `n_eff` — so warning there described a quantity the fit does not
     # use, and a healthy Poisson fit could emit an alarming irrelevant
     # message about an unidentified σ̂².
-    if family isa Gaussian && Mp_eff >= n
+    if family isa GaussianLikelihood && Mp_eff >= n
         @warn "LAML: the unpenalized (fixed-effect) part of the model has " *
               "rank $(Mp_eff) ≥ n = $n data points, so the restricted " *
               "residual degrees of freedom are exhausted and the REML " *
@@ -426,8 +539,19 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
     # wherever the bound bites. `_working_residual` is `y .- mu` for every
     # other family, so this line is bit-identical off the truncated path.
     z_work = _working_residual(family, y, mu, w_data) .+ J * beta
-    JWJ = J' * Diagonal(W_irls) * J
-    JWz = J' * (W_irls .* z_work)
+    W_eff = similar(W_irls)
+    z_eff = similar(z_work)
+    @inbounds for i in eachindex(W_irls)
+        if _usable(y[i], w_data[i]) && isfinite(W_irls[i]) && W_irls[i] > 0.0 && isfinite(z_work[i])
+            W_eff[i] = W_irls[i]
+            z_eff[i] = W_irls[i] * z_work[i]
+        else
+            W_eff[i] = 0.0
+            z_eff[i] = 0.0
+        end
+    end
+    JWJ = J' * Diagonal(W_eff) * J
+    JWz = J' * z_eff
     beta_fs = copy(beta)
 
     for fs_iter in 1:n_fs
@@ -454,7 +578,7 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
         #   family working weights W̃ inside H. It therefore (approximately)
         #   ascends exactly the objective the Newton phase refines.
         # When sigma2_max is finite, cap to prevent oversmoothing.
-        sigma2 = if family isa Gaussian
+        sigma2 = if family isa GaussianLikelihood
             r_work = z_work .- J * beta_fs
             RSS = 0.0
             for i in eachindex(y)
@@ -485,6 +609,9 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
 
         all_converged = true
         for k in 1:m
+            if fixed_mask !== nothing && fixed_mask[k]
+                continue
+            end
             nk = nknots_list[k]
             off = offsets[k]
             beta_k = @view beta_fs[off+1:off+nk]
@@ -670,7 +797,7 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
         end
 
         if verbose && (fs_iter <= 5 || fs_iter % 10 == 0 || all_converged)
-            sigma_str = family isa Gaussian ? @sprintf(" σ̂²=%.3e", sigma2) : ""
+            sigma_str = family isa GaussianLikelihood ? @sprintf(" σ̂²=%.3e", sigma2) : ""
             println("LAML-FS iter $fs_iter:$sigma_str λ = ",
                     [round(l, sigdigits=4) for l in lambda])
         end
@@ -694,7 +821,7 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
     # dispersion, so Newton runs there too.
     MAX_STEP = 5.0
     V_prev = -Inf
-    n_newton = (family isa Gaussian || criterion === :laplace) ?
+    n_newton = (family isa GaussianLikelihood || criterion === :laplace) ?
                max(0, maxiter - n_fs) : 0
 
     # The objective must be evaluated at the SAME coefficients β̂_fs as its
@@ -707,79 +834,255 @@ function estimate_smoothing_params(J::AbstractMatrix, W_irls::AbstractVector,
     # (identical in spirit to holding J and W̃ frozen within this call).
     mu_fs = mu .+ J * (beta_fs .- beta)
 
-    for iter in 1:min(n_newton, 20)
-        # Evaluate at the working-model optimum β̂(λ) from the FS phase —
-        # not the stale outer-loop β. (Within Newton the β̂ is held fixed:
-        # a small approximation, polished by the outer IRLS re-linearization.)
-        V, H, S_lambda, sigma2 = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu_fs,
-                                                 S_list, offsets, nknots_list, rho, n_p)
-        if !isfinite(V)
-            if verbose; println("LAML-Newton: non-finite V, stopping"); end
-            break
+    # ─── Block-orthogonal penalty eigenbasis (Wood 2011 §3 / Sl.repara) ──
+    # Diagonalize each penalty block S_k = Q_k diag(d_k) Q_k' once so that
+    # H_Q = Q'(JWJ)Q + diag(w_λ) keeps the penalty strictly diagonal. Zeroing
+    # null-space eigenvalues ensures diagonal equilibration leaves null-space
+    # coordinates at O(1) while scaling penalized coordinates by √λ_k, keeping
+    # κ(D⁻¹ H_Q D⁻¹) = O(1) uniformly all the way to λ = e^30 (~10^13) with
+    # zero Float64 cancellation in log|H|, H⁻¹, β̂, gradient, Hessian, and EDF.
+    Q = Matrix{Float64}(I, n_p, n_p)
+    d_blocks = Vector{Vector{Float64}}(undef, m)
+    log_det_plus_k = zeros(Float64, m)
+    for k in 1:m
+        nk = nknots_list[k]
+        off = offsets[k]
+        rk = (off + 1):(off + nk)
+        ef = eigen(Symmetric(S_list[k]))
+        Q[rk, rk] .= ef.vectors
+        dmax = maximum(abs, ef.values)
+        dtol = max(1e-10 * dmax, 1e-14)
+        dk = Float64[v > dtol ? v : 0.0 for v in ef.values]
+        d_blocks[k] = dk
+        s_ld = 0.0
+        @inbounds for v in dk
+            v > 0.0 && (s_ld += log(v))
         end
+        log_det_plus_k[k] = s_ld
+    end
+    A_Q = Matrix{Float64}(Symmetric(Q' * JWJ * Q))
+    b_Q = Q' * JWz
+    J_Q = J * Q
+    mu_base = mu .- J * beta
 
-        grad = laml_gradient(family, beta_fs, S_list, offsets,
-                             nknots_list, rho, n_p, H, sigma2)
-        hess = laml_hessian(family, beta_fs, S_list, offsets,
-                            nknots_list, rho, n_p, H, sigma2)
-
-        if verbose
-            println("LAML-Newton iter $iter: V=$(@sprintf("%.6e", V)) " *
-                    "|grad|=$(@sprintf("%.3e", norm(grad)))")
+    function _solve_HQ(rho_cand::AbstractVector)
+        w_lam = zeros(Float64, n_p)
+        @inbounds for k in 1:m
+            lam_k = exp(rho_cand[k])
+            off = offsets[k]
+            dk = d_blocks[k]
+            for j in eachindex(dk)
+                w_lam[off + j] = lam_k * dk[j]
+            end
         end
-
-        if norm(grad) < tol; break; end
-        if iter > 1 && abs(V - V_prev) < tol * max(1.0, abs(V)); break; end
-        V_prev = V
-
-        # Regularized Newton step
-        neg_hess = -hess
-        min_eig = minimum(eigvals(Symmetric(neg_hess)))
-        if min_eig < 1e-8
-            ridge = max(1e-8 - min_eig, 1e-6 * norm(neg_hess))
-            for i in 1:m; neg_hess[i, i] += ridge; end
+        H_Q = copy(A_Q)
+        @inbounds for i in 1:n_p
+            H_Q[i, i] += w_lam[i]
         end
-
-        delta = try
-            Symmetric(neg_hess) \ grad
-        catch
-            0.1 * grad
+        Hs, d_sqrt = _equilibrate_pd(H_Q; rel_ridge=0.0)
+        log_scale = 2.0 * sum(log, d_sqrt)
+        C = cholesky(Symmetric(Hs), check=false)
+        Hs_inv = nothing
+        ld_s = 0.0
+        if issuccess(C)
+            Hs_inv = inv(C)
+            ld_s = 2.0 * sum(log, diag(C.U))
+        else
+            for rr in (1e-14, 1e-12, 1e-10, 1e-8)
+                Hs2 = copy(Hs)
+                @inbounds for i in 1:n_p
+                    Hs2[i, i] += rr
+                end
+                C2 = cholesky(Symmetric(Hs2), check=false)
+                if issuccess(C2)
+                    Hs_inv = inv(C2)
+                    ld_s = 2.0 * sum(log, diag(C2.U))
+                    break
+                end
+            end
+            if Hs_inv === nothing
+                ef_h = eigen(Symmetric(Hs))
+                pos = filter(e -> e > 0, ef_h.values)
+                ld_s = isempty(pos) ? 0.0 : sum(log, pos)
+                Hs_inv = pinv(Hs)
+            end
         end
-
-        for k in 1:m
-            delta[k] = clamp(delta[k], -MAX_STEP, MAX_STEP)
+        H_Q_inv = Matrix{Float64}(undef, n_p, n_p)
+        @inbounds for j in 1:n_p
+            dj = d_sqrt[j]
+            for i in 1:n_p
+                H_Q_inv[i, j] = Hs_inv[i, j] / (d_sqrt[i] * dj)
+            end
         end
-
-        # Line search
-        step = 1.0
-        rho_new = clamp.(rho .+ step .* delta, RHO_MIN, RHO_MAX)
-        V_new = try
-            v, _, _, _ = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu_fs,
-                                         S_list, offsets, nknots_list, rho_new, n_p)
-            v
-        catch; -Inf end
-
-        for _ in 1:20
-            if isfinite(V_new) && V_new >= V; break; end
-            step *= 0.5
-            rho_new = clamp.(rho .+ step .* delta, RHO_MIN, RHO_MAX)
-            V_new = try
-                v, _, _, _ = laml_objective(family, beta_fs, J, W_irls, w_data, y, mu_fs,
-                                             S_list, offsets, nknots_list, rho_new, n_p)
-                v
-            catch; -Inf end
-        end
-
-        if !isfinite(V_new) || V_new < V; break; end
-        rho .= rho_new
+        return H_Q_inv, log_scale + ld_s, w_lam
     end
 
-    # Final EDF computation
-    theta = exp.(clamp.(rho, RHO_MIN, RHO_MAX))
-    S_lambda_final = build_S_lambda(S_list, offsets, nknots_list, log.(theta), n_p)
-    H_final = J' * Diagonal(W_irls) * J + S_lambda_final
-    H_inv = _safe_inv(H_final)
-    edf = tr(H_inv * (J' * Diagonal(W_irls) * J))
+    if n_newton > 0
+        # Phase 2 re-solves working β̂(ρ) = (JWJ + S_λ(ρ))⁻¹ JWz at every ρ
+        # in the orthogonal Q-basis and uses Wood (2011) Theorem 1's exact
+        # implicit-derivative Hessian.
+        Mp_raw = n_p - total_rank
+        free_idx = fixed_mask === nothing ? collect(1:m) : findall(!, fixed_mask)
+
+        function _eval_working_V(rho_cand)
+            HQi, ldH, w_lam = _solve_HQ(rho_cand)
+            beta_Q = HQi * b_Q
+            mu_c = mu_base .+ J_Q * beta_Q
+            dt_c = if family isa GaussianLikelihood
+                rss_c = 0.0
+                @inbounds for i in eachindex(y)
+                    _usable(y[i], w_data[i]) || continue
+                    rss_c += w_data[i] * (y[i] - mu_c[i])^2
+                end
+                rss_c
+            else
+                log_likelihood(family, y, mu_c, w_data)
+            end
+            pen_blocks = zeros(Float64, m)
+            pen_c = 0.0
+            lds = 0.0
+            @inbounds for l in 1:m
+                off = offsets[l]
+                nk = nknots_list[l]
+                pl = 0.0
+                for j in 1:nk
+                    idx = off + j
+                    pl += w_lam[idx] * beta_Q[idx]^2
+                end
+                pen_blocks[l] = pl
+                pen_c += pl
+                lds += ranks[l] * rho_cand[l] + log_det_plus_k[l]
+            end
+            if family isa GaussianLikelihood
+                sig2_c = max((dt_c + pen_c) / n_eff, 1e-30)
+                V_c = -0.5 * n_eff * log(sig2_c) + 0.5 * lds - 0.5 * ldH
+            else
+                sig2_c = 1.0
+                V_c = dt_c - 0.5 * pen_c + 0.5 * lds - 0.5 * ldH + 0.5 * Mp_raw * log(2π)
+            end
+            V_c, HQi, w_lam, beta_Q, pen_blocks, sig2_c
+        end
+
+        for iter in 1:min(n_newton, 20)
+            isempty(free_idx) && break
+            V, HQi, w_lam, beta_Q, pen_blocks, sigma2 = _eval_working_V(rho)
+            if !isfinite(V)
+                if verbose; println("LAML-Newton: non-finite V, stopping"); end
+                break
+            end
+
+            # Exact gradient and Wood (2011) Theorem 1 Hessian in the Q-basis
+            scale_inv = family isa GaussianLikelihood ? (1.0 / sigma2) : 1.0
+            grad_full = zeros(Float64, m)
+            tau_vec = zeros(Float64, m)
+            u_blocks = Vector{Vector{Float64}}(undef, m)
+            for k in 1:m
+                off = offsets[k]
+                nk = nknots_list[k]
+                tk = 0.0
+                uk = Vector{Float64}(undef, nk)
+                @inbounds for j in 1:nk
+                    idx = off + j
+                    tk += w_lam[idx] * HQi[idx, idx]
+                    uk[j] = w_lam[idx] * beta_Q[idx]
+                end
+                tau_vec[k] = tk
+                u_blocks[k] = uk
+                grad_full[k] = 0.5 * (ranks[k] - tk - scale_inv * pen_blocks[k])
+            end
+
+            hess_full = zeros(Float64, m, m)
+            for j in 1:m
+                oj = offsets[j]; nj = nknots_list[j]
+                uj = u_blocks[j]
+                for k in j:m
+                    ok = offsets[k]; nk = nknots_list[k]
+                    uk = u_blocks[k]
+                    # tr(H⁻¹ λ_j S_j H⁻¹ λ_k S_k) = Σ_{a∈Bj, b∈Bk} HQi[a,b]² w_lam[a] w_lam[b]
+                    tr_jk = 0.0
+                    imp_b = 0.0
+                    @inbounds for a in 1:nj
+                        ia = oj + a
+                        wa = w_lam[ia]
+                        wa == 0.0 && continue
+                        ua = uj[a]
+                        for b in 1:nk
+                            ib = ok + b
+                            wb = w_lam[ib]
+                            wb == 0.0 && continue
+                            hij = HQi[ia, ib]
+                            tr_jk += (hij * hij) * wa * wb
+                            imp_b += ua * hij * uk[b]
+                        end
+                    end
+                    hval = 0.5 * tr_jk + scale_inv * imp_b
+                    if j == k
+                        hval -= 0.5 * tau_vec[j] + 0.5 * scale_inv * pen_blocks[j]
+                    end
+                    if family isa GaussianLikelihood
+                        hval += (0.5 / (n_eff * sigma2^2)) * pen_blocks[j] * pen_blocks[k]
+                    end
+                    hess_full[j, k] = hval
+                    hess_full[k, j] = hval
+                end
+            end
+
+            grad = grad_full[free_idx]
+            hess = hess_full[free_idx, free_idx]
+
+            if verbose
+                println("LAML-Newton iter $iter: V=$(@sprintf("%.6e", V)) " *
+                        "|grad|=$(@sprintf("%.3e", norm(grad)))")
+            end
+
+            if norm(grad) < tol; break; end
+            if iter > 1 && abs(V - V_prev) < tol * max(1.0, abs(V)); break; end
+            V_prev = V
+
+            # Regularized Newton step on free coordinates
+            neg_hess = -hess
+            min_eig = minimum(eigvals(Symmetric(neg_hess)))
+            if min_eig < 1e-8
+                ridge = max(1e-8 - min_eig, 1e-6 * norm(neg_hess))
+                for i in eachindex(free_idx); neg_hess[i, i] += ridge; end
+            end
+
+            delta_free = try
+                Symmetric(neg_hess) \ grad
+            catch
+                0.1 * grad
+            end
+
+            delta = zeros(m)
+            for (fi, k) in enumerate(free_idx)
+                delta[k] = clamp(delta_free[fi], -MAX_STEP, MAX_STEP)
+            end
+
+            # Line search with re-solved working β̂(ρ_new)
+            step = 1.0
+            rho_new = clamp.(rho .+ step .* delta, RHO_MIN, RHO_MAX)
+            V_new = try; first(_eval_working_V(rho_new)); catch; -Inf end
+
+            for _ in 1:20
+                if isfinite(V_new) && V_new >= V; break; end
+                step *= 0.5
+                rho_new = clamp.(rho .+ step .* delta, RHO_MIN, RHO_MAX)
+                V_new = try; first(_eval_working_V(rho_new)); catch; -Inf end
+            end
+
+            if !isfinite(V_new) || V_new < V; break; end
+            rho .= rho_new
+        end
+    end
+
+    # Final EDF computation in the orthogonal Q-basis (exact even at λ ~ e^30)
+    rho_final = clamp.(rho, RHO_MIN, RHO_MAX)
+    theta = exp.(rho_final)
+    HQi_final, _, _ = _solve_HQ(rho_final)
+    edf = 0.0
+    @inbounds for j in 1:n_p, i in 1:n_p
+        edf += HQi_final[i, j] * A_Q[j, i]
+    end
 
     theta, edf
 end
@@ -848,22 +1151,56 @@ function _log_det_plus(S::AbstractMatrix)
     isempty(pos) ? 0.0 : sum(log, pos)
 end
 
-"""Log determinant of a positive definite matrix (with regularization)."""
+"""
+    _equilibrate_pd(H; rel_ridge=1e-12) -> (H_scaled, d_sqrt)
+
+Symmetrically diagonally equilibrate `H` via `D = diag(sqrt(max(|H_ii|, 1e-30)))`
+so that `H_scaled = D⁻¹ H D⁻¹ + rel_ridge * I` has unit diagonal scale.
+Prevents an O(1e14) heavily-penalized smooth block from contaminating O(1)
+blocks via an isotropic `1e-10 * maximum(diag(H))` ridge.
+"""
+function _equilibrate_pd(H::AbstractMatrix; rel_ridge::Float64=1e-12)
+    n = size(H, 1)
+    d_sqrt = Vector{Float64}(undef, n)
+    @inbounds for i in 1:n
+        d_sqrt[i] = sqrt(max(abs(Float64(H[i, i])), 1e-30))
+    end
+    Hs = Matrix{Float64}(undef, n, n)
+    @inbounds for j in 1:n
+        dj = d_sqrt[j]
+        for i in 1:n
+            Hs[i, j] = Float64(H[i, j]) / (d_sqrt[i] * dj)
+        end
+        Hs[j, j] += rel_ridge
+    end
+    return Hs, d_sqrt
+end
+
+"""Log determinant of a positive definite matrix (diagonally equilibrated)."""
 function _log_det_pd(H::AbstractMatrix)
     n = size(H, 1)
-    maxd = maximum(abs.(diag(H)))
-    H_reg = copy(H)
-    for i in 1:n
-        H_reg[i, i] += 1e-10 * maxd + 1e-15
+    n == 0 && return 0.0
+    # Try unridged equilibrated Cholesky FIRST (Wood 2011): preserves small
+    # spline null-space eigenvalues when λ_k ~ 1e12 without inflating log|H|.
+    Hs, d_sqrt = _equilibrate_pd(H; rel_ridge=0.0)
+    log_scale = 2.0 * sum(log, d_sqrt)
+    C = cholesky(Symmetric(Hs), check=false)
+    if issuccess(C)
+        return log_scale + 2.0 * sum(log, diag(C.U))
     end
-    try
-        C = cholesky(Symmetric(H_reg))
-        2.0 * sum(log.(diag(C.U)))
-    catch
-        evals = eigvals(Symmetric(H_reg))
-        pos = filter(e -> e > 0, evals)
-        isempty(pos) ? 0.0 : sum(log, pos)
+    for rr in (1e-14, 1e-12, 1e-10, 1e-8)
+        Hs2 = copy(Hs)
+        @inbounds for i in 1:n
+            Hs2[i, i] += rr
+        end
+        C2 = cholesky(Symmetric(Hs2), check=false)
+        if issuccess(C2)
+            return log_scale + 2.0 * sum(log, diag(C2.U))
+        end
     end
+    evals = eigvals(Symmetric(Hs))
+    pos = filter(e -> e > 0, evals)
+    log_scale + (isempty(pos) ? 0.0 : sum(log, pos))
 end
 
 """Rank of a penalty matrix (number of positive eigenvalues)."""
@@ -873,17 +1210,35 @@ function _rank_penalty(S::AbstractMatrix)
     count(e -> e > tol, evals)
 end
 
-"""Safe matrix inverse via Cholesky with regularization fallback."""
+"""Safe matrix inverse via diagonally equilibrated Cholesky with fallback."""
 function _safe_inv(H::AbstractMatrix)
     n = size(H, 1)
-    maxd = maximum(abs.(diag(H)))
-    H_reg = copy(H)
-    for i in 1:n
-        H_reg[i, i] += 1e-10 * maxd + 1e-15
+    n == 0 && return zeros(0, 0)
+    Hs, d_sqrt = _equilibrate_pd(H; rel_ridge=0.0)
+    C = cholesky(Symmetric(Hs), check=false)
+    Hs_inv = if issuccess(C)
+        inv(C)
+    else
+        found = nothing
+        for rr in (1e-14, 1e-12, 1e-10, 1e-8)
+            Hs2 = copy(Hs)
+            @inbounds for i in 1:n
+                Hs2[i, i] += rr
+            end
+            C2 = cholesky(Symmetric(Hs2), check=false)
+            if issuccess(C2)
+                found = inv(C2)
+                break
+            end
+        end
+        found === nothing ? pinv(Hs) : found
     end
-    try
-        inv(cholesky(Symmetric(H_reg)))
-    catch
-        pinv(H_reg)
+    H_inv = Matrix{Float64}(undef, n, n)
+    @inbounds for j in 1:n
+        dj = d_sqrt[j]
+        for i in 1:n
+            H_inv[i, j] = Hs_inv[i, j] / (d_sqrt[i] * dj)
+        end
     end
+    return H_inv
 end

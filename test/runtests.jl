@@ -28,7 +28,14 @@ if !isempty(ARGS)
                   "calibration-resume" => "calibration_resume.jl",
                   "calibration-checkpointed" => "calibration_checkpointed.jl",
                   "kan-multivariate" => "kan_multivariate.jl",
-                  "resilience" => "resilience.jl")
+                  "resilience" => "resilience.jl",
+                  "v03-bugfixes" => "v03_bugfixes.jl",
+                  "v03-performance" => "v03_performance.jl",
+                  "v03-api-ecosystem" => "v03_api_ecosystem.jl",
+                  "v03-faithfulness" => "v03_faithfulness.jl",
+                  "v03-features" => "v03_features.jl",
+                  "v03-vignettes" => "v03_vignettes.jl",
+                  "aqua" => "aqua.jl")
     all(haskey(groups, arg) for arg in ARGS) ||
         throw(ArgumentError("unknown test group; choose from " * join(sort!(collect(keys(groups))), ", ")))
     for group in unique(ARGS)
@@ -39,6 +46,7 @@ end
 
 using Test
 using PartiallySpecifiedModels
+using PartiallySpecifiedModels: penalty_matrix, penalty_blocks, nparams, initial_params, build_evaluator, band_domain
 using PartiallySpecifiedModels: solve
 using LinearAlgebra
 using MCMCChains
@@ -73,6 +81,13 @@ include("calibration_suite.jl")
 include("calibration_resume.jl")
 include("calibration_checkpointed.jl")
 include("resilience.jl")
+include("v03_bugfixes.jl")
+include("v03_performance.jl")
+include("v03_api_ecosystem.jl")
+include("v03_faithfulness.jl")
+include("v03_features.jl")
+include("v03_vignettes.jl")
+include("aqua.jl")
 
 # ─── Custom approximator for the "approximator extension protocol" testset ──
 # Struct and method definitions must live at top level; the tests themselves
@@ -274,22 +289,22 @@ end
         w = [1.0, 1.0, 1.0]
 
         # Gaussian
-        ll = PartiallySpecifiedModels.log_likelihood(Gaussian(), y, mu, w)
+        ll = PartiallySpecifiedModels.log_likelihood(GaussianLikelihood(), y, mu, w)
         @test ll < 0.0
-        wt = PartiallySpecifiedModels.irls_weights(Gaussian(), y, mu, w)
+        wt = PartiallySpecifiedModels.irls_weights(GaussianLikelihood(), y, mu, w)
         @test wt == w
 
         # Poisson
         y_p = [5.0, 10.0, 3.0]
         mu_p = [4.5, 11.0, 3.2]
-        ll_p = PartiallySpecifiedModels.log_likelihood(Poisson(), y_p, mu_p, w)
+        ll_p = PartiallySpecifiedModels.log_likelihood(PoissonLikelihood(), y_p, mu_p, w)
         @test isfinite(ll_p)
-        wt_p = PartiallySpecifiedModels.irls_weights(Poisson(), y_p, mu_p, w)
+        wt_p = PartiallySpecifiedModels.irls_weights(PoissonLikelihood(), y_p, mu_p, w)
         @test all(wt_p .> 0)
         @test wt_p ≈ 1.0 ./ mu_p  # identity link: W = 1/μ
 
         # NegBin
-        ll_nb = PartiallySpecifiedModels.log_likelihood(NegativeBinomial(5.0), y_p, mu_p, w)
+        ll_nb = PartiallySpecifiedModels.log_likelihood(NegativeBinomialLikelihood(5.0), y_p, mu_p, w)
         @test isfinite(ll_nb)
     end
 
@@ -300,7 +315,7 @@ end
         mu = [1.1, 2.1, 2.9]
         w = [1.0, 1.0, 1.0]
 
-        ll_builtin = PartiallySpecifiedModels.log_likelihood(Gaussian(), y, mu, w)
+        ll_builtin = PartiallySpecifiedModels.log_likelihood(GaussianLikelihood(), y, mu, w)
         ll_custom = PartiallySpecifiedModels.log_likelihood(custom_gauss, y, mu, w)
         @test ll_builtin ≈ ll_custom
 
@@ -387,7 +402,7 @@ end
         # slip, factor-of-two, or dropped term (all O(1) relative).
         y_g = sin.(xs) .+ 0.3 .* cos.(2.0 .* xs) .+ 0.05 .* sin.(37.0 .* (1:n))
         for rho in ([-2.0, 1.0], [0.0, 0.0], [3.0, -1.0], [5.0, 4.0])
-            g, gfd = fd_vs_analytic(Gaussian(), y_g, w, rho)
+            g, gfd = fd_vs_analytic(GaussianLikelihood(), y_g, w, rho)
             @test g ≈ gfd rtol=1e-3 atol=1e-6
         end
         # Non-Gaussian branch (unit scale, ℓ(β̂) − ½β̂'S^λβ̂ + …): identity
@@ -396,12 +411,12 @@ end
         y_p = round.(6.0 .+ 4.0 .* sin.(xs))
         W_p = 1.0 ./ max.(y_p, 1.0)
         for rho in ([-1.0, 0.5], [1.0, 1.0], [3.0, 0.0])
-            g, gfd = fd_vs_analytic(Poisson(), y_p, W_p, rho)
+            g, gfd = fd_vs_analytic(PoissonLikelihood(), y_p, W_p, rho)
             @test g ≈ gfd rtol=1e-3 atol=1e-6
         end
         # Sanity: V is not flat here, so a zero-returning stub gradient would
         # fail the comparisons above rather than pass them vacuously.
-        g0, _ = fd_vs_analytic(Gaussian(), y_g, w, [0.0, 0.0])
+        g0, _ = fd_vs_analytic(GaussianLikelihood(), y_g, w, [0.0, 0.0])
         @test norm(g0) > 1.0
     end
 
@@ -428,7 +443,7 @@ end
                           data_times=data_times,
                           data_values=data_values,
                           obs_to_state=[1],
-                          likelihood=Gaussian(),
+                          likelihood=GaussianLikelihood(),
                           solver=Tsit5())
 
         sol = solve(prob, LAML(maxiters=30, verbose=false))
@@ -457,7 +472,7 @@ end
             [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
             data_times=data_times, data_values=data_values,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=Gaussian(), solver=Tsit5(),
+            likelihood=GaussianLikelihood(), solver=Tsit5(),
             abstol=1e-8, reltol=1e-8, maxiters=10000)
 
         sol = solve(prob, CollocationLAML(
@@ -484,7 +499,7 @@ end
         end
         prob_dde = PSMProblem(dde_dyn!, [1.0], (0.0, 5.0), [approx_r()];
             data_times=data_times, data_values=data_values,
-            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5(),
+            obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5(),
             delays=[1.0], history=(p, t) -> [1.0])
         err = try
             solve(prob_dde, CollocationLAML(maxiters=5, verbose=false,
@@ -504,7 +519,7 @@ end
         end
         prob_bug = PSMProblem(buggy_colloc!, [1.0], (0.0, 5.0), [approx_r()];
             data_times=data_times, data_values=data_values,
-            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+            obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5())
         @test_throws UndefVarError solve(prob_bug,
             CollocationLAML(maxiters=5, verbose=false, n_continuation=2))
 
@@ -513,7 +528,7 @@ end
         end
         prob_oob = PSMProblem(oob_colloc!, [1.0], (0.0, 5.0), [approx_r()];
             data_times=data_times, data_values=data_values,
-            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+            obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5())
         @test_throws BoundsError solve(prob_oob,
             CollocationLAML(maxiters=5, verbose=false, n_continuation=2))
 
@@ -528,7 +543,7 @@ end
         end
         prob_expl = PSMProblem(explode_colloc!, [1.0], (0.0, 5.0), [approx_r()];
             data_times=data_times, data_values=data_values,
-            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+            obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5())
         local sol_expl
         logs, _ = Test.collect_test_logs() do
             sol_expl = solve(prob_expl, CollocationLAML(maxiters=5,
@@ -549,7 +564,7 @@ end
         prob_ok = PSMProblem((du, u, p, t) -> (du[1] = p.r(u[1]) * u[1]),
             [1.0], (0.0, 5.0), [approx_r()];
             data_times=data_times, data_values=data_values,
-            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+            obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5())
         sol_ok = solve(prob_ok, CollocationLAML(maxiters=10, verbose=false,
             n_continuation=2))
         @test all(t -> isfinite(t) && t > 0, sol_ok.smoothing_params)
@@ -570,7 +585,7 @@ end
         prob_bnd = PSMProblem(sqrt_colloc!, [0.5], (0.0, 5.0),
             [BSplineApproximator(:r, (0.0, 5.0), 5; initial=x -> 0.2)];
             data_times=bt, data_values=bv, obs_to_state=[1],
-            likelihood=Gaussian(), solver=Tsit5())
+            likelihood=GaussianLikelihood(), solver=Tsit5())
         beta_bnd = Float64[]
         for a in prob_bnd.approximators
             append!(beta_bnd, PartiallySpecifiedModels.initial_params(a))
@@ -630,7 +645,7 @@ end
             [GPApproximator(:r, (0.5, 5.0), 6; kernel=:matern52, initial=x -> 0.2)];
             data_times=data_times, data_values=data_values,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=Gaussian(), solver=Tsit5(),
+            likelihood=GaussianLikelihood(), solver=Tsit5(),
             abstol=1e-8, reltol=1e-8, maxiters=10000)
 
         sol = solve(prob, LAML(maxiters=60, verbose=false))
@@ -743,7 +758,7 @@ end
             [SPDEApproximator(:r, (0.5, 5.0), 8; nu=1.5, initial=x -> 0.2)];
             data_times=data_times, data_values=data_values,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=Gaussian(), solver=Tsit5(),
+            likelihood=GaussianLikelihood(), solver=Tsit5(),
             abstol=1e-8, reltol=1e-8, maxiters=10000)
 
         sol = solve(prob, LAML(maxiters=60, verbose=false))
@@ -898,7 +913,7 @@ end
                 nu=1.5, initial=x -> 0.2)];
             data_times=data_times, data_values=data_values,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=Gaussian(), solver=Tsit5(),
+            likelihood=GaussianLikelihood(), solver=Tsit5(),
             abstol=1e-8, reltol=1e-8, maxiters=10000)
 
         sol = solve(prob, LAML(maxiters=60, verbose=false))
@@ -920,7 +935,7 @@ end
                 nu=1.5, initial=x -> 0.2, penalty=:difference)];
             data_times=data_times, data_values=data_values,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=Gaussian(), solver=Tsit5(),
+            likelihood=GaussianLikelihood(), solver=Tsit5(),
             abstol=1e-8, reltol=1e-8, maxiters=10000)
         sol_d = solve(prob_d, LAML(maxiters=60, verbose=false))
         @test sol_d.data_loss < 1.0
@@ -944,7 +959,7 @@ end
             [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
             data_times=data_times, data_values=data_values,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=Gaussian(), solver=Tsit5(),
+            likelihood=GaussianLikelihood(), solver=Tsit5(),
             abstol=1e-8, reltol=1e-8, maxiters=10000)
 
         sol = solve(prob, GradientMatching(maxiters=50, verbose=false))
@@ -967,7 +982,7 @@ end
             [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
             data_times=data_times, data_values=data_values,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=Gaussian(), solver=Tsit5(),
+            likelihood=GaussianLikelihood(), solver=Tsit5(),
             abstol=1e-8, reltol=1e-8, maxiters=10000)
 
         sol = solve(prob, AdamSolver(maxiters=150, lr=0.01, verbose=false))
@@ -991,7 +1006,7 @@ end
             [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
             data_times=data_times, data_values=data_values,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=Gaussian(), solver=Tsit5(),
+            likelihood=GaussianLikelihood(), solver=Tsit5(),
             abstol=1e-8, reltol=1e-8, maxiters=10000)
 
         sol = solve(prob, MultipleShootingSolver(
@@ -1068,7 +1083,7 @@ end
         prob_agm = PSMProblem(relax_agm!, [1010.0], (0.0, 8.0), [uf_agm];
             data_times=t_agm, data_values=reshape(data_agm, :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_agm = solve(prob_agm, AdaptiveGradientMatching(maxiters=100, verbose=false))
         err_agm = maximum(abs(sol_agm.unknown_functions[:f](x) - f_relax(x))
                           for x in (1002.0, 1005.0, 1008.0))
@@ -1193,7 +1208,7 @@ end
             data_times=times_magi, data_values=data_magi,
             obs_to_state=[1],
             known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
 
         sol_magi = solve(prob_magi, MagiSolver(
             n_samples=50, n_warmup=50, n_gridpoints=50,
@@ -1215,8 +1230,8 @@ end
         y = [0.0, 3.0, 7.0]
         mu = [0.5, 2.5, 8.0]
         w = [1.0, 0.5, 2.0]
-        for fam in (Gaussian(), Poisson(), NegativeBinomial(5.0),
-                    TruncatedNormal(lower=0.0, sigma=1.0),
+        for fam in (GaussianLikelihood(), PoissonLikelihood(), NegativeBinomialLikelihood(5.0),
+                    TruncatedNormalLikelihood(lower=0.0, sigma=1.0),
                     CustomLikelihood((yy, m) -> -abs(yy - m)))
             ll_vec = PartiallySpecifiedModels.log_likelihood(fam, y, mu, w)
             ll_pt = sum(w[i] * PartiallySpecifiedModels.loglik_pointwise(
@@ -1246,7 +1261,7 @@ end
         prob_pmc = PSMProblem(exp_decay_pmc!, [200.0], (0.0, 10.0), [bs_pmc];
             data_times=times_pmc, data_values=reshape(y_pmc, :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=Poisson(), solver=Tsit5())
+            likelihood=PoissonLikelihood(), solver=Tsit5())
 
         sol_pmc = solve(prob_pmc, MCMCSolver(
             n_samples=50, n_warmup=25, verbose=false))
@@ -1278,7 +1293,7 @@ end
         prob_mgw_pois = PSMProblem(exp_decay_mgw!, [1.0], (0.0, 10.0), [bs_mgw];
             data_times=times_mgw, data_values=data_mgw,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=Poisson())
+            likelihood=PoissonLikelihood())
         @test_throws ErrorException solve(prob_mgw_pois, MagiSolver(verbose=false))
 
         # (ii)+(iii) weight-0 masking + explicit per-state sigma: corrupt one
@@ -1292,7 +1307,7 @@ end
         prob_mgw_mask = PSMProblem(exp_decay_mgw!, [1.0], (0.0, 10.0), [bs_mgw];
             data_times=times_mgw, data_values=data_bad, data_weights=w_mask,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         Random.seed!(9182)   # NUTS draws from the global RNG
         sol_mask = solve(prob_mgw_mask, MagiSolver(
             n_samples=50, n_warmup=50, n_gridpoints=50,
@@ -1330,7 +1345,7 @@ end
         prob_msl = PSMProblem(growth_msl!, [20.0], (0.0, 5.0), [bs_msl];
             data_times=t_msl, data_values=reshape(y_msl, :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=Poisson(), solver=Tsit5())
+            likelihood=PoissonLikelihood(), solver=Tsit5())
 
         # MultipleShooting: loss=:auto routes Poisson data to the Poisson
         # negative log-likelihood (previously silently fit Gaussian SSE).
@@ -1359,7 +1374,7 @@ end
         prob_msl_nb = PSMProblem(growth_msl!, [20.0], (0.0, 5.0), [bs_msl];
             data_times=t_msl, data_values=reshape(y_msl, :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=NegativeBinomial(5.0), solver=Tsit5())
+            likelihood=NegativeBinomialLikelihood(5.0), solver=Tsit5())
         @test_throws ErrorException solve(prob_msl_nb, MultipleShootingSolver())
 
         # penalty_weight > 0 smoke test (Gaussian data): finite objective
@@ -1368,7 +1383,7 @@ end
         prob_msg = PSMProblem(growth_msl!, [1.0], (0.0, 5.0), [bs_msg];
             data_times=t_msl, data_values=data_msg,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian(), solver=Tsit5())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood(), solver=Tsit5())
         sol_msp = solve(prob_msg, MultipleShootingSolver(
             n_intervals=3, maxiters_inner=20, maxiters_outer=2,
             rho_init=1.0, penalty_weight=1e-3, verbose=false))
@@ -1384,7 +1399,7 @@ end
         # the SSE (pre-fix :mse default reported SSE + penalty, O(10³) here
         # vs O(10²) for the full NLL)
         nll_dfp = -PartiallySpecifiedModels.log_likelihood(
-            Poisson(), vec(prob_msl.data_values), vec(sol_dfp.fitted_values),
+            PoissonLikelihood(), vec(prob_msl.data_values), vec(sol_dfp.fitted_values),
             vec(prob_msl.data_weights))
         beta_dfp = collect(sol_dfp.parameters)
         S_dfp = penalty_matrix(bs_msl)
@@ -1416,7 +1431,7 @@ end
         prob_vip = PSMProblem(exp_decay_vip!, [200.0], (0.0, 10.0), [bs_vip];
             data_times=times_vip, data_values=reshape(y_vip, :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=Poisson(), solver=Tsit5())
+            likelihood=PoissonLikelihood(), solver=Tsit5())
 
         sol_vip = solve(prob_vip, VariationalSolver(
             maxiters=400, n_elbo_samples=5, verbose=false))
@@ -1971,7 +1986,7 @@ end
             data_times=t_data, data_values=u_data,
             obs_to_state=[1],
             known_params=NamedTuple(),
-            likelihood=PSM.Gaussian())
+            likelihood=PSM.GaussianLikelihood())
 
         sol = solve(prob, AdamSolver(lr=0.01, maxiters=100))
 
@@ -1997,7 +2012,7 @@ end
         prob_seeded = PSMProblem(exp_decay!, [1.0], (0.0, 10.0), [uf_seeded];
             data_times=t_data, data_values=u_data,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PSM.Gaussian())
+            likelihood=PSM.GaussianLikelihood())
         r_init = PSM.build_comonet_evaluator(uf_seeded, initial_params(uf_seeded))
         err_init = maximum(abs(r_init(t) - 0.3) for t in 0.0:2.0:10.0)
         sol_seeded = solve(prob_seeded, AdamSolver(lr=0.01, maxiters=100))
@@ -2028,7 +2043,7 @@ end
         prob_bng = PSMProblem(logistic_bng!, [1.0], (0.0, 15.0), [uf_bng];
             data_times=t_bng, data_values=reshape(data_bng, :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_bng = solve(prob_bng, BNGSolver(maxiters=500, k_obs=4, k_proc=2,
                                             rng_seed=7, verbose=false))
 
@@ -2071,7 +2086,7 @@ end
         prob_dal = PSMProblem(decay_dal!, [5.0], (0.0, 10.0), [uf_dal];
             data_times=t_dal, data_values=reshape(max.(data_dal, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         # Runs on the auto-estimated obs_var (≈0.0195). This was previously
         # pinned to obs_var=0.01 because the uncalibrated DALTON objective
         # was unbounded above and the fit diverged for scattered obs_var
@@ -2112,7 +2127,7 @@ end
         prob_pm = PSMProblem(logistic_pm!, [1.0], (0.0, 15.0), [uf_pm];
             data_times=t_pm, data_values=reshape(max.(data_pm, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_pm = solve(prob_pm, PseudoMarginalSolver(
             n_samples=50, n_warmup=25, n_steps=50, verbose=false))
 
@@ -2161,7 +2176,7 @@ end
         prob_dde = PSMProblem(dde_decay!, [1.0], (0.0, 8.0), [uf_dde];
             data_times=t_dde, data_values=reshape(max.(data_dde, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian(),
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood(),
             delays=[1.0], history=h_dde)
 
         @test !isempty(prob_dde.delays)
@@ -2202,7 +2217,7 @@ end
             [1.0], (0.0, 10.0),
             [BSplineApproximator(:f, (0.0, 1.5), 6; initial=x -> 0.3x)];
             data_times=t_hf, data_values=d_hf, obs_to_state=[1],
-            likelihood=Gaussian(), delays=[1.0], history=h_hf)
+            likelihood=GaussianLikelihood(), delays=[1.0], history=h_hf)
 
         # (a) Every solver that cannot supply the delayed history says so.
         for alg in (GradientMatching(maxiters=5, verbose=false),
@@ -2303,7 +2318,7 @@ end
         prob_gcv = PSMProblem(logistic_gcv!, [1.0], (0.0, 15.0), [uf_gcv];
             data_times=t_gcv, data_values=reshape(max.(data_gcv, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_gcv = solve(prob_gcv, GCVSolver(maxiters=30, verbose=false))
 
         @test sol_gcv isa PSMSolution
@@ -2399,7 +2414,7 @@ end
         function f5_working(prob, beta)
             n_t = length(prob.data_times); n_o = length(prob.obs_to_state)
             n_d = n_t * n_o; n_pp = length(beta)
-            pred = PSM.simulate(prob, beta)
+            pred = PSM.simulate_psm(prob, beta)
             yv = zeros(n_d); wv = zeros(n_d); fv = zeros(n_d)
             local kk = 1
             for oi in 1:n_o, ti in 1:n_t
@@ -2439,7 +2454,7 @@ end
         prob_f5 = PSMProblem(f5_growth!, [1.0], (0.0, 12.0),
             [BSplineApproximator(:r, (0.5, 4.0), 8; initial=0.10)];
             data_times=dt_f5, data_values=dv_f5, obs_to_state=[1],
-            likelihood=Gaussian())
+            likelihood=GaussianLikelihood())
         np_f5 = 8
         btrue_f5 = fill(0.10, np_f5)
         J_f5, z_f5, w_f5 = f5_working(prob_f5, btrue_f5)
@@ -2494,7 +2509,7 @@ end
         prob_f5b = PSMProblem(f5_growth!, [1.1], (0.0, 12.0),
             [BSplineApproximator(:r, (0.5, 4.0), 8)];   # default x -> 0
             data_times=dt_f5, data_values=dv_f5, obs_to_state=[1],
-            likelihood=Gaussian())
+            likelihood=GaussianLikelihood())
         beta0_f5b = PSM.build_initial_params(prob_f5b)
         @test all(iszero, beta0_f5b)
         J_f5b, z_f5b, w_f5b = f5_working(prob_f5b, beta0_f5b)
@@ -2559,7 +2574,7 @@ end
             [BSplineApproximator(:r, (5.0, 60.0), 6; initial=0.5),
              BSplineApproximator(:δ, (5.0, 60.0), 6; initial=0.25)];
             data_times=dt_lv5, data_values=dv_lv5, obs_to_state=[1, 2],
-            known_params=(α=0.01,), likelihood=Gaussian())
+            known_params=(α=0.01,), likelihood=GaussianLikelihood())
         b0_lv5 = PSM.build_initial_params(prob_lv5)
         J_lv5, z_lv5, w_lv5 = f5_working(prob_lv5, b0_lv5)
         C_lv5 = PSM.penalty_sqrt_matrix(f5_B(prob_lv5, [2.56, 4.832e9], 12))
@@ -2589,7 +2604,7 @@ end
         wv_lv5 = [prob_lv5.data_weights[ti, oi] for oi in 1:2 for ti in 1:7]
         function lv5_obj(b, Bm)
             ft = try
-                pred = PSM.simulate(prob_lv5, b)
+                pred = PSM.simulate_psm(prob_lv5, b)
                 [pred[ti, oi] for oi in 1:2 for ti in 1:7]
             catch; return Inf; end
             any(!isfinite, ft) && return Inf
@@ -2636,7 +2651,7 @@ end
         #    exactly.
         function f5_obj(b, Bm)
             ft = try
-                pred = PSM.simulate(prob_f5, b); [pred[ti, 1] for ti in 1:12]
+                pred = PSM.simulate_psm(prob_f5, b); [pred[ti, 1] for ti in 1:12]
             catch; return Inf; end
             any(!isfinite, ft) && return Inf
             -PSM.log_likelihood(prob_f5.likelihood,
@@ -2685,7 +2700,7 @@ end
         prob_ts = PSMProblem(logistic_ts!, [1.0], (0.0, 15.0), [uf_ts];
             data_times=t_ts, data_values=reshape(max.(data_ts, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_ts = solve(prob_ts, TwoStageSolver(maxiters=500, verbose=false))
 
         @test sol_ts isa PSMSolution
@@ -2709,7 +2724,7 @@ end
         prob_df = PSMProblem(decay_df!, [5.0], (0.0, 10.0), [uf_df];
             data_times=t_df, data_values=reshape(max.(data_df, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_df = solve(prob_df, DerivativeFreeSolver(maxiters=5000, verbose=false))
 
         @test sol_df isa PSMSolution
@@ -2734,7 +2749,7 @@ end
         prob_vi = PSMProblem(logistic_vi!, [1.0], (0.0, 15.0), [uf_vi];
             data_times=t_vi, data_values=reshape(max.(data_vi, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_vi = solve(prob_vi, VariationalSolver(maxiters=500, n_elbo_samples=5, verbose=false))
 
         @test sol_vi isa PSMSolution
@@ -2782,7 +2797,7 @@ end
             [BSplineApproximator(:r, (0.0, 12.0), 6)];
             data_times=t_vi, data_values=dv_vim, data_weights=w_vim,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_vim = solve(prob_vim,
             VariationalSolver(maxiters=500, n_elbo_samples=5, verbose=false))
         @test isfinite(sol_vim.objective)
@@ -2820,7 +2835,7 @@ end
         prob_abc = PSMProblem(decay_abc!, [5.0], (0.0, 10.0), [uf_abc];
             data_times=t_abc, data_values=reshape(max.(data_abc, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_abc = solve(prob_abc, ABCSolver(n_particles=100, n_generations=6, verbose=false))
 
         @test sol_abc isa PSMSolution
@@ -2858,7 +2873,7 @@ end
         prob_sd = PSMProblem(decay_seed!, [5.0], (0.0, 8.0), [uf_sd];
             data_times=t_sd, data_values=data_sd, obs_to_state=[1],
             known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
 
         # same seed → identical; explicit 42 ≡ the default
         eki = (seed; kw...) -> solve(prob_sd, EnsembleKalmanSolver(
@@ -2904,7 +2919,7 @@ end
         prob_abcn = PSMProblem(decay_abcn!, [5.0], (0.0, 10.0), [uf_abcn];
             data_times=t_abcn, data_values=d_abcn, data_weights=w_abcn,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         Random.seed!(7)
         sol_abcn = solve(prob_abcn, ABCSolver(n_particles=100,
                                               n_generations=6, verbose=false))
@@ -2969,7 +2984,7 @@ end
         prob_rick = PSMProblem(ricker!, [N0], (0.0, Float64(T_end)), [uf_rick];
             data_times=t_rick, data_values=reshape(max.(data_rick, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian(), discrete=true)
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood(), discrete=true)
 
         # Accuracy on the discrete path for each solver (true r(5) = 0.25;
         # all four recover it to ~0.002 on this seeded data)
@@ -3038,7 +3053,7 @@ end
         prob = PSMProblem(decay!, u0, tspan, [uf];
             data_times=t_obs, data_values=Float64.(data),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
 
         result = optimize_spde_range(prob, LAML(maxiters=50, verbose=false);
             range_multipliers=[0.5, 1.0, 2.0], verbose=false)
@@ -3118,8 +3133,8 @@ end
         end
 
         @testset "appraise" begin
-            using PartiallySpecifiedModels: appraise
-            diag = appraise(sol)
+            using PartiallySpecifiedModels: psm_appraise
+            diag = psm_appraise(sol)
             n = length(sol.data_times) * size(sol.data_values, 2)
             @test length(diag.residuals) == n
             @test length(diag.fitted) == n
@@ -3136,18 +3151,18 @@ end
             mu = [4.5, 11.0, 18.0, 55.0]
 
             # Gaussian: just y - mu
-            dr_g = deviance_residuals(Gaussian(), y, mu)
+            dr_g = deviance_residuals(GaussianLikelihood(), y, mu)
             @test dr_g ≈ y .- mu
 
             # Poisson: sign(y-mu) * sqrt(2(y*log(y/mu) - (y-mu)))
-            dr_p = deviance_residuals(Poisson(), y, mu)
+            dr_p = deviance_residuals(PoissonLikelihood(), y, mu)
             @test length(dr_p) == 4
             @test all(isfinite, dr_p)
             @test sign(dr_p[1]) == sign(y[1] - mu[1])
             @test sign(dr_p[2]) == sign(y[2] - mu[2])
 
             # NegativeBinomial
-            dr_nb = deviance_residuals(NegativeBinomial(10.0), y, mu)
+            dr_nb = deviance_residuals(NegativeBinomialLikelihood(10.0), y, mu)
             @test length(dr_nb) == 4
             @test all(isfinite, dr_nb)
 
@@ -3158,7 +3173,7 @@ end
             # correctly-specified truncated fit report residuals with a
             # systematic positive mean, which ACF/Durbin-Watson then read as
             # structure. Fixed with the N1 working-residual batch.
-            fam_tn = TruncatedNormal()
+            fam_tn = TruncatedNormalLikelihood()
             dr_tn = deviance_residuals(fam_tn, y, mu)
             @test dr_tn ≈ y .- PartiallySpecifiedModels._family_mean.(Ref(fam_tn), mu)
             # and it is genuinely different from the Gaussian centring here
@@ -3168,7 +3183,7 @@ end
             @test deviance_residuals(fam_tn, y, mu_far) ≈ y .- mu_far atol=1e-8
 
             # appraise with Poisson family
-            diag_p = appraise(sol; family=Poisson())
+            diag_p = psm_appraise(sol; family=PoissonLikelihood())
             @test length(diag_p.residuals) == length(sol.data_times)
             @test all(isfinite, diag_p.residuals)
         end
@@ -3227,11 +3242,11 @@ end
 
     @testset "TruncatedNormal likelihood" begin
         @testset "construction" begin
-            tn = TruncatedNormal()
+            tn = TruncatedNormalLikelihood()
             @test tn.lower == 0.0
             @test tn.sigma == 1.0
 
-            tn2 = TruncatedNormal(sigma=5.0, lower=-1.0)
+            tn2 = TruncatedNormalLikelihood(sigma=5.0, lower=-1.0)
             @test tn2.lower == -1.0
             @test tn2.sigma == 5.0
         end
@@ -3241,13 +3256,13 @@ end
             y = [1.0, 2.0, 5.0]
             mu = [1.5, 2.5, 4.0]
             w = ones(3)
-            ll = log_likelihood(TruncatedNormal(sigma=1.0), y, mu, w)
+            ll = log_likelihood(TruncatedNormalLikelihood(sigma=1.0), y, mu, w)
             @test isfinite(ll)
             @test ll < 0.0  # log-likelihood is negative
 
             # Higher sigma → less peaked → lower (more negative) log-lik per point
             # but broader coverage — just check finite
-            ll2 = log_likelihood(TruncatedNormal(sigma=5.0), y, mu, w)
+            ll2 = log_likelihood(TruncatedNormalLikelihood(sigma=5.0), y, mu, w)
             @test isfinite(ll2)
         end
 
@@ -3256,7 +3271,7 @@ end
             y = [1.0, 3.0, 10.0]
             mu = [1.5, 2.5, 9.0]
             w = ones(3)
-            wi = irls_weights(TruncatedNormal(sigma=2.0), y, mu, w)
+            wi = irls_weights(TruncatedNormalLikelihood(sigma=2.0), y, mu, w)
             @test length(wi) == 3
             @test all(wi .> 0)
             @test all(isfinite, wi)
@@ -3268,7 +3283,7 @@ end
             # reproduce the analytic information used as the IRLS weight,
             # including at ξ < 0 where the old (1 + ξλ - λ²) formula went
             # negative and was clamped to 1e-10.
-            fam = TruncatedNormal(sigma=1.0, lower=0.0)
+            fam = TruncatedNormalLikelihood(sigma=1.0, lower=0.0)
             h = 1e-4
             for μ in (-1.0, 0.3, 1.0, 2.5)   # ξ = μ/σ spans negative and positive
                 y = [max(μ, 0.1) + 0.2]      # any y ≥ lower; info is y-free
@@ -3326,12 +3341,12 @@ end
             # with the per-observation metric; 2.6e-16 for NegativeBinomial with
             # the scaled one).
             mu_g = [0.5, 1.0, 2.0, 3.0, 5.0, 8.0]
-            @test score_err_scaled(Gaussian(), mu_g .+ 0.3, mu_g, w) < 1e-12
-            @test score_err_scaled(Poisson(), round.(mu_g .* 1.2), mu_g, w) < 1e-12
-            @test score_err_scaled(NegativeBinomial(3.0), round.(mu_g .* 1.2), mu_g, w) < 1e-12
+            @test score_err_scaled(GaussianLikelihood(), mu_g .+ 0.3, mu_g, w) < 1e-12
+            @test score_err_scaled(PoissonLikelihood(), round.(mu_g .* 1.2), mu_g, w) < 1e-12
+            @test score_err_scaled(NegativeBinomialLikelihood(3.0), round.(mu_g .* 1.2), mu_g, w) < 1e-12
 
             # TruncatedNormal across the range where the bound bites.
-            fam = TruncatedNormal(sigma=1.0, lower=0.0)
+            fam = TruncatedNormalLikelihood(sigma=1.0, lower=0.0)
             mu_t = [-1.0, 0.0, 0.5, 1.0, 2.0, 4.0]
             # This 1e-5 gate originally allowed the CDF approximation's
             # measured 1.55e-7 error (65x headroom). Stable tail moments now
@@ -3361,10 +3376,10 @@ end
             # byte-for-byte pre-fix arithmetic, since the whole "no-op
             # elsewhere" claim rests on it.
             let mu = [0.7, 1.3, 2.9], y = [1.0, 1.0, 3.0], w1 = ones(3)
-                for fam2 in (Gaussian(), Poisson(), NegativeBinomial(4.0))
+                for fam2 in (GaussianLikelihood(), PoissonLikelihood(), NegativeBinomialLikelihood(4.0))
                     @test all(PSM._working_residual(fam2, y, mu, w1) .=== (y .- mu))
                 end
-                @test !all(PSM._working_residual(TruncatedNormal(), y, mu, w1) .=== (y .- mu))
+                @test !all(PSM._working_residual(TruncatedNormalLikelihood(), y, mu, w1) .=== (y .- mu))
             end
 
             # CustomLikelihood is the OTHER family whose score is not
@@ -3390,7 +3405,7 @@ end
             # they are used by different solvers (pseudodata vs collocation
             # rows) and drifting apart is this package's signature defect.
             let mu = [0.2, 0.9, 2.5], y = [0.4, 1.4, 2.0], w1 = ones(3)
-                for fam2 in (Gaussian(), Poisson(), TruncatedNormal(sigma=1.5, lower=0.0))
+                for fam2 in (GaussianLikelihood(), PoissonLikelihood(), TruncatedNormalLikelihood(sigma=1.5, lower=0.0))
                     @test PSM._working_residual(fam2, y, mu, w1) ==
                           PSM._working_residual_scalar.(Ref(fam2), y, mu)
                 end
@@ -3408,7 +3423,7 @@ end
             rng = StableRNG(4242)
             N = 20_000
             σ, a = 1.0, 0.0
-            fam = TruncatedNormal(sigma=σ, lower=a)
+            fam = TruncatedNormalLikelihood(sigma=σ, lower=a)
             for (ξ, old_min_se) in ((0.0, 15.0), (0.5, 15.0), (1.0, 15.0),
                                     (2.0, 4.0), (4.0, 0.0))
                 mu = a + σ * ξ
@@ -3468,7 +3483,7 @@ end
                 v
             end
             @test 0.2 < minimum(mu_true) / σ < 0.4     # truncation really bites
-            fam = TruncatedNormal(sigma=σ, lower=a)
+            fam = TruncatedNormalLikelihood(sigma=σ, lower=a)
 
             dyn!(du, u, p, t) = (du[1] = -max(p.k(u[1]), 0.0) * u[1])
             uf = BSplineApproximator(:k, (0.0, 11.0), 6; initial=x -> 0.15 + 0.02x)
@@ -3554,7 +3569,7 @@ end
             prob = PSMProblem(sir_tn!, [990.0, 10.0, 0.0], (0.0, 40.0), [uf];
                 data_times=sol_true.t, data_values=reshape(I_data, :, 1),
                 obs_to_state=[2], known_params=NamedTuple(),
-                likelihood=TruncatedNormal(sigma=5.0), solver=Tsit5())
+                likelihood=TruncatedNormalLikelihood(sigma=5.0), solver=Tsit5())
             # This is a strongly nonlinear problem (ODE-coupled transmission
             # rate fit through a B-spline): per the LAML docstring, use a
             # longer `warmup` so coefficients stabilise before the smoothing
@@ -3813,14 +3828,14 @@ end
 
         lam_pure, edf_pure = estimate_smoothing_params(
             J_spline, w, w, y, mu0, beta0, [S], [0], [nk], nk;
-            family=Gaussian(), maxiter=50)
+            family=GaussianLikelihood(), maxiter=50)
 
         n_extra = 30
         J_mixed = hcat(J_spline, zeros(n, n_extra))
         beta0m = vcat(beta0, zeros(n_extra))
         lam_mixed, edf_mixed = estimate_smoothing_params(
             J_mixed, w, w, y, mu0, beta0m, [S], [0], [nk], nk + n_extra;
-            family=Gaussian(), maxiter=50)
+            family=GaussianLikelihood(), maxiter=50)
 
         @test lam_mixed[1] ≈ lam_pure[1] rtol=1e-8
         @test edf_mixed ≈ edf_pure rtol=1e-8
@@ -3878,7 +3893,7 @@ end
             beta = _safe_inv(Jfull' * Diagonal(w_rd) * Jfull + S_lam) *
                    (Jfull' * (w_rd .* y_rd))
             mu = Jfull * beta
-            _, _, S_l, s2 = laml_objective(Gaussian(), beta, Jfull, w_rd,
+            _, _, S_l, s2 = laml_objective(GaussianLikelihood(), beta, Jfull, w_rd,
                                            w_rd, y_rd, mu, [S_rd], [0], [nk],
                                            rho, n_p_rd)
             RSS = sum(w_rd[i] * (y_rd[i] - mu[i])^2 for i in 1:n)
@@ -3931,7 +3946,7 @@ end
                           [approx_r, approx_d];
                           data_times=dtimes, data_values=dvals,
                           obs_to_state=[1, 2], known_params=(α=0.01,),
-                          likelihood=Gaussian(), solver=Tsit5())
+                          likelihood=GaussianLikelihood(), solver=Tsit5())
 
         # The over-parameterization advisory must fire (rank-based residual
         # dof = 14 − 9 = 5 < 10)
@@ -3991,7 +4006,7 @@ end
         prob = PSMProblem(sir_pois!, [990.0, 10.0, 0.0], (0.0, 40.0), [uf];
             data_times=sol_true.t, data_values=reshape(y_pois, :, 1),
             obs_to_state=[2], known_params=NamedTuple(),
-            likelihood=Poisson(), solver=Tsit5())
+            likelihood=PoissonLikelihood(), solver=Tsit5())
         # warmup=10: see the identical rationale on the TruncatedNormal
         # test above -- this is the same class of strongly nonlinear
         # ODE+B-spline fit.
@@ -4075,7 +4090,7 @@ end
         uf_nb2 = BSplineApproximator(:r, (10.0, 420.0), 6; initial=x -> 0.3)
         prob_nb2 = PSMProblem(logistic_nb!, [20.0], (0.0, 20.0), [uf_nb2];
             data_times=t_nb, data_values=reshape(y_nb, :, 1), obs_to_state=[1],
-            known_params=NamedTuple(), likelihood=NegativeBinomial(theta_nb),
+            known_params=NamedTuple(), likelihood=NegativeBinomialLikelihood(theta_nb),
             solver=Tsit5())
         sol_nb2 = solve(prob_nb2, LAML(maxiters=60, verbose=false))
 
@@ -4215,7 +4230,7 @@ end
             prob_p = PSMProblem(sir_bs_pois!, [990.0,10.0,0.0], (0.0,40.0), [uf];
                 data_times=sol_ode.t, data_values=reshape(y_pois,:,1),
                 obs_to_state=[2], known_params=NamedTuple(),
-                likelihood=Poisson(), solver=Tsit5())
+                likelihood=PoissonLikelihood(), solver=Tsit5())
             sol_p = solve(prob_p, LAML(maxiters=80, verbose=false))
 
             bs = bootstrap(sol_p, prob_p, LAML(maxiters=80, verbose=false);
@@ -4233,7 +4248,7 @@ end
             prob_nb = PSMProblem(logistic_bs!, [1.0], (0.0, 15.0), [uf_nb];
                 data_times=t_obs, data_values=data_pos,
                 obs_to_state=[1], known_params=NamedTuple(),
-                likelihood=NegativeBinomial(10.0), solver=Tsit5())
+                likelihood=NegativeBinomialLikelihood(10.0), solver=Tsit5())
             sol_nb = solve(prob_nb, LAML(maxiters=50, verbose=false))
             bs_nb = bootstrap(sol_nb, prob_nb, LAML(maxiters=50, verbose=false);
                 nboot=10, method=:parametric, rng=Random.Xoshiro(7))
@@ -4283,7 +4298,7 @@ end
         prob_im = PSMProblem(logistic_im!, [1.0], (0.0, 15.0), [uf_im];
             data_times=t_im, data_values=reshape(max.(data_im, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_im = solve(prob_im, IntegralMatchingSolver(maxiters=500, verbose=false))
 
         @test sol_im isa PSMSolution
@@ -4309,7 +4324,7 @@ end
         prob_ek = PSMProblem(decay_ek!, [5.0], (0.0, 10.0), [uf_ek];
             data_times=t_ek, data_values=reshape(max.(data_ek, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_ek = solve(prob_ek, EnsembleKalmanSolver(n_ensemble=30, n_iterations=15, verbose=false))
 
         @test sol_ek isa PSMSolution
@@ -4345,7 +4360,7 @@ end
         prob_ekd = PSMProblem(decmap_ek!, [N0_ek], (0.0, 20.0), [uf_ekd];
             data_times=t_gap, data_values=reshape(max.(data_gap, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian(), discrete=true)
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood(), discrete=true)
         sol_ekd = solve(prob_ekd,
             EnsembleKalmanSolver(n_ensemble=40, n_iterations=20, verbose=false))
 
@@ -4387,12 +4402,12 @@ end
             [BSplineApproximator(:r, (0.0, 12.0), 8)];
             data_times=t_nl, data_values=dvals_nl,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         prob_nl2 = PSMProblem(nl2_gm!, [1.0, 1.0], (0.0, 15.0),
             [BSplineApproximator(:r, (0.0, 12.0), 8)];
             data_times=t_nl, data_values=dvals_nl,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_nl1 = solve(prob_nl1, GradientMatching(maxiters=30, tol=0.0, verbose=false))
         sol_nl2 = solve(prob_nl2, GradientMatching(maxiters=30, tol=0.0, verbose=false))
 
@@ -4427,7 +4442,7 @@ end
         prob_od = PSMProblem(logistic_od!, [1.0], (0.0, 15.0), [uf_od];
             data_times=t_od, data_values=reshape(max.(data_od, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_od = solve(prob_od, ODINSolver(maxiters=20, verbose=false))
 
         @test sol_od isa PSMSolution
@@ -4444,7 +4459,7 @@ end
         prob_odw = PSMProblem(logistic_od!, [1.0], (0.0, 15.0), [uf_od];
             data_times=t_od, data_values=reshape(max.(data_od, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian(), data_weights=w_od)
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood(), data_weights=w_od)
         sol_odw = solve(prob_odw, ODINSolver(maxiters=10, verbose=false))
         @test isapprox(sol_odw.data_loss,
                        sum(w_od .* abs2.(prob_odw.data_values .- sol_odw.fitted_values));
@@ -4469,7 +4484,7 @@ end
         prob_osc = PSMProblem(osc_od!, [1.5, 0.0], (0.0, 8.0), [uf_osc];
             data_times=t_osc, data_values=reshape(data_osc, :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_osc = solve(prob_osc, ODINSolver(maxiters=60, verbose=false))
 
         errs = [abs(sol_osc.unknown_functions[:k](x) - k_osc(x))
@@ -4493,7 +4508,7 @@ end
         prob_rk = PSMProblem(decay_rk!, [5.0], (0.0, 10.0), [uf_rk];
             data_times=t_rk, data_values=reshape(max.(data_rk, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_rk = solve(prob_rk, RKHSSolver(maxiters=500, n_repr_points=10,
                                             kernel=:rbf, verbose=false))
 
@@ -4526,7 +4541,7 @@ end
             [BSplineApproximator(:k, (-2.0, 2.0), 7)];
             data_times=t_ork, data_values=reshape(data_ork, :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_ork = solve(prob_ork, RKHSSolver(maxiters=400, verbose=false))
 
         errs = [abs(sol_ork.unknown_functions[:k](x) - k_rkhs(x))
@@ -4539,7 +4554,7 @@ end
             data_times=collect(0.0:1.0:5.0),
             data_values=reshape(ones(6), :, 1), obs_to_state=[1],
             known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian(), discrete=true)
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood(), discrete=true)
         @test_throws Exception solve(prob_disc, RKHSSolver())
     end
 
@@ -4559,7 +4574,7 @@ end
         prob_pl = PSMProblem(logistic_pl!, [1.0], (0.0, 15.0), [uf_pl];
             data_times=t_pl, data_values=reshape(max.(data_pl, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         # Profile only first 2 parameters to keep test fast
         sol_pl = solve(prob_pl, ProfileLikelihoodSolver(
             n_profile_points=10, param_indices=[1, 2], verbose=false))
@@ -4598,7 +4613,7 @@ end
             [BSplineApproximator(:r, (0.5, 6.0), 5; initial=x -> 0.3),
              BSplineApproximator(:g, (0.5, 6.0), 5; initial=x -> 0.03x)];
             data_times=tt, data_values=dv, obs_to_state=[1],
-            known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+            known_params=NamedTuple(), likelihood=GaussianLikelihood(), solver=Tsit5())
         sol2 = solve(prob2, LAML(maxiters=60, verbose=false))
         @test haskey(sol2.unknown_functions, :r)
         @test haskey(sol2.unknown_functions, :g)
@@ -4631,7 +4646,7 @@ end
                                                  initial=0.25)];  # away from β(0.05)≈0.39
             data_times=collect(st.t), data_values=data,
             obs_to_state=[1, 2], known_params=(γ=0.25,),
-            likelihood=Gaussian(), solver=Tsit5())
+            likelihood=GaussianLikelihood(), solver=Tsit5())
         # THIS TESTSET'S CLAIM IS THE PLUMBING, NOT THE FIT. It asks whether
         # `known_params` reaches the dynamics alongside an approximator, so
         # that is what is asserted: two problems differing ONLY in gamma must
@@ -4661,7 +4676,7 @@ end
                                                  initial=0.25)];
             data_times=collect(st.t), data_values=data,
             obs_to_state=[1, 2], known_params=(γ=0.50,),
-            likelihood=Gaussian(), solver=Tsit5())
+            likelihood=GaussianLikelihood(), solver=Tsit5())
         sol_g2 = solve(prob_g2, LAML(maxiters=50, verbose=false))
         # gamma genuinely reaches `p.γ` in the dynamics. That -- and only
         # that -- is what this testset claims.
@@ -4685,7 +4700,7 @@ end
             [BSplineApproximator(:β, (0.0, 0.15), 6)];
             data_times=collect(st.t), data_values=data,
             obs_to_state=[1, 2], known_params=(β=0.5,),
-            likelihood=Gaussian(), solver=Tsit5())
+            likelihood=GaussianLikelihood(), solver=Tsit5())
     end
 
     @testset "CustomLikelihood end-to-end matches Gaussian" begin
@@ -4697,7 +4712,7 @@ end
             [BSplineApproximator(:r, (0.5, 5.0), 5; initial=x -> 0.25)];
             data_times=tt, data_values=dv, obs_to_state=[1],
             known_params=NamedTuple(), likelihood=lik, solver=Tsit5())
-        sol_g = solve(mk_cl(Gaussian()), LAML(maxiters=40, verbose=false))
+        sol_g = solve(mk_cl(GaussianLikelihood()), LAML(maxiters=40, verbose=false))
         # CustomLikelihood with the Gaussian kernel drives the same IRLS
         cl = CustomLikelihood((y, mu) -> -0.5 * (y - mu)^2)
         sol_c = solve(mk_cl(cl), LAML(maxiters=40, verbose=false))
@@ -4728,7 +4743,7 @@ end
             [BSplineApproximator(:r, (0.5, 5.0), 5; initial=x -> 0.15)];
             data_times=tt, data_values=data, data_weights=w,
             obs_to_state=[2, 1], known_params=NamedTuple(),
-            likelihood=Gaussian(), solver=Tsit5())
+            likelihood=GaussianLikelihood(), solver=Tsit5())
         sol = solve(prob, LAML(maxiters=50, verbose=false))
         # masked outliers must not derail the fit; permuted mapping honored
         @test abs(sol.unknown_functions[:r](2.0) - 0.3) < 0.1
@@ -4742,7 +4757,7 @@ end
         prob = PSMProblem(growth_cb!, [1.0], (0.0, 5.0),
             [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.25)];
             data_times=tt, data_values=dv, obs_to_state=[1],
-            known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+            known_params=NamedTuple(), likelihood=GaussianLikelihood(), solver=Tsit5())
         sol = solve(prob, LAML(maxiters=50, verbose=false))
         bands = confidence_band(sol, prob; level=0.95)
         @test haskey(bands, :r)
@@ -4792,7 +4807,7 @@ end
         prob = PSMProblem(growth_ad!, [1.0], (0.0, 4.0),
             [BSplineApproximator(:r, (0.5, 4.5), 5; initial=x -> 0.25)];
             data_times=tt, data_values=dv, obs_to_state=[1],
-            known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+            known_params=NamedTuple(), likelihood=GaussianLikelihood(), solver=Tsit5())
         β0 = collect(PartiallySpecifiedModels.initial_params(prob.approximators[1]))
         L(β) = adam_loss_mse(prob, β)
         g_ad = ForwardDiff.gradient(L, β0)
@@ -4818,7 +4833,7 @@ end
         @test g_a.adapt
         prob_a = PSMProblem(growth_gp!, [0.8], (0.0, 6.0), [g_a];
             data_times=tt, data_values=dv, obs_to_state=[1],
-            known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+            known_params=NamedTuple(), likelihood=GaussianLikelihood(), solver=Tsit5())
         sol_a = solve(prob_a, LAML(maxiters=60, verbose=false))
         @test g_a.lengthscale != ℓ0                 # adaptation ran
         errs = [abs(sol_a.unknown_functions[:r](x) - rtrue_gp(x))
@@ -4829,7 +4844,7 @@ end
         @test !g_f.adapt
         prob_f = PSMProblem(growth_gp!, [0.8], (0.0, 6.0), [g_f];
             data_times=tt, data_values=dv, obs_to_state=[1],
-            known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+            known_params=NamedTuple(), likelihood=GaussianLikelihood(), solver=Tsit5())
         solve(prob_f, LAML(maxiters=30, verbose=false))
         @test g_f.lengthscale == 1.0
     end
@@ -4841,16 +4856,16 @@ end
         prob = PSMProblem(growth_sp!, [1.0], (0.0, 3.0),
             [BSplineApproximator(:r, (0.5, 3.5), 5; initial=x -> 0.3)];
             data_times=tt, data_values=dv, obs_to_state=[1],
-            known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+            known_params=NamedTuple(), likelihood=GaussianLikelihood(), solver=Tsit5())
         β0 = collect(PartiallySpecifiedModels.initial_params(prob.approximators[1]))
-        pred = simulate(prob, β0)
+        pred = simulate_psm(prob, β0)
         @test size(pred) == (10, 1)
         @test all(isfinite, pred)
         sol = solve(prob, LAML(maxiters=30, verbose=false))
         # predict returns the stored fit; verify those values are actually
         # reproducible from the stored parameters (not a stale artifact)
         @test isapprox(predict(sol, prob),
-                       simulate(prob, Float64.(collect(sol.parameters)));
+                       simulate_psm(prob, Float64.(collect(sol.parameters)));
                        rtol=1e-5)
     end
 
@@ -5010,7 +5025,7 @@ end
             [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
             data_times=t_conv, data_values=y_conv,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=Gaussian(), solver=Tsit5(),
+            likelihood=GaussianLikelihood(), solver=Tsit5(),
             abstol=1e-8, reltol=1e-8, maxiters=10000)
 
         # Shared sanity check on the extension keys
@@ -5234,7 +5249,7 @@ end
             [BSplineApproximator(:r, (0.0, 5.0), 5; initial=x -> 0.05)];
             data_times=t_f2,
             data_values=reshape(exp.(0.1 .* t_f2) .+ noi_f2, :, 1),
-            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+            obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5())
 
         s_ok = solve(mk_f2(), LAML(maxiters=30))
         @test s_ok.convergence.converged
@@ -5277,7 +5292,7 @@ end
             [NeuralApproximator(:r, nn_f2; domain=(0.0, 5.0), rng_seed=42)];
             data_times=t_f2,
             data_values=reshape(exp.(0.1 .* t_f2) .+ noi_f2, :, 1),
-            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+            obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5())
         # `converged` is deliberately NOT asserted: how this unpenalized
         # 13-weight tanh fit ends is chaotic in the exact arithmetic. On macOS
         # (Julia 1.12, 1.13) seed 42 stalls at data loss 5.08 (noise floor
@@ -5401,7 +5416,7 @@ end
             [BSplineApproximator(:r, (0.0, 80.0), 6; initial=x -> 0.5),
              BSplineApproximator(:m, (0.0, 30.0), 6; initial=x -> 0.3)];
             data_times=st_f2.t, data_values=Y_f2, obs_to_state=[1, 2],
-            likelihood=Gaussian(), solver=Tsit5())
+            likelihood=GaussianLikelihood(), solver=Tsit5())
         s_lv2 = solve(prob_lv2, LAML(maxiters=60))
         @test s_lv2.convergence.converged
         # WEAKENED from `> 12`. The iteration count is a proxy for "the loop
@@ -5458,7 +5473,7 @@ end
             [BSplineApproximator(:r, (0.0, 5.0), k; initial=x -> 0.05)];
             data_times=t_f6,
             data_values=reshape(exp.(0.1 .* t_f6) .+ noi_f6, :, 1),
-            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+            obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5())
         lam0_f6(k) = 1.0 / tr(penalty_matrix(
             BSplineApproximator(:r, (0.0, 5.0), k)))
 
@@ -5544,7 +5559,7 @@ end
         prob6c = PSMProblem(lg_f6!, [1.0], (0.0, 20.0),
             [BSplineApproximator(:g, (0.0, 60.0), 6; initial=x -> 0.3)];
             data_times=t6c, data_values=reshape(y6c, :, 1),
-            obs_to_state=[1], likelihood=Poisson(), solver=Tsit5())
+            obs_to_state=[1], likelihood=PoissonLikelihood(), solver=Tsit5())
         s6c = solve(prob6c, LAML(maxiters=40))
         @test s6c.convergence.converged
         @test s6c.convergence.smoothing_advanced           # was false
@@ -5637,7 +5652,7 @@ end
         lam_a0 = 1e6
         lam_a, _ = estimate_smoothing_params(J3, w3, w3, ones(3), zeros(3),
                                              zeros(3), S_a, [0], [3], 3;
-                                             family=Gaussian(),
+                                             family=GaussianLikelihood(),
                                              rho_init=[log(lam_a0)],
                                              maxiter=30)
         # PRE-CHANGE: exactly exp(log(1e6)). The freeze guard returned
@@ -5676,7 +5691,7 @@ end
         lam_b0 = 1e-3
         lam_b, _ = estimate_smoothing_params(J3, w3, w3, zeros(3), zeros(3),
                                              zeros(3), S_b, [0], [3], 3;
-                                             family=Gaussian(),
+                                             family=GaussianLikelihood(),
                                              rho_init=[log(lam_b0)],
                                              maxiter=30)
         @test lam_b[1] == exp(log(lam_b0))    # 2.354e17 if escalated
@@ -5690,7 +5705,7 @@ end
         lam_c0 = 1e6
         lam_c, _ = estimate_smoothing_params(J3, w3, w3, zeros(3), zeros(3),
                                              zeros(3), S_a, [0], [3], 3;
-                                             family=Gaussian(),
+                                             family=GaussianLikelihood(),
                                              rho_init=[log(lam_c0)],
                                              maxiter=30)
         @test lam_c[1] == exp(log(lam_c0))
@@ -5711,7 +5726,7 @@ end
         lam_d, edf_d = estimate_smoothing_params(J_d, w_d, w_d, y_d,
                                                  zeros(40), zeros(8), S_d,
                                                  [0], [8], 8;
-                                                 family=Gaussian(),
+                                                 family=GaussianLikelihood(),
                                                  rho_init=[log(1.0 / tr(S_d[1]))],
                                                  maxiter=30)
         @test lam_d[1] ≈ 5.529284778348337e-6 rtol=1e-9
@@ -5778,16 +5793,16 @@ end
             y_p = [5.0, 10.0, 3.0]; mu_p = [4.5, 11.0, 3.2]; w = ones(3)
             ll_ref = sum(y_p[i] * log(mu_p[i]) - mu_p[i] -
                          _loggamma(y_p[i] + 1) for i in 1:3)
-            @test log_likelihood(Poisson(), y_p, mu_p, w) ≈ ll_ref atol=1e-12
+            @test log_likelihood(PoissonLikelihood(), y_p, mu_p, w) ≈ ll_ref atol=1e-12
             # Nonpositive μ sees the SAME effective mean max(|μ|, 1e-6) as
             # the IRLS weights (old floor at 1e-10 was a cliff the
             # curvature never saw).
-            @test log_likelihood(Poisson(), [2.0], [-0.5], [1.0]) ==
-                  log_likelihood(Poisson(), [2.0], [0.5], [1.0])
-            @test loglik_pointwise(Poisson(), 2.0, -0.5) ==
-                  loglik_pointwise(Poisson(), 2.0, 0.5)
-            @test irls_weights(Poisson(), [2.0], [-0.5], [1.0]) ==
-                  irls_weights(Poisson(), [2.0], [0.5], [1.0])
+            @test log_likelihood(PoissonLikelihood(), [2.0], [-0.5], [1.0]) ==
+                  log_likelihood(PoissonLikelihood(), [2.0], [0.5], [1.0])
+            @test loglik_pointwise(PoissonLikelihood(), 2.0, -0.5) ==
+                  loglik_pointwise(PoissonLikelihood(), 2.0, 0.5)
+            @test irls_weights(PoissonLikelihood(), [2.0], [-0.5], [1.0]) ==
+                  irls_weights(PoissonLikelihood(), [2.0], [0.5], [1.0])
         end
 
         @testset "SCOP initial_params: unclamped Greville reproduces linears" begin
@@ -6101,7 +6116,7 @@ end
             nan_growth!, [1.0], tspan_nan,
             [BSplineApproximator(:r, (0.0, 5.0), 5; initial=x -> 0.05)];
             data_times=ts, data_values=vs, obs_to_state=[1],
-            data_weights=ws, likelihood=Gaussian(), solver=Tsit5())
+            data_weights=ws, likelihood=GaussianLikelihood(), solver=Tsit5())
 
         prob_nan_masked = mk_nan(times_nan, vals_masked, w_masked)
         prob_nan_pruned = mk_nan(times_pruned, vals_pruned,
@@ -6281,8 +6296,8 @@ end
             mu_ref = [1.1, 2.9]
             w_ref  = [1.0, 1.0]
 
-            fams = (Gaussian(), Poisson(), NegativeBinomial(5.0),
-                    TruncatedNormal(0.0, 0.7),
+            fams = (GaussianLikelihood(), PoissonLikelihood(), NegativeBinomialLikelihood(5.0),
+                    TruncatedNormalLikelihood(0.0, 0.7),
                     CustomLikelihood((a, b) -> -0.6 * (a - b)^2))
             for fam in fams
                 ll_bad = PartiallySpecifiedModels.log_likelihood(
@@ -6370,15 +6385,15 @@ end
 
             # Pointwise likelihoods treat ±Inf like NaN: zero contribution,
             # zero gradient, rather than an Inf/NaN that poisons the sum.
-            for fam in (Gaussian(), Poisson(), NegativeBinomial(5.0),
-                        TruncatedNormal())
+            for fam in (GaussianLikelihood(), PoissonLikelihood(), NegativeBinomialLikelihood(5.0),
+                        TruncatedNormalLikelihood())
                 @test PartiallySpecifiedModels.loglik_pointwise(fam, Inf, 2.0) == 0.0
             end
         end
 
         # ── D1: residual diagnostics are mask-aware ───────────────────
         @testset "residual diagnostics are mask-aware" begin
-            using PartiallySpecifiedModels: residual_diagnostics, appraise
+            using PartiallySpecifiedModels: residual_diagnostics, psm_appraise
             # PRE-FIX FAILURE MODE (measured on this exact fit): the LAML
             # fit itself was clean, but `diagnostics.jl` never saw the mask.
             #   residual_diagnostics: durbin_watson = [NaN], acf = all NaN,
@@ -6434,8 +6449,8 @@ end
             @test isapprox(rd.semivariogram[1].gamma,
                            rp.semivariogram[1].gamma; rtol=1e-3)
 
-            ad = appraise(sol_dm)
-            ap = appraise(sol_dp)
+            ad = psm_appraise(sol_dm)
+            ap = psm_appraise(sol_dp)
             @test length(ad.residuals) == length(keep_d)
             @test length(ad.observed) == length(keep_d)
             @test length(ad.fitted) == length(keep_d)
@@ -6454,7 +6469,7 @@ end
             # Non-Gaussian path (deviance residuals + robust scale) is
             # masked too — pre-fix `median_abs` over a NaN-bearing vector
             # made every standardized residual NaN.
-            ad_p = appraise(sol_dm; family=Poisson())
+            ad_p = psm_appraise(sol_dm; family=PoissonLikelihood())
             @test length(ad_p.residuals) == length(keep_d)
             @test all(isfinite, ad_p.residuals)
 
@@ -6518,7 +6533,7 @@ end
                 [1.0], (0.0, 8.0),
                 [BSplineApproximator(:r, (0.0, 8.0), 5; initial=0.2)];
                 data_times=ts_mg, data_values=vals_mg, obs_to_state=[1],
-                known_params=NamedTuple(), likelihood=Gaussian(),
+                known_params=NamedTuple(), likelihood=GaussianLikelihood(),
                 solver=Tsit5())
             s_mg = solve(prob_mg, MagiSolver(n_samples=30, n_warmup=30,
                                              n_gridpoints=17, verbose=false))
@@ -6591,7 +6606,7 @@ end
             prob_ne = PSMProblem(bad_ne!, [2.0], (0.0, 8.0),
                 [BSplineApproximator(:k, (-1.0, 2.5), 8; initial=x -> 0.3)];
                 data_times=ts_ne, data_values=dv_ne, obs_to_state=[1],
-                likelihood=Gaussian())
+                likelihood=GaussianLikelihood())
             @test_throws Exception solve(prob_ne,
                 GradientMatching(maxiters=20, verbose=false))
 
@@ -6603,7 +6618,7 @@ end
             prob_ab = PSMProblem(allbad!, [2.0], (0.0, 8.0),
                 [BSplineApproximator(:k, (-1.0, 2.5), 8; initial=x -> 0.3)];
                 data_times=ts_ne, data_values=dv_ne, obs_to_state=[1],
-                likelihood=Gaussian())
+                likelihood=GaussianLikelihood())
             # B6/B7 ORDERING GUARD. `_dynamics_failure_verdict` must run
             # BEFORE B7's reporting `simulate` call. Move it back after, and
             # this fixture emits B7's "integrating the fitted dynamics from
@@ -6649,7 +6664,7 @@ end
             mkp_sf(f) = PSMProblem(f, [0.5], (0.0, 12.0),
                 [BSplineApproximator(:r, (0.0, 10.0), 8; initial=x -> 0.25)];
                 data_times=ts_sf, data_values=dv_sf, obs_to_state=[1],
-                likelihood=Gaussian())
+                likelihood=GaussianLikelihood())
 
             s_sf = @test_logs (:warn,) match_mode=:any solve(mkp_sf(band_sf!),
                         GradientMatching(maxiters=50, tol=1e-8, verbose=false))
@@ -6705,7 +6720,7 @@ end
                 [200.0], (0.0, 10.0),
                 [BSplineApproximator(:r, (150.0, 400.0), 5; initial=x -> 0.05)];
                 data_times=ts_v, data_values=reshape(counts, :, 1),
-                obs_to_state=[1], likelihood=Poisson(), solver=Tsit5())
+                obs_to_state=[1], likelihood=PoissonLikelihood(), solver=Tsit5())
 
             beta_v = PartiallySpecifiedModels.build_initial_params(prob_pois)
             n_pv = length(beta_v)
@@ -6725,7 +6740,7 @@ end
                 [200.0], (0.0, 10.0),
                 [BSplineApproximator(:r, (150.0, 400.0), 5; initial=x -> 0.05)];
                 data_times=ts_v, data_values=reshape(counts, :, 1),
-                obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+                obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5())
             edf_prefix = _vi_edf(prob_gauss, Float64.(beta_v), Λ, 1.0, n_pv)
             @test isfinite(edf_prefix)
             # MEASURED: Poisson curvature gives EDF 1.180, the pre-fix
@@ -6766,10 +6781,10 @@ end
                         [Sw], [0], [p_w], p_w; family=fam, maxiter=3,
                         verbose=false)
             # Gaussian: the warning is relevant and still fires.
-            @test_logs (:warn, r"unpenalized \(fixed-effect\) part") match_mode=:any call(Gaussian())
+            @test_logs (:warn, r"unpenalized \(fixed-effect\) part") match_mode=:any call(GaussianLikelihood())
             # Poisson: no such warning (its scale comes from n − sum(ranks)).
             # `Base.CoreLogging.Warn` avoids adding a Logging test dep.
-            @test_logs min_level=Base.CoreLogging.Warn call(Poisson())
+            @test_logs min_level=Base.CoreLogging.Warn call(PoissonLikelihood())
         end
 
         # ── D8a: the LAML denominator genuinely counts usable cells ───
@@ -6803,7 +6818,7 @@ end
 
             run_u(J, w, y) = estimate_smoothing_params(J, w, w, y, J * beta_u,
                                 copy(beta_u), [Su], [0], [p_u], p_u;
-                                family=Gaussian(), maxiter=50, verbose=false)
+                                family=GaussianLikelihood(), maxiter=50, verbose=false)
             lam_um, edf_um = run_u(Ju, w_um, y_um)
             lam_up, edf_up = run_u(Ju[keep_u, :], ones(length(keep_u)),
                                    yu[keep_u])
@@ -6829,7 +6844,7 @@ end
             mk_n(t, v, w) = PSMProblem(nan_growth!, [1.0], tspan_nan,
                 [BSplineApproximator(:r, (0.0, 5.0), 6; initial=x -> 0.05)];
                 data_times=t, data_values=v, obs_to_state=[1],
-                data_weights=w, likelihood=Gaussian(), solver=Tsit5())
+                data_weights=w, likelihood=GaussianLikelihood(), solver=Tsit5())
 
             s_nm = solve(mk_n(ts_n, vals_n, w_n), LAML(maxiters=40, verbose=false))
             s_np = solve(mk_n(ts_n[keep_n], reshape(clean_n[keep_n], :, 1),
@@ -6904,7 +6919,7 @@ end
         mk_b7(u0; kw...) = PSMProblem(dyn_b7!, u0, (0.0, 20.0),
             [BSplineApproximator(:r, (0.5, 10.5), 8; initial=x -> 0.05)];
             data_times=ts_b7, data_values=dv_b7, obs_to_state=[1],
-            likelihood=PartiallySpecifiedModels.Gaussian(), kw...)
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood(), kw...)
 
         @testset "u0 lever: $nm" for (nm, alg) in (
                 ("GradientMatching",  GradientMatching(maxiters=60, verbose=false)),
@@ -6970,7 +6985,7 @@ end
             s_s = solve(p_s, GradientMatching(maxiters=60, verbose=false))
             @test !(s_s.data_loss ≈ smoother_ss)
             @test s_s.data_loss ≈ PartiallySpecifiedModels.weighted_data_loss(
-                      p_s, PartiallySpecifiedModels.simulate(
+                      p_s, PartiallySpecifiedModels.simulate_psm(
                                p_s, Vector(s_s.parameters))) rtol=1e-10
         end
 
@@ -7120,7 +7135,7 @@ end
         # Measured ratio new/old: 0.132, 0.236, 0.397, 0.786, 0.999 at
         # ξ = 0, 0.5, 1, 2, 4 — i.e. the EDF was wrong by up to 7.6× where the
         # bound bites, decaying to a no-op once it stops binding.
-        fam = TruncatedNormal(sigma=1.0, lower=0.0)
+        fam = TruncatedNormalLikelihood(sigma=1.0, lower=0.0)
         ratios = Float64[]
         for xi in (0.0, 0.5, 1.0, 2.0, 4.0)
             mu = [xi]; y = [xi + 0.3]; w = [1.0]
@@ -7131,7 +7146,7 @@ end
         @test issorted(ratios)                # monotone toward 1
 
         # Poisson / NegativeBinomial: identical, so those EDFs are untouched.
-        for f in (Poisson(), NegativeBinomial(3.0))
+        for f in (PoissonLikelihood(), NegativeBinomialLikelihood(3.0))
             mu = [0.5, 2.0, 9.0]; y = [1.0, 2.0, 8.0]; w = ones(3)
             @test irls_weights(f, y, mu, w) == [vold(f, mu[i], w[i]) for i in 1:3]
         end
@@ -7158,7 +7173,7 @@ end
         y9 = [max(m + randn(rng9), 0.01) for m in mu9]
         dyn9!(du, u, p, t) = (du[1] = p.g(u[1]))
         uf9 = BSplineApproximator(:g, (0.0, 6.0), 5; initial=x -> 0.4)
-        fam9 = TruncatedNormal(sigma=1.0, lower=0.0)
+        fam9 = TruncatedNormalLikelihood(sigma=1.0, lower=0.0)
         prob9 = PSMProblem(dyn9!, [1.0], (0.0, 6.0), [uf9];
             data_times=ts9, data_values=reshape(y9, :, 1), obs_to_state=[1],
             known_params=NamedTuple(), likelihood=fam9, solver=Tsit5())
@@ -7168,12 +7183,12 @@ end
         edf_pkg = PSM._vi_edf(prob9, mu_opt9, Λ9, 1.0, np9)
 
         keep9 = [(i, 1) for i in eachindex(ts9) if PSM.usable_cell(prob9, i, 1)]
-        base9 = Float64.(PSM.simulate(prob9, mu_opt9))
+        base9 = Float64.(PSM.simulate_psm(prob9, mu_opt9))
         J9 = zeros(length(keep9), np9)
         for b in 1:np9                     # same FD recipe as `_vi_edf`
             step = max(1e-6, abs(mu_opt9[b]) * 1e-6)
             bp = copy(mu_opt9); bp[b] += step
-            pert = Float64.(PSM.simulate(prob9, bp))
+            pert = Float64.(PSM.simulate_psm(prob9, bp))
             for (r, (i, j)) in enumerate(keep9)
                 J9[r, b] = (pert[i, j] - base9[i, j]) / step
             end
@@ -7324,7 +7339,7 @@ end
             [BSplineApproximator(:r, (0.0, 12.0), 8)];
             data_times=t_b7d, data_values=reshape(max.(data_b7d, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian(), discrete=true)
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood(), discrete=true)
 
         s_b7d = solve(prob_b7d, GradientMatching(maxiters=50, verbose=false))
         # rtol 1e-4 against a measured 0.22321184. The pre- and post-B7 runs
@@ -7391,7 +7406,7 @@ end
         mk_poly() = PSMProblem(poly_decay!, [1.0], (0.0, 4.0),
             [PolyApproximator(:f, (0.0, 1.0), 2)];
             data_times=ts_poly, data_values=obs_poly, obs_to_state=[1],
-            likelihood=Gaussian(), solver=Tsit5())
+            likelihood=GaussianLikelihood(), solver=Tsit5())
 
         # (a) AdamSolver (through-the-solver autodiff: exercises the
         # Dual-safety of the custom evaluator)
@@ -7425,7 +7440,7 @@ end
             [PolyApproximator(:f, (0.0, 2.0), 2)];
             data_times=t_w12, data_values=d_w12, obs_to_state=[1],
             known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
 
         # PolyApproximator's penalty is a ridge on the curvature (x^2)
         # coefficient, so a huge lambda_smooth must crush |beta_3| in the
@@ -7606,7 +7621,7 @@ end
             [TensorBSplineApproximator(:g, (0.0, 3.0), (0.5, 3.0), 5, 5;
                                        initial=(N, P) -> 0.3 * N * P)];
             data_times=ts2d, data_values=data2d, obs_to_state=[1, 2],
-            known_params=(e=0.5, m=0.25), likelihood=Gaussian(),
+            known_params=(e=0.5, m=0.25), likelihood=GaussianLikelihood(),
             solver=Tsit5())
         prob2d = mk2d()
 
@@ -7617,7 +7632,7 @@ end
         # Reference: data loss of the initial bilinear mass-action surface
         beta0 = PartiallySpecifiedModels.build_initial_params(prob2d)
         loss0 = PartiallySpecifiedModels.weighted_data_loss(
-            prob2d, PartiallySpecifiedModels.simulate(prob2d, beta0))
+            prob2d, PartiallySpecifiedModels.simulate_psm(prob2d, beta0))
 
         # (a) AdamSolver — ForwardDiff through the ODE solve (Dual params
         # AND Dual states through the two-argument evaluator)
@@ -7695,7 +7710,7 @@ end
             [TensorBSplineApproximator(:g, (0.0, 3.0), (0.0, 2.0), 5, 5;
                                        initial=(N, P) -> 0.2 * N * P)];
             data_times=ts_d, data_values=data_d, obs_to_state=[1, 2],
-            known_params=(e=0.2, m=0.1), likelihood=Gaussian(),
+            known_params=(e=0.2, m=0.1), likelihood=GaussianLikelihood(),
             solver=Tsit5())
 
         sol_gcv = solve(prob_d, GCVSolver(maxiters=60))
@@ -7841,7 +7856,7 @@ end
 
         mk_gp(approx) = PSMProblem(uptake_gp!, [2.0], (0.0, 8.0), [approx];
             data_times=ts_gp, data_values=data_gp, obs_to_state=[1],
-            known_params=NamedTuple(), likelihood=Gaussian(), solver=Tsit5())
+            known_params=NamedTuple(), likelihood=GaussianLikelihood(), solver=Tsit5())
 
         grid = collect(range(0.05, 2.0, length=200))
         # Worst decrease as a fraction of the fitted range (positive ⇒ the
@@ -8039,7 +8054,7 @@ end
             [a_gp, a_b, BSplineApproximator(:h, dom_cc, 5)];
             data_times=[0.0, 1.0], data_values=reshape([1.0, 0.5], :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=Gaussian(), solver=Tsit5())
+            likelihood=GaussianLikelihood(), solver=Tsit5())
         sol_cc = PSMSolution(
             PSM.ComponentArrays.ComponentArray(f=γ_alt, g=γ_alt),
             0.0, 0.0, 0.0, Float64[], zeros(1, 1), zeros(1, 1), [0.0],
@@ -8090,7 +8105,7 @@ end
         # laml_objective's Gaussian branch), and in code the two criteria
         # take the identical path — so λ̂ trajectory, objective and fit must
         # coincide to machine precision.
-        prob_g = mk_lik(Gaussian())
+        prob_g = mk_lik(GaussianLikelihood())
         sol_w = solve(prob_g, LAML(maxiters=30, verbose=false))
         sol_l = solve(prob_g, LAML(maxiters=30, verbose=false,
                                    criterion=:laplace))
@@ -8155,7 +8170,7 @@ end
         # agreement 6.5e-10 (the residual is laml_objective's 1e-10
         # stabilizing ridge inside _log_det_pd); atol=1e-6 leaves ~1000x
         # headroom while catching any dropped or mis-scaled term.
-        V_solver, = laml_objective(Poisson(), beta, J, W, w, y, mu,
+        V_solver, = laml_objective(PoissonLikelihood(), beta, J, W, w, y, mu,
                                    [S], [0], [nk], [log(lam_fix)], nk)
         logfact(k) = sum(log.(1:Int(k)); init=0.0)
         ll = sum(w[i] * (y[i] * log(mu[i]) - mu[i] - logfact(y[i]))
@@ -8179,10 +8194,10 @@ end
         pearson = sum((y[i] - mu[i])^2 / mu[i] for i in 1:n) / (n - rS)
         @test pearson > 1.02   # the mechanism the discrimination relies on
         lam_w, = estimate_smoothing_params(J, W, w, y, mu, beta,
-            [S], [0], [nk], nk; family=Poisson(), rho_init=[0.0],
+            [S], [0], [nk], nk; family=PoissonLikelihood(), rho_init=[0.0],
             criterion=:working)
         lam_l, = estimate_smoothing_params(J, W, w, y, mu, beta,
-            [S], [0], [nk], nk; family=Poisson(), rho_init=[0.0],
+            [S], [0], [nk], nk; family=PoissonLikelihood(), rho_init=[0.0],
             criterion=:laplace)
         @test isfinite(lam_l[1]) && lam_l[1] > 0
         @test lam_w[1] / lam_l[1] > 1.05
@@ -8224,7 +8239,7 @@ end
         # visibly larger λ̂ than the full Laplace criterion.
         rng_p = Xoshiro(1)
         y_p = Float64[rpois(rng_p, m) for m in mu_true]
-        sol_pw = solve(mk_count(y_p, Poisson()),
+        sol_pw = solve(mk_count(y_p, PoissonLikelihood()),
                        LAML(maxiters=40, verbose=false))
         # maxiters 120, not 40: the per-column FD noise fix changes WHICH
         # columns grow their step, and hence the optimizer's path, and this
@@ -8232,7 +8247,7 @@ end
         # The claim being tested is that :laplace runs to convergence and
         # records its own criterion -- not that 40 iterations suffice -- so
         # the budget is the honest thing to change.
-        sol_pl = solve(mk_count(y_p, Poisson()),
+        sol_pl = solve(mk_count(y_p, PoissonLikelihood()),
                        LAML(maxiters=120, verbose=false, criterion=:laplace))
         # Honest reporting: :laplace runs to convergence and records itself
         @test sol_pl.convergence.converged
@@ -8268,7 +8283,7 @@ end
         y_nb = Float64[rpois(rng_nb,
                              m * (-sum(log(rand(rng_nb)) for _ in 1:th) / th))
                        for m in mu_true]
-        sol_nb = solve(mk_count(y_nb, NegativeBinomial(Float64(th))),
+        sol_nb = solve(mk_count(y_nb, NegativeBinomialLikelihood(Float64(th))),
                        LAML(maxiters=40, verbose=false, criterion=:laplace))
         @test sol_nb.convergence.converged
         @test sol_nb.convergence.criterion == :laplace
@@ -8383,7 +8398,7 @@ end
             [BSplineApproximator(:r, (0.0, 12.0), 8)];
             data_times=t_w6, data_values=reshape(vals, :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PSM.Gaussian())
+            likelihood=PSM.GaussianLikelihood())
         prob_ar_w6 = mk_prob_w6(max.(data_w6, 0.01))
 
         # ── Default equivalence: GCVSolver() ≡ GCVSolver(criterion=:gcv)
@@ -8479,7 +8494,7 @@ end
         prob_fg = PSMProblem(decay_fg!, [5.0], (0.0, 10.0), [uf_fg];
             data_times=t_fg, data_values=reshape(max.(data_fg, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_fg = solve(prob_fg, FGPGMSolver(n_samples=3000, n_warmup=3000,
                                             rng_seed=7, verbose=false))
 
@@ -8542,7 +8557,7 @@ end
         prob_fg_pois = PSMProblem(decay_fg!, [5.0], (0.0, 10.0), [uf_fg];
             data_times=t_fg, data_values=reshape(max.(data_fg, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Poisson())
+            likelihood=PartiallySpecifiedModels.PoissonLikelihood())
         err_fg = try
             solve(prob_fg_pois, FGPGMSolver(n_samples=5, n_warmup=5))
             nothing
@@ -8566,7 +8581,7 @@ end
         prob_fgm = PSMProblem(decay_fgm!, [5.0], (0.0, 10.0), [uf_fgm];
             data_times=t_fgm, data_values=d_fgm, data_weights=w_fgm,
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_fgm = solve(prob_fgm, FGPGMSolver(n_samples=1500, n_warmup=1500,
                                               rng_seed=13))
         @test isfinite(sol_fgm.objective)
@@ -8579,7 +8594,7 @@ end
             data_times=t_fgm, data_values=d_fgm,
             data_weights=zeros(length(t_fgm), 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         err_fgall = try
             solve(prob_fgall, FGPGMSolver(n_samples=5, n_warmup=5))
             nothing
@@ -8609,7 +8624,7 @@ end
         prob_ofg2 = PSMProblem(osc_fg!, [1.5, 0.0], (0.0, 8.0), [uf_ofg];
             data_times=t_ofg, data_values=hcat(pos_ofg, vel_ofg),
             obs_to_state=[1, 2], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_ofg2 = solve(prob_ofg2, FGPGMSolver(n_samples=3000, n_warmup=3000,
                                                 rng_seed=11))
         errs_ofg2 = [abs(sol_ofg2.unknown_functions[:k](x) - k_fg(x))
@@ -8624,7 +8639,7 @@ end
         prob_ofg1 = PSMProblem(osc_fg!, [1.5, 0.0], (0.0, 8.0), [uf_ofg];
             data_times=t_ofg, data_values=reshape(pos_ofg, :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_ofg1 = solve(prob_ofg1, FGPGMSolver(n_samples=3000, n_warmup=3000,
                                                 rng_seed=11))
         errs_ofg1 = [abs(sol_ofg1.unknown_functions[:k](x) - k_fg(x))
@@ -8871,7 +8886,7 @@ end
         prob_dsq = PSMProblem(decay_sq!, [5.0], (0.0, 10.0), [uf_dsq];
             data_times=t_dsq, data_values=reshape(max.(data_dsq, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_d_std = solve(prob_dsq, DaltonSolver(n_steps=100, maxiters=50,
                                                  verbose=false))
         sol_d_sq = solve(prob_dsq, DaltonSolver(n_steps=100, maxiters=50,
@@ -8924,7 +8939,7 @@ end
         prob_psq = PSMProblem(logis_psq!, [1.0], (0.0, 15.0), [uf_psq];
             data_times=t_psq, data_values=reshape(max.(data_psq, 0.01), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PartiallySpecifiedModels.Gaussian())
+            likelihood=PartiallySpecifiedModels.GaussianLikelihood())
         sol_p_sq = solve(prob_psq, PseudoMarginalSolver(
             n_samples=50, n_warmup=25, n_steps=50, rng_seed=31415,
             verbose=false, sqrt_filter=true))
@@ -8961,7 +8976,7 @@ end
         mk_spline_prob() = PSMProblem(growth_aj!, [1.0], (0.0, 5.0),
             [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
             data_times=t_aj, data_values=y_aj, obs_to_state=[1],
-            likelihood=Gaussian(), solver=Tsit5(), abstol=1e-8, reltol=1e-8)
+            likelihood=GaussianLikelihood(), solver=Tsit5(), abstol=1e-8, reltol=1e-8)
 
         # The extension must be active under the test environment
         @test Base.get_extension(PSM,
@@ -8985,7 +9000,7 @@ end
             prob_m = PSMProblem(growth_aj!, [1.0], (0.0, 5.0),
                 [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
                 data_times=t_aj, data_values=y_mask, data_weights=w_mask,
-                obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5(),
+                obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5(),
                 abstol=1e-8, reltol=1e-8)
             fm = b -> PSM.adam_loss_mse(prob_m, b, 0.0)
             l_fdm = fm(beta)
@@ -9000,7 +9015,7 @@ end
             prob_p = PSMProblem(growth_aj!, [1.0], (0.0, 5.0),
                 [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
                 data_times=t_aj, data_values=round.(y_aj), obs_to_state=[1],
-                likelihood=Poisson(), solver=Tsit5(),
+                likelihood=PoissonLikelihood(), solver=Tsit5(),
                 abstol=1e-8, reltol=1e-8)
             beta = PSM.initial_params(prob_p.approximators[1]) .+
                    0.05 .* randn(StableRNG(12), 6)
@@ -9018,7 +9033,7 @@ end
                 (0.0, 5.0),
                 [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
                 data_times=t_aj, data_values=y_aj, obs_to_state=[1],
-                likelihood=Gaussian(), solver=Tsit5(),
+                likelihood=GaussianLikelihood(), solver=Tsit5(),
                 abstol=1e-8, reltol=1e-8)
             beta = PSM.initial_params(prob_u.approximators[1]) .+
                    0.05 .* randn(StableRNG(13), 6)
@@ -9176,7 +9191,7 @@ end
             prob_nb = PSMProblem(growth_aj!, [1.0], (0.0, 5.0),
                 [BSplineApproximator(:r, (0.5, 5.0), 6; initial=x -> 0.2)];
                 data_times=t_aj, data_values=y_aj, obs_to_state=[1],
-                likelihood=NegativeBinomial(10.0))
+                likelihood=NegativeBinomialLikelihood(10.0))
             err = try
                 solve(prob_nb, AdamSolver(maxiters=2, sensealg=:auto))
                 nothing
@@ -9336,7 +9351,7 @@ end
             [BSplineApproximator(:r, (0.0, 12.0), res)];
             data_times=times, data_values=reshape(vals, :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=PSM.Gaussian())
+            likelihood=PSM.GaussianLikelihood())
         prob_e2e_w10 = mk_w10(8, t_w10, data_w10)
         sol_d_w10 = solve(prob_e2e_w10, GCVSolver(maxiters=25))
         sol_r_w10 = solve(prob_e2e_w10, GCVSolver(maxiters=25, search=:reuse))
@@ -9371,7 +9386,7 @@ end
             [BSplineApproximator(:r, (0.5, 6.0), 5; initial=x -> 0.3),
              BSplineApproximator(:g, (0.5, 6.0), 5; initial=x -> 0.03x)];
             data_times=tt2_w10, data_values=dv2_w10, obs_to_state=[1],
-            known_params=NamedTuple(), likelihood=PSM.Gaussian(),
+            known_params=NamedTuple(), likelihood=PSM.GaussianLikelihood(),
             solver=Tsit5())
         sol2_d_w10 = solve(prob2_w10, GCVSolver(maxiters=15))
         sol2_r_w10 = solve(prob2_w10, GCVSolver(maxiters=15, search=:reuse))
@@ -9475,7 +9490,7 @@ end
         np_w11 = length(b0_w11)
 
         # ── Jacobian agreement, FD vs ForwardDiff (smooth ODE) ──
-        f0_w11 = vec(PSM.simulate(prob_w11, b0_w11))
+        f0_w11 = vec(PSM.simulate_psm(prob_w11, b0_w11))
         J_fd_w11 = zeros(25, np_w11)
         J_ad_w11 = zeros(25, np_w11)
         cfg_w11 = PSM._fd_jacobian_config(np_w11)
@@ -9525,7 +9540,7 @@ end
         for (i, t) in enumerate(ttd_w11), j in 1:npd_w11
             J_an_w11[i, j] = t == 0.0 ? 0.0 : t * g0_w11^(t - 1) * Bj_w11[j]
         end
-        f0d_w11 = vec(PSM.simulate(probd_w11, bd_w11))
+        f0d_w11 = vec(PSM.simulate_psm(probd_w11, bd_w11))
         J_fdd_w11 = zeros(9, npd_w11)
         J_add_w11 = zeros(9, npd_w11)
         PSM.compute_jacobian!(J_fdd_w11, probd_w11, bd_w11, f0d_w11, 9, 1;
@@ -9546,7 +9561,7 @@ end
                                data_times=tt_w11, data_values=dat_w11)
         bn_w11 = PSM.build_initial_params(probn_w11)
         npn_w11 = length(bn_w11)
-        f0n_w11 = vec(PSM.simulate(probn_w11, bn_w11))
+        f0n_w11 = vec(PSM.simulate_psm(probn_w11, bn_w11))
         J_fdn_w11 = zeros(25, npn_w11)
         J_adn_w11 = zeros(25, npn_w11)
         PSM.compute_jacobian!(J_fdn_w11, probn_w11, bn_w11, f0n_w11, 25, 1;
@@ -9564,7 +9579,7 @@ end
         datm_w11 = copy(dat_w11); datm_w11[5] = NaN
         wm_w11 = ones(25, 1); wm_w11[9] = 0.0
         probm_w11 = mk_w11(data=datm_w11, weights=wm_w11)
-        f0m_w11 = vec(PSM.simulate(probm_w11, b0_w11))
+        f0m_w11 = vec(PSM.simulate_psm(probm_w11, b0_w11))
         J_fdm_w11 = zeros(25, np_w11)
         J_adm_w11 = zeros(25, np_w11)
         PSM.compute_jacobian!(J_fdm_w11, probm_w11, b0_w11, f0m_w11, 25, 1;
@@ -9726,7 +9741,7 @@ end
                                 delays=[1.0])
         bdd_w11 = PSM.build_initial_params(probdd_w11)
         npdd_w11 = length(bdd_w11)
-        f0dd_w11 = vec(PSM.simulate(probdd_w11, bdd_w11))
+        f0dd_w11 = vec(PSM.simulate_psm(probdd_w11, bdd_w11))
         Jd_fd_w11 = zeros(12, npdd_w11)
         Jd_ad_w11 = zeros(12, npdd_w11)
         PSM.compute_jacobian!(Jd_fd_w11, probdd_w11, bdd_w11, f0dd_w11, 12, 1;
@@ -9789,7 +9804,7 @@ end
         b1_prob = PSMProblem(b1_dyn!, [1.0, 0.0], (0.0, 5.0), [b1_a];
                              data_times=b1_times,
                              data_values=reshape(ones(b1_nT), :, 1),
-                             obs_to_state=[1], likelihood=Gaussian(),
+                             obs_to_state=[1], likelihood=GaussianLikelihood(),
                              solver=Tsit5())
 
         # Per-interval cubic extraction from the package's own evaluator
@@ -9829,7 +9844,7 @@ end
         b1_Jref = [b1_integral_basis(j, b1_times[i])
                    for i in 1:b1_nT, j in 1:b1_nk]
 
-        b1_f0 = vec(PSM.simulate(b1_prob, b1_beta))
+        b1_f0 = vec(PSM.simulate_psm(b1_prob, b1_beta))
         # Closed-form trajectory parity: pred(tᵢ) = 1 + Σⱼ βⱼ∫₀^{tᵢ}Bⱼ —
         # measured 8.3e-7 (the ODE solver's own error at default tolerance)
         @test maximum(abs(b1_f0[i] - (1.0 + sum(b1_beta[j] *
@@ -9902,7 +9917,7 @@ end
                 data_times=[0.0, 0.5, 1.0],
                 data_values=reshape(zeros(3), :, 1),
                 obs_to_state=[1], known_params=NamedTuple(),
-                likelihood=PSM.Gaussian())
+                likelihood=PSM.GaussianLikelihood())
             S_list_pb, offs_pb, nks_pb = PSM.build_penalty_matrices(prob_pb)
             @test length(S_list_pb) == 2
             @test S_list_pb[1] == penalty_matrix(r_pb)
@@ -9921,7 +9936,7 @@ end
                 data_times=[0.0, 0.5, 1.0],
                 data_values=reshape(zeros(3), :, 1),
                 obs_to_state=[1], known_params=NamedTuple(),
-                likelihood=PSM.Gaussian())
+                likelihood=PSM.GaussianLikelihood())
             S_pb2, offs_pb2, nks_pb2 = PSM.build_penalty_matrices(prob_pb2)
             # t: one block at 0 (5 params); f: ridge on local 1:2 ⟹ global
             # offset 5, spline on local 3:8 ⟹ global offset 5 + 3 - 1 = 7
@@ -9938,7 +9953,7 @@ end
                 data_times=[0.0, 0.5, 1.0],
                 data_values=reshape(zeros(3), :, 1),
                 obs_to_state=[1], known_params=NamedTuple(),
-                likelihood=PSM.Gaussian())
+                likelihood=PSM.GaussianLikelihood())
             @test_throws ArgumentError PSM.build_penalty_matrices(
                 mkprob_pb(BadBlocksApproximator(:bad, :overlap)))
             err_pb = try
@@ -10025,7 +10040,7 @@ end
         prob_n0 = PSMProblem(dyn_n0!, [0.0], (0.0, 3.0), [a_n0];
                              data_times=tt_n0, data_values=dv_n0,
                              obs_to_state=[1], known_params=NamedTuple(),
-                             likelihood=PSM.Gaussian())
+                             likelihood=PSM.GaussianLikelihood())
         S_n0, offs_n0, nks_n0 = PSM.build_penalty_matrices(prob_n0)
 
         @testset "two-block LAML fit: per-block smoothing parameters" begin
@@ -10074,7 +10089,7 @@ end
         J_n0 = zeros(length(tt_n0), np_n0)
         for j in 1:np_n0
             ej_n0 = zeros(np_n0); ej_n0[j] = 1.0
-            J_n0[:, j] = PSM.simulate(prob_n0, ej_n0)[:, 1]
+            J_n0[:, j] = PSM.simulate_psm(prob_n0, ej_n0)[:, 1]
         end
 
         @testset "two-block LAML gradient matches finite differences" begin
@@ -10114,7 +10129,7 @@ end
             # Same tolerance rationale as the harness above: observed
             # agreement ≤ 3e-5 relative; rtol 1e-3 catches any O(1) slip.
             for rho in ([-2.0, 1.0], [0.0, 0.0], [3.0, -1.0], [5.0, 4.0])
-                g, gfd = fd_vs_analytic_n0(Gaussian(), y_g2, w_g, rho)
+                g, gfd = fd_vs_analytic_n0(GaussianLikelihood(), y_g2, w_g, rho)
                 @test g ≈ gfd rtol=1e-3 atol=1e-6
             end
             # Non-Gaussian branch (identity link ⟹ IRLS weights 1/μ,
@@ -10122,7 +10137,7 @@ end
             y_pois_n0 = max.(round.(4.0 .* (y_g2 .+ 1.0)), 1.0)
             W_pois_n0 = 1.0 ./ y_pois_n0
             for rho in ([-1.0, 2.0], [2.0, 0.0])
-                g, gfd = fd_vs_analytic_n0(Poisson(), y_pois_n0,
+                g, gfd = fd_vs_analytic_n0(PoissonLikelihood(), y_pois_n0,
                                            W_pois_n0, rho)
                 @test g ≈ gfd rtol=1e-3 atol=1e-6
             end
@@ -10475,7 +10490,7 @@ end
                                                du[2] = -0.1 * u[2]; nothing),
             [1.0, 1.0], (0.0, 1.0), [a, a_free];
             data_times=[0.0, 0.5, 1.0], data_values=ones(3, 2), obs_to_state=[1, 2],
-            likelihood=Gaussian(), solver=Tsit5())
+            likelihood=GaussianLikelihood(), solver=Tsit5())
         S_list, offs, nks = PartiallySpecifiedModels.build_penalty_matrices(prob_pb)
         @test length(S_list) == 4
         @test offs == [0, 1, 9, 11]
@@ -10513,7 +10528,7 @@ end
                                      index_stats=(zeros(2), Matrix(1.0I, 2, 2)))
         prob_w = PSMProblem(dyn_w!, [2.0, 1.0], (0.0, 3.0), [aw];
             data_times=tw, data_values=dw, obs_to_state=[1, 2],
-            known_params=NamedTuple(), likelihood=PSM.Gaussian())
+            known_params=NamedTuple(), likelihood=PSM.GaussianLikelihood())
         @test_logs (:warn, r"anchor=nothing") match_mode=:any begin
             solve(prob_w, LAML(maxiters=3))
         end
@@ -10525,7 +10540,7 @@ end
                                      index_stats=(zeros(2), Matrix(1.0I, 2, 2)))
         prob_a = PSMProblem(dyn_w!, [2.0, 1.0], (0.0, 3.0), [aa];
             data_times=tw, data_values=dw, obs_to_state=[1, 2],
-            known_params=NamedTuple(), likelihood=PSM.Gaussian())
+            known_params=NamedTuple(), likelihood=PSM.GaussianLikelihood())
         @test_logs min_level=Base.CoreLogging.Warn match_mode=:any begin
             solve(prob_a, LAML(maxiters=3))
         end
@@ -10550,7 +10565,7 @@ end
                                      index_stats=(zeros(2), Matrix(1.0I, 2, 2)))
         prob_c = PSMProblem(dyn_c!, [2.0, 1.0], (0.0, 3.0), [ac];
             data_times=tc, data_values=dc, obs_to_state=[1, 2],
-            known_params=NamedTuple(), likelihood=PSM.Gaussian())
+            known_params=NamedTuple(), likelihood=PSM.GaussianLikelihood())
         @test_logs (:warn, r"anchor=nothing") match_mode=:any begin
             solve(prob_c, CollocationLAML(maxiters=3, n_continuation=2))
         end
@@ -10559,7 +10574,7 @@ end
                                       index_stats=(zeros(2), Matrix(1.0I, 2, 2)))
         prob_ca = PSMProblem(dyn_c!, [2.0, 1.0], (0.0, 3.0), [aca];
             data_times=tc, data_values=dc, obs_to_state=[1, 2],
-            known_params=NamedTuple(), likelihood=PSM.Gaussian())
+            known_params=NamedTuple(), likelihood=PSM.GaussianLikelihood())
         @test_logs min_level=Base.CoreLogging.Warn match_mode=:any begin
             solve(prob_ca, CollocationLAML(maxiters=3, n_continuation=2))
         end
@@ -10604,7 +10619,7 @@ end
     si_data = si_traj .+ 0.02 .* randn(StableRNG(31), size(si_traj))
     si_prob(a) = PSMProblem(si_psm!, [3.0, 0.25], (0.0, 40.0), [a];
         data_times=si_ts, data_values=si_data, obs_to_state=[1, 2],
-        known_params=(c=0.4, m=0.4, d=0.12), likelihood=Gaussian(),
+        known_params=(c=0.4, m=0.4, d=0.12), likelihood=GaussianLikelihood(),
         solver=Tsit5())
 
     @testset "SingleIndexApproximator — reference statistics are fixed" begin
@@ -10615,7 +10630,7 @@ end
                                     du[2] = -0.05 * u[2]; nothing)
         mkfx(a) = PSMProblem(dyn_fx!, [2.0, 8.0], (0.0, 6.0), [a];
             data_times=ts_fx, data_values=y_fx, obs_to_state=[1, 2],
-            likelihood=Gaussian(), solver=Tsit5())
+            likelihood=GaussianLikelihood(), solver=Tsit5())
 
         prob_fx = mkfx(SingleIndexApproximator(:g, 2, 6))
         rfx = prob_fx.approximators[1]
@@ -10642,7 +10657,7 @@ end
         before = build_evaluator(a_mv, θ_mv)
         vals_before = [before(x, y) for (x, y) in pts_mv]
         μ_before, Σ_before = copy(a_mv.mu), copy(a_mv.Sigma)
-        pred0 = PartiallySpecifiedModels.simulate(prob_mv, θ_mv)
+        pred0 = PartiallySpecifiedModels.simulate_psm(prob_mv, θ_mv)
         sol_mv = solve(prob_mv, LAML(maxiters=40, warmup=10, initial_lambda=0.01))
         @test prob_mv.approximators[1] === a_mv        # never swapped out
         @test a_mv.mu == μ_before                      # never mutated
@@ -10672,7 +10687,7 @@ end
         prob3 = PSMProblem(dyn3!, [2.0, 8.0, 4.0], (0.0, 6.0),
             [SingleIndexApproximator(:g, 2, 6; states=[1, 3])];
             data_times=ts_fx, data_values=y_fx, obs_to_state=[1, 2],
-            likelihood=Gaussian(), solver=Tsit5())
+            likelihood=GaussianLikelihood(), solver=Tsit5())
         r3 = prob3.approximators[1]
         @test r3.mu[2] == 4.0
         @test r3.Sigma[2, 2] == 16.0
@@ -10815,7 +10830,7 @@ end
         prob3 = PSMProblem(si3!, [4.0, 0.5, 0.2], (0.0, 12.0),
             [SingleIndexApproximator(:g, 3, 8; xi=2.5, initial=z -> 0.6)];
             data_times=ts3, data_values=d3, obs_to_state=[1, 2, 3],
-            known_params=(a=0.5, b=0.3, c=0.2), likelihood=Gaussian(),
+            known_params=(a=0.5, b=0.3, c=0.2), likelihood=GaussianLikelihood(),
             solver=Tsit5())
         a3 = prob3.approximators[1]
         @test nparams(a3) == 2 + 8
@@ -11248,7 +11263,7 @@ end
                                                du[2] = -0.1 * u[2]; nothing),
             [1.0, 1.0], (0.0, 10.0), [a, al_c];
             data_times=[0.0, 5.0, 10.0], data_values=ones(3, 2),
-            obs_to_state=[1, 2], likelihood=Gaussian(), solver=Tsit5())
+            obs_to_state=[1, 2], likelihood=GaussianLikelihood(), solver=Tsit5())
         S_list, offs, nks = PartiallySpecifiedModels.build_penalty_matrices(prob_pb)
         @test length(S_list) == 4
         @test offs == [0, 1, 9, 13]
@@ -11325,7 +11340,7 @@ end
     end
     tc_prob(a) = PSMProblem(tc_sir!, [990.0, 10.0, 0.0], (0.0, 120.0), [a];
         data_times=tc_ts, data_values=tc_data, obs_to_state=[2, 3],
-        known_params=(N=1000.0, gam=0.2), likelihood=Gaussian(), solver=Tsit5())
+        known_params=(N=1000.0, gam=0.2), likelihood=GaussianLikelihood(), solver=Tsit5())
     tc_beta_rmse(f) = sqrt(mean(abs2,
         [f(t) - tc_btrue(t) for t in 0.0:1.0:120.0]))
 
@@ -11451,7 +11466,7 @@ end
         lg_dyn!(du, u, p, t) = (du[1] = p.g(t) - p.k * u[1]; nothing)
         lg_prob(a) = PSMProblem(lg_dyn!, [1.25], (0.0, 40.0), [a];
             data_times=lg_ts, data_values=lg_data, obs_to_state=[1],
-            known_params=(k=0.8,), likelihood=Gaussian(), solver=Tsit5())
+            known_params=(k=0.8,), likelihood=GaussianLikelihood(), solver=Tsit5())
         centroid(w) = sum((0:(length(w) - 1)) .* w) / sum(w)
 
         # (a) RECOVERY of the decaying lag profile
@@ -11625,18 +11640,17 @@ end
             @test rough(sP_) < rough(s0_)
         end
 
-        # The remaining four whitelists (AGM — whose smoothing_lambda is not a
-        # user-facing keyword — plus MAGI, rodeo and DALTON, which sit inside
-        # Kalman/HMC objectives far too slow to gate a unit test on) cannot be
-        # exercised end-to-end here. The campaign's recurring failure mode is
-        # precisely a type landing on some sibling sites and not others, so
-        # assert the registration at each site directly.
+        # All secondary solvers now dispatch generically through
+        # `penalty_matrix(approx)` (v0.3 M2 cleanup), so any approximator
+        # implementing the protocol — including TransformedCovariateApproximator —
+        # automatically receives its penalty without per-type whitelists.
         src_dir = dirname(pathof(PartiallySpecifiedModels))
         for f in ("two_stage_solver.jl", "integral_matching_solver.jl",
                   "magi_solver.jl", "adaptive_gradient_matching.jl",
-                  "rodeo_solver.jl", "dalton_solver.jl",
-                  "bootstrap.jl", "diagnostics.jl",
-                  "approximator_interface.jl")
+                  "rodeo_solver.jl", "dalton_solver.jl")
+            @test occursin("penalty_matrix", read(joinpath(src_dir, f), String))
+        end
+        for f in ("bootstrap.jl", "diagnostics.jl", "approximator_interface.jl")
             @test occursin("TransformedCovariateApproximator",
                            read(joinpath(src_dir, f), String))
         end
@@ -11683,7 +11697,7 @@ end
                 end
             end
 
-            pred = PSM.simulate(prob, beta)
+            pred = PSM.simulate_psm(prob, beta)
             y = zeros(n_data); w = zeros(n_data); f = zeros(n_data)
             k = 1
             for oi in 1:n_obs, ti in 1:n_times
@@ -11755,7 +11769,7 @@ end
             [BSplineApproximator(:r, (0.0, 80.0), 6; initial=x -> 0.4),
              BSplineApproximator(:δ, (0.0, 100.0), 5; initial=x -> 0.25)];
             data_times=dtimes_lv, data_values=dvals_lv, obs_to_state=[1, 2],
-            known_params=(α=0.01,), likelihood=Gaussian(), solver=Tsit5())
+            known_params=(α=0.01,), likelihood=GaussianLikelihood(), solver=Tsit5())
         # maxiters 150, not 60: this fit converged in well under 60 against
         # the pinned local Manifest but exhausted the budget on ubuntu CI
         # (`converged` false), where a different OrdinaryDiffEq version walks
@@ -11869,7 +11883,7 @@ end
         prob_eg = PSMProblem(growth_f1!, [1.0], (0.0, 10.0),
             [BSplineApproximator(:r, (0.0, 5.0), 5; initial=x -> 0.05)];
             data_times=dt_eg, data_values=dv_eg, obs_to_state=[1],
-            likelihood=Gaussian(), solver=Tsit5())
+            likelihood=GaussianLikelihood(), solver=Tsit5())
         for alg_f1 in (LAML(maxiters=30, verbose=false),
                        LAML(maxiters=30, verbose=false, jac=:forwarddiff))
             sol_eg = solve(prob_eg, alg_f1)
@@ -12006,7 +12020,7 @@ end
         prob_f1b_pois = PSMProblem(growth_f1b!, [5.0], (0.0, 6.0),
             [BSplineApproximator(:r, (0.0, 30.0), 6; initial=x -> 0.2)];
             data_times=dt_f1b, data_values=reshape(counts_f1b, :, 1),
-            obs_to_state=[1], likelihood=Poisson(), solver=Tsit5())
+            obs_to_state=[1], likelihood=PoissonLikelihood(), solver=Tsit5())
         alg_f1b = CollocationLAML(maxiters=20, verbose=false,
                                   lambda_ode_start=0.01, lambda_ode_end=100.0,
                                   n_continuation=4)
@@ -12036,7 +12050,7 @@ end
             data_times=dt_f1b_g,
             data_values=reshape(exp.(0.3 .* dt_f1b_g), :, 1),
             obs_to_state=[1], known_params=NamedTuple(),
-            likelihood=Gaussian(), solver=Tsit5(),
+            likelihood=GaussianLikelihood(), solver=Tsit5(),
             abstol=1e-8, reltol=1e-8, maxiters=10000)
         for alg_g in (alg_f1b,
                       CollocationLAML(maxiters=20, verbose=false,
@@ -12076,8 +12090,8 @@ end
             data_times=t_lik, data_values=reshape(counts_lik, :, 1),
             obs_to_state=[1], likelihood=lik)
         alg_lik = CollocationLAML(maxiters=60, n_continuation=6, verbose=false)
-        sol_lik_p = solve(mk_lik(Poisson()), alg_lik)
-        sol_lik_g = solve(mk_lik(Gaussian()), alg_lik)
+        sol_lik_p = solve(mk_lik(PoissonLikelihood()), alg_lik)
+        sol_lik_g = solve(mk_lik(GaussianLikelihood()), alg_lik)
 
         # ── The old bit-identity is dead: Poisson ≠ Gaussian ──
         # Measured max |Δparam| = 0.0917 (was exactly 0.0 pre-fix); the gate
@@ -12141,8 +12155,8 @@ end
             [BSplineApproximator(:r, (0.0, 10.0), 6)];
             data_times=t_lc, data_values=reshape(counts_lc, :, 1),
             obs_to_state=[1], likelihood=lik)
-        sol_lc_p = solve(mk_lc(Poisson()), alg_lik)
-        sol_lc_g = solve(mk_lc(Gaussian()), alg_lik)
+        sol_lc_p = solve(mk_lc(PoissonLikelihood()), alg_lik)
+        sol_lc_g = solve(mk_lc(GaussianLikelihood()), alg_lik)
         r_true_lc(N) = 0.6 * (1 - N / 8.0)
         @test sol_lc_p.convergence.converged
         @test sol_lc_g.convergence.converged
@@ -12201,7 +12215,7 @@ end
         prob_d6c = PSMProblem(decay_d6!, [1.0], (0.0, 4.0),
             [BSplineApproximator(:g, (0.0, 1.05), 6; initial=x -> 0.5)];
             data_times=ts_d6c, data_values=reshape(yv_d6, :, 1),
-            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+            obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5())
         @test solve(prob_d6c, cl_d6(1e4)).convergence.lambda_ode_final == 1e4
     end
 
@@ -12331,7 +12345,7 @@ end
         yv_d2 = exp.(-0.5 .* ts_d2) .+ 0.02 .* randn(rng_d2, length(ts_d2))
         mk_d2(ap) = PSMProblem(decay_d2!, [1.0], (0.0, 4.0), [ap];
             data_times=ts_d2, data_values=reshape(yv_d2, :, 1),
-            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+            obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5())
 
         @test !hasproperty(ProtocolOnlyApprox(:r, 3), :domain)
         # The default accessor returns `nothing` rather than throwing …
@@ -12394,7 +12408,7 @@ end
                 y_ref[i, j] = fit_d1[i, j] + sig_d1[j] * randn(r)
             end
         end
-        @test samebits(newdraw(:parametric, Gaussian()), y_ref)
+        @test samebits(newdraw(:parametric, GaussianLikelihood()), y_ref)
         # the unknown-family fallback shares that expression
         @test samebits(newdraw(:parametric,
                                CustomLikelihood((y, m) -> -0.5 * (y - m)^2)),
@@ -12407,7 +12421,7 @@ end
                     max(fit_d1[i, j], 1e-10), r))
             end
         end
-        @test samebits(newdraw(:parametric, Poisson()), y_ref_p)
+        @test samebits(newdraw(:parametric, PoissonLikelihood()), y_ref_p)
 
         y_ref_nb = similar(fit_d1)       # pre-fix NegativeBinomial sampler
         let r = Random.Xoshiro(2024), θ = 3.5
@@ -12417,7 +12431,7 @@ end
                 y_ref_nb[i, j] = Float64(PSM._sample_poisson(g, r))
             end
         end
-        @test samebits(newdraw(:parametric, NegativeBinomial(3.5)), y_ref_nb)
+        @test samebits(newdraw(:parametric, NegativeBinomialLikelihood(3.5)), y_ref_nb)
 
         y_ref_tn = similar(fit_d1)       # pre-fix TruncatedNormal sampler
         let r = Random.Xoshiro(2024), σ = 0.20, lo = 0.0
@@ -12430,7 +12444,7 @@ end
                 end
             end
         end
-        @test samebits(newdraw(:parametric, TruncatedNormal(0.0, 0.20)),
+        @test samebits(newdraw(:parametric, TruncatedNormalLikelihood(0.0, 0.20)),
                        y_ref_tn)
 
         y_ref_np = similar(fit_d1)       # pre-fix residual resampler
@@ -12443,7 +12457,7 @@ end
                 end
             end
         end
-        @test samebits(newdraw(:nonparametric, Gaussian()), y_ref_np)
+        @test samebits(newdraw(:nonparametric, GaussianLikelihood()), y_ref_np)
 
         # ── (b) Non-uniform weights now scale the draw. ─────────────────
         # w = 1 on the first 9 cells, w = 4 on the rest.  Under the package
@@ -12484,10 +12498,10 @@ end
         #   NegativeBinomial(4)   1.0003 → 0.4990
         # Gate 0.5 ± 0.05: ≈10× headroom below every broken value (all ≈1.0)
         # and ≈10× above the Monte-Carlo scatter at 20 000 draws (≈0.005).
-        @test d1_sd_ratio(:parametric, Gaussian(), f1_d1, [0.034254]) ≈ 0.5 atol = 0.05
-        @test d1_sd_ratio(:nonparametric, Gaussian(), f1_d1, [0.034254]) ≈ 0.5 atol = 0.05
-        @test d1_sd_ratio(:parametric, Poisson(), fill(9.0, 17, 1), [3.0]) ≈ 0.5 atol = 0.05
-        @test d1_sd_ratio(:parametric, NegativeBinomial(4.0), fill(9.0, 17, 1),
+        @test d1_sd_ratio(:parametric, GaussianLikelihood(), f1_d1, [0.034254]) ≈ 0.5 atol = 0.05
+        @test d1_sd_ratio(:nonparametric, GaussianLikelihood(), f1_d1, [0.034254]) ≈ 0.5 atol = 0.05
+        @test d1_sd_ratio(:parametric, PoissonLikelihood(), fill(9.0, 17, 1), [3.0]) ≈ 0.5 atol = 0.05
+        @test d1_sd_ratio(:parametric, NegativeBinomialLikelihood(4.0), fill(9.0, 17, 1),
                           [3.0]) ≈ 0.5 atol = 0.05
 
         # TruncatedNormal is the one family whose ratio is NOT 0.5, and the
@@ -12509,7 +12523,7 @@ end
         # form and 8.9 rtol-widths outside the gate.  sd(w=1) is a control
         # (pre-fix 0.1755379, post-fix 0.1758614: both pass, as they must —
         # nothing changes at w = 1).
-        tn_d1 = TruncatedNormal(0.0, 0.20)
+        tn_d1 = TruncatedNormalLikelihood(0.0, 0.20)
         function tn_sd_d1(w)
             σe = tn_d1.sigma / sqrt(w)
             ξ = (0.30 - tn_d1.lower) / σe
@@ -12536,7 +12550,7 @@ end
         # (a) the accessor.  `_variance_function` already returned the
         # TRUNCATED variance while the Pearson numerator centred on the
         # LATENT location, so the two halves of the statistic disagreed.
-        fam_d5 = TruncatedNormal(0.0, 0.15)
+        fam_d5 = TruncatedNormalLikelihood(0.0, 0.15)
         # Independent derivative of the accurate log-CDF, not the former
         # absolute-error CDF approximation used by the implementation.
         imr_d5(ξ) = PSM.ForwardDiff.derivative(PSM._normlogcdf, ξ)
@@ -12550,9 +12564,9 @@ end
         end
         # Identity for every other family — this is exactly why the
         # Gaussian/Poisson/NegBin/Custom paths are bit-identical.
-        @test PSM._family_mean(Gaussian(), 3.7) === 3.7
-        @test PSM._family_mean(Poisson(), 12.0) === 12.0
-        @test PSM._family_mean(NegativeBinomial(4.0), 12.0) === 12.0
+        @test PSM._family_mean(GaussianLikelihood(), 3.7) === 3.7
+        @test PSM._family_mean(PoissonLikelihood(), 12.0) === 12.0
+        @test PSM._family_mean(NegativeBinomialLikelihood(4.0), 12.0) === 12.0
         @test PSM._family_mean(CustomLikelihood((y, m) -> -0.5 * (y - m)^2),
                                2.5) === 2.5
 
@@ -12575,11 +12589,11 @@ end
         # (c) every other family is untouched.  These λ̂/edf came out
         # BITWISE identical in the before and after runs; the loose rtol
         # here is for cross-machine arithmetic, not for the fix.
-        lam_g, edf_g = d5_run(Gaussian(), collect(range(2.0, 0.5, length=25)),
+        lam_g, edf_g = d5_run(GaussianLikelihood(), collect(range(2.0, 0.5, length=25)),
                               (m, r) -> m .+ 0.10 .* randn(r, 25))
-        lam_p, edf_p = d5_run(Poisson(), collect(range(9.0, 2.0, length=25)),
+        lam_p, edf_p = d5_run(PoissonLikelihood(), collect(range(9.0, 2.0, length=25)),
                               (m, r) -> max.(round.(m .+ 0.8 .* randn(r, 25)), 0.0))
-        lam_n, edf_n = d5_run(NegativeBinomial(4.0),
+        lam_n, edf_n = d5_run(NegativeBinomialLikelihood(4.0),
                               collect(range(9.0, 2.0, length=25)),
                               (m, r) -> max.(round.(m .+ 0.8 .* randn(r, 25)), 0.0))
         # THESE WERE ABSOLUTE PINS AT rtol 1e-4 AND COULD NOT SURVIVE A
@@ -12651,7 +12665,7 @@ end
         yv_d4 = truth_d4 .+ 0.02 .* randn(rng_d4, length(ts_d4))
         mkprob_d4(ap) = PSMProblem(gm_d4!, [0.30], (0.0, 14.0), [ap];
             data_times=ts_d4, data_values=reshape(yv_d4, :, 1),
-            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+            obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5())
 
         # An SPDE penalty on 9 coefficients has rank 9, not the guessed 7.
         sol_d4s = solve(mkprob_d4(SPDEApproximator(:f, (0.0, 4.0), 9;
@@ -12716,7 +12730,7 @@ end
         prob_w = PSMProblem(gh_w!, [1.0], (0.0, 10.0),
             [BSplineApproximator(:r, (0.0, 5.0), 6; initial=x -> 0.05)];
             data_times=t_w, data_values=reshape(exp.(0.1 .* t_w) .+ noi_w, :, 1),
-            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+            obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5())
 
         # DETERMINISTIC trigger: `maxiters <= warmup` means Fellner–Schall
         # never runs at all. The other route into this state — FS proposals
@@ -12742,7 +12756,7 @@ end
             [NeuralApproximator(:r, Lux.Chain(Lux.Dense(1, 4, tanh), Lux.Dense(4, 1));
                                 domain=(0.0, 5.0), rng_seed=42)];
             data_times=t_w, data_values=reshape(exp.(0.1 .* t_w) .+ noi_w, :, 1),
-            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+            obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5())
         s_nn_w = @test_logs min_level = Base.CoreLogging.Warn begin
             solve(prob_nn_w, LAML(maxiters=10))
         end
@@ -12781,8 +12795,8 @@ end
             times = collect(0.0:0.5:5.0)
             prob = PSMProblem(dyn!, [1.0, 0.0], (0.0, 5.0), [a];
                 data_times=times, data_values=reshape(ones(length(times)), :, 1),
-                obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
-            f0 = vec(PSM.simulate(prob, beta))
+                obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5())
+            f0 = vec(PSM.simulate_psm(prob, beta))
             J = zeros(length(f0), nk)
             PSM.compute_jacobian!(J, prob, beta, f0, length(times), 1;
                                   dam=fill(1e-8, nk), jac=mode)
@@ -12850,7 +12864,7 @@ end
         prob_b = PSMProblem(gh_b!, [1.0], (0.0, 10.0),
             [BSplineApproximator(:r, (0.0, 5.0), 6; initial=x -> 0.05)];
             data_times=t_b, data_values=reshape(exp.(0.1 .* t_b) .+ noi_b, :, 1),
-            obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5())
+            obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5())
 
         # DETERMINISTIC stall: maxiters <= warmup means Fellner-Schall never
         # runs, so EVERY replicate fit reports smoothing_advanced == false,
@@ -12925,7 +12939,7 @@ end
              BSplineApproximator(:mu_j, (0.0, 90.0), 15; initial=t -> 0.1 * exp(-0.02t)),
              BSplineApproximator(:mu_a, (0.0, 90.0), 15; initial=t -> 0.1)];
             data_times=cop_t, data_values=cop_y, obs_to_state=collect(1:11),
-            known_params=NamedTuple(), likelihood=Gaussian(), solver=BS3(),
+            known_params=NamedTuple(), likelihood=GaussianLikelihood(), solver=BS3(),
             abstol=1e-6, reltol=1e-6, maxiters=10000)
         sol_cop = solve(prob_cop, LAML(maxiters=60, verbose=false))
         c_cop = sol_cop.convergence

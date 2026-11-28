@@ -30,7 +30,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DerivativeFreeSolver)
     # Resolve the loss: :auto follows prob.likelihood (Gaussian → :mse,
     # anything else → :likelihood); explicit :mse/:likelihood is honored.
     loss_sym = if alg.loss == :auto
-        prob.likelihood isa Gaussian ? :mse : :likelihood
+        prob.likelihood isa GaussianLikelihood ? :mse : :likelihood
     elseif alg.loss in (:mse, :likelihood)
         alg.loss
     else
@@ -103,7 +103,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::DerivativeFreeSolver)
     function loss_fn(beta::AbstractVector)
         # Simulate model
         pred = try
-            simulate(prob, beta)
+            simulate_psm(prob, beta)
         catch e
             _is_program_error(e) && rethrow()
             return 1e20
@@ -174,15 +174,26 @@ function SciMLBase.solve(prob::PSMProblem, alg::DerivativeFreeSolver)
 
     beta_opt = Optim.minimizer(result)
     obj_val  = Optim.minimum(result)
+    hit_sentinel = !isfinite(obj_val) || obj_val >= 1e19
 
     if verbose
         println("  Optimization complete: f=$(round(obj_val, sigdigits=6)), " *
-                "converged=$(Optim.converged(result)), " *
+                "converged=$(Optim.converged(result) && !hit_sentinel), " *
                 "iters=$(Optim.iterations(result))")
     end
 
     # ── Simulate with optimal parameters for fitted values ──
-    pred = simulate(prob, beta_opt)
+    sim_failed = false
+    pred = try
+        simulate_psm(prob, beta_opt)
+    catch e
+        _is_program_error(e) && rethrow()
+        sim_failed = true
+        zeros(length(prob.data_times), size(prob.data_values, 2))
+    end
+    if !all(isfinite, pred)
+        sim_failed = true
+    end
 
     # Data loss (weighted sum of squares)
     data_loss = weighted_data_loss(prob, pred)
@@ -216,13 +227,19 @@ function SciMLBase.solve(prob::PSMProblem, alg::DerivativeFreeSolver)
     # EDF = n_p (all parameters are "free"; no penalized smoothing selection)
     edf = Float64(n_p)
 
+    df_converged = Optim.converged(result) && !hit_sentinel && !sim_failed
+    df_reason = (hit_sentinel || sim_failed) ? :dynamics_failure :
+                (Optim.converged(result) ? :converged : :maxiters)
+
     PSMSolution(params, obj_val, data_loss, edf,
                 Float64[],   # no smoothing parameters selected
                 Float64.(pred), Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
-                (converged=Optim.converged(result),
+                (converged=df_converged,
+                 reason=df_reason,
                  method=alg.method,
                  iterations=Optim.iterations(result),
                  f_calls=Optim.f_calls(result),
-                 minimum=Optim.minimum(result)))
+                 minimum=Optim.minimum(result),
+                 simulation_failed=sim_failed))
 end

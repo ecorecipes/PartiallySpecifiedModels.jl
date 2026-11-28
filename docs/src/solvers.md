@@ -1,6 +1,6 @@
 # Solvers
 
-PartiallySpecifiedModels.jl provides 23 solvers for fitting partially specified models. Solvers are passed as the second argument to `solve`:
+PartiallySpecifiedModels.jl provides 24 solvers for fitting partially specified models (ODEs, DDEs, discrete maps, multi-trajectory hierarchical problems, and continuous-discrete SDEs). Solvers are passed as the second argument to `solve`:
 
 ```@example solvers
 using PartiallySpecifiedModels # hide
@@ -14,7 +14,7 @@ approx_r = BSplineApproximator(:r, (0.0, 12.0), 8; initial = x -> 0.3) # hide
 r0, K, N0 = 0.5, 10.0, 0.5 # hide
 true_sol = OrdinaryDiffEq.solve(ODEProblem((du,u,p,t) -> du[1] = r0*(1-u[1]/K)*u[1], [N0], (0.0,15.0)), Tsit5(); saveat=0.5) # hide
 obs = max.([true_sol.u[i][1] + 0.3*randn() for i in 1:length(true_sol.t)], 0.01) # hide
-prob = PSMProblem(growth!, [N0], (0.0,15.0), [approx_r]; data_times=collect(true_sol.t), data_values=reshape(obs,:,1), obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5()) # hide
+prob = PSMProblem(growth!, [N0], (0.0,15.0), [approx_r]; data_times=collect(true_sol.t), data_values=reshape(obs,:,1), obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5()) # hide
 sol = solve(prob, LAML())
 println("Data loss: ", round(sol.data_loss, digits=4), ", EDF: ", round(sol.edf, digits=2))
 ```
@@ -25,13 +25,20 @@ println("Data loss: ", round(sol.data_loss, digits=4), ", EDF: ", round(sol.edf,
 
 Penalized Iteratively Reweighted Least Squares (P-IRLS) with **Laplace Approximate Marginal Likelihood** for automatic smoothing parameter selection. The default and recommended solver for B-spline approximators. For Gaussian data, LAML is equivalent to REML.
 
-For deliberate coefficient refitting at a specified smoothing weight, use
-`LAML(fixed_lambda=0.1)`. The scalar applies to every penalty block and
-cannot be combined with `initial_lambda`. This mode skips smoothing
-selection and automatic GP kernel updates while retaining coefficient
-stability, EDF and covariance reporting. It requires a penalized term.
-Unlike an artificially long warmup, it can stop when the coefficients
-stabilize.
+For deliberate coefficient refitting at specified smoothing weights, use
+`LAML(fixed_lambda=0.1)` (shared scalar across every block) or a per-block
+vector such as `LAML(fixed_lambda=[0.1, nothing])` (fixing block 1 while
+estimating block 2 via LAML). When every block is fixed, `fixed_lambda` cannot
+be combined with `initial_lambda`, skips smoothing selection and automatic GP
+kernel updates, and sets `convergence.smoothing_fixed=true` while retaining
+coefficient stability, EDF, and covariance reporting.
+
+In v0.3, `LAML` defaults to `jac=:auto` (trying `ForwardDiff` once and latching
+to `:fd` if user dynamics are not Dual-compatible), `exploratory_maxiters=5_000`
+(capping exploratory trial steps to prevent stiff-ODE hangs), and uses the exact
+Wood (2011) Theorem 1 implicit-derivative Hessian during Phase-2 Newton
+refinement. `LAML` also supports `MultiTrajectoryPSMProblem` (with optional
+`parallel=true` threading across trajectories).
 
 `convergence.smoothing_fixed=true` marks this intentional mode:
 `smoothing_advanced=false` is expected, no stalled-selection warning is
@@ -49,9 +56,9 @@ conditional covariance unchanged. Fixed-lambda fits need an explicitly
 supplied selection-stage `rho_covariance`; non-Gaussian and other-solver
 fits cannot reuse this Gaussian profiled-REML curvature.
 
-For non-Gaussian likelihoods the default smoothing criterion (`criterion=:working`) is PQL-flavored: smoothing parameters are calibrated on the Gaussian working model of the IRLS loop via a Pearson-dispersion-scaled Fellner–Schall update. The opt-in `criterion=:laplace` instead maximizes the actual family's full Laplace-approximate marginal likelihood, `ℓ(β̂) − ½β̂ᵀS_λβ̂ + ½log|S_λ|₊ − ½log|JᵀW̃J + S_λ| + (Mp/2)log 2π` (Wood 2011; Wood, Pya & Säfken 2016), using the generalized Fellner–Schall update of Wood & Fasiolo (2017) plus Newton refinement. Prefer `:laplace` for count data with low means (Poisson μ ≲ 10), where the working-model approximation is most biased. It supports `Poisson`, `NegativeBinomial` (dispersion fixed at the supplied `theta`), and `TruncatedNormal` (fixed `lower`/`sigma`); `CustomLikelihood` is rejected because it declares no normalized density or dispersion. For `Gaussian` data `:laplace` reduces exactly to the profiled-REML criterion, so results are identical to the default. `sol.convergence.criterion` records which criterion ran and `sol.convergence.laml` the criterion value at the fit.
+For non-Gaussian likelihoods the default smoothing criterion (`criterion=:working`) is PQL-flavored: smoothing parameters are calibrated on the Gaussian working model of the IRLS loop via a Pearson-dispersion-scaled Fellner–Schall update. The opt-in `criterion=:laplace` instead maximizes the actual family's full Laplace-approximate marginal likelihood, `ℓ(β̂) − ½β̂ᵀS_λβ̂ + ½log|S_λ|₊ − ½log|JᵀW̃J + S_λ| + (Mp/2)log 2π` (Wood 2011; Wood, Pya & Säfken 2016), using the generalized Fellner–Schall update of Wood & Fasiolo (2017) plus Newton refinement. Prefer `:laplace` for count data with low means (Poisson μ ≲ 10), where the working-model approximation is most biased. It supports `PoissonLikelihood`, `NegativeBinomialLikelihood` (dispersion fixed at the supplied `theta`), `TruncatedNormalLikelihood`, `GammaLikelihood`, `LogNormalLikelihood`, `BinomialLikelihood`, and `StudentTLikelihood`; `CustomLikelihood` is rejected because it declares no normalized density or dispersion. For `GaussianLikelihood` data `:laplace` reduces exactly to the profiled-REML criterion, so results are identical to the default. `sol.convergence.criterion` records which criterion ran and `sol.convergence.laml` the criterion value at the fit.
 
-For `TruncatedNormal`, the model predicts the latent normal location, which
+For `TruncatedNormalLikelihood`, the model predicts the latent normal location, which
 can lie below `lower`; it is not the mean of the observed truncated response.
 The log-density, IRLS score and information, and Pearson dispersion use
 consistent, stable tail calculations. Negative latent locations are not
@@ -66,7 +73,7 @@ There is deliberately **no `stationary::Bool`**: measured across all 163 LAML so
 
 Neither `GCVSolver` nor `CollocationLAML` reports these yet, and neither can reuse LAML's residual, because neither optimizes the LAML criterion. `GCVSolver` minimizes a GCV (or, with `criterion=:ncv`, a neighbourhood-CV) score by grid plus golden-section search over `log λ`, so its analogue would be the derivative of that score — and `smoothing_advanced` would be near-vacuous there, since a golden-section search always moves λ. `CollocationLAML` runs its own inline Fellner–Schall update against the collocation criterion (which carries the extra ODE-compliance term and its own `S_full`), so its analogue is the gradient of *that* criterion, not of `laml_objective`. Both need their own residual derivation and their own calibration sweep.
 
-Both `LAML` and `GCVSolver` (and `CollocationLAML`) accept `jac=:forwarddiff` to compute the working-model Jacobian of the predictions by forward-mode AD (`ForwardDiff`) straight through the ODE/map/DDE solve instead of the default adaptive central finite differences (`jac=:fd`): exact to solver precision and roughly an order of magnitude faster per Jacobian (one chunked Dual sweep replaces 2·p perturbed solves), with an automatic per-iteration fallback to finite differences if the Dual-valued solve fails. For `CollocationLAML` the option also covers the pointwise state Jacobian and the ∂F/∂β block of the collocation residual, preserving the failure-sentinel convention exactly (failed collocation points keep a large residual and a zero Jacobian; the sentinel is never differentiated).
+Both `LAML` (default `jac=:auto`), `GCVSolver`, and `CollocationLAML` accept `jac=:forwarddiff` to compute the working-model Jacobian of the predictions by forward-mode AD (`ForwardDiff`) straight through the ODE/map/DDE solve instead of adaptive central finite differences (`jac=:fd`): exact to solver precision and roughly an order of magnitude faster per Jacobian (one chunked Dual sweep replaces 2·p perturbed solves), with an automatic per-iteration fallback to finite differences if the Dual-valued solve fails. For `CollocationLAML` the option also covers the pointwise state Jacobian and the ∂F/∂β block of the collocation residual, preserving the failure-sentinel convention exactly (failed collocation points keep a large residual and a zero Jacobian; the sentinel is never differentiated).
 
 The `:fd` path carries a **residual noise floor** that `:forwarddiff` does not: adaptive integrators re-select their accepted-step sequence under each parameter perturbation, so two solves at nearly identical parameters differ by an integration jitter far above machine precision (measured 1.5e-6 on a Tsit5 quadrature fixture at the default `reltol=abstol=1e-8`). The FD path measures that jitter once per Jacobian with a nudge solve, and a column whose central-difference signal falls below 10× the measured jitter — the qualitatively-garbage regime, where the noise floor used to produce entries wrong by half their scale — is recomputed at grown steps until its signal clears 1e4× the noise, each grown step validated against the previous column and guarded against growing into truncation. On an exact-reference fixture with O(1) sensitivities this repairs the FD Jacobian from 54%-of-scale error to 5.7e-5 of scale (vs 2.2e-6 for `:forwarddiff`). Noise-free problems such as discrete maps keep the historical tolerance-tied floor step and their ~1e-10 accuracy; but on *noisy* problems a column that measures above the 10× trigger keeps the historical floor step **and its historical noise floor** — the trigger's jitter estimate comes from a single base-point nudge solve, which can underestimate the realized per-column re-solve noise by ~10×, and on a one-coefficient variant of the reference fixture untriggered columns at measured SNR 12–18 retained errors of ~0.3–0.95 of column scale. These bounds are as-measured on these fixtures, not a guarantee. One exception by design: `GCVSolver` pins the historical fixed-step FD policy (no growth) inside its λ search, because its `search=:direct` vs `search=:reuse` equivalence contract requires a Jacobian that responds continuously to the coefficients, which a jitter-triggered step policy does not. The consequence is that `GCVSolver`'s `:fd` path retains the original noise floor on noisy problems in full; prefer `jac=:forwarddiff` there whenever the dynamics accept Dual numbers. Prefer `jac=:forwarddiff` when the dynamics are generic enough to accept Dual numbers — it is exact to solver precision and roughly 9–19× faster per Jacobian in this package's microbenchmarks (measured 14.1× on a spline fixture at p=8, 9.0× on a neural fixture at p=13, and 19.1× on a noisy fixture where the FD path pays signal-growth retries); `:fd` remains the default because it makes no genericity demands on user dynamics.
 
@@ -94,7 +101,7 @@ GCVSolver
 
 **Generalized profiling** (collocation) approach. Fits spline approximations to the state variables first, then optimizes the unknown function parameters to match the implied derivatives. Can be more robust than direct ODE fitting for stiff or chaotic systems.
 
-The data-fidelity block is likelihood-aware: non-Gaussian families (`Poisson`, `NegativeBinomial`, `TruncatedNormal`, `CustomLikelihood`) are fitted by PIRLS working weights on the identity link with a deviance-scale objective, mirroring `LAML`'s default `:working` criterion; the ODE-compliance penalty stays Gaussian in the derivative residuals, and Gaussian data follow the plain least-squares path unchanged. Note that `PSMSolution.objective` and `data_loss` remain squared-error quantities for all families (the pre-existing cross-solver reporting convention), so the reported objective is not the internal deviance criterion the solver optimizes for non-Gaussian data (e.g. 223.005 reported vs 90.07 internal on a Poisson fixture, as measured by the review).
+The data-fidelity block is likelihood-aware: non-Gaussian families (`PoissonLikelihood`, `NegativeBinomialLikelihood`, `TruncatedNormalLikelihood`, `GammaLikelihood`, `LogNormalLikelihood`, `BinomialLikelihood`, `StudentTLikelihood`, `CustomLikelihood`) are fitted by PIRLS working weights on the identity link with a deviance-scale objective, mirroring `LAML`'s default `:working` criterion; the ODE-compliance penalty stays Gaussian in the derivative residuals, and Gaussian data follow the plain least-squares path unchanged. Note that `PSMSolution.objective` and `data_loss` remain squared-error quantities for all families (the pre-existing cross-solver reporting convention), so the reported objective is not the internal deviance criterion the solver optimizes for non-Gaussian data (e.g. 223.005 reported vs 90.07 internal on a Poisson fixture, as measured by the review).
 
 ```@docs
 CollocationLAML
@@ -177,10 +184,18 @@ AdamSolver
 
 ### MultipleShootingSolver
 
-**Multiple shooting** with Adam optimization. Divides the time span into segments and optimizes continuity constraints. More robust than single shooting for long time series or chaotic dynamics.
+**Multiple shooting** using an **Augmented Lagrangian + L-BFGS** outer/inner optimization loop (with optional cosine-decayed warm starts). Divides the time span into segments and optimizes continuity constraints across segment boundaries. More robust than single shooting for long time series or chaotic dynamics.
 
 ```@docs
 MultipleShootingSolver
+```
+
+### EKFSolver (SDE / Process-Noise State-Space PSMs)
+
+Continuous-discrete **Extended Kalman Filter + Rauch–Tung–Striebel (RTS) smoother** for [`SDEPSMProblem`](@ref), separating environmental/demographic process noise ($Q$) from measurement error ($R$) while estimating unknown drift functions with outer Laplace / Fellner–Schall smoothing selection. Handles ragged missing (`NaN`) observations natively.
+
+```@docs
+EKFSolver
 ```
 
 ### DerivativeFreeSolver
@@ -308,6 +323,7 @@ RKHSSolver
 | Use case | Recommended solver |
 |----------|-------------------|
 | Default / first try | [`LAML`](@ref) |
+| Process noise / stochastic ODE (`SDEPSMProblem`) | [`EKFSolver`](@ref) |
 | Neural or KAN approximators with `LAML` | [`MultiStart`](@ref) |
 | Automatic smoothing comparison | [`GCVSolver`](@ref) |
 | Stiff or chaotic systems | [`CollocationLAML`](@ref) |
@@ -389,7 +405,7 @@ To use one of these four with incomplete data, drop the masked rows from
 
 ### Diagnostics
 
-[`residual_diagnostics`](@ref) and [`appraise`](@ref) exclude masked cells
+[`residual_diagnostics`](@ref) and [`psm_appraise`](@ref) exclude masked cells
 from every statistic. Because a `PSMSolution` stores `data_values` but not
 `data_weights`, they detect masking from the stored **value** only — one more
 reason to mark a masked cell with `NaN` as well as with a zero weight.

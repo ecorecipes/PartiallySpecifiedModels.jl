@@ -110,6 +110,7 @@ struct MAGILogDensity{P <: PSMProblem}
     obs_indices::Vector{Int}
     obs_var::Vector{Float64}           # per state component
     prior_scale::Float64
+    temper::Float64                    # Yang et al. (2021) prior tempering β = D|I|/|I_obs|
     n_vars::Int
     n_grid::Int
     n_params::Int
@@ -117,6 +118,7 @@ struct MAGILogDensity{P <: PSMProblem}
     mmap::Vector{Matrix{Float64}}      # 'K C⁻¹
     Kstar_inv::Vector{Matrix{Float64}}
     μ::Vector{Vector{Float64}}         # GP prior mean per component
+    penalties::Vector{Tuple{Int,Int,Matrix{Float64}}}  # precomputed (off, nk, S)
 end
 
 LogDensityProblems.dimension(ld::MAGILogDensity) = ld.n_params + ld.n_vars * ld.n_grid
@@ -159,14 +161,17 @@ function _magi_logposterior(ld::MAGILogDensity, v::AbstractVector{T}) where T
     end
 
     lp = zero(T)
+    inv_temper = T(1.0) / T(ld.temper)
     for d in 1:n_vars
         xd = @view X[:, d]
         xc = xd .- ld.μ[d]
-        # GP prior: −½ xcᵀ C⁻¹ xc
-        lp += -T(0.5) * dot(xc, ld.Cinv[d] * xc)
-        # Manifold constraint: −½ (F − m·xc)ᵀ K*⁻¹ (F − m·xc)
+        # Yang, Wong & Kou (2021) Eq. (7): temper GP prior and manifold
+        # constraint by β = D|I| / |I_obs| so discretization infill does not
+        # overwhelm the data likelihood.
+        lp += -T(0.5) * inv_temper * dot(xc, ld.Cinv[d] * xc)
+        # Manifold constraint: −(1 / 2β) (F − m·xc)ᵀ K*⁻¹ (F − m·xc)
         resid = @view(F[:, d]) .- ld.mmap[d] * xc
-        lp += -T(0.5) * dot(resid, ld.Kstar_inv[d] * resid)
+        lp += -T(0.5) * inv_temper * dot(resid, ld.Kstar_inv[d] * resid)
     end
 
     # Data likelihood (Gaussian; per-state noise variance). Weight-zero
@@ -184,29 +189,13 @@ function _magi_logposterior(ld::MAGILogDensity, v::AbstractVector{T}) where T
         end
     end
 
-    # Parameter prior (smoothing penalty + broad ridge)
-    offset = 0
-    for approx in prob.approximators
-        nk = nparams(approx)
-        pk = @view theta[offset+1:offset+nk]
-        offset += nk
-        # Non-built-in (custom protocol) types take the generic branch too;
-        # built-in treatment is unchanged (see _BUILTIN_APPROX_TYPES).
-        if approx isa BSplineApproximator || approx isa ShapeConstrainedBSplineApproximator ||
-           approx isa GPApproximator || approx isa COMONetApproximator ||
-           approx isa SPDEApproximator || approx isa ShapeConstrainedSPDEApproximator ||
-           approx isa ShapeConstrainedGPApproximator ||
-           approx isa TensorBSplineApproximator ||
-           approx isa SingleIndexApproximator ||
-           approx isa TransformedCovariateApproximator ||
-           !(approx isa _BUILTIN_APPROX_TYPES)
-            S = penalty_matrix(approx)
-            if S !== nothing
-                lp += -T(0.5) / T(ld.prior_scale) * dot(pk, T.(S) * pk)
-            end
-        end
-        lp += -T(0.5) / T(100.0 * ld.prior_scale) * dot(pk, pk)
+    # Parameter prior (precomputed smoothing penalties + broad ridge)
+    inv_ps = T(0.5) / T(ld.prior_scale)
+    for (off, nk, S) in ld.penalties
+        pk = @view theta[off+1:off+nk]
+        lp -= inv_ps * dot(pk, S * pk)
     end
+    lp -= T(0.5) / T(100.0 * ld.prior_scale) * dot(theta, theta)
     lp
 end
 
@@ -258,26 +247,35 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     _validate_problem(prob, "MagiSolver"; require_continuous=true,
                       reject_delays=true, delay_reason=
                       "It builds a probabilistic ODE / GP state-space manifold from the 4-argument ODE signature f!(du, u, p, t).")
-    # The manifold-constrained GP posterior assumes Gaussian observation
-    # noise (the data term is a Gaussian quadratic form on the state grid),
-    # so refuse other families rather than silently fitting Gaussian.
-    prob.likelihood isa Gaussian ||
-        error("MagiSolver supports Gaussian likelihoods only (the " *
-              "manifold-constrained GP posterior assumes Gaussian " *
-              "observation noise); got $(typeof(prob.likelihood)). " *
-              "Use MCMCSolver or LAML for other likelihood families.")
+    _require_gaussian_likelihood(prob, "MagiSolver")
     verbose = alg.verbose
-    n_vars = length(prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)
+    u0v = _resolve_u0_init(prob)
+    n_vars = length(u0v)
 
     t0, tf = prob.tspan
-    grid_times = collect(range(t0, tf, length=alg.n_gridpoints))
-    n_grid = alg.n_gridpoints
-
-    obs_indices = Int[]
-    for td in prob.data_times
-        _, idx = findmin(abs.(grid_times .- td))
-        push!(obs_indices, idx)
+    data_times = Float64.(prob.data_times)
+    # Exact grid inclusion I_obs ⊆ I (Yang, Wong & Kou 2021): include every
+    # observation timestamp verbatim so data are never snapped to a wrong time,
+    # then augment with evenly spaced infill points up to at least n_gridpoints.
+    grid_pts = sort(unique(data_times))
+    tol_t = 1e-10 * max(tf - t0, 1.0)
+    for t_in in range(t0, tf, length=alg.n_gridpoints)
+        if !any(tg -> abs(tg - t_in) <= tol_t, grid_pts)
+            push!(grid_pts, Float64(t_in))
+        end
     end
+    sort!(grid_pts)
+    grid_times = grid_pts
+    n_grid = length(grid_times)
+
+    obs_indices = Int[argmin(abs.(grid_times .- td)) for td in data_times]
+
+    # Prior tempering factor β = D|I| / |I_obs| (Yang et al. 2021, PNAS Eq. 7)
+    n_usable_obs = 0
+    for i in 1:size(prob.data_values, 1), j in 1:size(prob.data_values, 2)
+        _usable(prob.data_values[i, j], prob.data_weights[i, j]) && (n_usable_obs += 1)
+    end
+    temper = max(Float64(n_vars * n_grid) / max(Float64(n_usable_obs), 1.0), 1.0)
 
     # ── Observation noise variance (one per state component) ──
     # Priority: `sigma` (explicit per-state SDs) > `obs_var` (shared
@@ -330,40 +328,52 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     end
 
     # ── GP hyperparameters and precomputed matrices per component ──
-    data_times = Float64.(prob.data_times)
     Cinv = Vector{Matrix{Float64}}(undef, n_vars)
     mmap = Vector{Matrix{Float64}}(undef, n_vars)
     Kstar_inv = Vector{Matrix{Float64}}(undef, n_vars)
     μ = Vector{Vector{Float64}}(undef, n_vars)
     Xinit = zeros(n_grid, n_vars)
+    ells = zeros(n_vars)
+    sig2s = zeros(n_vars)
+    ybars = zeros(n_vars)
+    is_obs_var = falses(n_vars)
 
-    u0v = Float64.(prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)
+    # First pass: observed state components
     for d in 1:n_vars
-        # observation column mapping to this state, if any
         ocol = findfirst(j -> prob.obs_to_state[j] == d, 1:size(prob.data_values, 2))
-        if ocol !== nothing
-            yobs = Float64.(prob.data_values[:, ocol])
-            # weight-0 points are masked: keep them out of the GP
-            # hyperparameter fit and the state initialization too
-            keep = _usable.(yobs, prob.data_weights[:, ocol])
-            td = data_times[keep]; yv = yobs[keep]
-            ℓ, σ2 = _magi_fit_hyperparams(td, yv, obs_var_vec[d])
-            ybar = Statistics.mean(yv)
-            for i in 1:n_grid
-                Xinit[i, d] = _magi_linear_interp(td, yv, grid_times[i])
-            end
-        else
-            ℓ = (tf - t0) / 4
-            σ2 = 1.0
-            ybar = u0v[d]
+        ocol === nothing && continue
+        is_obs_var[d] = true
+        yobs = Float64.(prob.data_values[:, ocol])
+        keep = _usable.(yobs, prob.data_weights[:, ocol])
+        td = data_times[keep]; yv = yobs[keep]
+        ℓ, σ2 = _magi_fit_hyperparams(td, yv, obs_var_vec[d])
+        ells[d] = ℓ; sig2s[d] = σ2; ybars[d] = Statistics.mean(yv)
+        for i in 1:n_grid
+            Xinit[i, d] = _magi_linear_interp(td, yv, grid_times[i])
+        end
+    end
+
+    # Second pass: unobserved components borrow mean observed (ℓ, σ²) instead of hardcoded 1.0
+    obs_ells = ells[is_obs_var]
+    obs_sig2s = sig2s[is_obs_var]
+    ℓ_borrow = isempty(obs_ells) ? (tf - t0) / 4 : Statistics.mean(obs_ells)
+    σ2_borrow = isempty(obs_sig2s) ? 1.0 : Statistics.mean(obs_sig2s)
+    for d in 1:n_vars
+        if !is_obs_var[d]
+            ells[d] = ℓ_borrow
+            sig2s[d] = isempty(obs_sig2s) ? max(u0v[d]^2, 1.0) : σ2_borrow
+            ybars[d] = u0v[d]
             Xinit[:, d] .= u0v[d]
         end
+        ℓ = ells[d]; σ2 = sig2s[d]; ybar = ybars[d]
         C, K1, K2 = _matern32_gp_matrices(grid_times, ℓ, σ2)
-        jitter = 1e-7 * σ2
-        Cf = cholesky(Symmetric(C + jitter * I))
+        jitter_c = max(1e-7 * σ2, 1e-10)
+        # Derivative-scale jitter: diag(K2) = 3 σ² / ℓ² for Matérn-3/2
+        jitter_k = max(1e-6 * (3.0 * σ2 / ℓ^2), 1e-9)
+        Cf = cholesky(Symmetric(C + jitter_c * I))
         Ci = inv(Cf)
         m = K1 * Ci
-        Kstar = Symmetric(K2 - K1 * Ci * K1' + jitter * I)
+        Kstar = Symmetric(K2 - K1 * Ci * K1' + jitter_k * I)
         Cinv[d] = Matrix(Ci)
         mmap[d] = m
         Kstar_inv[d] = Matrix(inv(cholesky(Kstar)))
@@ -380,8 +390,21 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     end
     v0 = vcat(theta0, vec(Xinit))
 
+    magi_penalties = Tuple{Int,Int,Matrix{Float64}}[]
+    let off = 0
+        for approx in prob.approximators
+            nk = nparams(approx)
+            if !(approx isa NeuralApproximator)
+                S = penalty_matrix(approx)
+                S !== nothing && push!(magi_penalties, (off, nk, S))
+            end
+            off += nk
+        end
+    end
+
     ld = MAGILogDensity(prob, grid_times, obs_indices, obs_var_vec, alg.prior_scale,
-                        n_vars, n_grid, n_params, Cinv, mmap, Kstar_inv, μ)
+                        temper, n_vars, n_grid, n_params, Cinv, mmap, Kstar_inv, μ,
+                        magi_penalties)
 
     ld_ad = LogDensityProblemsAD.ADgradient(Val(:ForwardDiff), ld)
 
@@ -410,7 +433,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
     verbose && println("MAGI: NUTS sampling ($n_total iterations, $(alg.n_warmup) warmup)...")
     # n_adapts must equal n_warmup so all discarded draws are adaptation
     # and all retained draws come from the frozen kernel.
-    chain_raw = AbstractMCMC.sample(ld_ad, nuts, n_total;
+    rng_magi = alg.rng_seed === nothing ? Random.default_rng() : Random.Xoshiro(alg.rng_seed)
+    chain_raw = AbstractMCMC.sample(rng_magi, ld_ad, nuts, n_total;
                                     n_adapts=alg.n_warmup,
                                     initial_params=v0, progress=verbose)
 
@@ -485,7 +509,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::MagiSolver)
                 pred, Float64.(prob.data_values),
                 Float64.(prob.data_times), uf_evals,
                 (method=:magi, chains=chains, state_mean=state_mean,
-                 mean_logposterior=mean_logpost,
+                 grid_times=grid_times, obs_indices=obs_indices,
+                 temper=temper, mean_logposterior=mean_logpost,
                  converged=false, reason=:maxiters,
                  iterations=n_total))
 end

@@ -47,6 +47,7 @@ docstring.
 function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
     _validate_problem(prob, "ODINSolver"; require_continuous=true,
                       reject_delays=true)
+    _require_gaussian_likelihood(prob, "ODINSolver")
     if (alg.gp_lengthscale === nothing) != (alg.gp_variance === nothing)
         throw(ArgumentError(
             "ODINSolver: supply BOTH gp_lengthscale and gp_variance to fix " *
@@ -57,7 +58,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
 
     times = Float64.(prob.data_times)
     n_times = length(times)
-    u0_vec = Float64.(prob.u0 isa Function ? prob.u0(prob.known_params) : prob.u0)
+    u0_vec = _resolve_u0_init(prob)
     n_vars = length(u0_vec)
     n_obs = size(prob.data_values, 2)
     obs_of_state = Dict{Int, Vector{Int}}()   # state ↦ data columns
@@ -68,21 +69,23 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
     if verbose; println("ODINSolver: $n_obs observed states, $n_times time points"); end
 
     # ── Stage 1: GP hyperparameters and fixed matrices per state ────
-    # For each state k we need: center m_k, prior precision P_k = K⁻¹,
-    # derivative map D_k = 'K K⁻¹, mismatch precision Ainv_k, and (for
-    # observed states) the data weight 1/σ_n².
+    # For each state k we need: center m_k, scale s_k (when standardize=true),
+    # prior precision P_k = K⁻¹, derivative map D_k = 'K K⁻¹, mismatch
+    # precision Ainv_k, and (for observed states) the data weight 1/σ_n².
     m_center = zeros(n_vars)
+    s_scale = ones(n_vars)
     P = Vector{Matrix{Float64}}(undef, n_vars)
     D = Vector{Matrix{Float64}}(undef, n_vars)
     Ainv = Vector{Matrix{Float64}}(undef, n_vars)
-    data_w = zeros(n_vars)                    # 1/σ_n² (0 for unobserved)
+    data_w = zeros(n_vars)                    # 1/σ_n² in standardized units
     hyper = Vector{NamedTuple}(undef, n_vars)
-    x_init = zeros(n_times, n_vars)
+    hyper_std = Vector{NamedTuple}(undef, n_vars)
+    x_init = zeros(n_times, n_vars)           # standardized state coordinates
 
     function state_matrices(σ²::Float64, ℓ::Float64, σn²::Float64)
-        K, dK, d2K = rbf_kernel_with_derivs(times, σ², ℓ)
-        # Noiseless RBF Grams are severely ill-conditioned; regularize with
-        # a small jitter before factorizing.
+        K, dK, d2K = _gp_kernel_with_derivs(times, σ², ℓ, alg.kernel)
+        # Noiseless GP Grams can be ill-conditioned; regularize with a small
+        # jitter before factorizing.
         jitter = 1e-6 * σ²
         C = cholesky(Symmetric(K + jitter * I))
         Pk = Matrix(inv(C))
@@ -111,47 +114,51 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
             "entirely masked; state $sk has no usable data.")
         y_k = Float64.(prob.data_values[keep_k, jc])
         m_center[sk] = mean(y_k)
-        yc = y_k .- m_center[sk]
+        sd_k = length(y_k) > 1 ? std(y_k) : 1.0
+        s_scale[sk] = (alg.standardize && isfinite(sd_k) && sd_k > 1e-8) ? sd_k : 1.0
+        yc = (y_k .- m_center[sk]) ./ s_scale[sk]
         times_k = times[keep_k]
         # Fixed-hyperparameter path assumes 1% observation noise; with
         # several data columns per state, hyperparameters and the center
         # come from the first column (replicates enter only the data term).
         σ², ℓ, σn² = if alg.gp_lengthscale !== nothing && alg.gp_variance !== nothing
-            (alg.gp_variance, alg.gp_lengthscale, 0.01 * alg.gp_variance)
+            σ²_s = alg.gp_variance / s_scale[sk]^2
+            (σ²_s, alg.gp_lengthscale, 0.01 * σ²_s)
         else
-            optimize_gp_hyperparams(times_k, yc, :rbf; verbose=verbose)
+            optimize_gp_hyperparams(times_k, yc, alg.kernel; verbose=verbose)
         end
-        hyper[sk] = (σ²=σ², ℓ=ℓ, σn²=σn², observed=true)
+        hyper_std[sk] = (σ²=σ², ℓ=ℓ, σn²=σn²)
+        hyper[sk] = (σ²=σ² * s_scale[sk]^2, ℓ=ℓ, σn²=σn² * s_scale[sk]^2,
+                     observed=true)
         data_w[sk] = 1.0 / σn²
         P[sk], D[sk], Ainv[sk] = state_matrices(σ², ℓ, σn²)
-        # Initialise at the GP posterior mean, conditioned on the usable rows
-        # and evaluated on the FULL time grid via the cross-covariance
-        # K(t, t_keep). Reduces to the previous K(t,t)-based expression when
-        # every row is usable.
-        K_full, _, _ = rbf_kernel_with_derivs(times, σ², ℓ)
+        # Initialise at the GP posterior mean (in standardized centered coords),
+        # conditioned on the usable rows and evaluated on the FULL time grid.
+        K_full, _, _ = _gp_kernel_with_derivs(times, σ², ℓ, alg.kernel)
         if length(keep_k) == n_times
-            # Unmasked: the original expression, unchanged bit-for-bit.
-            x_init[:, sk] = m_center[sk] .+
-                            K_full * (cholesky(Symmetric(K_full + σn² * I)) \ yc)
+            x_init[:, sk] = K_full * (cholesky(Symmetric(K_full + σn² * I)) \ yc)
         else
             K_cross = K_full[:, keep_k]
             K_kk = K_full[keep_k, keep_k]
-            x_init[:, sk] = m_center[sk] .+
-                            K_cross * (cholesky(Symmetric(K_kk + σn² * I)) \ yc)
+            x_init[:, sk] = K_cross * (cholesky(Symmetric(K_kk + σn² * I)) \ yc)
         end
     end
 
     # Unobserved states: free variables with a borrowed GP prior centered
     # at the initial condition; identified through the ODE terms.
-    ℓ_bar = mean(hyper[sk].ℓ for sk in obs_states)
-    σ²_bar = mean(hyper[sk].σ² for sk in obs_states)
-    σn²_bar = mean(hyper[sk].σn² for sk in obs_states)
+    ℓ_bar = mean(hyper_std[sk].ℓ for sk in obs_states)
+    σ²_bar = mean(hyper_std[sk].σ² for sk in obs_states)
+    σn²_bar = mean(hyper_std[sk].σn² for sk in obs_states)
+    s_bar = alg.standardize ? mean(s_scale[sk] for sk in obs_states) : 1.0
     for k in 1:n_vars
         haskey(obs_of_state, k) && continue
         m_center[k] = u0_vec[k]
-        hyper[k] = (σ²=σ²_bar, ℓ=ℓ_bar, σn²=σn²_bar, observed=false)
+        s_scale[k] = s_bar
+        hyper_std[k] = (σ²=σ²_bar, ℓ=ℓ_bar, σn²=σn²_bar)
+        hyper[k] = (σ²=σ²_bar * s_scale[k]^2, ℓ=ℓ_bar,
+                    σn²=σn²_bar * s_scale[k]^2, observed=false)
         P[k], D[k], Ainv[k] = state_matrices(σ²_bar, ℓ_bar, σn²_bar)
-        x_init[:, k] .= u0_vec[k]
+        x_init[:, k] .= 0.0
     end
 
     # ── Initialise unknown-function parameters ───────────────────
@@ -180,69 +187,77 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
                 "$n_beta unknown-function parameters")
     end
 
+    # Precompute penalty matrices once before optimization (eliminates
+    # per-ForwardDiff-pass penalty rebuild inside odin_risk).
+    odin_penalties = Tuple{Int,Int,Matrix{Float64}}[]
+    let off = 0
+        for approx in prob.approximators
+            np = nparams(approx)
+            S = penalty_matrix(approx)
+            S !== nothing && push!(odin_penalties, (off, np, S))
+            off += np
+        end
+    end
+
     # ── Stage 2: joint Adam on z = [vec(X); β] ──────────────────────
     ode_weight = alg.ode_weight
     lr = alg.lr
 
+    # Precompute standardized observations for the data term
+    y_std = Matrix{Float64}(undef, n_times, n_obs)
+    for j in 1:n_obs
+        sk = prob.obs_to_state[j]
+        y_std[:, j] .= (prob.data_values[:, j] .- m_center[sk]) ./ s_scale[sk]
+    end
+
     function odin_risk(z)
         T_el = eltype(z)
-        X = reshape(@view(z[1:n_state]), n_times, n_vars)
+        X_std = reshape(@view(z[1:n_state]), n_times, n_vars)
         β_eval = @view z[n_state+1:end]
         p = build_autodiff_param_struct(prob, β_eval)
         du = zeros(T_el, n_vars)
-        F = Matrix{T_el}(undef, n_times, n_vars)   # ODE RHS along X
+        u = Vector{T_el}(undef, n_vars)
+        F = Matrix{T_el}(undef, n_times, n_vars)   # standardized ODE RHS
         for i in 1:n_times
-            u = Vector{T_el}(@view X[i, :])
+            @inbounds for k in 1:n_vars
+                u[k] = m_center[k] + s_scale[k] * X_std[i, k]
+            end
             try
                 prob.dynamics!(du, u, p, times[i])
             catch e
                 _is_program_error(e) && rethrow()
                 du .= T_el(1e6)
             end
-            F[i, :] .= du
+            @inbounds for k in 1:n_vars
+                F[i, k] = du[k] / s_scale[k]
+            end
         end
         loss = zero(T_el)
         for k in 1:n_vars
-            xc = @view(X[:, k]) .- m_center[k]
+            xc = @view(X_std[:, k])
             loss += dot(xc, P[k] * xc)                              # GP prior
             resid = @view(F[:, k]) .- D[k] * xc                     # ODE mismatch
             loss += ode_weight * dot(resid, Ainv[k] * resid)
             if haskey(obs_of_state, k)                              # data terms
                 for j in obs_of_state[k]
-                    # Accumulate over usable rows only. The whole-column form
-                    # `sum(abs2, data[:, j] .- X[:, k])` turns NaN on one
-                    # masked cell, and there is no finiteness sentinel in this
-                    # risk: the NaN reaches the Adam moments, every parameter
-                    # becomes NaN, `loss_val < best_loss` is false forever, and
-                    # the solver returns its initialization as if converged.
-                    # (Per-cell `data_weights` magnitudes remain unapplied here
-                    # — ODIN weights by state via `data_w[k] = 1/σn²`; only the
-                    # zero/NaN mask is honored.)
                     rows = data_rows[j]
                     if length(rows) == n_times
-                        # Unmasked: the original vectorized expression, whose
-                        # pairwise summation order this loop would otherwise
-                        # perturb at the 1e-16 level.
-                        r = @view(prob.data_values[:, j]) .- @view(X[:, k])
+                        r = @view(y_std[:, j]) .- @view(X_std[:, k])
                         loss += data_w[k] * sum(abs2, r)
                     else
-                        acc = zero(eltype(X))
+                        acc = zero(T_el)
                         for i in rows
-                            acc += (prob.data_values[i, j] - X[i, k])^2
+                            acc += (y_std[i, j] - X_std[i, k])^2
                         end
                         loss += data_w[k] * acc
                     end
                 end
             end
         end
-        # Smoothing penalty on the unknown-function parameters
-        offset = 0
-        for approx in prob.approximators
-            np = nparams(approx)
-            pk = @view β_eval[offset+1:offset+np]
-            offset += np
-            S = penalty_matrix(approx)
-            S !== nothing && (loss += dot(pk, S * pk))
+        # Smoothing penalty on the unknown-function parameters (precomputed)
+        for (off, np, S) in odin_penalties
+            pk = @view β_eval[off+1:off+np]
+            loss += dot(pk, S * pk)
         end
         loss
     end
@@ -297,7 +312,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::ODINSolver)
             end
         end
     end
-    X_fit = reshape(best_z[1:n_state], n_times, n_vars)
+    X_std_fit = reshape(best_z[1:n_state], n_times, n_vars)
+    X_fit = [m_center[k] + s_scale[k] * X_std_fit[i, k] for i in 1:n_times, k in 1:n_vars]
     beta = best_z[n_state+1:end]
 
     # ── Build solution ───────────────────────────────────────────

@@ -21,7 +21,7 @@
 # it unpenalized. KANApproximator is deliberately outside this set so it
 # receives the generic penalty treatment in every one of those solvers.
 const _BUILTIN_APPROX_TYPES = Union{
-    BSplineApproximator, ShapeConstrainedBSplineApproximator,
+    BSplineApproximator, CyclicBSplineApproximator, ShapeConstrainedBSplineApproximator,
     SPDEApproximator, ShapeConstrainedSPDEApproximator,
     GPApproximator, ShapeConstrainedGPApproximator,
     NeuralApproximator, COMONetApproximator,
@@ -94,6 +94,23 @@ function build_evaluator(approx::BSplineApproximator, params_k)
                             length=approx.nknots))
     build_bspline_evaluator(knots_x, params_k)
 end
+
+build_evaluator(approx::CyclicBSplineApproximator, params_k) =
+    build_cyclic_bspline_evaluator(approx, params_k)
+
+struct _RandomEffectEval{V<:AbstractVector}
+    beta::V
+end
+@inline (e::_RandomEffectEval)(g::Integer) = @inbounds e.beta[g]
+@inline (e::_RandomEffectEval)(g::Real) = @inbounds e.beta[round(Int, g)]
+
+build_evaluator(::RandomEffectApproximator, params_k) =
+    _RandomEffectEval(params_k)
+
+penalty_matrix(a::RandomEffectApproximator) = Matrix{Float64}(I, a.n_groups, a.n_groups)
+penalty_blocks(a::RandomEffectApproximator) =
+    Tuple{Matrix{Float64}, UnitRange{Int}}[(Matrix{Float64}(I, a.n_groups, a.n_groups), 1:a.n_groups)]
+band_domain(::RandomEffectApproximator) = nothing
 
 # Two-argument callable f(x, y) — tensor product of the univariate
 # construction; Dual-safe in params and in (x, y).

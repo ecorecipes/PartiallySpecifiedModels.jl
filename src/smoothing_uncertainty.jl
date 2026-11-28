@@ -169,7 +169,7 @@ This is neither a smoothing-bias correction nor a coverage guarantee.
 function smoothing_covariance_correction(sol::PSMSolution, prob::PSMProblem;
                                           rho_covariance=nothing,
                                           rho_regularization::Real=0.0)
-    prob.likelihood isa Gaussian ||
+    prob.likelihood isa GaussianLikelihood ||
         throw(ArgumentError("smoothing covariance: only Gaussian LAML working models are supported"))
     c = sol.convergence
     c !== nothing && get(c, :solver, nothing) === :LAML &&
@@ -230,7 +230,7 @@ function smoothing_covariance_correction(sol::PSMSolution, prob::PSMProblem;
     allowance = 64n * eps(Float64) * maximum(abs, expected)
     all(isfinite, c.V_beta) && maximum(abs, c.V_beta - expected) <= allowance ||
         throw(DomainError(c.V_beta, "smoothing covariance: stored covariance differs from the final working model"))
-    determinant_ridge = 1e-10 * maximum(abs, diag(H)) + 1e-15
+    determinant_ridge = [1e-10 * max(abs(H[i, i]), 1e-30) + 1e-15 for i in 1:n]
     profile = nothing
     eigenvalues = nothing
     Vrho = if rho_covariance === nothing

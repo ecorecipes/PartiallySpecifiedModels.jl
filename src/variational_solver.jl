@@ -31,8 +31,10 @@ function _variational_simulate(prob::PSMProblem, beta)
         ode_prob = ODEProblem(ode_fn, u0_T, prob.tspan, p)
         OrdinaryDiffEq.solve(ode_prob, prob.ode_solver;
                              saveat=prob.data_times,
-                             abstol=1e-7, reltol=1e-7,
-                             maxiters=10000)
+                             abstol=get(prob.ode_kwargs, :abstol, 1e-7),
+                             reltol=get(prob.ode_kwargs, :reltol, 1e-7),
+                             maxiters=get(prob.ode_kwargs, :maxiters, 10000),
+                             verbose=_quiet_solve())
     end
 
     if sol.retcode != :Success && sol.retcode != SciMLBase.ReturnCode.Success
@@ -84,7 +86,7 @@ variance); every other family uses its own pointwise log-likelihood with
 `data_weights` multiplied in (`obs_noise_var` is ignored — dispersion
 parameters live in the family object).
 """
-_vi_loglik(::Gaussian, pred, data, weights, obs_noise_var) =
+_vi_loglik(::GaussianLikelihood, pred, data, weights, obs_noise_var) =
     _gaussian_loglik(pred, data, weights, obs_noise_var)
 
 function _vi_loglik(fam::AbstractLikelihood, pred, data, weights, obs_noise_var)
@@ -142,6 +144,7 @@ function _compute_elbo(prob::PSMProblem, mu, log_sigma, Λ, logdetΛ,
 
     avg_ll = zero(T)
     n_valid = 0
+    n_failed = 0
 
     for s in 1:n_samples
         theta_s = mu .+ sigma .* epsilons[:, s]
@@ -154,12 +157,11 @@ function _compute_elbo(prob::PSMProblem, mu, log_sigma, Λ, logdetΛ,
         end
 
         if pred === nothing
-            # A failed simulation is a draw of effectively zero likelihood.
-            # Averaging only over the successes would bias the ELBO toward
-            # the non-failing region and hide infeasible posterior mass, so
-            # count the failure with a large finite log-likelihood penalty.
+            # Failed simulation draw: penalize when mixed with valid draws,
+            # but do NOT increment `n_valid` so an all-failing iteration hits
+            # the -1e10 sentinel instead of triggering a false ELBO plateau.
             avg_ll += T(-1e8)
-            n_valid += 1
+            n_failed += 1
             continue
         end
 
@@ -171,7 +173,7 @@ function _compute_elbo(prob::PSMProblem, mu, log_sigma, Λ, logdetΛ,
     if n_valid == 0
         return T(-1e10)
     end
-    avg_ll /= n_valid
+    avg_ll /= (n_valid + n_failed)
 
     kl = _kl_gaussian_penalized(mu, log_sigma, Λ, logdetΛ)
 
@@ -215,7 +217,7 @@ function _vi_edf(prob::PSMProblem, mu_opt::Vector{Float64},
     isempty(keep) && return NaN
 
     base = try
-        Float64.(simulate(prob, mu_opt))
+        Float64.(simulate_psm(prob, mu_opt))
     catch e
         _is_program_error(e) && rethrow()
         return NaN
@@ -227,7 +229,7 @@ function _vi_edf(prob::PSMProblem, mu_opt::Vector{Float64},
         step = max(1e-6, abs(mu_opt[b]) * 1e-6)
         bp = copy(mu_opt); bp[b] += step
         pert = try
-            Float64.(simulate(prob, bp))
+            Float64.(simulate_psm(prob, bp))
         catch e
             _is_program_error(e) && rethrow()
             return NaN
@@ -239,7 +241,7 @@ function _vi_edf(prob::PSMProblem, mu_opt::Vector{Float64},
     end
 
     fam = prob.likelihood
-    w_gn = if fam isa Gaussian
+    w_gn = if fam isa GaussianLikelihood
         [Float64(prob.data_weights[i, j]) / obs_noise_var for (i, j) in keep]
     else
         # CALL `irls_weights` rather than re-deriving the weight from
@@ -317,7 +319,7 @@ negated best ELBO.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     _validate_problem(prob, "VariationalSolver")
-    gaussian_obs = prob.likelihood isa Gaussian
+    gaussian_obs = prob.likelihood isa GaussianLikelihood
     if !gaussian_obs && alg.obs_noise_var !== nothing
         error("VariationalSolver: obs_noise_var is the Gaussian " *
               "observation-noise variance, but prob.likelihood is " *
@@ -410,26 +412,84 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     rng = alg.rng_seed === nothing ? Random.Xoshiro(rand(UInt32)) :
           Random.Xoshiro(alg.rng_seed)
 
+    # Pre-allocated buffers and n_p-dimensional ForwardDiff config for the
+    # chain-rule reparameterization gradient (n_p partials instead of 2*n_p).
+    dΛ = diag(Λ)
+    sample_ll_fn = theta_s -> begin
+        pred = try
+            _variational_simulate(prob, theta_s)
+        catch e
+            _is_program_error(e) && rethrow()
+            nothing
+        end
+        pred === nothing && return eltype(theta_s)(NaN)
+        _vi_loglik(prob.likelihood, pred, prob.data_values,
+                   prob.data_weights, obs_noise_var)
+    end
+    vi_diff_res = DiffResults.MutableDiffResult(0.0, (zeros(n_p),))
+    vi_grad_cfg = ForwardDiff.GradientConfig(sample_ll_fn, zeros(n_p),
+                                             ForwardDiff.Chunk(n_p))
+    theta_buf = Vector{Float64}(undef, n_p)
+    grad_buf = Vector{Float64}(undef, n_phi)
+    g_mu_acc = Vector{Float64}(undef, n_p)
+    g_ls_acc = Vector{Float64}(undef, n_p)
+
     for iter in 1:alg.maxiters
         # Draw shared noise samples (fixed across gradient computation)
         epsilons = randn(rng, n_p, alg.n_elbo_samples)
+        mu_v = @view phi[1:n_p]
+        ls_v = @view phi[n_p+1:end]
+        sigma_v = exp.(ls_v)
 
-        # Define ELBO as function of φ for ForwardDiff
-        function neg_elbo(phi_vec)
-            mu_v = phi_vec[1:n_p]
-            ls_v = phi_vec[n_p+1:end]
-            -_compute_elbo(prob, mu_v, ls_v, Λ, logdetΛ, epsilons,
-                           obs_noise_var)
-        end
-
-        # Compute gradient via ForwardDiff
-        local elbo_val
+        # Compute ELBO and gradient via exact chain rule over n_p partials:
+        #   θ_s = μ + σ ⊙ ε_s
+        #   ∂ℓ/∂μ     = g_s
+        #   ∂ℓ/∂log σ = g_s ⊙ (σ ⊙ ε_s)
+        # Analytical KL gradient:
+        #   ∂KL/∂μ      = Λ μ
+        #   ∂KL/∂log σᵢ = Λᵢᵢ σᵢ² − 1
+        local elbo_val::Float64
+        fill!(g_mu_acc, 0.0)
+        fill!(g_ls_acc, 0.0)
         grad = try
-            result = DiffResults.MutableDiffResult(0.0, (zeros(n_phi),))
-            ForwardDiff.gradient!(result, neg_elbo, phi)
-            elbo_val = -DiffResults.value(result)
-            neg_grad = DiffResults.gradient(result)
-            neg_grad
+            avg_ll = 0.0
+            n_valid = 0
+            n_failed = 0
+            for s in 1:alg.n_elbo_samples
+                @inbounds for j in 1:n_p
+                    theta_buf[j] = mu_v[j] + sigma_v[j] * epsilons[j, s]
+                end
+                ForwardDiff.gradient!(vi_diff_res, sample_ll_fn, theta_buf, vi_grad_cfg)
+                ll_s = DiffResults.value(vi_diff_res)
+                g_s = DiffResults.gradient(vi_diff_res)
+                if !isfinite(ll_s) || !all(isfinite, g_s)
+                    avg_ll += -1e8
+                    n_failed += 1
+                    continue
+                end
+                avg_ll += ll_s
+                @inbounds for j in 1:n_p
+                    g_mu_acc[j] += g_s[j]
+                    g_ls_acc[j] += g_s[j] * sigma_v[j] * epsilons[j, s]
+                end
+                n_valid += 1
+            end
+
+            if n_valid == 0
+                elbo_val = -1e10
+                fill!(grad_buf, 0.0)
+            else
+                inv_S = 1.0 / (n_valid + n_failed)
+                avg_ll *= inv_S
+                kl_val = _kl_gaussian_penalized(mu_v, ls_v, Λ, logdetΛ)
+                elbo_val = avg_ll - kl_val
+                Λmu = Λ * mu_v
+                @inbounds for j in 1:n_p
+                    grad_buf[j]       = -g_mu_acc[j] * inv_S + Λmu[j]
+                    grad_buf[n_p + j] = -g_ls_acc[j] * inv_S + (dΛ[j] * sigma_v[j]^2 - 1.0)
+                end
+            end
+            copy(grad_buf)
         catch e
             _is_program_error(e) && rethrow()
             if verbose && iter <= 5
@@ -455,6 +515,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
         # Cosine learning rate annealing
         lr_t = lr * 0.5 * (1 + cos(π * iter / alg.maxiters))
 
+        # Skip non-finite gradients so Adam moments are never poisoned by NaN
+        if !all(isfinite, grad)
+            continue
+        end
         # Adam update (minimize negative ELBO)
         m_adam .= β1_adam .* m_adam .+ (1 - β1_adam) .* grad
         v_adam .= β2_adam .* v_adam .+ (1 - β2_adam) .* grad.^2
@@ -520,7 +584,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
 
     # Build solution using posterior mean
     pred = try
-        p = simulate(prob, mu_opt)
+        p = simulate_psm(prob, mu_opt)
         Float64.(p)
     catch e
         _is_program_error(e) && rethrow()
@@ -579,8 +643,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::VariationalSolver)
     end
     params_ca = ComponentArray(NamedTuple(ca_entries))
 
+    plateau_converged = false
+    # Check if the loop exited early via plateau:
+    if length(elbo_history) < alg.maxiters && isfinite(best_elbo) && best_elbo > -1e9
+        plateau_converged = true
+    end
+
     convergence = Dict{Symbol, Any}(
         :method => :variational,
+        :converged => plateau_converged,
+        :reason => (best_elbo <= -1e9 ? :dynamics_failure :
+                    (plateau_converged ? :elbo_plateau : :maxiters)),
+        :iterations => length(elbo_history),
         :elbo_history => elbo_history,
         :final_elbo => best_elbo,
         :posterior_mean => copy(mu_opt),

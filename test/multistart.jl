@@ -5,6 +5,7 @@ using Lux
 using FluxKAN
 using OrdinaryDiffEq
 using PartiallySpecifiedModels
+using PartiallySpecifiedModels: nparams, initial_params
 using PartiallySpecifiedModels: solve
 
 const PSM = PartiallySpecifiedModels
@@ -28,7 +29,7 @@ mixed!(du, u, p, t) = (du[1] = (p.r(u[1]) + p.s(t)) * u[1])
 function growth_problem(approximators; dynamics=growth!, cap=(maxiters=10_000,))
     PSMProblem(dynamics, [1.0], (0.0, 10.0), approximators;
                data_times=t_ms, data_values=reshape(y_ms, :, 1),
-               obs_to_state=[1], likelihood=Gaussian(), solver=Tsit5(),
+               obs_to_state=[1], likelihood=GaussianLikelihood(), solver=Tsit5(),
                cap...)
 end
 neural_problem(seed) = growth_problem(

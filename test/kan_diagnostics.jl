@@ -6,6 +6,7 @@ using LinearAlgebra
 using Lux, FluxKAN
 using PartiallySpecifiedModels
 
+using PartiallySpecifiedModels: nparams, initial_params, build_evaluator
 const PSM = PartiallySpecifiedModels
 
 layer(ni, no, grid=2; activation=identity) =

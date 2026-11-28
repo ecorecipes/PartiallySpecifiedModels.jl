@@ -110,7 +110,7 @@ prob = PSMProblem(sir_psm!, u0, tspan, [approx_β];
     data_values = data_values,
     obs_to_state = [4],  # observe cumulative cases (state 4)
     known_params = (γ = γ, N = N),
-    likelihood = Poisson(),  # counts → Poisson (identity link)
+    likelihood = PoissonLikelihood(),  # counts → Poisson (identity link)
     solver = Tsit5(),
     abstol = 1e-6,
     reltol = 1e-6)

@@ -24,9 +24,11 @@ Simulate a DDE model with given parameters. Uses DelayDiffEq.jl with
 The user's dynamics function must have signature `f!(du, u, h, p, t)`
 where `h` is the DelayDiffEq history function.
 """
-function simulate_dde(prob::PSMProblem, beta::AbstractVector)
+function simulate_dde(prob::PSMProblem, beta::AbstractVector;
+                      maxiters_override::Union{Nothing,Int}=nothing)
     p = build_param_struct(prob, beta)
-    u0 = prob.u0 isa Function ? prob.u0(p) : prob.u0
+    u0 = !isempty(prob.estimate_u0) ? _resolve_u0(prob, beta) :
+         (prob.u0 isa Function ? prob.u0(p) : prob.u0)
     # Promote the state eltype when β carries ForwardDiff Duals (the
     # jac=:forwarddiff Jacobian path differentiates straight through this
     # solve) — mirrors adam_solve_dde below; a no-op for Float64 β WITH
@@ -46,21 +48,26 @@ function simulate_dde(prob::PSMProblem, beta::AbstractVector)
     # History function: user-provided or constant at u0
     h_func = _build_history(prob, p, u0)
 
-    dde_prob = DDEProblem(dde_rhs!, u0, h_func, prob.tspan;
-                          constant_lags=prob.delays)
+    od0 = get(prob.ode_kwargs, :order_discontinuity_t0, nothing)
+    dde_prob = od0 === nothing ?
+        DDEProblem(dde_rhs!, u0, h_func, prob.tspan; constant_lags=prob.delays) :
+        DDEProblem(dde_rhs!, u0, h_func, prob.tspan; constant_lags=prob.delays,
+                   order_discontinuity_t0=od0)
 
     inner_solver = prob.ode_solver !== nothing ? prob.ode_solver : Tsit5()
     dde_solver = MethodOfSteps(inner_solver)
 
+    default_maxiters = maxiters_override === nothing ? _DEFAULT_ODE_MAXITERS : maxiters_override
     solve_kwargs = Dict{Symbol, Any}(
         :saveat => prob.data_times,
         :abstol => get(prob.ode_kwargs, :abstol, 1e-8),
         :reltol => get(prob.ode_kwargs, :reltol, 1e-8),
         # Same default as the ODE forward solve (src/solver.jl).
-        :maxiters => get(prob.ode_kwargs, :maxiters, _DEFAULT_ODE_MAXITERS),
+        :maxiters => get(prob.ode_kwargs, :maxiters, default_maxiters),
         :verbose => _quiet_solve(),
     )
     merge!(solve_kwargs, _normalise_ode_kwargs(prob.ode_kwargs))
+    delete!(solve_kwargs, :order_discontinuity_t0)
 
     sol = DelayDiffEq.solve(dde_prob, dde_solver; solve_kwargs...)
 
@@ -70,7 +77,7 @@ function simulate_dde(prob::PSMProblem, beta::AbstractVector)
         error("DDE solve failed: $(sol.retcode)")
     end
 
-    _observation_predictions(prob, sol, eltype(beta))
+    _observation_predictions(prob, sol, eltype(beta), p)
 end
 
 """
@@ -127,7 +134,8 @@ function adam_solve_dde(prob::PSMProblem, beta)
                       saveat=prob.data_times,
                       abstol=get(prob.ode_kwargs, :abstol, 1e-7),
                       reltol=get(prob.ode_kwargs, :reltol, 1e-7),
-                      maxiters=get(prob.ode_kwargs, :maxiters, 10_000))
+                      maxiters=get(prob.ode_kwargs, :maxiters, 10_000),
+                      verbose=_quiet_solve())
 end
 
 """
@@ -153,7 +161,8 @@ function adam_solve_dde_final(prob::PSMProblem, p_opt, u0)
                       saveat=prob.data_times,
                       abstol=get(prob.ode_kwargs, :abstol, 1e-7),
                       reltol=get(prob.ode_kwargs, :reltol, 1e-7),
-                      maxiters=get(prob.ode_kwargs, :maxiters, 10_000))
+                      maxiters=get(prob.ode_kwargs, :maxiters, 10_000),
+                      verbose=_quiet_solve())
 end
 
 # ─── DDEProblem constructor for PSMProblem ───────────────────────

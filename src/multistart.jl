@@ -115,17 +115,22 @@ struct MultiStart{A}
     n_starts::Int
     rng_seed::Int
     ode_maxiters::Union{Nothing,Int}
+    parallel::Bool
 end
 
 function MultiStart(alg::LAML; n_starts::Int=8, rng_seed::Integer=1,
-                    ode_maxiters::Union{Nothing,Integer}=10_000)
+                    ode_maxiters::Union{Nothing,Integer}=10_000,
+                    parallel::Bool=false)
     n_starts >= 1 ||
         throw(ArgumentError("MultiStart: n_starts must be at least 1 (got $n_starts)"))
     ode_maxiters === nothing || ode_maxiters >= 1 ||
         throw(ArgumentError("MultiStart: ode_maxiters must be at least 1 or nothing (got $ode_maxiters)"))
     MultiStart{LAML}(alg, n_starts, Int(rng_seed),
-                     ode_maxiters === nothing ? nothing : Int(ode_maxiters))
+                     ode_maxiters === nothing ? nothing : Int(ode_maxiters),
+                     parallel)
 end
+MultiStart(alg::LAML, n_starts::Int, rng_seed::Int, ode_maxiters) =
+    MultiStart{LAML}(alg, n_starts, rng_seed, ode_maxiters, false)
 
 # Rebuild a randomly initialized approximator with a new seed, or return
 # `nothing` for a deterministically initialized one. Each method calls the
@@ -144,7 +149,8 @@ _reseeded(a::KANApproximator, seed::Int) =
                     penalty=a.penalty, nullspace_penalty=a.nullspace_penalty,
                     rng_seed=seed)
 
-_is_random_init(a::AbstractApproximator) = _reseeded(a, 1) !== nothing
+_is_random_init(::AbstractApproximator) = false
+_is_random_init(::Union{NeuralApproximator, COMONetApproximator, KANApproximator}) = true
 
 # Same problem, different approximators. The positional constructor is used
 # so nothing the keyword constructor resolves from the data (index
@@ -154,7 +160,7 @@ _with_approximators(prob::PSMProblem, approximators, ode_kwargs) =
                prob.data_times, prob.data_values, prob.data_weights,
                prob.obs_to_state, prob.known_params, prob.likelihood,
                prob.ode_solver, ode_kwargs, prob.discrete, prob.delays,
-               prob.history)
+               prob.history, prob.obs_fn, prob.estimate_u0)
 
 # The problem's solver keywords with the MultiStart step cap added, unless
 # the problem already sets `maxiters`. A copy, so `prob` is never mutated.
@@ -191,12 +197,11 @@ function SciMLBase.solve(prob::PSMProblem, ms::MultiStart{LAML})
     sols = Vector{Union{Nothing,PSMSolution}}(nothing, n)
     reasons = Vector{Symbol}(undef, n)
     converged = falses(n)
-    first_error = nothing
-    for k in 1:n
+    errors = Vector{Any}(nothing, n)
+
+    function _run_start(k::Int)
         approximators = deepcopy(prob.approximators)
         if k > 1
-            # `map` rather than assignment in place: a reseeded parametric
-            # approximator (KAN) need not match a concrete element type.
             approximators = map(enumerate(approximators)) do (i, a)
                 j = findfirst(==(i), random_idx)
                 j === nothing ? a : _reseeded(a, seeds[k][j])
@@ -206,9 +211,9 @@ function SciMLBase.solve(prob::PSMProblem, ms::MultiStart{LAML})
             solve(_with_approximators(prob, approximators, ode_kwargs), ms.alg)
         catch e
             (_is_program_error(e) || e isa ArgumentError) && rethrow()
-            first_error === nothing && (first_error = e)
+            errors[k] = e
             reasons[k] = Symbol("threw_", nameof(typeof(e)))
-            continue
+            return
         end
         reasons[k] = sol.convergence.reason
         converged[k] = sol.convergence.converged
@@ -219,6 +224,19 @@ function SciMLBase.solve(prob::PSMProblem, ms::MultiStart{LAML})
         end
     end
 
+    if ms.parallel && Threads.nthreads() > 1
+        Threads.@threads for k in 1:n
+            _run_start(k)
+        end
+    else
+        for k in 1:n
+            _run_start(k)
+        end
+    end
+    first_error = let idx_e = findfirst(!isnothing, errors)
+        idx_e === nothing ? nothing : errors[idx_e]
+    end
+
     ok = findall(!isnothing, sols)
     if isempty(ok)
         msg = "MultiStart: all $n starts failed (reasons: $(join(reasons, ", ")))."
@@ -227,14 +245,16 @@ function SciMLBase.solve(prob::PSMProblem, ms::MultiStart{LAML})
         error(msg)
     end
 
-    use_laml = all(k -> isfinite(sols[k].convergence.laml), ok)
+    laml_ok = filter(k -> isfinite(sols[k].convergence.laml), ok)
+    use_laml = !isempty(laml_ok)
+    candidates = use_laml ? laml_ok : ok
     criterion = use_laml ? :laml : :objective
     values = fill(NaN, n)
     for k in ok
         values[k] = use_laml ? sols[k].convergence.laml : sols[k].objective
     end
-    chosen = first(ok)
-    for k in ok
+    chosen = first(candidates)
+    for k in candidates
         better = use_laml ? values[k] > values[chosen] : values[k] < values[chosen]
         better && (chosen = k)
     end

@@ -188,7 +188,7 @@ end
             @test isapprox(only(correction.coefficient_sensitivity), -lambda*beta/(A+lambda);
                            atol=1e-7, rtol=1e-7)
             @test isapprox(only(correction.root_derivatives[1]),
-                           -lambda/(2(A+lambda+correction.covariance_ridge)^1.5);
+                           -lambda/(2(A+lambda+only(correction.covariance_ridge))^1.5);
                            atol=1e-7, rtol=1e-7)
 
             plain = confidence_band(sol, prob; uf_points=queries)[:r]
@@ -261,7 +261,7 @@ end
                 rho_covariance=correction.rho_covariance)[:r].rho_source == :supplied
         end
         count_prob = PSMProblem(rhs!, [0.0], (0.0,2.0), [RidgeRate(:r)];
-            data_times=times, data_values=reshape(values,:,1), likelihood=Poisson())
+            data_times=times, data_values=reshape(values,:,1), likelihood=PoissonLikelihood())
         unpen = PSMProblem(rhs!, [0.0], (0.0,2.0), [BareRate(:r)];
             data_times=times, data_values=reshape(values,:,1))
         bare = solve(unpen, LAML(maxiters=20))

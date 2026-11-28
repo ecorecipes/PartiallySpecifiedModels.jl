@@ -5,6 +5,7 @@ module ResilienceTests
 
 using Test, LinearAlgebra
 using PartiallySpecifiedModels
+using PartiallySpecifiedModels: initial_params
 using PartiallySpecifiedModels: solve
 using DynamicalResilience: DynamicalResilience, steady_state, linearise, resilience, isstable
 using OrdinaryDiffEq
@@ -28,7 +29,7 @@ const TRUTH = 10 ./ (1 .+ 9 .* exp.(-0.8 .* TIMES))     # logistic, r = 0.8, K =
 logistic_problem(data) = PSMProblem(logistic!, [1.0], (0.0, 20.0),
                                     [BSplineApproximator(:r, (0.0, 12.0), 8; initial = N -> 0.8 * (1 - N / 10))];
                                     data_times = TIMES, data_values = reshape(data, :, 1), obs_to_state = [1],
-                                    likelihood = Gaussian(), solver = Tsit5())
+                                    likelihood = GaussianLikelihood(), solver = Tsit5())
 
 @testset "Resilience of fitted PSMs" begin
     rng = StableRNG(20261117)
@@ -47,7 +48,7 @@ logistic_problem(data) = PSMProblem(logistic!, [1.0], (0.0, 20.0),
         sol = OrdinaryDiffEq.solve(ode, Tsit5(); saveat = TIMES, abstol = 1e-8, reltol = 1e-8,
                                    maxiters = 1_000_000,
                                    verbose = PartiallySpecifiedModels._quiet_solve())
-        @test simulate(prob, β) == reshape([u[1] for u in sol.u], :, 1)
+        @test simulate_psm(prob, β) == reshape([u[1] for u in sol.u], :, 1)
     end
 
     @testset "equilibrium and linearisation of the fitted model" begin
@@ -86,7 +87,7 @@ logistic_problem(data) = PSMProblem(logistic!, [1.0], (0.0, 20.0),
             u = un
             push!(path, u[1])
         end
-        @test simulate(dprob, βd) == reshape(path, :, 1)
+        @test simulate_psm(dprob, βd) == reshape(path, :, 1)
         # its fixed point is where g(N) = 0
         ss = steady_state(dp, [40.0])
         @test ss.converged
@@ -104,12 +105,18 @@ logistic_problem(data) = PSMProblem(logistic!, [1.0], (0.0, 20.0),
     @testset "draws from a fit, the bootstrap and MCMC" begin
         fit = solve(prob, LAML(maxiters = 30, verbose = false))
         @test to_ode_problem(prob, fit).p.r(5.0) == to_ode_problem(prob, collect(fit.parameters)).p.r(5.0)
-        # a LAML solution carries no posterior draws
-        @test_throws ArgumentError parameter_draws(fit, prob)
-        @test_throws ArgumentError DynamicalResilience.metrics_over(prob, fit; u0 = [8.0])
+        # v0.3.0: LAML solutions support posterior_draws (MVN from V_beta) and metrics_over directly!
+        laml_draws = posterior_draws(fit, prob; n = 10, rng = StableRNG(2))
+        @test length(laml_draws) == 10
+        @test all(length(d) == length(β) for d in laml_draws)
+        ml = DynamicalResilience.metrics_over(prob, fit; u0 = [8.0], n = 10, rng = StableRNG(2))
+        @test ml.n == 10
+        # A solver with neither samples nor V_beta still throws ArgumentError
+        df_fit = solve(prob, DerivativeFreeSolver(maxiters = 5))
+        @test_throws ArgumentError posterior_draws(df_fit, prob)
 
         bs = bootstrap(fit, prob, LAML(maxiters = 30, verbose = false); nboot = 4, rng = StableRNG(1))
-        draws = parameter_draws(bs)
+        draws = posterior_draws(bs)
         @test length(draws) == bs.n_success
         @test all(length(d) == length(β) for d in draws)
         @test draws[1] == bs.coefs[1, :]
@@ -128,11 +135,11 @@ logistic_problem(data) = PSMProblem(logistic!, [1.0], (0.0, 20.0),
 
         mcmc = solve(prob, MCMCSolver(n_samples = 20, n_warmup = 20, rng_seed = 7, verbose = false))
         @test mcmc.convergence isa MCMCChains.Chains
-        pd = parameter_draws(mcmc, prob)
+        pd = posterior_draws(mcmc, prob)
         @test length(pd) == size(mcmc.convergence, 1) * size(mcmc.convergence, 3)
         @test all(length(d) == length(β) for d in pd)     # log_σ dropped
-        @test length(parameter_draws(mcmc, prob; thin = 4)) == cld(length(pd), 4)
-        @test_throws ArgumentError parameter_draws(mcmc, prob; thin = 0)
+        @test length(posterior_draws(mcmc, prob; thin = 4)) == cld(length(pd), 4)
+        @test_throws ArgumentError posterior_draws(mcmc, prob; thin = 0)
         mm = metrics_over(prob, mcmc; u0 = [8.0], thin = 4)
         @test mm.n == cld(length(pd), 4)
         @test mm.n_converged + mm.n_unconverged == mm.n

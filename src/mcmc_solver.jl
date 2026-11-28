@@ -14,6 +14,7 @@ import AbstractMCMC
 struct PSMLogDensity
     prob::PSMProblem
     penalty_matrices::Vector{Matrix{Float64}}
+    penalty_ranks::Vector{Int}
     param_offsets::Vector{Int}
     n_params::Int
     prior_scale::Float64
@@ -31,7 +32,7 @@ function LogDensityProblems.dimension(ld::PSMLogDensity)
     d = ld.n_params
     # The σ nuisance parameter exists only for Gaussian observations;
     # other families carry their own (fixed) dispersion.
-    if ld.obs_sigma === nothing && ld.prob.likelihood isa Gaussian
+    if ld.obs_sigma === nothing && ld.prob.likelihood isa GaussianLikelihood
         d += 1
     end
     if ld.sample_smoothing; d += ld.n_smooths; end
@@ -58,7 +59,7 @@ function _psm_logdensity(ld::PSMLogDensity, theta)
     beta = theta[1:idx]
 
     fam = prob.likelihood
-    if fam isa Gaussian
+    if fam isa GaussianLikelihood
         if ld.obs_sigma === nothing
             idx += 1
             log_sigma = theta[idx]
@@ -120,14 +121,14 @@ function _psm_logdensity(ld::PSMLogDensity, theta)
             # end of a short solve, so the former `prob.discrete` branch here
             # (and its `sol[obs_to_state[j], i]` indexing) is gone.
             pred_ij = pred[i, j]
-            if fam isa Gaussian
+            if fam isa GaussianLikelihood
                 ll -= T(0.5) * w * (pred_ij - T(y))^2 / sigma2
             else
                 ll += T(w) * loglik_pointwise(fam, y, pred_ij)
             end
         end
     end
-    if fam isa Gaussian
+    if fam isa GaussianLikelihood
         # Normalizer counts only weight-carrying finite observations:
         # counting masked points in n_data biases the estimated σ² low.
         ll -= T(0.5) * n_eff * log(T(2π) * sigma2)
@@ -148,7 +149,7 @@ function _psm_logdensity(ld::PSMLogDensity, theta)
         else
             T(1.0) / T(ld.prior_scale)
         end
-        rk = _rank_penalty(S)
+        rk = ld.penalty_ranks[k]
         lp += T(0.5) * rk * (log(lambda_k) - log(sigma2)) -
               T(0.5) * lambda_k / sigma2 * dot(beta_k, S * beta_k)
     end
@@ -256,7 +257,7 @@ no `extras` field on `PSMSolution`.
 """
 function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     _validate_problem(prob, "MCMCSolver")
-    if !(prob.likelihood isa Gaussian) && alg.obs_sigma !== nothing
+    if !(prob.likelihood isa GaussianLikelihood) && alg.obs_sigma !== nothing
         error("MCMCSolver: obs_sigma is the Gaussian observation-noise " *
               "standard deviation, but prob.likelihood is " *
               "$(typeof(prob.likelihood)), which has no σ parameter " *
@@ -287,12 +288,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     else
         Float64[]
     end
-    ld = PSMLogDensity(prob, penalties, offsets, n_beta, alg.prior_scale,
+    penalty_ranks = Int[_rank_penalty(S) for S in penalties]
+    ld = PSMLogDensity(prob, penalties, penalty_ranks, offsets, n_beta, alg.prior_scale,
                        alg.obs_sigma, alg.sample_smoothing, n_smooths,
                        log_lambda_init)
 
     # σ is sampled only for Gaussian observations with unspecified obs_sigma
-    estimate_sigma = alg.obs_sigma === nothing && prob.likelihood isa Gaussian
+    estimate_sigma = alg.obs_sigma === nothing && prob.likelihood isa GaussianLikelihood
     D = LogDensityProblems.dimension(ld)
 
     # Initial point: beta0 + optional log_sigma + optional log_lambda
@@ -429,11 +431,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::MCMCSolver)
     end
     ca = ComponentArray(NamedTuple(ca_entries))
 
-    # Layout is [β; log σ; log λ...]: with sample_smoothing the LAST entry
-    # is a smoothing parameter, so index log σ by position, not by end.
-    # Non-Gaussian families sample no σ, so there is nothing to report.
-    sigma_map = estimate_sigma ? exp(map_theta[n_beta + 1]) : alg.obs_sigma
-    smoothing = sigma_map === nothing ? Float64[] : [sigma_map]
+    # Layout is [β; (log σ if estimate_sigma); (log λ... if sample_smoothing)]:
+    # Report sampled smoothing parameters λ when sample_smoothing=true rather
+    # than placing σ_obs in `sol.smoothing_params`.
+    smoothing = if alg.sample_smoothing
+        lam_start = n_beta + (estimate_sigma ? 2 : 1)
+        lam_start <= length(map_theta) ? exp.(Float64.(map_theta[lam_start:end])) : Float64[]
+    else
+        Float64[]
+    end
 
     PSMSolution(ca, -logp_values[map_idx], data_loss, Float64(n_beta),
                 smoothing, pred, prob.data_values, collect(prob.data_times),

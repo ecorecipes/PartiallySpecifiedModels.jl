@@ -62,11 +62,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     # error into a SILENT wrong answer, which is strictly worse. Real support
     # needs a history-from-the-smoother rework; that is a feature, not a fix.
     _validate_problem(prob, "BNGSolver"; reject_delays=true)
+    _require_gaussian_likelihood(prob, "BNGSolver")
     verbose = alg.verbose
 
     times = Float64.(prob.data_times)
     n_times = length(times)
-    n_vars = length(prob.u0)
+    u0_init = _resolve_u0_init(prob)
+    n_vars = length(u0_init)
     n_obs = size(prob.data_values, 2)
     rng = alg.rng_seed === nothing ? Random.Xoshiro(rand(UInt32)) :
           Random.Xoshiro(alg.rng_seed)
@@ -125,9 +127,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
         # Unobserved states: constant at the initial condition
         for k in 1:n_vars
             if k ∉ observed_states
-                u0_k = Float64(prob.u0 isa Function ? prob.u0(prob.known_params)[k] :
-                               prob.u0[k])
-                y_smooth[:, k] .= u0_k
+                y_smooth[:, k] .= u0_init[k]
                 dydt[:, k] .= 0.0
             end
         end
@@ -141,19 +141,19 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
     # coefficients otherwise — so the process ensemble explores distinct
     # basins.
     function init_beta(kp::Int)
-        beta = Float64[]
+        beta_init = Float64[]
         for approx in prob.approximators
             if approx isa NeuralApproximator
                 r = kp == 1 && approx.rng_seed !== nothing ?
                     Random.Xoshiro(approx.rng_seed) : rng
-                append!(beta, neural_init_params(approx, r))
+                append!(beta_init, neural_init_params(approx, r))
             else
                 b0 = Float64.(initial_params(approx))
                 kp > 1 && (b0 .+= 0.2 .* (abs.(b0) .+ 1.0) .* randn(rng, length(b0)))
-                append!(beta, b0)
+                append!(beta_init, b0)
             end
         end
-        beta
+        beta_init
     end
     n_beta = length(init_beta(1))
 
@@ -187,6 +187,35 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
                 "prior_sd=$prior_sd")
     end
 
+    # Precompute smoothing penalties once before the ensemble Adam fits.
+    bng_mat_pens = Tuple{Int,Int,Matrix{Float64}}[]
+    bng_l2_pens = Tuple{Int,Int,Float64}[]
+    let off = 0
+        for approx in prob.approximators
+            np = nparams(approx)
+            if approx isa COMONetApproximator
+                approx.penalty_weight > 0.0 && push!(bng_l2_pens, (off, np, approx.penalty_weight))
+            else
+                S = penalty_matrix(approx)
+                S !== nothing && push!(bng_mat_pens, (off, np, S))
+            end
+            off += np
+        end
+    end
+
+    # Standardize observed state & time scales (Bonnaffé & Coulson 2023) so
+    # the variance-marginalized `log1p(ssr / 2)` term is scale-invariant and
+    # multi-scale states contribute equitably.
+    time_scale = prob.discrete ? 1.0 : max(times[end] - times[1], 1e-6)
+    deriv_scale = ones(n_vars)
+    for k in observed_states
+        vals_k = Float64[prob.data_values[i, j] for j in 1:n_obs if prob.obs_to_state[j] == k
+                         for i in 1:n_times if usable_cell(prob, i, j)]
+        sd_k = length(vals_k) > 1 ? std(vals_k) : 1.0
+        state_scale_k = (isfinite(sd_k) && sd_k > 1e-8) ? sd_k : 1.0
+        deriv_scale[k] = state_scale_k / time_scale
+    end
+
     # Variance-marginalized gradient-matching log-posterior
     function bng_loss(β_eval, y_smooth, dydt)
         T_el = eltype(β_eval)
@@ -202,68 +231,56 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
                 du .= T_el(1e6)
             end
             for k in 1:n_vars
-                # Match only observed states (unobserved targets are
-                # fabricated constants — see two_stage_solver.jl).
                 k in observed_states || continue
-                # …and only where that state has a usable observation:
-                # the smoother now excludes masked rows, so the target
-                # there is an extrapolation rather than data.
                 match_usable[i, k] || continue
-                ssr += (dydt[i, k] - du[k])^2
+                ssr += ((dydt[i, k] - du[k]) / deriv_scale[k])^2
             end
         end
         loss_val = (n_resid / 2) * log1p(ssr / 2) +
                    (n_beta / 2) * log1p(sum(abs2, β_eval ./ prior_sd) / 2)
-        # Smoothing penalties from approximators
-        offset = 0
-        for approx in prob.approximators
-            np = nparams(approx)
-            params_k = β_eval[offset+1:offset+np]
-            offset += np
-            if approx isa COMONetApproximator
-                loss_val += approx.penalty_weight * sum(abs2, params_k)
-            else
-                S = penalty_matrix(approx)
-                S !== nothing &&
-                    (loss_val += lambda_smooth * dot(params_k, S * params_k))
-            end
+        for (off, np, w_l2) in bng_l2_pens
+            pk = @view β_eval[off+1:off+np]
+            loss_val += w_l2 * sum(abs2, pk)
+        end
+        for (off, np, S) in bng_mat_pens
+            pk = @view β_eval[off+1:off+np]
+            loss_val += lambda_smooth * dot(pk, S * pk)
         end
         loss_val
     end
 
-    # One Adam fit against fixed targets
+    # One Adam fit against fixed targets (explicit `local` declarations prevent
+    # Julia from boxing outer-scope names like `best_loss` across threads).
     function fit_member(beta0, y_smooth, dydt)
-        beta = copy(beta0)
-        β1_adam, β2_adam, eps_adam = 0.9, 0.999, 1e-8
-        m_adam = zeros(n_beta); v_adam = zeros(n_beta)
-        best_beta = copy(beta)
-        best_loss = Inf
-        loss_window = fill(Inf, 30)
-        loss_fn = β -> bng_loss(β, y_smooth, dydt)
-        result = DiffResults.MutableDiffResult(0.0, (zeros(n_beta),))
-        iters_used = alg.maxiters
-        plateaued = false
+        local beta_cur = copy(beta0)
+        local β1_adam = 0.9
+        local β2_adam = 0.999
+        local eps_adam = 1e-8
+        local m_adam = zeros(n_beta)
+        local v_adam = zeros(n_beta)
+        local best_beta_m = copy(beta_cur)
+        local best_loss_m = Inf
+        local loss_window = fill(Inf, 30)
+        local loss_fn = β -> bng_loss(β, y_smooth, dydt)
+        local result = DiffResults.MutableDiffResult(0.0, (zeros(n_beta),))
+        local iters_used = alg.maxiters
+        local plateaued = false
         for iter in 1:alg.maxiters
-            ForwardDiff.gradient!(result, loss_fn, beta)
-            loss_val = DiffResults.value(result)
-            grad = DiffResults.gradient(result)
-            if loss_val < best_loss
-                best_loss = loss_val
-                best_beta .= beta
+            ForwardDiff.gradient!(result, loss_fn, beta_cur)
+            local loss_val = DiffResults.value(result)
+            local grad = DiffResults.gradient(result)
+            if loss_val < best_loss_m
+                best_loss_m = loss_val
+                best_beta_m .= beta_cur
             end
             loss_window[mod1(iter, 30)] = loss_val
-            lr_t = alg.lr * 0.5 * (1 + cos(π * iter / alg.maxiters))
+            local lr_t = alg.lr * 0.5 * (1 + cos(π * iter / alg.maxiters))
             m_adam .= β1_adam .* m_adam .+ (1 - β1_adam) .* grad
             v_adam .= β2_adam .* v_adam .+ (1 - β2_adam) .* grad.^2
-            m_hat = m_adam ./ (1 - β1_adam^iter)
-            v_hat = v_adam ./ (1 - β2_adam^iter)
-            beta .-= lr_t .* m_hat ./ (sqrt.(v_hat) .+ eps_adam)
-            # Plateau convergence, guarded against the cosine lr schedule
-            # manufacturing a plateau as lr_t → 0 near maxiters.
-            # `best_loss < 1e9` is AdamSolver's failure-sentinel guard:
-            # the dynamics fall back to `du .= 1e6` when the RHS throws,
-            # so a run pinned at that sentinel is stuck, not converged.
-            if iter > 60 && best_loss < 1e9 && lr_t > 0.05 * alg.lr
+            local m_hat = m_adam ./ (1 - β1_adam^iter)
+            local v_hat = v_adam ./ (1 - β2_adam^iter)
+            beta_cur .-= lr_t .* m_hat ./ (sqrt.(v_hat) .+ eps_adam)
+            if iter > 60 && best_loss_m < 1e9 && lr_t > 0.05 * alg.lr
                 rmin, rmax = extrema(loss_window)
                 if (rmax - rmin) / max(abs(rmin), 1.0) < 1e-6
                     iters_used = iter
@@ -272,45 +289,79 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
                 end
             end
         end
-        best_beta, best_loss, iters_used, plateaued
+        best_beta_m, best_loss_m, iters_used, plateaued
     end
 
     # ── Step 2/3: the K_o × K_p ensemble ─────────────────────────
-    member_betas = Vector{Vector{Float64}}()
-    member_losses = Float64[]
-    member_plateaued = Bool[]
-    total_iters = 0
-    # The unbootstrapped (ko = 1) smoothed trajectory, kept so the sentinel
-    # accounting below can be taken on the same states `bng_loss` matched
-    # against — see `_dynamics_failure_verdict` (solver.jl).
-    y_smooth_base = zeros(n_times, n_vars)
+    # Pre-generate all bootstrap targets & initializations deterministically so
+    # `parallel=true` yields bit-identical ensembles regardless of thread scheduling.
+    ys_list = Vector{Matrix{Float64}}(undef, alg.k_obs)
+    dy_list = Vector{Matrix{Float64}}(undef, alg.k_obs)
     for ko in 1:alg.k_obs
         data_ko = if ko == 1
             Float64.(prob.data_values)
         else
-            # Residual bootstrap: smoother fit + resampled residual rows
-            # (rows resampled jointly across columns, preserving any
-            # cross-series residual correlation)
             idx_boot = rand(rng, 1:n_times, n_times)
             base_fit .+ resid[idx_boot, :]
         end
-        y_smooth, dydt = smooth_targets(data_ko)
-        ko == 1 && (y_smooth_base .= y_smooth)
-        for kp in 1:alg.k_proc
-            beta_fit, loss_fit, it, plat = fit_member(init_beta(kp), y_smooth, dydt)
-            push!(member_betas, beta_fit)
-            push!(member_losses, loss_fit)
-            push!(member_plateaued, plat)
-            total_iters += it
+        ys_list[ko], dy_list[ko] = smooth_targets(data_ko)
+    end
+    y_smooth_base = ys_list[1]
+    dydt_base = dy_list[1]
+
+    inits = Vector{Vector{Float64}}(undef, K_total)
+    ko_of = Vector{Int}(undef, K_total)
+    kp_of = Vector{Int}(undef, K_total)
+    let idx = 0
+        for ko in 1:alg.k_obs, kp in 1:alg.k_proc
+            idx += 1
+            ko_of[idx] = ko; kp_of[idx] = kp
+            inits[idx] = init_beta(kp)
+        end
+    end
+
+    member_betas = Vector{Vector{Float64}}(undef, K_total)
+    member_losses = Vector{Float64}(undef, K_total)
+    member_plateaued = Vector{Bool}(undef, K_total)
+    member_iters = Vector{Int}(undef, K_total)
+
+    if alg.parallel && Threads.nthreads() > 1
+        Threads.@threads for idx in 1:K_total
+            ko = ko_of[idx]
+            bf, lf, it, plat = fit_member(inits[idx], ys_list[ko], dy_list[ko])
+            member_betas[idx] = bf
+            member_losses[idx] = lf
+            member_plateaued[idx] = plat
+            member_iters[idx] = it
+        end
+    else
+        for idx in 1:K_total
+            ko = ko_of[idx]; kp = kp_of[idx]
+            bf, lf, it, plat = fit_member(inits[idx], ys_list[ko], dy_list[ko])
+            member_betas[idx] = bf
+            member_losses[idx] = lf
+            member_plateaued[idx] = plat
+            member_iters[idx] = it
             if verbose
                 println("  member (obs $ko, proc $kp): " *
-                        "loss=$(round(loss_fit, sigdigits=5)) [$it iters]")
+                        "loss=$(round(lf, sigdigits=5)) [$it iters]")
             end
         end
     end
-    best_idx = argmin(member_losses)
-    beta = copy(member_betas[best_idx])
-    best_loss = member_losses[best_idx]
+    total_iters = sum(member_iters)
+    # Evaluate all members on the SAME unbootstrapped base smooth rather than
+    # comparing uncalibrated losses across different bootstrap resamples.
+    base_losses = [bng_loss(b, y_smooth_base, dydt_base) for b in member_betas]
+    best_idx = argmin(base_losses)
+    # Ensemble median/mean for parameter vector when multiple finite members exist
+    finite_members = [i for i in eachindex(base_losses) if isfinite(base_losses[i])]
+    beta = if isempty(finite_members)
+        copy(member_betas[best_idx])
+    else
+        M_ens = hcat((member_betas[i] for i in finite_members)...)
+        vec(median(M_ens; dims=2))
+    end
+    best_loss = bng_loss(beta, y_smooth_base, dydt_base)
 
     if verbose
         println("  Best member: $best_idx/$K_total, " *
@@ -362,15 +413,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::BNGSolver)
         u0 = prob.u0 isa Function ? prob.u0(p_opt) : prob.u0
         ode_prob = ODEProblem((du, u, params, t) -> prob.dynamics!(du, u, p_opt, t),
                               Float64.(u0), prob.tspan)
-        sol_ode = OrdinaryDiffEq.solve(ode_prob, prob.ode_solver;
-                                       saveat=prob.data_times,
-                                       abstol=1e-7, reltol=1e-7,
-                                       maxiters=10000)
+        bng_kw = Dict{Symbol,Any}(:saveat => prob.data_times, :abstol => 1e-7,
+                                  :reltol => 1e-7, :maxiters => 10000,
+                                  :verbose => _quiet_solve())
+        for (k, v) in _normalise_ode_kwargs(prob.ode_kwargs)
+            bng_kw[k] = v
+        end
+        sol_ode = OrdinaryDiffEq.solve(ode_prob, prob.ode_solver; bng_kw...)
 
         pred = zeros(n_times, n_obs)
         if sol_ode.retcode == SciMLBase.ReturnCode.Success ||
-           sol_ode.retcode == SciMLBase.ReturnCode.Default ||
-           sol_ode.retcode == SciMLBase.ReturnCode.Terminated
+           sol_ode.retcode == SciMLBase.ReturnCode.Default
             for j in 1:n_obs
                 sk = prob.obs_to_state[j]
                 for i in 1:min(n_times, length(sol_ode.t))

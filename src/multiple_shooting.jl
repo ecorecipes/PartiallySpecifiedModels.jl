@@ -94,9 +94,14 @@ function init_shooting_vars(data_times::Vector{Float64}, data_values::Matrix{Flo
         keep = [i for i in axes(data_values, 1)
                 if isfinite(data_values[i, j]) &&
                    (data_weights === nothing || data_weights[i, j] > 0)]
-        length(keep) < 2 && continue   # leave this state at 0.0; too little data
-        itp = CubicSpline(data_values[keep, j], data_times[keep];
-                          extrapolation=ExtrapolationType.Extension)
+        length(keep) < 2 && continue   # leave this state at fallback; too little data
+        itp = if length(keep) >= 3
+            CubicSpline(data_values[keep, j], data_times[keep];
+                        extrapolation=ExtrapolationType.Extension)
+        else
+            LinearInterpolation(data_values[keep, j], data_times[keep];
+                                extrapolation=ExtrapolationType.Extension)
+        end
         for i in 1:n_interior
             shooting_vars[i, sk] = itp(boundaries[i + 1])
         end
@@ -253,8 +258,10 @@ function _ms_loss_inner(prob::PSMProblem, z, n_theta::Int, K::Int,
             ode_prob = ODEProblem(ode_fn, u0_k, (t_lo, t_hi), p)
             sol = OrdinaryDiffEq.solve(ode_prob, prob.ode_solver;
                                        saveat=save_times,
-                                       abstol=1e-7, reltol=1e-7,
-                                       maxiters=10000)
+                                       abstol=get(prob.ode_kwargs, :abstol, 1e-7),
+                                       reltol=get(prob.ode_kwargs, :reltol, 1e-7),
+                                       maxiters=get(prob.ode_kwargs, :maxiters, 10000),
+                                       verbose=_quiet_solve())
 
             if sol.retcode != :Success && sol.retcode != SciMLBase.ReturnCode.Success
                 return T(1e10)
@@ -372,9 +379,9 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
     # AdamSolver).
     loss_sym = alg.loss
     if loss_sym == :auto
-        loss_sym = if prob.likelihood isa Gaussian
+        loss_sym = if prob.likelihood isa GaussianLikelihood
             :mse
-        elseif prob.likelihood isa Poisson
+        elseif prob.likelihood isa PoissonLikelihood
             :poisson
         else
             error("MultipleShootingSolver has no loss for " *
@@ -383,8 +390,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
                   "families.")
         end
     elseif loss_sym in (:mse, :poisson)
-        expected = prob.likelihood isa Poisson ? :poisson : :mse
-        if !(prob.likelihood isa Gaussian || prob.likelihood isa Poisson)
+        expected = prob.likelihood isa PoissonLikelihood ? :poisson : :mse
+        if !(prob.likelihood isa GaussianLikelihood || prob.likelihood isa PoissonLikelihood)
             @warn "MultipleShootingSolver: prob.likelihood is " *
                   "$(typeof(prob.likelihood)), which this solver cannot " *
                   "honor; fitting with loss=$loss_sym instead"
@@ -523,14 +530,18 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
                 ode_prob = ODEProblem(ode_fn, u0_k, (t_lo, t_hi), p_cur)
                 sol = OrdinaryDiffEq.solve(ode_prob, prob.ode_solver;
                                            saveat=[t_hi],
-                                           abstol=1e-7, reltol=1e-7,
-                                           maxiters=10000)
-                if length(sol.t) > 0
+                                           abstol=get(prob.ode_kwargs, :abstol, 1e-7),
+                                           reltol=get(prob.ode_kwargs, :reltol, 1e-7),
+                                           maxiters=get(prob.ode_kwargs, :maxiters, 10000),
+                                           verbose=_quiet_solve())
+                if sol.retcode == SciMLBase.ReturnCode.Success && length(sol.t) > 0
                     for s in 1:K
                         gap = sol[s, end] - shooting_cur[k, s]
                         lagrange_mult[k, s] += rho * gap
                         max_gap = max(max_gap, abs(gap))
                     end
+                else
+                    max_gap = Inf
                 end
             end
         end
@@ -543,10 +554,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
             println("  Data-only loss: $(round(data_only_loss, sigdigits=5))")
         end
 
-        # Check convergence (relative to state scale)
+        # Check convergence (relative to state scale, floored at 1.0 so u0 == 0 can converge)
         final_max_gap = max_gap
-        state_scale = norm(u0_init)
-        if max_gap < 1e-2 * state_scale
+        state_scale = max(norm(u0_init), 1.0)
+        if isfinite(max_gap) && max_gap < 1e-2 * state_scale
             if verbose; println("  Shooting gaps converged!"); end
             conv_converged = true
             conv_reason = :converged_tol
@@ -577,7 +588,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::MultipleShootingSolver)
                                        saveat=prob.data_times,
                                        abstol=get(prob.ode_kwargs, :abstol, 1e-7),
                                        reltol=get(prob.ode_kwargs, :reltol, 1e-7),
-                                       maxiters=get(prob.ode_kwargs, :maxiters, 10000))
+                                       maxiters=get(prob.ode_kwargs, :maxiters, 10000),
+                                       verbose=_quiet_solve())
         sol_ode.retcode == SciMLBase.ReturnCode.Success && length(sol_ode.u) >= T_pts ||
             error("final ODE solve at the fitted parameters failed " *
                   "(retcode $(sol_ode.retcode))")

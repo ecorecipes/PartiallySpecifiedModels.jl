@@ -1,6 +1,6 @@
 # Vignettes
 
-The `vignettes/` directory contains 42 worked examples covering every solver, approximator, and likelihood type. Each vignette is a self-contained [Quarto](https://quarto.org/) document; the rendered output of each is included in this documentation as a tutorial page, linked below.
+The `vignettes/` directory contains 48 worked examples covering every solver, approximator, likelihood family, and `ecorecipes` workflow. Each vignette is a self-contained [Quarto](https://quarto.org/) document; rendered tutorials are linked below.
 
 ## Getting Started
 
@@ -14,7 +14,7 @@ The `vignettes/` directory contains 42 worked examples covering every solver, ap
 | # | Vignette | Description |
 |:--|:---------|:------------|
 | 03 | [Lotka–Volterra](tutorials/03_lotka_volterra.md) | Hare–lynx predator-prey with LAML and collocation |
-| 04 | [Copepod](tutorials/04_copepod.md) | 11-stage structured population model with multiple unknown functions |
+| 04 | [Copepod](tutorials/04_copepod.md) | Wood (2001) 13-state fixed-duration stage-structured DDE with `:positive` SCOP-splines |
 | 08 | [Rosenzweig–MacArthur](tutorials/08_rosenzweig_macarthur.md) | Recovering functional responses in consumer-resource dynamics |
 | 10 | [Chemostat](tutorials/10_chemostat.md) | Microbial dynamics recovering unknown Monod growth kinetics |
 | 11 | [Count Data SIR](tutorials/11_count_data_sir.md) | SIR model with Poisson and Negative Binomial likelihoods |
@@ -68,6 +68,17 @@ The `vignettes/` directory contains 42 worked examples covering every solver, ap
 | 30 | [Model Selection](tutorials/30_model_selection.md) | LAML marginal likelihood for knot, approximator, and structural selection |
 | 32 | [Profile Likelihood](tutorials/32_profile_likelihood.md) | Identifiability analysis and likelihood-ratio CIs |
 | 42 | [Resilience](tutorials/42_resilience.md) | Resilience of a fitted equilibrium with bootstrap intervals: a spline functional response vs a misspecified Type II (DynamicalResilience.jl) |
+
+## Advanced & Ecosystem Workflows (v0.3)
+
+| # | Vignette | Description |
+|:--|:---------|:------------|
+| 43 | Gause *Paramecium* Competition | Multi-replicate competition with `MultiTrajectoryPSMProblem`, `RandomEffectApproximator`, `:decreasing` SCOP-splines, and Wood (2013) `test_parametric_hypothesis` |
+| 44 | *Tribolium* LPA Beetle Chaos | Discrete-time cannibalism with `ShapeConstrainedBSplineApproximator` (`:dec_positive`) and `to_discrete_problem` (`DynamicalResilience.jl`) |
+| 45 | Seasonal Measles Forcing | Periodic transmission with `CyclicBSplineApproximator`, `TrajectoryObservation` interval incidence, `Distributions.NegativeBinomial`, and `compare_models` |
+| 46 | Fisheries Surplus Production & Decision Analysis | Surplus-production biomass (`LogNormalLikelihood`) bridged to `DecisionAnalysis.jl` (`ManagedPSM`, `sample_belief`, EVPI & EVPPI) |
+| 47 | GAM.jl & DynamicalResilience Ecosystem Bridge | Embedding `GAM.jl` smooths (`GAMSmoothApproximator`) inside ODEs with equilibrium resilience propagation |
+| 48 | Stochastic Predator–Prey with Process Noise | Separating environmental stochasticity from observation error via `SDEPSMProblem` and `EKFSolver` |
 
 ## Running Vignettes Locally
 

@@ -2,6 +2,7 @@ module SimultaneousBandTests
 
 using Test, Random, LinearAlgebra, Statistics
 using PartiallySpecifiedModels, Lux, FluxKAN
+using PartiallySpecifiedModels: initial_params, build_evaluator
 const PSM=PartiallySpecifiedModels
 
 function fixture(approximators)

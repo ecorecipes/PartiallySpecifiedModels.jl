@@ -45,7 +45,7 @@ PSM.build_evaluator(::RidgeRate,b)=x->b[1]
     end
 
     count_prob=PSMProblem(rhs!,[1.0],(0.0,1.0),[RidgeRate(:r)];
-        data_times=times,data_values=reshape([1.,2.,2.,3.,3.,4.],:,1),likelihood=Poisson())
+        data_times=times,data_values=reshape([1.,2.,2.,3.,3.,4.],:,1),likelihood=PoissonLikelihood())
     count_fit=@test_logs solve(count_prob,LAML(maxiters=30,fixed_lambda=lambda,jac=:forwarddiff))
     @test count_fit.smoothing_params == [lambda]
     @test count_fit.convergence.smoothing_fixed && !count_fit.convergence.smoothing_advanced

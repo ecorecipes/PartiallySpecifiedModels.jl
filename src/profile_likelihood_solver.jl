@@ -74,7 +74,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
     # The profile statistic ΔPenSS/σ̂² is the fixed-smoothing Gaussian
     # likelihood ratio; its χ²₁ calibration does not hold for other
     # families, so refuse rather than return wrong CIs.
-    prob.likelihood isa Gaussian ||
+    prob.likelihood isa GaussianLikelihood ||
         error("ProfileLikelihoodSolver supports Gaussian likelihoods only " *
               "(the penalized-SS profile statistic is χ²₁-calibrated for " *
               "Gaussian errors); got $(typeof(prob.likelihood)).")
@@ -131,7 +131,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
     function _profile_objective(prob, β_full; with_penalty::Bool=true)
         total_loss = 0.0
         try
-            pred = simulate(prob, β_full)
+            pred = simulate_psm(prob, β_full)
             for i in 1:length(prob.data_times)
                 for j in 1:size(prob.data_values, 2)
                     w = prob.data_weights[i, j]
@@ -142,7 +142,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
             end
         catch e
             _is_program_error(e) && rethrow()
-            return 1e10
+            return Inf
         end
         # Penalty at the FITTED smoothing parameters λ̂, over exactly the
         # penalty BLOCKS LAML used: `base_sol.smoothing_params` carries one
@@ -180,22 +180,17 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
         println("  Hessian diagonal: ", [round(h, sigdigits=3) for h in hess_diag])
     end
 
-    for idx in indices
+    function _profile_one_param(idx::Int)
         if verbose; println("  Profiling parameter $idx (MLE=$(round(beta_mle[idx], sigdigits=4)))..."); end
 
-        # Scale from Hessian: σ ≈ 1/√(H_jj), then grid = MLE ± 4σ
-        if hess_diag[idx] > 1e-8
-            sigma_j = 1.0 / sqrt(hess_diag[idx])
+        if isfinite(hess_diag[idx]) && hess_diag[idx] > 1e-8
+            sigma_j = sqrt(2.0 * max(sigma2_hat, 1e-12) / hess_diag[idx])
         else
             sigma_j = max(abs(beta_mle[idx]) * 0.3, 0.1)
         end
         half_width = 4.0 * sigma_j
         grid = collect(range(beta_mle[idx] - half_width, beta_mle[idx] + half_width,
                              length=alg.n_profile_points))
-        # Insert the exact MLE value: with an even point count the center
-        # falls between grid points, and a steep profile can then cross the
-        # χ² threshold inside the first grid cell — quantizing the CI to a
-        # single off-MLE point.
         if !any(g -> isapprox(g, beta_mle[idx]; atol=1e-12), grid)
             grid = sort(vcat(grid, beta_mle[idx]))
         end
@@ -203,14 +198,10 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
 
         profile_obj = fill(Inf, n_grid)
         profile_beta = Vector{Vector{Float64}}(undef, n_grid)
-
         other_idx = [i for i in 1:n_beta if i != idx]
-
-        # Find the grid index closest to MLE (start point)
         mle_gi = argmin(abs.(grid .- beta_mle[idx]))
 
-        # Profile loss for a given fixed value of parameter idx
-        function make_profile_loss(beta_template, idx_fixed, other_idx_list)
+        function make_profile_loss(beta_template, other_idx_list)
             function profile_loss(β_other_eval)
                 β_full = copy(beta_template)
                 for (oi, ov) in enumerate(other_idx_list)
@@ -221,21 +212,13 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
             profile_loss
         end
 
-        # Evaluate at a single grid point, warm-started from beta_warm
         function _eval_grid_point!(gi, gval, beta_warm)
             beta_fixed = copy(beta_warm)
             beta_fixed[idx] = gval
             beta_other = beta_fixed[other_idx]
 
             if length(beta_other) > 0
-                ploss = make_profile_loss(beta_fixed, idx, other_idx)
-                # Long NelderMead over the nuisance coefficients. Gradient
-                # methods stall immediately here (finite-difference gradients
-                # through an adaptive ODE solve are noisy), and a short
-                # NelderMead under-optimizes the nuisances — both inflate the
-                # profile away from the MLE, producing anti-conservative
-                # (sometimes single-point) CIs that can even exclude the
-                # fitted parameter. Warm starts keep the long run affordable.
+                ploss = make_profile_loss(beta_fixed, other_idx)
                 opt_result = Optim.optimize(ploss, beta_other,
                                             Optim.NelderMead(),
                                             Optim.Options(iterations=5000,
@@ -257,63 +240,42 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
             end
         end
 
-        # Evaluate at MLE grid point first
         beta_warm_r = _eval_grid_point!(mle_gi, grid[mle_gi], beta_mle)
-
-        # Sweep RIGHT from MLE
         beta_warm_right = copy(beta_warm_r)
         for gi in (mle_gi+1):n_grid
             beta_warm_right = _eval_grid_point!(gi, grid[gi], beta_warm_right)
         end
-
-        # Sweep LEFT from MLE
         beta_warm_left = copy(beta_warm_r)
         for gi in (mle_gi-1):-1:1
             beta_warm_left = _eval_grid_point!(gi, grid[gi], beta_warm_left)
         end
 
-        # Penalized profile-likelihood-ratio statistic, conditional on λ̂:
-        #   PLR(θ) = (PenSS_profile(θ) − PenSS_min) / σ̂²  ~  χ²₁,
-        # the fixed-smoothing Gaussian LRT. (Raw-RSS ratios are NOT usable
-        # here: the penalized MLE does not minimize raw RSS, so re-optimized
-        # neighbors can beat it, giving negative ratios and nonsense CIs.)
-        # Anchor the center at the MLE's own penalized objective so
-        # PLR(center) = 0 exactly.
         pen_at_mle = _profile_objective(prob, beta_mle; with_penalty=true)
-        if isfinite(pen_at_mle) && pen_at_mle < 1e10
+        if isfinite(pen_at_mle)
             profile_obj[mle_gi] = min(profile_obj[mle_gi], pen_at_mle)
         end
-        pen_min = minimum(filter(isfinite, profile_obj))
-        plr = [isfinite(o) && o < 1e10 ? (o - pen_min) / sigma2_hat : Inf
+        finite_objs = filter(isfinite, profile_obj)
+        pen_min = isempty(finite_objs) ? Inf : minimum(finite_objs)
+        plr = [isfinite(o) && isfinite(pen_min) ? (o - pen_min) / max(sigma2_hat, 1e-30) : Inf
                for o in profile_obj]
 
-        # Interpolated threshold crossings: the χ² boundary generally falls
-        # between grid points; snapping CI endpoints to grid values both
-        # quantizes the interval and can exclude the MLE entirely when the
-        # profile is steep relative to the grid spacing.
-        function _cross(gL, gR, pL, pR)
+        _cross(gL, gR, pL, pR) =
             (isfinite(pL) && isfinite(pR) && pR != pL) ?
-                gL + (chi2_threshold - pL) / (pR - pL) * (gR - gL) :
-                gR
-        end
+                gL + (chi2_threshold - pL) / (pR - pL) * (gR - gL) : gR
 
-        # Find CI: largest interval where PLR < threshold. An endpoint that
-        # sits on the grid boundary means the profile never crossed the
-        # threshold on that side — the interval is open (parameter weakly
-        # identified or grid too narrow), which callers need to know.
         in_ci = plr .< chi2_threshold
         i1 = findfirst(in_ci)
         i2 = findlast(in_ci)
-        open_left = in_ci[1]
-        open_right = in_ci[end]
-        ci_lo = open_left ? grid[1] :
-                _cross(grid[i1-1], grid[i1], plr[i1-1], plr[i1])
-        ci_hi = open_right ? grid[end] :
-                _cross(grid[i2+1], grid[i2], plr[i2+1], plr[i2])
-
-        profiles[idx] = (grid=grid, objective=profile_obj, plr=plr,
-                         ci=(ci_lo, ci_hi), threshold=chi2_threshold,
-                         open_left=open_left, open_right=open_right)
+        if i1 === nothing || i2 === nothing
+            open_left = true; open_right = true
+            ci_lo = grid[1]; ci_hi = grid[end]
+        else
+            open_left = in_ci[1]; open_right = in_ci[end]
+            ci_lo = (open_left || i1 <= 1) ? grid[1] :
+                    _cross(grid[i1-1], grid[i1], plr[i1-1], plr[i1])
+            ci_hi = (open_right || i2 >= n_grid) ? grid[end] :
+                    _cross(grid[i2+1], grid[i2], plr[i2+1], plr[i2])
+        end
 
         if verbose
             lo_br = open_left ? "(" : "["
@@ -323,6 +285,23 @@ function SciMLBase.solve(prob::PSMProblem, alg::ProfileLikelihoodSolver)
                     (open_left || open_right ?
                      "  (open endpoint: profile did not cross threshold)" : ""))
         end
+        (grid=grid, objective=profile_obj, plr=plr,
+         ci=(ci_lo, ci_hi), threshold=chi2_threshold,
+         open_left=open_left, open_right=open_right)
+    end
+
+    prof_results = Vector{NamedTuple}(undef, length(indices))
+    if alg.parallel && Threads.nthreads() > 1
+        Threads.@threads for k in eachindex(indices)
+            prof_results[k] = _profile_one_param(indices[k])
+        end
+    else
+        for k in eachindex(indices)
+            prof_results[k] = _profile_one_param(indices[k])
+        end
+    end
+    for (k, idx) in enumerate(indices)
+        profiles[idx] = prof_results[k]
     end
 
     # Return solution with profiles in convergence field. The profiles are

@@ -95,6 +95,23 @@ Returns `(F, failed)` where `F` is a (T × K) matrix with entry
 evaluation at point `i` raised a numerical error and `F[i, :]` therefore
 holds the failure sentinel rather than a real derivative.
 """
+function _eval_discrete_multi!(du, u, prob::PSMProblem, p, t_start::Float64, n_steps::Int)
+    if n_steps <= 1
+        prob.dynamics!(du, u, p, t_start)
+        return du
+    end
+    T = promote_type(eltype(du), eltype(u))
+    cur = T.(u)
+    nxt = similar(cur)
+    for s in 0:(n_steps - 1)
+        fill!(nxt, zero(T))
+        prob.dynamics!(nxt, cur, p, t_start + Float64(s))
+        cur, nxt = nxt, cur
+    end
+    du .= cur
+    du
+end
+
 function eval_ode_rhs_masked(prob::PSMProblem, times::Vector{Float64},
                              alpha::Matrix{Float64}, beta::Vector{Float64})
     T, K = size(alpha)
@@ -107,7 +124,12 @@ function eval_ode_rhs_masked(prob::PSMProblem, times::Vector{Float64},
     for i in 1:n_rhs
         u = alpha[i, :]
         try
-            prob.dynamics!(du, u, p, times[i])
+            if prob.discrete
+                n_steps = max(round(Int, times[i + 1] - times[i]), 1)
+                _eval_discrete_multi!(du, u, prob, p, times[i], n_steps)
+            else
+                prob.dynamics!(du, u, p, times[i])
+            end
         catch e
             _is_program_error(e) && rethrow()
             du .= _COLLOC_FAIL_SENTINEL  # numerical failure → large residual
@@ -160,16 +182,18 @@ Program errors are always rethrown.
 function _colloc_state_jac!(dFdx::Matrix{Float64}, prob::PSMProblem, p,
                             u::Vector{Float64}, t::Float64,
                             du0::Vector{Float64}, du_p::Vector{Float64};
-                            jac::Symbol=:fd)
+                            jac::Symbol=:fd, n_steps::Int=1)
     K = length(u)
     if jac === :forwarddiff
         fill!(dFdx, 0.0)
         M = try
             ForwardDiff.jacobian(
-                uu -> (duu = zero(uu);   # zero, not similar: dynamics that
-                       # skip a du entry must read 0.0, not garbage memory
-                       # (parity with _colloc_beta_jac_ad!'s fill!(dud, 0))
-                       prob.dynamics!(duu, uu, p, t);
+                uu -> (duu = zero(uu);
+                       if prob.discrete && n_steps > 1
+                           _eval_discrete_multi!(duu, uu, prob, p, t, n_steps)
+                       else
+                           prob.dynamics!(duu, uu, p, t)
+                       end;
                        duu), u)
         catch e
             _is_program_error(e) && rethrow()
@@ -184,7 +208,11 @@ function _colloc_state_jac!(dFdx::Matrix{Float64}, prob::PSMProblem, p,
     # :fd — byte-identical to the historical inline code.
     base_failed = false
     try
-        prob.dynamics!(du0, u, p, t)
+        if prob.discrete && n_steps > 1
+            _eval_discrete_multi!(du0, u, prob, p, t, n_steps)
+        else
+            prob.dynamics!(du0, u, p, t)
+        end
     catch e
         _is_program_error(e) && rethrow()
         du0 .= _COLLOC_FAIL_SENTINEL  # match the residual sentinel
@@ -197,7 +225,11 @@ function _colloc_state_jac!(dFdx::Matrix{Float64}, prob::PSMProblem, p,
         u_p[k_pert] += eps_x
         pert_failed = false
         try
-            prob.dynamics!(du_p, u_p, p, t)
+            if prob.discrete && n_steps > 1
+                _eval_discrete_multi!(du_p, u_p, prob, p, t, n_steps)
+            else
+                prob.dynamics!(du_p, u_p, p, t)
+            end
         catch e
             _is_program_error(e) && rethrow()
             du_p .= du0
@@ -262,7 +294,12 @@ function _colloc_beta_jac_ad!(J::AbstractMatrix, prob::PSMProblem,
             F_failed[i] && continue
             fill!(dud, zero(eltype(bd)))
             try
-                prob.dynamics!(dud, alpha[i, :], pd, times[i])
+                if prob.discrete
+                    n_steps = max(round(Int, times[i + 1] - times[i]), 1)
+                    _eval_discrete_multi!(dud, alpha[i, :], prob, pd, times[i], n_steps)
+                else
+                    prob.dynamics!(dud, alpha[i, :], pd, times[i])
+                end
             catch e
                 _is_program_error(e) && rethrow()
                 ad_failed[i] = true
@@ -430,7 +467,8 @@ function collocation_residual_jacobian(
         # ∂/∂alpha[i,k_pert]: -sqrt_lode * ∂F[i,k_eq]/∂x[k_pert]
         for i in 1:(T-1)
             u = alpha[i, :]
-            _colloc_state_jac!(dFdx, prob, p, u, times[i], du0, du_p; jac=jac)
+            n_st = max(round(Int, times[i + 1] - times[i]), 1)
+            _colloc_state_jac!(dFdx, prob, p, u, times[i], du0, du_p; jac=jac, n_steps=n_st)
 
             for k_pert in 1:K
                 col_i = (k_pert - 1) * T + i  # alpha[i, k_pert]
@@ -664,7 +702,8 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     times = Float64.(prob.data_times)
     T_pts = length(times)
     n_obs = size(prob.data_values, 2)
-    K = length(prob.u0)  # Number of state variables
+    u0_init = _resolve_u0_init(prob)
+    K = length(u0_init)  # Number of state variables
 
     # Build differentiation matrix
     D = build_diff_matrix(times)
@@ -689,7 +728,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
             # `alpha`, making the whole state block NaN from step one.
             keep = usable_rows(prob, obs_idx)
             if isempty(keep)
-                alpha[:, k] .= prob.u0[k]
+                alpha[:, k] .= u0_init[k]
             else
                 col = Float64.(prob.data_values[keep, obs_idx])
                 floor_k = all(>=(0.0), col) ? 0.01 : -Inf
@@ -718,7 +757,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                 end
             end
         else
-            alpha[:, k] .= prob.u0[k]
+            alpha[:, k] .= u0_init[k]
         end
     end
 
@@ -772,7 +811,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     # Gaussian keeps the historical path bit-identical: `w_iter === w_vec`
     # and the residual-SS objective below are the pre-fix computations.
     lik = prob.likelihood
-    is_gauss = lik isa Gaussian
+    is_gauss = lik isa GaussianLikelihood
     # y flattened obs-major (matches w_vec). Masked cells carry y = 0
     # beside their zero weight so `_usable` drops them and no NaN can leak
     # into irls_weights/log_likelihood.
@@ -1011,7 +1050,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
         if m > 0
             ord(M) = Float64[M[i, j] for j in 1:n_obs for i in 1:T_pts]
             μ_pred = try
-                simulate(prob, beta)
+                simulate_psm(prob, beta)
             catch e
                 _is_program_error(e) && rethrow()
                 nothing
@@ -1062,7 +1101,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                         step = max(1e-6, abs(beta[b]) * 1e-6)
                         bp = copy(beta); bp[b] += step
                         pp = try
-                            simulate(prob, bp)
+                            simulate_psm(prob, bp)
                         catch e
                             _is_program_error(e) && rethrow()
                             μ_pred  # zero FD column on numerical failure
@@ -1082,9 +1121,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
                     S_full[idx, idx] .+= theta[l] .* S_list[l]
                 end
                 H = JWJ + S_full
-                maxd = maximum(abs.(diag(H)))
-                for i in 1:n_beta; H[i, i] += 1e-10 * (maxd + 1); end
-                H_inv = try; inv(cholesky(Symmetric(H))); catch; pinv(H); end
+                H_inv = _safe_inv(H)
                 edf_total = clamp(tr(H_inv * JWJ), 1.0, Float64(n_beta))
                 sigma2_est = if is_gauss
                     sum(w_vec2 .* (y_vec2 .- mu_base).^2) /
@@ -1216,9 +1253,11 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
             end
         end
     else
-        for k in 1:K, i in 1:T_pts
-            dalpha_k = (D * alpha[:, k])[i]
-            ode_loss += (dalpha_k - F[i, k])^2
+        for k in 1:K
+            dalpha_k = D * alpha[:, k]
+            for i in 1:T_pts
+                ode_loss += (dalpha_k[i] - F[i, k])^2
+            end
         end
     end
 
@@ -1287,9 +1326,15 @@ function SciMLBase.solve(prob::PSMProblem, alg::CollocationLAML)
     end
     params = ComponentArray(NamedTuple(ca_entries))
 
-    obj_val = data_loss + sum((theta[l] * dot(beta[uf_offsets[l]+1:uf_offsets[l]+uf_nk[l]],
-                  S_list[l] * beta[uf_offsets[l]+1:uf_offsets[l]+uf_nk[l]]) for l in 1:m);
-                  init=0.0)   # m == 0 (all approximators unpenalized) is valid
+    pen_total = sum((theta[l] * dot(beta[uf_offsets[l]+1:uf_offsets[l]+uf_nk[l]],
+                    S_list[l] * beta[uf_offsets[l]+1:uf_offsets[l]+uf_nk[l]]) for l in 1:m);
+                    init=0.0)
+    obj_val = if is_gauss
+        0.5 * (data_loss + pen_total)
+    else
+        fill_mu!(mu_flat, alpha)
+        -log_likelihood(lik, y_flat, mu_flat, w_vec) + 0.5 * pen_total
+    end
 
     if verbose
         println("\nFinal: data_SS=$(round(data_loss, sigdigits=5)) " *

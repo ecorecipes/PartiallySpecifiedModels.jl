@@ -11,14 +11,16 @@
 
 Sample an index from `weights` using inverse-CDF (no StatsBase dependency).
 """
+@inline function _abc_weighted_sample_cdf(rng::Random.AbstractRNG,
+                                          cumw::AbstractVector{Float64})
+    r = rand(rng) * @inbounds(cumw[end])
+    idx = searchsortedfirst(cumw, r)
+    idx > length(cumw) ? length(cumw) : idx
+end
+
 function _abc_weighted_sample(rng::Random.AbstractRNG,
                               weights::AbstractVector{Float64})
-    cumw = cumsum(weights)
-    r = rand(rng) * cumw[end]
-    for i in eachindex(cumw)
-        r <= cumw[i] && return i
-    end
-    return length(weights)
+    _abc_weighted_sample_cdf(rng, cumsum(weights))
 end
 
 """
@@ -233,22 +235,34 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
     distances = Vector{Float64}(undef, N)
     weights   = fill(1.0 / N, N)
 
+    # Pre-draw generation-0 particles sequentially from `rng` so `parallel=true`
+    # evaluates the exact same population deterministically.
     for i in 1:N
         particles[i] = prior_sample()
-        try
-            pred = simulate(prob, particles[i])
-            distances[i] = summary_fn(pred, prob.data_values)
-        catch e
-            # A genuine integration failure means this particle is a bad
-            # draw, and Inf is the right distance. A PROGRAM error (typo,
-            # MethodError, BoundsError in the user's dynamics) is not a bad
-            # draw — scoring it as "infinitely bad" makes every particle
-            # look rejected and the solver reports a converged-looking fit
-            # built entirely on nothing. Same policy as LAML and
-            # DerivativeFreeSolver: bugs raise, model failures score.
-            _is_program_error(e) && rethrow()
-            distances[i] = Inf
-            n_sim_failed += 1
+    end
+    if alg.parallel && Threads.nthreads() > 1
+        sim_fail_flags = zeros(Int, N)
+        Threads.@threads for i in 1:N
+            try
+                pred = simulate_psm(prob, particles[i])
+                distances[i] = summary_fn(pred, prob.data_values)
+            catch e
+                _is_program_error(e) && rethrow()
+                distances[i] = Inf
+                sim_fail_flags[i] = 1
+            end
+        end
+        n_sim_failed += sum(sim_fail_flags)
+    else
+        for i in 1:N
+            try
+                pred = simulate_psm(prob, particles[i])
+                distances[i] = summary_fn(pred, prob.data_values)
+            catch e
+                _is_program_error(e) && rethrow()
+                distances[i] = Inf
+                n_sim_failed += 1
+            end
         end
     end
 
@@ -278,41 +292,69 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
 
         accepted_slots = Int[]
         failed_slots   = Int[]
-        for i in 1:N
-            found = false
-            for _attempt in 1:1000
-                # (a) resample from previous generation
-                j = _abc_weighted_sample(rng, weights)
-                # (b) perturb with Gaussian kernel
-                theta_star = particles[j] .+ kernel_std .* randn(rng, n_p)
-
-                # check prior support (no-op for the Gaussian prior)
-                in_support(theta_star) || continue
-
-                # (c-d) simulate and compute distance
-                local d::Float64
-                try
-                    pred = simulate(prob, theta_star)
-                    d = summary_fn(pred, prob.data_values)
-                catch e
-                    # Same policy as the prior-sampling loop above: a bug in
-                    # the dynamics must raise rather than be silently
-                    # skipped as a rejected proposal.
-                    _is_program_error(e) && rethrow()
-                    n_sim_failed += 1
-                    continue
-                end
-
-                # (e) accept / reject
-                if d < epsilon
-                    new_particles[i] = theta_star
-                    new_distances[i] = d
-                    accepted += 1
-                    found = true
-                    break
+        cumw_gen = cumsum(weights)
+        if alg.parallel && Threads.nthreads() > 1
+            part_rngs = [Random.Xoshiro(rand(rng, UInt64)) for _ in 1:N]
+            found_flags = falses(N)
+            gen_fails = zeros(Int, N)
+            Threads.@threads for i in 1:N
+                ri = part_rngs[i]
+                for _attempt in 1:1000
+                    j = _abc_weighted_sample_cdf(ri, cumw_gen)
+                    theta_star = particles[j] .+ kernel_std .* randn(ri, n_p)
+                    in_support(theta_star) || continue
+                    local d::Float64
+                    try
+                        pred = simulate_psm(prob, theta_star)
+                        d = summary_fn(pred, prob.data_values)
+                    catch e
+                        _is_program_error(e) && rethrow()
+                        gen_fails[i] += 1
+                        continue
+                    end
+                    if d < epsilon
+                        new_particles[i] = theta_star
+                        new_distances[i] = d
+                        found_flags[i] = true
+                        break
+                    end
                 end
             end
-            push!(found ? accepted_slots : failed_slots, i)
+            n_sim_failed += sum(gen_fails)
+            for i in 1:N
+                if found_flags[i]
+                    accepted += 1
+                    push!(accepted_slots, i)
+                else
+                    push!(failed_slots, i)
+                end
+            end
+        else
+            for i in 1:N
+                found = false
+                for _attempt in 1:1000
+                    j = _abc_weighted_sample_cdf(rng, cumw_gen)
+                    theta_star = particles[j] .+ kernel_std .* randn(rng, n_p)
+                    in_support(theta_star) || continue
+                    local d::Float64
+                    try
+                        pred = simulate_psm(prob, theta_star)
+                        d = summary_fn(pred, prob.data_values)
+                    catch e
+                        _is_program_error(e) && rethrow()
+                        n_sim_failed += 1
+                        continue
+                    end
+                    if d < epsilon
+                        new_particles[i] = theta_star
+                        new_distances[i] = d
+                        accepted += 1
+                        found = true
+                        break
+                    end
+                end
+                push!(found ? accepted_slots : failed_slots, i)
+            end
         end
 
         # Slots that never produced an accepted draw within the attempt
@@ -379,7 +421,7 @@ function SciMLBase.solve(prob::PSMProblem, alg::ABCSolver)
     # posterior mean with best-particle functions returned inconsistent
     # summaries.
     pred = try
-        simulate(prob, mean_beta)
+        simulate_psm(prob, mean_beta)
     catch e
         _is_program_error(e) && rethrow()
         fill(NaN, size(prob.data_values))

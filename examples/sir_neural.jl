@@ -98,7 +98,7 @@ prob = PSMProblem(sir_neural!, u0, tspan, [approx_β];
     data_values = data_values,
     obs_to_state = [1, 2],  # observe S and I
     known_params = (γ = γ, N = N),
-    likelihood = Gaussian(),
+    likelihood = GaussianLikelihood(),
     solver = Tsit5(),
     abstol = 1e-6,
     reltol = 1e-6)

@@ -43,6 +43,7 @@ A `NamedTuple` with fields:
 function optimize_spde_range(prob::PSMProblem, alg;
     range_multipliers::Union{Nothing, AbstractVector}=nothing,
     n_grid::Int=10,
+    parallel::Bool=false,
     verbose::Bool=false)
 
     # Identify SPDE approximators and their default ranges
@@ -63,30 +64,27 @@ function optimize_spde_range(prob::PSMProblem, alg;
         exp.(range(log(0.1), log(10.0), length=n_grid))
     end
 
-    n_data = length(prob.data_times) * length(prob.obs_to_state)
+    n_data = count(i -> _usable(prob.data_values[i], prob.data_weights[i]),
+                   eachindex(prob.data_values))
+    n_data = max(n_data, 1)
 
-    best_gcv = Inf
-    best_sol = nothing
-    best_range = 0.0
-    gcv_scores = Float64[]
-    range_values = Float64[]
+    n_m = length(mults)
+    range_values = Float64[default_ranges[1] * m for m in mults]
+    gcv_scores = fill(Inf, n_m)
+    sol_list = Vector{Union{Nothing, PSMSolution}}(nothing, n_m)
 
-    for mult in mults
-        # Rebuild approximators with scaled range
+    function _eval_range(mi::Int)
+        mult = mults[mi]
+        range_val = range_values[mi]
         new_approxs = AbstractApproximator[
             if i in spde_indices
                 idx = findfirst(==(i), spde_indices)
                 with_range_param(prob.approximators[i], default_ranges[idx] * mult)
             else
-                prob.approximators[i]
+                deepcopy(prob.approximators[i])
             end
             for i in eachindex(prob.approximators)
         ]
-
-        range_val = default_ranges[1] * mult
-        push!(range_values, range_val)
-
-        # Rebuild problem with new approximators
         new_prob = PSMProblem(prob.dynamics!, prob.u0, prob.tspan, new_approxs;
             data_times=prob.data_times,
             data_values=prob.data_values,
@@ -97,36 +95,53 @@ function optimize_spde_range(prob::PSMProblem, alg;
             solver=prob.ode_solver,
             discrete=prob.discrete,
             delays=prob.delays,
-            history=prob.history)
+            history=prob.history,
+            obs_fn=prob.obs_fn,
+            estimate_u0=prob.estimate_u0,
+            prob.ode_kwargs...)
 
-        # Run solver
         sol = try
             solve(new_prob, alg)
         catch e
+            _is_program_error(e) && rethrow()
             verbose && @printf("  range=%6.3f (×%.2f): FAILED (%s)\n",
                 range_val, mult, sprint(showerror, e))
-            push!(gcv_scores, Inf)
-            continue
+            return
         end
 
-        # GCV score: n * data_loss / (n - edf)²
         denom = max(n_data - sol.edf, 1.0)
-        gcv = n_data * sol.data_loss / denom^2
-        push!(gcv_scores, gcv)
-
+        gcv = if prob.likelihood isa GaussianLikelihood
+            n_data * sol.data_loss / denom^2
+        else
+            y_v = vec(prob.data_values)
+            mu_v = vec(sol.fitted_values)
+            w_v = vec(prob.data_weights)
+            dev = -2.0 * log_likelihood(prob.likelihood, y_v, mu_v, w_v)
+            dev + 2.0 * sol.edf * (n_data / denom)
+        end
+        gcv_scores[mi] = gcv
+        sol_list[mi] = sol
         if verbose
             @printf("  range=%6.3f (×%.2f): GCV=%.4f, loss=%.4f, edf=%.1f\n",
                 range_val, mult, gcv, sol.data_loss, sol.edf)
         end
+    end
 
-        if gcv < best_gcv
-            best_gcv = gcv
-            best_sol = sol
-            best_range = range_val
+    if parallel && Threads.nthreads() > 1
+        Threads.@threads for mi in 1:n_m
+            _eval_range(mi)
+        end
+    else
+        for mi in 1:n_m
+            _eval_range(mi)
         end
     end
 
+    best_mi = argmin(gcv_scores)
+    best_sol = sol_list[best_mi]
     best_sol === nothing && error("All range parameter values failed")
+    best_gcv = gcv_scores[best_mi]
+    best_range = range_values[best_mi]
 
     if verbose
         @printf("Best range=%.3f, GCV=%.4f\n", best_range, best_gcv)

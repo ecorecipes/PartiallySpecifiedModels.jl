@@ -196,10 +196,11 @@ function _sqrt_probsolve_filter(ode_fun!, p, u0::AbstractVector,
     μ_filt = Vector{Vector{Float64}}(undef, n_steps + 1)
     R_filt = Vector{Matrix{Float64}}(undef, n_steps + 1)
 
+    R0 = sqrt.(_joint_init_cov(n_vars, q, sigma, dt))
     μ_pred[1] = X0
-    R_pred[1] = zeros(D, D)
+    R_pred[1] = copy(R0)
     μ_filt[1] = X0
-    R_filt[1] = zeros(D, D)
+    R_filt[1] = copy(R0)
 
     calib_acc = 0.0  # Σ_n νᵀ S⁻¹ ν = Σ_n ‖S_R⁻ᵀν‖²
 

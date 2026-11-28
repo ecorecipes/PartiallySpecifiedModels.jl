@@ -17,7 +17,7 @@ PartiallySpecifiedModels.jl provides a unified interface for specifying and fitt
 - **Basis function approximators** (B-splines, shape-constrained splines, Gaussian processes): fewer parameters, automatic smoothing via LAML/GCV, interpretable, and easy to constrain (monotonicity, convexity, positivity).
 - **Neural network approximators** (Lux.jl networks, COMONet): more flexible for high-dimensional or complex functional forms, compatible with gradient-based UDE-style training.
 
-The package builds on the [SciML ecosystem](https://sciml.ai/) and supports 23 fitting algorithms, 12 approximator types (including an optional KAN backend), 5 likelihood families, and 14 shape constraint types.
+The package builds on the [SciML ecosystem](https://sciml.ai/) and supports 24 fitting algorithms (including continuous-discrete EKF for SDEs), 15 approximator types (including optional `FluxKAN.jl` and `GAM.jl` backends), 9 likelihood families (plus direct `Distributions.jl` coercion), and 14 shape constraint types.
 
 ## Installation
 
@@ -26,7 +26,7 @@ using Pkg
 Pkg.add(url="https://github.com/ecorecipes/PartiallySpecifiedModels.jl")
 ```
 
-Requires Julia ≥ 1.12.
+Requires Julia ≥ 1.13. See [Migration to v0.3](docs/src/migration_v03.md) if upgrading from v0.2.
 
 ## Quick Start
 
@@ -68,7 +68,7 @@ prob = PSMProblem(
     data_times = data_times,
     data_values = reshape(observed_N, :, 1),
     obs_to_state = [1],
-    likelihood = Gaussian(),
+    likelihood = GaussianLikelihood(),
     solver = Tsit5()
 )
 
@@ -82,20 +82,21 @@ r_estimated = [r_fitted(N) for N in range(0.1, 11.0, length=100)]
 
 ## Solvers
 
-PartiallySpecifiedModels.jl provides 23 solvers spanning penalized likelihood, gradient matching, probabilistic numerics, and Bayesian inference:
+PartiallySpecifiedModels.jl provides 24 solvers spanning penalized likelihood, state-space SDE filtering, gradient matching, probabilistic numerics, and Bayesian inference:
 
 | Solver | Method | ODE-free? | Bayesian? | Reference |
 |--------|--------|:---------:|:---------:|-----------|
-| `LAML` | Penalized IRLS + LAML smoothing | No | No | Wood et al. (2016) |
-| `GCVSolver` | Penalized IRLS + GCV smoothing | No | No | Wood (2001) |
+| `LAML` | Penalized IRLS + LAML smoothing (exact Wood 2011 Newton) | No | No | Wood et al. (2016) |
+| `EKFSolver` | Continuous-discrete EKF + RTS smoother for `SDEPSMProblem` | No | No | Särkkä & Solin (2019) |
+| `GCVSolver` | Penalized IRLS + GCV/NCV smoothing | No | No | Wood (2001, 2024) |
 | `CollocationLAML` | Generalized profiling | No | No | Ramsay et al. (2007) |
 | `GradientMatching` | Smooth then match derivatives | Yes | No | — |
-| `TwoStageSolver` | Smooth then match (simple) | Yes | No | Varah (1982) |
+| `TwoStageSolver` | Smooth then match (simple) | Yes | No | Varah (1982); Brunel (2008) |
 | `BNGSolver` | Ensemble Bayesian gradient matching | Yes | Yes | Bonnaffé & Coulson (2023) |
 | `AdaptiveGradientMatching` | GP product-of-experts | Yes | No | Macdonald & Husmeier (2015) |
 | `FGPGMSolver` | GP product-of-experts MCMC over states + parameters | Yes | Yes | Wenk et al. (2019) |
 | `AdamSolver` | Adam through ODE (UDE-style) | No | No | Rackauckas et al. (2020) |
-| `MultipleShootingSolver` | Multiple shooting + Adam | No | No | Turan & Jäschke (2021) |
+| `MultipleShootingSolver` | Multiple shooting (Augmented Lagrangian + L-BFGS) | No | No | Turan & Jäschke (2021) |
 | `DerivativeFreeSolver` | NelderMead / Particle Swarm | No | No | — |
 | `RodeoSolver` | Probabilistic ODE (Kalman) | No | No | Wu & Lysy (2024); Tronarp et al. (2022) for `:fenrir` |
 | `DaltonSolver` | Data-adaptive Kalman likelihood | No | No | Wu & Lysy (2024) |
@@ -115,15 +116,18 @@ PartiallySpecifiedModels.jl provides 23 solvers spanning penalized likelihood, g
 | Approximator | Description | Parameters |
 |-------------|-------------|------------|
 | `BSplineApproximator` | Cubic B-spline basis | Spline coefficients |
+| `CyclicBSplineApproximator` | $C^2$ periodic cubic B-spline for seasonal forcing | Periodic spline coefficients |
 | `ShapeConstrainedBSplineApproximator` | SCOP-spline (Pya & Wood 2015) | Constrained coefficients |
-| `TensorBSplineApproximator` | Bivariate tensor-product spline `f(x, y)` | Surface values on the knot grid |
+| `TensorBSplineApproximator` | Bivariate tensor-product spline `f(x, y)` (isotropic or Wood 2006 `t2` anisotropic) | Surface values on the knot grid |
 | `SingleIndexApproximator` | `f(u₁,…,u_p) = s(z)`, `z` the standardized index `aᵀu`: nested inner direction + outer smooth | Loadings + outer coefficients |
 | `TransformedCovariateApproximator` | `f(t) = s(z(t))`, `z` a standardized learned transform (adaptive exponential smoothing or distributed lag) of an exogenous covariate | Transform parameters + outer coefficients |
+| `RandomEffectApproximator` | Ridge-penalized group random effects (`S = I`) for `MultiTrajectoryPSMProblem` | Group-level random effects |
+| `GAMSmoothApproximator` | Any `GAM.jl` smooth (`cr`, `tp`, `cc`, `ps`, `bs`, `re`, `ds`, `fs`, `mrf`, `te`, `ti`, `t2`); load `GAM.jl` | Basis coefficients |
 | `SPDEApproximator` | Matérn SPDE penalty (Lindgren et al. 2011) | Mesh node values |
 | `ShapeConstrainedSPDEApproximator` | SPDE + shape constraints | Constrained mesh values |
 | `NeuralApproximator` | Lux.jl neural network | Network weights |
 | `KANApproximator` | Fixed-grid cubic KAN; load FluxKAN.jl | Edge spline and residual weights |
-| `GPApproximator` | Gaussian process | GP hyperparameters |
+| `GPApproximator` | Gaussian process kernel interpolant | Inducing-point function values |
 | `ShapeConstrainedGPApproximator` | GP + SCOP shape constraints | Constrained inducing values |
 | `COMONetApproximator` | Constrained monotone network | exp(W) weights |
 
@@ -159,11 +163,16 @@ cohorts kept separate from exploratory family comparisons.
 
 ### Likelihoods
 
-- **`Gaussian()`** — Gaussian errors with identity link (default)
-- **`Poisson()`** — Count data, fitted on the response scale (identity link)
-- **`NegativeBinomial()`** — Overdispersed counts with fixed dispersion θ, identity link
-- **`TruncatedNormal()`** — Continuous data bounded below (e.g. non-negative densities)
+- **`GaussianLikelihood()`** — Gaussian errors with identity link (default)
+- **`PoissonLikelihood()`** — Count data, fitted on the response scale (identity link)
+- **`NegativeBinomialLikelihood(theta)`** — Overdispersed counts with fixed dispersion θ, identity link
+- **`TruncatedNormalLikelihood(lower, sigma)`** — Continuous data bounded below (e.g. non-negative densities)
+- **`GammaLikelihood(phi)`** — Positive skewed continuous data (biomass, CPUE)
+- **`LogNormalLikelihood(sigma)`** — Multiplicative log-scale observation error
+- **`BinomialLikelihood(n_trials)`** — Binomial counts / proportions
+- **`StudentTLikelihood(df, sigma)`** — Heavy-tailed robust observations
 - **`CustomLikelihood(loglik_scalar)`** — User-defined likelihood
+- **`Distributions.jl` coercion** — Load `Distributions` and pass `Normal(...)`, `Poisson()`, `NegativeBinomial(...)`, `truncated(Normal(...), lo, Inf)`, `Gamma(...)`, `LogNormal(...)`, `Binomial(...)`, or `TDist(...)` directly to `PSMProblem`!
 
 ### Missing / Masked Observations
 
@@ -185,15 +194,17 @@ inside a Kalman/particle recursion with no per-cell mask; they raise a clear
 error rather than silently corrupting the filter. Drop the masked rows before
 building the problem to use those four.
 
-### Dynamical System Support
+### Dynamical System Support & Ecosystem Integration
 
-- **Continuous-time**: ODEs via `OrdinaryDiffEq.jl`, DDEs via `DelayDiffEq.jl`
-- **Discrete-time**: Maps via `DiscreteProblem`
-- Construct from SciML problem types directly: `PSMProblem(ODEProblem(...), approximators; ...)`
-- Fitted models back as SciML problems: `to_ode_problem(prob, sol)`; the resilience of their
-  equilibria, with bootstrap or posterior uncertainty, through
-  [DynamicalResilience.jl](https://github.com/ecorecipes/DynamicalResilience.jl)
-  (`metrics_over(prob, bootstrap_result; u0)`)
+- **Continuous-time**: ODEs via `OrdinaryDiffEq.jl`, DDEs via `DelayDiffEq.jl`, SDEs with process noise via `SDEPSMProblem` + `EKFSolver`
+- **Discrete-time**: Maps via `DiscreteProblem` (and back via `to_discrete_problem(prob, sol)`)
+- **Hierarchical & Observation Modeling**: Multi-trajectory pooling (`MultiTrajectoryPSMProblem` + `RandomEffectApproximator`), arbitrary observation operators (`obs_fn` & `TrajectoryObservation`), and joint initial-condition estimation (`estimate_u0=true`)
+- **Model Selection & StatsAPI**: `StatsAPI` verbs (`predict`, `coef`, `vcov`, `dof`, `loglikelihood`, `aic`, `bic`, `nobs`, `residuals`, `fitted`, `isconverged`), `compare_models`, and Wood (2013) `test_parametric_hypothesis`
+- **SciML & `ecorecipes` Integration**:
+  - Construct from SciML problems directly: `PSMProblem(ODEProblem(...), approximators; ...)`
+  - [GAM.jl](https://github.com/ecorecipes/GAM.jl): embed any GAM smooth basis via `GAMSmoothApproximator`
+  - [DynamicalResilience.jl](https://github.com/ecorecipes/DynamicalResilience.jl): `to_ode_problem`, `to_discrete_problem`, `steady_state(prob, sol)`, `linearise(prob, sol)`, `posterior_draws`, `metrics_over`
+  - [DecisionAnalysis.jl](https://github.com/ecorecipes/DecisionAnalysis.jl): `ManagedPSM` and `sample_belief` for EVPI, EVSI, and adaptive management under structural uncertainty
 
 ### Shape Constraints (14 types)
 
@@ -213,14 +224,14 @@ Following Pya & Wood (2015), the monotone and monotone-plus-curvature constraint
 
 ## Vignettes
 
-The `vignettes/` directory contains 42 worked examples:
+The `vignettes/` directory contains 48 worked examples:
 
 | # | Vignette | Description |
 |---|----------|-------------|
 | 01 | Getting Started | Basic PSM workflow with logistic growth |
 | 02 | Likelihoods | Gaussian, Poisson, Negative Binomial, and custom likelihoods |
 | 03 | Lotka–Volterra | Hare–lynx predator-prey with LAML and collocation |
-| 04 | Copepod | 11-stage structured population model with multiple unknown functions |
+| 04 | Copepod | Wood (2001) 13-state fixed-duration stage-structured DDE with `:positive` SCOP-splines |
 | 05 | Neural Networks | Comparing B-spline, GP, and neural network approximators on SIR |
 | 06 | Solver Comparison | Side-by-side comparison of eleven solvers |
 | 07 | Probabilistic Fitting | Probabilistic ODE fitting with uncertainty quantification |
@@ -259,6 +270,12 @@ The `vignettes/` directory contains 42 worked examples:
 | 40 | [FGPGM](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/40_fgpgm/40_fgpgm.md) | Bayesian gradient matching with `FGPGMSolver` (Wenk et al. 2019) |
 | 41 | [Kolmogorov-Arnold Networks](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/41_kan/41_kan.md) | Fixed-grid KAN responses, spline baseline, diagnostics and pointwise uncertainty |
 | 42 | [Resilience](https://github.com/ecorecipes/PartiallySpecifiedModels.jl/blob/main/vignettes/42_resilience/42_resilience.md) | Resilience of a fitted equilibrium with bootstrap intervals: a spline functional response vs a misspecified Type II (DynamicalResilience.jl) |
+| 43 | [Gause Competition](vignettes/43_gause_competition/43_gause_competition.qmd) | Multi-replicate *Paramecium* competition with `MultiTrajectoryPSMProblem`, `RandomEffectApproximator`, `:decreasing` SCOP-splines, and `test_parametric_hypothesis` |
+| 44 | [Tribolium LPA Chaos](vignettes/44_tribolium_lpa/44_tribolium_lpa.qmd) | Discrete-time flour-beetle cannibalism with `ShapeConstrainedBSplineApproximator` (`:dec_positive`) and `to_discrete_problem` / `DynamicalResilience.jl` |
+| 45 | [Seasonal Measles](vignettes/45_measles_seasonal/45_measles_seasonal.qmd) | Seasonal transmission forcing with `CyclicBSplineApproximator`, `TrajectoryObservation` interval incidence, `Distributions.NegativeBinomial`, and `compare_models` |
+| 46 | [Fisheries Decision Analysis](vignettes/46_fisheries_surplus_decision/46_fisheries_surplus_decision.qmd) | Surplus-production biomass (`LogNormalLikelihood`) bridged to `DecisionAnalysis.jl` (`ManagedPSM`, `sample_belief`, EVPI & EVPPI) |
+| 47 | [GAM Ecosystem Bridge](vignettes/47_gam_ecosystem_bridge/47_gam_ecosystem_bridge.qmd) | Embedding `GAM.jl` smooths (`GAMSmoothApproximator`) inside mechanistic ODEs with `DynamicalResilience.jl` equilibrium analysis |
+| 48 | [SDE Process Noise](vignettes/48_sde_process_noise/48_sde_process_noise.qmd) | Separating environmental process noise from observation error with `SDEPSMProblem` and `EKFSolver` |
 
 ## Testing
 

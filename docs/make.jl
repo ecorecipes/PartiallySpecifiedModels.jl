@@ -75,6 +75,7 @@ makedocs(
     pages = [
         "Home" => "index.md",
         "Getting Started" => "getting_started.md",
+        "Migration to v0.3" => "migration_v03.md",
         "Approximators" => "approximators.md",
         "Custom Approximators" => "extending.md",
         "Solvers" => "solvers.md",
